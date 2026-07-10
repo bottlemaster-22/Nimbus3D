@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Xcode / build output
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# XcodeGen generates the project from project.yml; don't commit the generated project
+*.xcodeproj/
+Nimbus3D.xcodeproj/
+
+# Rust build output
+target/
+**/target/
+
+# Built framework (CI produces this from the Rust core)
+app/Frameworks/*.xcframework

@@ -1,0 +1,115 @@
+name: iOS build (unsigned)
+
+# Builds Nimbus3D end to end on a macOS runner:
+#   1. Build the Rust/Brush core into Frameworks/NimbusSplatCore.xcframework
+#      (SplatEngine's build-xcframework.sh) — the app target links it.
+#   2. Generate the Xcode project from project.yml (XcodeGen).
+#   3. Archive unsigned and hand-zip a Payload/ IPA (no signing identity in CI).
+#
+# ASSUMPTION: the repository root is this app directory (the folder that holds
+# project.yml). If Nimbus3D/app is nested inside a larger repo instead, move this
+# file to <repo-root>/.github/workflows/ and set `working-directory` accordingly.
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to attach the IPA to a Release on v* tags
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      SCHEME: Nimbus3D
+      CONFIGURATION: Release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Install Rust + iOS targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('Sources/SplatEngine/rust/**/Cargo.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Cache Rust build (target/)
+        uses: actions/cache@v4
+        with:
+          path: Sources/SplatEngine/rust/nimbus-splat-core/target
+          key: rusttarget-${{ runner.os }}-${{ hashFiles('Sources/SplatEngine/rust/**/Cargo.toml', 'Sources/SplatEngine/rust/**/*.rs') }}
+          restore-keys: rusttarget-${{ runner.os }}-
+
+      - name: Build NimbusSplatCore.xcframework (Rust/Brush core)
+        run: bash Sources/SplatEngine/build-xcframework.sh
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Archive (unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Nimbus3D.xcodeproj \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Nimbus3D.xcarchive" \
+            archive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            | xcpretty || true
+          # Fail the job if the archive was not produced (xcpretty masks the exit code).
+          test -d "$RUNNER_TEMP/Nimbus3D.xcarchive/Products/Applications/Nimbus3D.app"
+
+      - name: Package unsigned IPA (hand-zipped Payload/)
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/Nimbus3D.xcarchive/Products/Applications/Nimbus3D.app"
+          WORK="$RUNNER_TEMP/ipa"
+          rm -rf "$WORK" && mkdir -p "$WORK/Payload"
+          cp -R "$APP" "$WORK/Payload/"
+          ( cd "$WORK" && zip -qry "$RUNNER_TEMP/Nimbus3D-unsigned.ipa" Payload )
+          SIZE_MB=$(( $(stat -f%z "$RUNNER_TEMP/Nimbus3D-unsigned.ipa") / 1048576 ))
+          echo "IPA size: ${SIZE_MB} MB"
+          if [ "$SIZE_MB" -gt 512 ]; then
+            echo "::warning::Unsigned IPA is ${SIZE_MB} MB (>512 MB). Check bundled resources / xcframework slices."
+          fi
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nimbus3D-unsigned-ipa
+          path: ${{ runner.temp }}/Nimbus3D-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Attach IPA to Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ runner.temp }}/Nimbus3D-unsigned.ipa

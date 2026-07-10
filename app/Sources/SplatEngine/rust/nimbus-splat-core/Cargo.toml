@@ -1,0 +1,43 @@
+# nimbus-splat-core: C-FFI library wrapping the Brush engine
+# (github.com/ArthurBrussee/brush) for on-device 3D Gaussian Splat training.
+# Built into NimbusSplatCore.xcframework by ../build-xcframework.sh.
+
+[package]
+name = "nimbus-splat-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "nimbus_splat_core"
+# staticlib: an .a for direct static linking / debugging.
+# cdylib:   a .dylib packaged into NimbusSplatCore.framework so the app can
+#           embed + code-sign it (project.yml links the xcframework with
+#           `embed: true, codeSign: true`, which requires a dynamic framework).
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+# SEAM(brush-api): Brush has no crates.io release; we build against the git
+# repository. TODO(nimbus): pin `rev = "<commit>"` after the first successful
+# macOS build so CI stays reproducible; `branch = "main"` is bootstrap only.
+# brush-process re-exports everything we touch (create_process, DataSource,
+# config::TrainStreamConfig, message::{ProcessMessage, TrainMessage},
+# burn_init_setup) and transitively pins the matching burn/wgpu versions, so we
+# do NOT depend on burn-wgpu / brush-dataset / brush-vfs directly (a hand-picked
+# burn version is the classic way this integration silently breaks).
+brush-process = { git = "https://github.com/ArthurBrussee/brush", branch = "main" }
+
+# SEAM(runtime): Brush's pipeline is async and does internal task spawning /
+# dataloading; a multi-thread runtime with timers is the safe default for
+# driving it to completion. TODO(nimbus): if a device build shows a lighter
+# runtime suffices (or a specific one is required), trim these features.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "time"] }
+futures = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+# Keep unwinding enabled so catch_unwind in src/lib.rs can convert panics from
+# deep inside brush/wgpu into a reportable FFI error instead of aborting the app.
+panic = "unwind"
+strip = "debuginfo"

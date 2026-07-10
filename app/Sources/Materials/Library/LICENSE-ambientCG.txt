@@ -1,0 +1,16 @@
+All texture files in this directory are from ambientCG.com,
+created by Lennart Demes, and released under the
+Creative Commons CC0 1.0 Universal License (Public Domain).
+
+https://ambientcg.com
+https://creativecommons.org/publicdomain/zero/1.0/
+
+Bundled sample assets (1K JPG variants):
+  Bricks090  https://ambientcg.com/a/Bricks090
+  Fabric062  https://ambientcg.com/a/Fabric062
+  Gravel022  https://ambientcg.com/a/Gravel022
+  Wood062    https://ambientcg.com/a/Wood062
+  Metal032   https://ambientcg.com/a/Metal032
+  Tiles101   https://ambientcg.com/a/Tiles101
+
+No attribution is required by CC0; this notice is included as a courtesy.

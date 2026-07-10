@@ -1,0 +1,111 @@
+# Nimbus3D — XcodeGen project spec.
+# Generate the Xcode project with:  xcodegen generate  (run in this directory, on macOS / CI)
+#
+# NOTE: Frameworks/NimbusSplatCore.xcframework is produced by the SplatEngine module's
+# Rust build (Brush engine, wgpu-on-Metal). It does not need to exist for `xcodegen generate`
+# to succeed, but the build will fail with a clear error (see preBuildScripts) until it is built.
+
+name: Nimbus3D
+
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "17.0"
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    CLANG_ENABLE_MODULES: "YES"
+    SWIFT_STRICT_CONCURRENCY: minimal
+  configs:
+    Debug:
+      MTL_ENABLE_DEBUG_INFO: INCLUDE_SOURCE
+      SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+    Release:
+      MTL_ENABLE_DEBUG_INFO: "NO"
+      SWIFT_OPTIMIZATION_LEVEL: "-O"
+
+targets:
+  Nimbus3D:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+
+    # Folder-per-module layout. Everything under Sources/ is compiled into the app target:
+    #   - .swift  -> Swift compiler (one module; no per-module namespaces, so type names
+    #                must be globally unique across modules).
+    #   - .metal  -> Metal compiler, anywhere under Sources/ (e.g. Sources/SplatRender/Shaders/,
+    #                Sources/Mesh/, Sources/Materials/Shaders/); each is a separate translation
+    #                unit and they are linked into default.metallib automatically.
+    #   - .jpg/.json/.txt (Sources/Materials/Library/*) -> Resources build phase, added as
+    #                individual (flattened) files so MaterialLibrary can resolve them with
+    #                bundle.url(forResource:withExtension:) with no subdirectory. Do NOT turn
+    #                this into a folder reference or those lookups break.
+    #   - .mlmodelc slots (NimbusDelighter, material classifier) are picked up here too once a
+    #                compiled model is dropped under Sources/Materials/; none ships today.
+    # The Rust crate, its build script, and docs are referenced elsewhere and must NOT be part
+    # of the app compile, so they are excluded below.
+    sources:
+      - path: Sources
+        excludes:
+          - "SplatEngine/rust/**"
+          - "SplatEngine/build-xcframework.sh"
+          - "**/*.md"
+
+    dependencies:
+      # Rust core (Brush-based splat training/IO), built as an XCFramework by the
+      # SplatEngine module: see Sources/SplatEngine for the build script + FFI wrapper.
+      - framework: Frameworks/NimbusSplatCore.xcframework
+        embed: true
+        codeSign: true
+
+    info:
+      path: Support/Info.plist
+      properties:
+        CFBundleDisplayName: Nimbus3D
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIRequiredDeviceCapabilities:
+          - arkit
+          - metal
+        NSCameraUsageDescription: Nimbus3D uses the camera to capture photos of objects and scenes for on-device 3D reconstruction.
+        NSPhotoLibraryAddUsageDescription: Nimbus3D can save exported 3D assets and renders to your photo library.
+        ITSAppUsesNonExemptEncryption: false
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.nimbus3d.app
+        PRODUCT_NAME: Nimbus3D
+        TARGETED_DEVICE_FAMILY: "1"          # iPhone only
+        CODE_SIGN_STYLE: Automatic
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_EMIT_LOC_STRINGS: "YES"
+        # Rust static libs inside the xcframework may pull in the C++ runtime.
+        OTHER_LDFLAGS:
+          - "-lc++"
+
+    preBuildScripts:
+      - name: Check NimbusSplatCore.xcframework
+        basedOnDependencyAnalysis: false
+        script: |
+          if [ ! -d "$SRCROOT/Frameworks/NimbusSplatCore.xcframework" ]; then
+            echo "error: Frameworks/NimbusSplatCore.xcframework is missing. Build the Rust core first (see Sources/SplatEngine/README or the SplatEngine build script). CI must run that step before xcodebuild."
+            exit 1
+          fi
+
+schemes:
+  Nimbus3D:
+    build:
+      targets:
+        Nimbus3D: all
+    run:
+      config: Debug
+    archive:
+      config: Release

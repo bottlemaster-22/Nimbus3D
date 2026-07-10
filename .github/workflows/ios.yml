@@ -1,0 +1,152 @@
+# Nimbus3D iOS CI
+#
+# Builds an UNSIGNED Nimbus3D.ipa on a macOS runner:
+#   1. Install XcodeGen, generate Nimbus3D.xcodeproj from app/project.yml
+#   2. Build the Rust core (Brush engine) into Frameworks/NimbusSplatCore.xcframework
+#      via the SplatEngine module's build script
+#   3. xcodebuild archive with CODE_SIGNING_ALLOWED=NO (no Apple certs anywhere in CI;
+#      the Bottle stack re-signs the IPA with the user's free Apple ID at install time)
+#   4. Package Payload/Nimbus3D.app into Nimbus3D.ipa by hand
+#      (xcodebuild -exportArchive requires signing, so we zip the archive output instead)
+#   5. Upload the IPA as a build artifact on every run, and as a Release asset on v* tags
+#      (that Release asset URL is what Bottle's source.json points at; see
+#       BOTTLE_HOOKS.md at the repo root)
+
+name: iOS build (unsigned IPA)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: write # needed only by the Release step on tag builds
+
+jobs:
+  build:
+    name: Archive unsigned Nimbus3D.ipa
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    env:
+      APP_DIR: app
+      SCHEME: Nimbus3D
+      CONFIGURATION: Release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        run: |
+          sw_vers
+          xcodebuild -version
+          rustc --version || echo "rustc not on PATH yet (installed below)"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Install Rust iOS targets
+        run: |
+          # Rust (rustup) is preinstalled on GitHub macOS runners; we only add the
+          # device/simulator targets the xcframework build needs.
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: Cache cargo registry and Rust build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ env.APP_DIR }}/Sources/SplatEngine/**/target
+          key: cargo-ios-${{ runner.os }}-${{ hashFiles('app/Sources/SplatEngine/**/Cargo.lock') }}
+          restore-keys: |
+            cargo-ios-${{ runner.os }}-
+
+      - name: Build Rust core (NimbusSplatCore.xcframework)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          # Contract (NIMBUS_CONTRACTS.md "Build rules"): the SplatEngine module owns the
+          # Rust crate and a build script that must produce Frameworks/NimbusSplatCore.xcframework.
+          # Conventional location: Sources/SplatEngine/build-xcframework.sh
+          SCRIPT="Sources/SplatEngine/build-xcframework.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "::error file=app/Sources/SplatEngine/build-xcframework.sh::Missing $SCRIPT. The SplatEngine module must provide this script (it builds the Brush-based Rust core into Frameworks/NimbusSplatCore.xcframework). The app cannot link without it; see app/NIMBUS_CONTRACTS.md, Build rules."
+            exit 1
+          fi
+          bash "$SCRIPT"
+          if [ ! -d "Frameworks/NimbusSplatCore.xcframework" ]; then
+            echo "::error::$SCRIPT completed but Frameworks/NimbusSplatCore.xcframework was not produced. Fix the SplatEngine build script so it emits the xcframework at that exact path (project.yml links it from there)."
+            exit 1
+          fi
+          echo "xcframework contents:"
+          find Frameworks/NimbusSplatCore.xcframework -maxdepth 2
+
+      - name: Generate Xcode project (XcodeGen)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          test -d Nimbus3D.xcodeproj
+
+      - name: Archive (unsigned)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project Nimbus3D.xcodeproj \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/Nimbus3D.xcarchive \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER=""
+
+      - name: Package Nimbus3D.ipa (Payload zip, still unsigned)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          APP="build/Nimbus3D.xcarchive/Products/Applications/Nimbus3D.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::Archive did not contain $APP. xcodebuild archive output layout changed or the archive failed silently."
+            exit 1
+          fi
+          rm -rf build/ipa
+          mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          (cd build/ipa && zip -qry ../Nimbus3D.ipa Payload)
+          ls -lh build/Nimbus3D.ipa
+          # Bottle's agent enforces MAX_IPA_BYTES (512 MB). Warn early if we blow past it.
+          SIZE=$(stat -f%z build/Nimbus3D.ipa)
+          if [ "$SIZE" -gt 536870912 ]; then
+            echo "::warning::Nimbus3D.ipa is $SIZE bytes (> 512 MB). Bottle's sideload agent will reject it; see Nimbus3D/BOTTLE_INTEGRATION.md 'Honest limits'."
+          fi
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nimbus3D-unsigned-ipa
+          path: ${{ env.APP_DIR }}/build/Nimbus3D.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach IPA to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.APP_DIR }}/build/Nimbus3D.ipa
+          fail_on_unmatched_files: true
+          generate_release_notes: true

@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "license": "CC0 1.0 Universal (Public Domain). All textures from ambientCG.com, created by Lennart Demes.",
+  "note": "Tiny bundled sample set. One representative tileable PBR material per coarse class. File names are unique so they can be looked up flat in the app bundle.",
+  "entries": [
+    {
+      "assetID": "Bricks090",
+      "displayName": "Bricks 090",
+      "coarseLabel": "masonry",
+      "sourceURL": "https://ambientcg.com/a/Bricks090",
+      "physicalSizeMeters": 1.5,
+      "maps": {
+        "color": "Bricks090_1K-JPG_Color.jpg",
+        "normalGL": "Bricks090_1K-JPG_NormalGL.jpg",
+        "roughness": "Bricks090_1K-JPG_Roughness.jpg",
+        "displacement": "Bricks090_1K-JPG_Displacement.jpg",
+        "ambientOcclusion": "Bricks090_1K-JPG_AmbientOcclusion.jpg"
+      }
+    },
+    {
+      "assetID": "Fabric062",
+      "displayName": "Fabric 062",
+      "coarseLabel": "fabric",
+      "sourceURL": "https://ambientcg.com/a/Fabric062",
+      "physicalSizeMeters": 0.4,
+      "maps": {
+        "color": "Fabric062_1K-JPG_Color.jpg",
+        "normalGL": "Fabric062_1K-JPG_NormalGL.jpg",
+        "roughness": "Fabric062_1K-JPG_Roughness.jpg",
+        "displacement": "Fabric062_1K-JPG_Displacement.jpg",
+        "ambientOcclusion": "Fabric062_1K-JPG_AmbientOcclusion.jpg"
+      }
+    },
+    {
+      "assetID": "Gravel022",
+      "displayName": "Gravel 022",
+      "coarseLabel": "granular",
+      "sourceURL": "https://ambientcg.com/a/Gravel022",
+      "physicalSizeMeters": 1.5,
+      "maps": {
+        "color": "Gravel022_1K-JPG_Color.jpg",
+        "normalGL": "Gravel022_1K-JPG_NormalGL.jpg",
+        "roughness": "Gravel022_1K-JPG_Roughness.jpg",
+        "displacement": "Gravel022_1K-JPG_Displacement.jpg",
+        "ambientOcclusion": "Gravel022_1K-JPG_AmbientOcclusion.jpg"
+      }
+    },
+    {
+      "assetID": "Wood062",
+      "displayName": "Wood 062",
+      "coarseLabel": "wood",
+      "sourceURL": "https://ambientcg.com/a/Wood062",
+      "physicalSizeMeters": 1.0,
+      "maps": {
+        "color": "Wood062_1K-JPG_Color.jpg",
+        "normalGL": "Wood062_1K-JPG_NormalGL.jpg",
+        "roughness": "Wood062_1K-JPG_Roughness.jpg",
+        "displacement": "Wood062_1K-JPG_Displacement.jpg",
+        "ambientOcclusion": "Wood062_1K-JPG_AmbientOcclusion.jpg"
+      }
+    },
+    {
+      "assetID": "Metal032",
+      "displayName": "Metal 032",
+      "coarseLabel": "metal",
+      "sourceURL": "https://ambientcg.com/a/Metal032",
+      "physicalSizeMeters": 1.0,
+      "maps": {
+        "color": "Metal032_1K-JPG_Color.jpg",
+        "normalGL": "Metal032_1K-JPG_NormalGL.jpg",
+        "roughness": "Metal032_1K-JPG_Roughness.jpg",
+        "displacement": "Metal032_1K-JPG_Displacement.jpg",
+        "metalness": "Metal032_1K-JPG_Metalness.jpg"
+      }
+    },
+    {
+      "assetID": "Tiles101",
+      "displayName": "Tiles 101",
+      "coarseLabel": "tile",
+      "sourceURL": "https://ambientcg.com/a/Tiles101",
+      "physicalSizeMeters": 1.0,
+      "maps": {
+        "color": "Tiles101_1K-JPG_Color.jpg",
+        "normalGL": "Tiles101_1K-JPG_NormalGL.jpg",
+        "roughness": "Tiles101_1K-JPG_Roughness.jpg",
+        "displacement": "Tiles101_1K-JPG_Displacement.jpg",
+        "ambientOcclusion": "Tiles101_1K-JPG_AmbientOcclusion.jpg"
+      }
+    }
+  ]
+}
