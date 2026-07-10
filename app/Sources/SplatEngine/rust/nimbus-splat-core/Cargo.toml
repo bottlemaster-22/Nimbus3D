@@ -17,15 +17,17 @@ name = "nimbus_splat_core"
 crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
-# SEAM(brush-api): Brush has no crates.io release; we build against the git
-# repository. TODO(nimbus): pin `rev = "<commit>"` after the first successful
-# macOS build so CI stays reproducible; `branch = "main"` is bootstrap only.
-# brush-process re-exports everything we touch (create_process, DataSource,
-# config::TrainStreamConfig, message::{ProcessMessage, TrainMessage},
-# burn_init_setup) and transitively pins the matching burn/wgpu versions, so we
-# do NOT depend on burn-wgpu / brush-dataset / brush-vfs directly (a hand-picked
-# burn version is the classic way this integration silently breaks).
-brush-process = { git = "https://github.com/ArthurBrussee/brush", branch = "main" }
+# Brush has no crates.io release; we build against a git pin of OUR FORK
+# (bottlemaster-22/brush) which adds an iOS build fix: upstream's `rrfd` file-dialog
+# crate pulls `rfd` (no iOS backend) on every non-android/non-wasm target, so any
+# iOS build failed to compile (E0277). The fork excludes iOS from `rfd` and stubs
+# the picker (never called at runtime; training is fed a real dataset path).
+# Pinned to a rev for reproducible CI. brush-process re-exports everything we touch
+# (create_process, DataSource, config::TrainStreamConfig,
+# message::{ProcessMessage, TrainMessage}, burn_init_setup) and transitively pins
+# the matching burn/wgpu, so we do NOT depend on burn-wgpu / brush-dataset /
+# brush-vfs directly.
+brush-process = { git = "https://github.com/bottlemaster-22/brush", rev = "de605e7862b315d6cd25ee5c94e0997ba6e52157" }
 
 # SEAM(runtime): Brush's pipeline is async and does internal task spawning /
 # dataloading; a multi-thread runtime with timers is the safe default for
