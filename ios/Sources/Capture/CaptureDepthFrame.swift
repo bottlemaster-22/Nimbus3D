@@ -58,10 +58,9 @@ struct CaptureDepthFrame: Sendable {
         guard mapWidth > 0, mapHeight > 0 else { return nil }
         guard CVPixelBufferGetPixelFormatType(depthMap) == kCVPixelFormatType_DepthFloat32
         else {
-            CaptureLog.session.error(
-                "sceneDepth.depthMap was not DepthFloat32; refusing to guess "
+            let message = "sceneDepth.depthMap was not DepthFloat32; refusing to guess "
                     + "its layout."
-            )
+            CaptureLog.session.error("\(message, privacy: .public)")
             return nil
         }
         guard CVPixelBufferLockBaseAddress(depthMap, .readOnly) == kCVReturnSuccess

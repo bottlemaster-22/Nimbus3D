@@ -135,7 +135,15 @@ class BonjourAdvertiser:
                 "phone may not find it automatically. Connecting by IP "
                 "address still works."
             )
-            log.warning("Bonjour registration failed: %s", error)
+            # The exception TYPE is logged as well as its text, because
+            # zeroconf raises several exceptions whose str() is empty, and
+            # "Bonjour registration failed: " with nothing after it is the
+            # least useful log line it is possible to write.
+            log.warning(
+                "Bonjour registration failed: %s: %s",
+                type(error).__name__,
+                error or "(no detail)",
+            )
             self._shutdown_zeroconf()
             return False
 

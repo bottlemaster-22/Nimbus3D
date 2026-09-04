@@ -171,7 +171,11 @@ struct ViewerCompositeUniforms {
     var heatmapGain: Float = 0.75                          // offset 132
     /// Divisor that turns a raw per-pixel splat-overlap count into 0...1.
     var overlapNormalizer: Float = 1.0 / 48.0              // offset 136
-    var pad0: Float = 0                                    // offset 140
+    /// Spacing of the honesty mask's diagonal stripes, in DRAWABLE pixels.
+    /// The renderer sets this from the screen's scale factor so the stripes
+    /// are the same physical size on a 2x and a 3x display; a fixed pixel
+    /// pitch shimmers on the denser one instead of reading as hatching.
+    var hatchPitchPx: Float = 12                           // offset 140
 }                                                          // size 144
 
 extension ViewerCompositeUniforms {

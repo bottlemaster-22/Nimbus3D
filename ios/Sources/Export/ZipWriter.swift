@@ -70,7 +70,8 @@ final class ZipWriter {
 
     /// Adds one entry, streaming its bytes from `fileURL` in chunks.
     /// `archivePath` is the forward-slash entry name inside the zip (e.g.
-    /// `"images/frame_000123_143001_500.jpg"`).
+    /// `"images/frame_20260903_141205_512.jpg"`, the
+    /// `frame_YYYYMMDD_HHMMSS_mmm` stamp per docs/DATA_FORMAT.md section 2).
     func addEntry(archivePath: String, fileURL: URL, chunkSize: Int = 4 * 1024 * 1024) throws {
         guard centralDirectory.count < Self.maxEntryCount else {
             throw ExportError.archiveLimitExceeded(

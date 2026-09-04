@@ -50,8 +50,14 @@ public struct DeviceCompatibilityFindings: Codable, Sendable {
     public var chipGenerationSource: ChipGenerationSource
 
     /// True when the model table claims this device has a scanner but ARKit
-    /// says it does not. That is not a "no scanner" situation and it does not
-    /// get the "no scanner" explanation; see `Reason.scannerNotRespondin`.
+    /// says it does not.
+    ///
+    /// That is not a "no scanner" situation and it must not get the "no
+    /// scanner" explanation: the phone has the hardware and iOS is simply not
+    /// offering it, which is usually temporary and usually fixed by a restart.
+    /// `OnboardingCopy.incompatibleReason(_:)` branches on this flag and says
+    /// so, and `OnboardingCopy.recheckCouldHelp(_:)` uses it to decide whether
+    /// the incompatible screen offers a "Check again" button at all.
     public var catalogDisagreesWithARKit: Bool
 
     public var checkedAt: Date

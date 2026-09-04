@@ -132,16 +132,27 @@ targets:
     #  A module may add Swift and .metal files inside its own directory and
     #  nowhere else.
     # -------------------------------------------------------------------------
+    #  EVERY MODULE DIRECTORY NOW EXISTS AND NONE OF THEM IS OPTIONAL.
+    #
     #  `optional: true` means "skip this directory if it is not on disk yet".
-    #  XcodeGen hard-errors on a missing source path, so a module whose agent
-    #  has not landed yet would break `xcodegen generate` for everybody. Core,
-    #  App, Export and Booster exist and are therefore NOT optional: if one of
-    #  them vanishes, CI must fail loudly. A module that is merely absent
-    #  cannot hide a bug, because App/NimbusApp.swift talks to every module
-    #  through a Core protocol and shows an honest "not installed yet"
-    #  placeholder when the implementation is not registered.
+    #  It was on six of these while their agents were still writing them,
+    #  because XcodeGen hard-errors on a missing source path and one unwritten
+    #  module would have broken `xcodegen generate` for everybody. All twelve
+    #  have landed (Pipeline joined them last), so the flag is gone: if a
+    #  directory ever vanishes, CI must fail loudly rather than quietly
+    #  archiving an app with a hole in it.
+    #
+    #  Each directory is listed with the `name` it appears under in Xcode's
+    #  navigator. Every `.swift` AND `.metal` file inside is picked up
+    #  recursively and added to the compile-sources phase, which is what puts
+    #  the three shader files into `default.metallib`. There is no separate
+    #  Metal build phase to keep in sync, and there must not be one.
     sources:
-      # Shared contracts, brand config, math conventions. Depends on nothing.
+      # Shared contracts, brand config, math conventions. NOT dependency-free:
+      # Contracts.swift borrows SHDegree, SplatCloud and ExportFormat from
+      # Sources/Export and BoosterJobStage from Sources/Booster (and extends
+      # SHDegree with Codable). That is legal only because this is one Xcode
+      # target with no module boundary, so Core cannot be split out as-is.
       - path: Sources/Core
         name: Core
       # App shell: @main, root flow, tab container, service registry.
@@ -150,33 +161,38 @@ targets:
       # First-launch device compatibility gate + tier explanation screens.
       - path: Sources/Onboarding
         name: Onboarding
-        optional: true
       # ARKit/LiDAR session, sidecar logging, coverage HUD, haptics and audio.
+      # Metal: CaptureCoverageShaders.metal
       - path: Sources/Capture
         name: Capture
-        optional: true
       # No-training pre-pass: submaps, loop closure, carving, trust, QC card.
       - path: Sources/PrePass
         name: PrePass
-        optional: true
-      # On-device 3DGS: Metal rasterizer + optimizer (.metal shaders live here).
+      # On-device 3DGS: Metal rasterizer + optimizer.
+      # Metal: TrainerShaders.metal
       - path: Sources/Trainer
         name: Trainer
-        optional: true
+      # The processing flow: the coordinator that drives PrePass then Trainer
+      # for one scan, the budget it sizes from the device and the scan itself,
+      # and the "Finish this scan" screen that starts it.
+      - path: Sources/Pipeline
+        name: Pipeline
       # Smart losses, background model, trust field, edge classifier.
       - path: Sources/Smart
         name: Smart
-        optional: true
       # Preview renderer, honesty mask, A/B slider, artifact heatmap.
+      # Metal: SplatRenderShaders.metal
       - path: Sources/Viewer
         name: Viewer
-        optional: true
       # PLY / SPZ / COLMAP writers.
       - path: Sources/Export
         name: Export
       # Bonjour discovery, pairing, chunked upload, job stream (iOS client).
       - path: Sources/Booster
         name: Booster
+      # Bundled assets. STAYS optional, and this is the one case where that is
+      # correct rather than temporary: the folder is empty, git does not track
+      # empty folders, so it is genuinely absent on a fresh CI checkout.
       - path: Resources
         name: Resources
         optional: true
@@ -239,9 +255,12 @@ targets:
         NSMotionUsageDescription: >-
           Motion data tells the app how fast you are turning, so it can warn you
           when a shot will come out blurry and keep the scan lined up properly.
-        NSPhotoLibraryAddUsageDescription: >-
-          Lets you save a picture or video of a finished scan to your photo
-          library. Only used when you tap Save.
+        #     There is deliberately NO NSPhotoLibraryAddUsageDescription
+        #     either, for the same reason. Nothing in the app writes to the
+        #     photo library today: the only sharing it does is a share sheet
+        #     over an exported .ply / .spz / .glb / .zip file, and none of
+        #     those can go to Photos. Add the key back in the same commit that
+        #     adds a "save a picture of this scan" button, and not before.
         NSLocalNetworkUsageDescription: >-
           Used to find your PC on your own Wi-Fi so it can help finish a large
           scan. Everything stays on your local network and nothing goes to the

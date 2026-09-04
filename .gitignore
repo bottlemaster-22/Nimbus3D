@@ -17,3 +17,5 @@ target/
 
 # Built framework (CI produces this from the Rust core)
 app/Frameworks/*.xcframework
+__pycache__/
+*.pyc

@@ -117,24 +117,35 @@ contained to the handful of named constants at the top of `splat_data.py`
 ### `.spz`
 
 Decoder for Niantic's open `.spz` container (`github.com/nianticlabs/spz`),
-now reconciled formula-by-formula against `ios/Sources/Export/SPZCodec.swift`
+reconciled formula-by-formula against `ios/Sources/Export/SPZCodec.swift`
 (our own exporter, itself verified against Niantic's C++ reference) instead
-of only the format's public docs. That reconciliation found and fixed four
-real bugs an earlier draft had: it only accepted versions 1-2 (our exporter
+of only the format's public docs. That reconciliation found and fixed five
+real bugs across two passes: it only accepted versions 1-2 (our exporter
 writes version 3 by default -- every real file would have been rejected),
 it only implemented the "first three" quaternion decoding (version 3 uses
 "smallest three" -- every real rotation would have been silently wrong, not
 rejected), it treated the stored colour byte as an already-finished 0..1
 colour instead of a quantised SH-DC coefficient needing the same
 `colorScale`/`SH_C0` dequantisation the `.ply` path already applies (colours
-would have been visibly washed out), and it read the SH-rest bands as
+would have been visibly washed out), it read the SH-rest bands as
 signed int8 instead of unsigned-with-128-bias (wrong scale and zero point,
-though not visible today since those bands aren't rendered yet). All four
-are fixed; `spz_reader.py`'s module docstring has the full detail, and
-`selftest.py` now round-trips a version-3 file (what our exporter actually
-writes) with known position/rotation/colour values and asserts the decoded
-result against them, plus a version-1 (float16-position) file for that
-separate code path.
+though not visible today since those bands aren't rendered yet), and -- found
+on a later pass, once `SPZCodec.swift` existed to check against -- it read
+the file's six attribute sections in the wrong order (`positions, scales,
+rotations, alphas, colors, sh` instead of the real `positions, alphas,
+colors, scales, rotations, sh`), so every field past positions was decoding
+someone else's bytes even though each field's own formula was correct in
+isolation. That last one was not caught by the self-test that existed at the
+time, because its synthetic `.spz` builder had the identical wrong section
+order -- internally consistent with the buggy decoder, not with the real
+format. All five are now fixed; `spz_reader.py`'s module docstring has the
+full detail (including how the section-order bug was confirmed: reverting
+only the decoder and re-running made the rotation and colour assertions
+fail with wildly wrong values, exactly as a real miscompiled `.spz` read
+would), and `selftest.py` round-trips a version-3 file (what our exporter
+actually writes) with known position/rotation/colour values and asserts the
+decoded result against them, plus a version-1 (float16-position) file for
+that separate code path.
 
 **Honesty note, still true:** none of this has been verified against a
 byte-exact REAL `.spz` file -- there is no macOS/Blender-side export

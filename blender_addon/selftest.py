@@ -94,6 +94,13 @@ def write_corrupt_ply(path):
 # -- not copied from spz_reader.py -- so it is a real check of agreement
 # between two independent implementations of the spec, not a tautology).
 #
+# Body section order is positions, alphas, colors, scales, rotations, sh --
+# matching SPZCodec.swift's write() exactly. (An earlier draft of both this
+# builder and spz_reader.py's decode_spz used positions/scales/rotations/
+# alphas/colors/sh instead: internally consistent with each other, so the
+# self-test passed, but wrong against the real format -- see spz_reader.py's
+# module docstring "SECTION ORDER" note. Both were fixed together.)
+#
 # Supports versions 1 (float16 positions, "first three" rotation), 2
 # (24-bit fixed positions, "first three" rotation) and 3 (24-bit fixed
 # positions, "smallest three" rotation) -- version 3 is what our own
@@ -168,6 +175,17 @@ def write_synthetic_spz(path, n=5, sh_degree=1, version=3, positions=None,
                 raw = int(round(v * scale)) & 0xFFFFFF  # two's complement wrap into 24 bits
                 body += bytes((raw & 0xFF, (raw >> 8) & 0xFF, (raw >> 16) & 0xFF))
 
+    # alphas: count bytes
+    for i in range(n):
+        body.append(int(round((0.5 + 0.1 * i) * 255)) & 0xFF)
+
+    # colors: count * 3 bytes, quantised SH-DC coefficient (SPZCodec.swift:
+    # byte = dc * (colorScale * 255) + 0.5 * 255)
+    for (dc_r, dc_g, dc_b) in colors_dc:
+        for dc in (dc_r, dc_g, dc_b):
+            b = int(round(dc * (_SPZ_COLOR_SCALE * 255) + 0.5 * 255))
+            body.append(max(0, min(255, b)))
+
     # scales: count*3 bytes, log-scale byte = (logscale + 10) * 16
     for i in range(n * 3):
         log_scale = -3.0 + 0.1 * i
@@ -181,17 +199,6 @@ def write_synthetic_spz(path, n=5, sh_degree=1, version=3, positions=None,
     else:
         for (x, y, z, w) in rotations:
             body += _spz_pack_first_three(x, y, z)  # w >= 0 implied, reconstructed on read
-
-    # alphas: count bytes
-    for i in range(n):
-        body.append(int(round((0.5 + 0.1 * i) * 255)) & 0xFF)
-
-    # colors: count * 3 bytes, quantised SH-DC coefficient (SPZCodec.swift:
-    # byte = dc * (colorScale * 255) + 0.5 * 255)
-    for (dc_r, dc_g, dc_b) in colors_dc:
-        for dc in (dc_r, dc_g, dc_b):
-            b = int(round(dc * (_SPZ_COLOR_SCALE * 255) + 0.5 * 255))
-            body.append(max(0, min(255, b)))
 
     # sh_rest: count * rests_per_channel*3 UNSIGNED int8, degree 1 -> 3 per channel
     rests_per_channel = {0: 0, 1: 3, 2: 8, 3: 15}[sh_degree]

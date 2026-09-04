@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nimbus-booster"
+version = "0.1.0"
+description = "Optional LAN companion that takes a large Gaussian-splat train off the phone. No cloud."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "TOMBLINE" }]
+
+# Deliberately split three ways.
+#
+#   base      the LAN listener. Pure Python plus aiohttp/zeroconf/numpy. This
+#             is enough to receive a scan, verify it, and tell the phone
+#             honestly that this PC cannot train yet. It installs on a laptop
+#             with no GPU in about ten seconds.
+#   [gui]     the PySide6 window. Separate because a headless box running the
+#             listener as a service has no business pulling in Qt.
+#   [train]   torch + gsplat. Separate because they are a multi-gigabyte,
+#             CUDA-version-specific install, and because pinning them into the
+#             base requirement would make the server refuse to start on a
+#             machine where it would otherwise work fine.
+#
+# torch is NOT listed with a version here on purpose: the correct wheel
+# depends on the installed CUDA runtime and comes from PyTorch's own index,
+# not PyPI. See README.md.
+dependencies = [
+    "aiohttp>=3.9",
+    "zeroconf>=0.130",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.5"]
+train = [
+    "torch>=2.1",
+    "gsplat>=1.3",
+    "pillow>=10.0",
+    "scipy>=1.10",
+    # Prompt Depth Anything (F5 mid-field) weights are pulled from the Hugging
+    # Face hub on first use. Apache-2.0, downloaded once, cached on disk.
+    "huggingface_hub>=0.23",
+    "safetensors>=0.4",
+]
+preview = ["pillow>=10.0"]
+
+[project.scripts]
+nimbus-booster = "nimbus_booster.cli:main"
+
+[project.gui-scripts]
+nimbus-booster-gui = "nimbus_booster.gui.main:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

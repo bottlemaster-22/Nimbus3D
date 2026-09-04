@@ -76,6 +76,11 @@ class BoosterServer:
         #: Set by the runner once a trainer is available. Signature:
         #: ``submit(job) -> None``, returning immediately.
         self.submit_job: Optional[Callable[[Any], None]] = None
+        #: Optional observer, set by the GUI. Called whenever a phone reads any
+        #: part of a finished result, which is the only evidence this server
+        #: has that a download is in progress: the window shows "sending your
+        #: scan back" off this and nothing else, rather than guessing.
+        self.on_result_read: Optional[Callable[[Any], None]] = None
         self._app: Optional[web.Application] = None
 
     # -- progress plumbing -------------------------------------------------
@@ -216,6 +221,15 @@ class BoosterServer:
             headers={wire.HEADER_API_VERSION: wire.API_VERSION},
             dumps=lambda obj: json.dumps(obj, sort_keys=True),
         )
+
+    def _result_read(self, job: Any) -> None:
+        """Tell the observer a phone is collecting this result. Never raises."""
+        if self.on_result_read is None:
+            return
+        try:
+            self.on_result_read(job)
+        except Exception as error:  # noqa: BLE001 - a watcher must not break a download
+            log.debug("on_result_read raised: %s", error)
 
     def _require_job(self, request: web.Request) -> Any:
         job = self.jobs.get(request.match_info.get("job_id", ""))
@@ -473,11 +487,13 @@ class BoosterServer:
             return self._error(
                 web.HTTPNotFound, "This scan does not have a finished result yet."
             )
+        self._result_read(job)
         return self._json(job.resultManifest.to_json())
 
     async def handle_result_file(self, request: web.Request) -> web.StreamResponse:
         """``GET /v1/jobs/{id}/result/files/{path}`` with Range support."""
         job = self._require_job(request)
+        self._result_read(job)
         relative = request.match_info.get("rel", "")
         result_dir = self.save_root.result_dir(job.scanID)
         try:
@@ -547,6 +563,12 @@ class _FileBody(web.StreamResponse):
     aiohttp wants ``prepare()`` called with the live request before any body
     is written, and a handler can only return a response object, so the read
     loop is deferred into ``prepare`` rather than run in the handler.
+
+    The attribute names carry a ``file_`` prefix for a reason that cost a
+    debugging session: ``StreamResponse`` already has a ``_start`` METHOD, and
+    an attribute of that name shadows it with an integer. The failure is a
+    ``TypeError: 'int' object is not callable`` raised deep inside aiohttp
+    while writing the response, long after this class is out of the picture.
     """
 
     def __init__(
@@ -555,17 +577,17 @@ class _FileBody(web.StreamResponse):
         super().__init__(status=template.status, headers=template.headers)
         self.content_type = "application/octet-stream"
         self.content_length = length
-        self._path = path
-        self._start = start
-        self._length = length
+        self._file_path = path
+        self._file_start = start
+        self._file_length = length
 
     async def prepare(self, request: web.BaseRequest) -> Any:
         writer = await super().prepare(request)
         if writer is None:
             return None
-        remaining = self._length
-        with open(self._path, "rb") as handle:
-            handle.seek(self._start)
+        remaining = self._file_length
+        with open(self._file_path, "rb") as handle:
+            handle.seek(self._file_start)
             while remaining > 0:
                 block = handle.read(min(65536, remaining))
                 if not block:

@@ -77,12 +77,31 @@ another module.
 | `booster/` | Python PC companion: LAN listener, our trainer on gsplat kernels, PySide6 GUI | `docs/BOOSTER_PROTOCOL.md`, `docs/DATA_FORMAT.md` |
 | `blender_addon/` | Blender importer for our `.ply` / `.spz` | `docs/DATA_FORMAT.md` |
 
-`Sources/Onboarding`, `Capture`, `PrePass`, `Trainer`, `Smart` and `Viewer` do
-not exist on disk yet and are marked `optional: true` in `ios/project.yml`, so
-XcodeGen does not fail on them. Creating the directory with one Swift file in
-it is all it takes to bring a module into the build. `Core`, `App`, `Export`
-and `Booster` are **not** optional: if one of those goes missing, CI must fail
-loudly.
+`Core`, `App`, `Export` and `Booster` are **not** optional in
+`ios/project.yml`: if one of those goes missing, CI must fail loudly. The rest
+are marked `optional: true`, which means only "skip this path if the directory
+is absent" so that a not-yet-written module cannot break `xcodegen generate`
+for everybody.
+
+**`optional: true` is not a safety net for a directory that *does* exist.** The
+moment a module's directory is on disk, every Swift file in it is compiled into
+the single app target. A half-written module therefore breaks the whole build,
+exactly as if it were required. See section 6.7.
+
+### What is actually on disk (audited 2026-09-04)
+
+| Directory | On disk | Compiles | Wired into the app |
+|---|---|---|---|
+| `Core` | yes | yes | n/a |
+| `App` | yes | yes | n/a |
+| `Export` | yes | yes | yes |
+| `Booster` | yes | yes | yes |
+| `Onboarding` | yes | **no** - 3 undeclared types | no |
+| `Capture` | yes (helpers only) | yes | no - no `ARCaptureService` |
+| `PrePass` | yes (math + sensor IO only) | yes | no - no `PrePassPipeline` |
+| `Smart` | yes (`NativeDepthEdgeClassifier`) | yes | n/a - not a registry service |
+| `Viewer` | yes (GPU layouts + shaders) | yes | no - no `MetalSplatRenderer` |
+| `Trainer` | **no** | n/a | no |
 
 ---
 
@@ -318,6 +337,65 @@ natural-log scales, logit opacity, channel-major `f_rest_*`). Section 8 of
 Its `.spz` reader remains unverified against a real sample and is honestly
 flagged PARTIAL. Our own `SPZCodec` writes version 3; the add-on should be
 tested against a file our exporter actually produced, once one exists.
+
+### 6.7 The one thing standing between this repo and a green CI run
+
+Everything in 6.1 to 6.6 is optional tidying. **This is not.**
+
+`ios/Sources/Onboarding` exists but does not compile. `DeviceCompatibilityProbe`
+and its supporting probes are real and good; the module was simply cut off
+before its copy and persistence files were written. Three types are called and
+never declared anywhere in the project:
+
+| Missing type | Called from `Onboarding/DeviceCompatibilityProbe.swift` at |
+|---|---|
+| `OnboardingCopy` | lines 75, 234, 397, 455, 473, 528 |
+| `OnboardingFormat` | line 527 |
+| `DeviceReportStore` | lines 267, 285 |
+
+From the call sites, what they have to be:
+
+* `OnboardingCopy` - a caseless `enum` of static functions returning the
+  plain-language sentences: `lastResortReason` (a `String`),
+  `incompatibleReason(_ context: ReasonContext) -> String`,
+  `noScannerFeatureDetail(_ context: ReasonContext) -> String`,
+  `trainingFeatureDetail(tier: DeviceTier, context: ReasonContext) -> String`,
+  `highDetailFeatureDetail(tier: DeviceTier, context: ReasonContext) -> String`,
+  `storageDetail(freeBytes: UInt64) -> String`. `ReasonContext` already exists
+  at `DeviceCompatibilityProbe.swift:364`. This is where the owner's exact
+  requirement lives: warm, specific, never generic, and it must name the actual
+  missing thing on **that** phone.
+* `OnboardingFormat` - `bytes(_:) -> String`, a human byte formatter.
+* `DeviceReportStore` - a `shared` singleton with
+  `save(_ findings: DeviceCompatibilityFindings)` and
+  `load() -> DeviceCompatibilityFindings?`, persisting the report so the
+  onboarding screens do not re-probe.
+
+There is also no `OnboardingFlowView` yet, which is why
+`NimbusUI.shared.onboardingFlow` stays nil and the app shell falls back to
+`MinimalCompatibilitySummaryView`.
+
+**Two ways to a green build, and only these two:**
+
+1. **Finish the module** (correct). Onboarding's agent writes those three types
+   plus `OnboardingFlowView`, then uncomments its lines in the integration
+   block in `NimbusApp.swift`.
+2. **Remove the directory** (stopgap). Delete `ios/Sources/Onboarding`; the
+   `optional: true` entry in `project.yml` then genuinely skips it, and the app
+   runs with `deviceCompatibility` nil and no first-run gate.
+
+Do **not** try to fix this by editing the integration block or `project.yml`.
+Neither is the cause. Nothing in `Core`, `App`, `Export` or `Booster` needs to
+change.
+
+### 6.8 One stale comment, no code impact
+
+`ios/Sources/Export/ZipWriter.swift:73` gives
+`"images/frame_000123_143001_500.jpg"` as an example entry name. That is the
+old `frame_<index>_<HHMMSS>_<mmm>` shape, not the format's
+`frame_<YYYYMMDD>_<HHMMSS>_<mmm>`. It is an illustrative doc comment only -
+`CaptureScanFolder.swift` builds the real stamp correctly and the on-disk format
+is consistent. Worth a one-line fix by Export's agent; nothing depends on it.
 
 ---
 

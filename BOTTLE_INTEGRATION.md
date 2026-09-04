@@ -12,7 +12,7 @@ The whole sign + install pipeline is already app-agnostic: it is parameterized b
 ## What Nimbus3D provides (the other side of the contract)
 - An **unsigned** `Nimbus3D.ipa`, built by GitHub Actions (macOS runner, Xcode archive with `CODE_SIGNING_ALLOWED=NO`, then zipped as `Payload/Nimbus3D.app` into an `.ipa`). Bottle does the signing, so CI needs **no Apple certs**.
 - A stable **downloadURL** for that IPA (a GitHub Release asset on the Nimbus3D repo).
-- A **bundle id**: `com.nimbus3d.app` (final value TBD, will be confirmed once the first CI build exists).
+- A **bundle id**: `com.tombline.nimbus`. This is now settled, not a placeholder: it is `NIMBUS_BUNDLE_ID` in the brand block of `ios/project.yml` and it is what the archive is built with. (An earlier draft of this file said `com.nimbus3d.app`; that value was never built and must not be used. `BOTTLE_HOOKS.md` already carries the correction.)
 These three values are all Bottle needs. Until the first build exists, wire everything with a placeholder URL/bundle id.
 
 ## Concrete changes on the Bottle side

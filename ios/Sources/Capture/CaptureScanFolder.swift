@@ -139,10 +139,9 @@ public struct CaptureScanFolder: Sendable {
         do {
             try fileManager.removeItem(at: root)
         } catch {
-            CaptureLog.writer.error(
-                "Could not delete cancelled scan \(scanID, privacy: .public): "
-                    + "\(error.localizedDescription, privacy: .public)"
-            )
+            let message = "Could not delete cancelled scan \(scanID): "
+                    + "\(error.localizedDescription)"
+            CaptureLog.writer.error("\(message, privacy: .public)")
         }
     }
 

@@ -109,7 +109,7 @@ struct ViewerCompositeUniforms {
     uint     flags;             // 128
     float    heatmapGain;       // 132
     float    overlapNormalizer; // 136
-    float    pad0;              // 140
+    float    hatchPitchPx;      // 140
 };                              // 144
 static_assert(sizeof(ViewerCompositeUniforms) == 144,
               "ViewerCompositeUniforms must be 144 bytes");
@@ -706,16 +706,27 @@ fragment float4 viewer_composite_fragment(
     }
 
     if (wantHonesty && unobserved > 0.5f) {
-        // 45-degree hatching, 8 px pitch, in screen pixels so it does not
-        // crawl with the geometry - it is an annotation, not a texture.
+        // 45-degree hatching, in SCREEN pixels so it does not crawl with the
+        // geometry - it is an annotation, not a texture. The pitch comes from
+        // the renderer, which sizes it from the screen's scale factor: a fixed
+        // 8 device pixels is under three points on a 3x display, which
+        // shimmers rather than reads.
+        //
+        // This is deliberately loud. It is the one mark on screen that says
+        // "this part is invented", and a subtle version of that message is
+        // worse than none: the user would see it, not register it, and come
+        // away trusting a surface nothing ever looked at.
         float2 px = in.uv * u.viewportPx;
-        float stripe = fract((px.x + px.y) * (1.0f / 8.0f));
-        float hatch = smoothstep(0.44f, 0.5f, stripe) * (1.0f - smoothstep(0.94f, 1.0f, stripe));
-        float3 hatchColour = float3(0.95f, 0.86f, 0.35f);
-        // Desaturate underneath so the hatch reads even over a bright wall.
+        float pitch = max(u.hatchPitchPx, 2.0f);
+        float stripe = fract((px.x + px.y) / pitch);
+        float hatch = smoothstep(0.40f, 0.48f, stripe) * (1.0f - smoothstep(0.92f, 1.0f, stripe));
+        float3 hatchColour = float3(0.98f, 0.87f, 0.28f);
+        // Drain the colour underneath, so the stripes read over a bright wall
+        // and the hatched region is obviously a different KIND of thing from
+        // the parts of the picture that are real.
         float luma = dot(rgb, float3(0.2126f, 0.7152f, 0.0722f));
-        float3 flat3 = mix(rgb, float3(luma), 0.55f);
-        rgb = mix(flat3, hatchColour, hatch * 0.55f);
+        float3 drained = mix(rgb, float3(luma * 0.72f), 0.70f);
+        rgb = mix(drained, hatchColour, hatch * 0.72f);
     }
 
     if (wantHeatmap) {

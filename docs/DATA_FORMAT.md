@@ -77,6 +77,7 @@ tree is identical in both places; the Booster receives a byte-for-byte mirror.
     background.json
     exposure.bin
     observed_directions.bin
+    held_out_frames.json
   export/                      user-facing files
     <scanID>.ply
     <scanID>.spz
@@ -414,9 +415,16 @@ Both are a JSON array of `Core.AnchorRecord`:
   { "identifier": "9C1F…-UUID",
     "transform": [1,0,0,0, 0,1,0,0, 0,0,1,0, 1.2,0.8,-2.3,1],
     "firstSeenFrame": 42,
-    "classification": "wall" }
+    "classification": "wall",
+    "isUserMarked": false }
 ]
 ```
+
+`isUserMarked` is provenance, not a second opinion. It is `true` only for an
+anchor a person placed by tapping "that is a window" in window mode;
+`classification` reads `window` either way. The field is optional on read: a
+file written before it existed decodes as `false`, which is why adding it did
+not bump `formatVersion`.
 
 `transform` is 16 floats, **column-major**, anchor -> world, in ARKit's own
 convention, unmodified.
@@ -572,6 +580,15 @@ through the same reader as everything else.
 `model/background.bin` + `background.json` hold the frozen direction-only far
 field (F5). `model/exposure.bin` holds `(UInt32 frameIndex, Float32 gain,
 Float32 bias)` per frame.
+
+`model/held_out_frames.json` is which frames the training run kept out of
+training, so the viewer's photo-versus-scan slider can compare against photos
+the model provably never saw. Either a bare array of frame indices,
+`[10, 30, 50]`, or `{"frames": [10, 30, 50]}`; readers accept both. Optional,
+and its absence means something specific: nobody wrote down what was held out,
+so a reader must fall back to a deterministic guess and say on screen that it
+is a guess. An empty array is NOT the same thing as an absent file, and a
+writer that held nothing out must omit the file rather than write `[]`.
 
 `model/observed_directions.bin` is the honesty mask's backing store: a coarse
 per-voxel bitmask of which directions each part of the scene was actually

@@ -6,13 +6,23 @@
 //  packages a scan directory for the Booster, imports .ply/.spz back into a
 //  SplatCloud, and hands back a share sheet for a finished export.
 //
-//  There is no Core/Contracts.swift yet for this to conform to (see
-//  SplatCloud.swift's header) so `ExportServicing` below is this module's
-//  own proposed shape for that eventual shared contract - a plain protocol
-//  so Viewer/App can depend on an abstraction and this module can be
-//  mocked out in tests, without pulling in whatever Core ends up defining.
-//  TODO(nimbus): fold ExportServicing into Core/Contracts.swift once that
-//  file exists, keeping ExportService as the concrete implementation.
+//  Written before Core/Contracts.swift existed (see SplatCloud.swift's
+//  header), so `ExportServicing` below is this module's own proposed shape
+//  for that eventual shared contract - a plain protocol so Viewer/App could
+//  depend on an abstraction without pulling in whatever Core ended up
+//  defining.
+//
+//  UPDATE: Core/Contracts.swift now exists and defines `SplatExporting`
+//  (CONTRACTS.md section 6.2) as the shared-contract name - `ExportService`
+//  was already this module's concrete class name and `ExportServicing` was
+//  already this module's own protocol name, so neither could be reused
+//  without a rename inside shipped code. `ExportService` conforms to
+//  `SplatExporting` via a short extension in `Sources/App/NimbusApp.swift`;
+//  this file's `ExportServicing` stays as the module-local protocol and the
+//  two coexist. TODO(nimbus): optional tidying - delete `ExportServicing`
+//  and conform `ExportService` directly to `SplatExporting`, updating the
+//  three method names below (`export`->`exportAsset`, add `scanID: ScanID`/
+//  `async`) to match; not required, see CONTRACTS.md 6.2.
 //
 
 import Foundation

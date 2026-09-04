@@ -10,6 +10,20 @@
 #  did not exist on disk when this decoder was first written; this pass
 #  reconciled every formula against it line by line:
 #
+#    - SECTION ORDER: SPZCodec.swift's `write()` lays the body out as
+#      positions, ALPHAS, COLORS, SCALES, rotations, sh -- an earlier draft
+#      of this decoder read positions, SCALES, ROTATIONS, alphas, colors,
+#      sh (scales and rotations swapped forward, ahead of alphas/colors).
+#      Every per-field formula below was individually correct, but reading
+#      them in the wrong section order means each field was actually
+#      decoding SOMEONE ELSE's bytes: a real 3-version-3 file's alpha bytes
+#      would have been consumed as if they were scale bytes, its colour
+#      bytes as if they were rotation bytes, and so on, corrupting the
+#      whole record. Fixed to match SPZCodec.swift's actual write order
+#      exactly; `selftest.py`'s synthetic-.spz body layout was updated to
+#      match (it had the same wrong order, which is why the self-test did
+#      not catch this: it was internally consistent with the buggy decoder,
+#      not with the real format).
 #    - versions 1-3 supported (SPZCodec.swift's own read() accepts 1...3,
 #      and WRITES version 3 by default -- a decoder that only understood
 #      1-2, as an earlier draft of this file did, would reject every file
@@ -284,17 +298,20 @@ def decode_spz(filepath):
     rests_per_channel = _SH_RESTS_PER_CHANNEL[sh_degree]
     offset = HEADER_SIZE
 
+    # Order matches SPZCodec.swift's write() EXACTLY: positions, alphas,
+    # colors, scales, rotations, sh -- see the module docstring's "SECTION
+    # ORDER" note. Do not reorder these without re-checking that file.
     if version == 1:
         positions, offset = _decode_positions_half(buf, offset, num_points)
     else:
         positions, offset = _decode_positions_fixed24(buf, offset, num_points, fractional_bits)
+    alphas, offset = _decode_alphas(buf, offset, num_points)
+    colors_dc, offset = _decode_colors_dc(buf, offset, num_points)
     scales, offset = _decode_scales(buf, offset, num_points)
     if version >= 3:
         rotations, offset = _decode_rotations_smallest_three(buf, offset, num_points)
     else:
         rotations, offset = _decode_rotations_first_three(buf, offset, num_points)
-    alphas, offset = _decode_alphas(buf, offset, num_points)
-    colors_dc, offset = _decode_colors_dc(buf, offset, num_points)
     sh_rest, offset = _decode_sh_rest(buf, offset, num_points, rests_per_channel)
 
     if offset > len(buf):

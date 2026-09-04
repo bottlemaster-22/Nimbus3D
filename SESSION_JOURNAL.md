@@ -149,3 +149,47 @@ Append-only continuity log. Newest entry at the bottom. Read the latest entry to
 **Build run 1 result (wf_f3ae4b97-25b):** PARTIAL. 10/14 agents failed on server-side API errors (500 / 529 Overloaded), ALL of them Opus; all 4 Sonnet agents succeeded. On disk and real: ios/Sources/Export (PLY/SPZ/GLB, ~2.5k lines), ios/Sources/Booster client (~2.7k lines), blender_addon (headless-tested on this PC with Blender 5.2), .github/workflows/ios.yml + BOTTLE_HOOKS.md (bundle id com.tombline.nimbus, target/scheme named "App", product name decoupled). Partial architect files: ios/project.yml, ios/Sources/Core/BrandConfig.swift. MISSING: Contracts.swift/docs, onboarding, capture, prepass, metal-trainer, smart-losses, viewer, booster-server, integrate, review. Fix: added an agentRetry wrapper (3 tries) to the script + told architect/modules to build on existing files; resuming.
 
 **Build resumes 2-3 (diagnosis):** the architect NEVER completed (0 results; every attempt hit API 500/529 while Opus was overloaded), but the script did not abort on architect failure: it dispatched all 11 modules with null contracts (42 distinct agent keys in the journal). The 4 Sonnet modules re-ran and correctly preserved prior work. Stopped the run before the 7 contract-less Opus modules got far. FIX: architect now retries 5x with 60s-step backoff and the run THROWS if it still fails (no contract-less module builds). Also: always write the script with LF endings (a CRLF rewrite once broke the permission validator). Host process restarts have also killed runs twice; resume is always safe (cached).
+
+**Build progress (2026-07-10, after abort-guard relaunch):** ARCHITECT COMPLETED and is cached (Contracts.swift, BrandConfig, docs/DATA_FORMAT.md, docs/BOOSTER_PROTOCOL.md, CONTRACTS.md). Core modules wrote partial real files before a usage-limit cut: Capture 10, booster/ 13, Onboarding 3, PrePass 2, Smart 2, Viewer 2; Trainer 0 (hardest, not yet written). Opus API 500/529 errors killed many module attempts (retry wrapper fired repeatedly). Resumed as task wvpseonxg; modules improve their existing files on re-run (monotonic progress). Local git checkpoint 9838d04 (209 files), NOT pushed (would trigger a doomed CI run until the trainer exists). NEXT on completion: reviewer verdict -> MODULE_STATUS -> push -> CI IPA -> Bottle hooks. If Opus stays flaky, option (owner must approve): allow Sonnet fallback on module retries.
+
+---
+
+## 2026-09-04 : The build is further along than the journal said. Only the DRIVERS were missing.
+
+**Corrected picture.** A run on 2026-09-04 (14:18-14:29) landed a lot more than the previous journal entry recorded, then hit the session limit mid-trainer. Actual state verified on disk by file count and by grepping for declarations, not by trusting MODULE_STATUS.md:
+
+| Module | Files | Reality |
+|---|---|---|
+| Core | 2 | Contracts.swift (2170 lines) + BrandConfig. REAL. |
+| Onboarding | 10 | **Compile blocker FIXED**: OnboardingCopy.swift, OnboardingFormat.swift, DeviceReportStore.swift all now exist. |
+| Capture | 22 | All the parts. `ARCaptureService` + `CaptureScreen` MISSING. |
+| PrePass | 6 | All the parts. `PrePassPipeline` MISSING. |
+| Trainer | 2 | TrainerShaders.metal = 2042 lines, **28 kernels, complete forward AND backward 3DGS** (preprocess, radix sort, tile ranges, rasterize fwd/bwd, SSIM, depth loss, regularizer, Adam splat/SH). TrainerGPULayouts.swift = 604 lines of struct layouts + TrainerBufferIndex. `MetalSplatTrainer` (the whole CPU side) MISSING. |
+| Smart | 5 | Trust field, authority map, edge classifier, background model. |
+| Viewer | 8 | Renderer + shaders + honesty direction field + camera path + library store. Nothing declares `SplatRenderer` conformance. |
+| Export | 12 | REAL, verified 3 passes. |
+| Booster (iOS) | 20 | REAL, verified 3 passes. |
+| booster/ (PC) | 30 py | server 631 lines aiohttp, trainer ~2400 lines. `gui/` is an EMPTY package. |
+| blender_addon | 10 | REAL, 43/43 tests on installed Blender 5.2.0. |
+
+**The pattern:** every module wrote its internals but not its top-level driver, the one class that owns the parts and conforms to the protocol. Five drivers missing: `MetalSplatTrainer`, `ARCaptureService` (+ `CaptureScreen`), `PrePassPipeline`, the Viewer's `SplatRenderer` conformance, and the Booster GUI. `NimbusApp.swift` is also STALE: it still says Trainer's "Directory absent" and Onboarding is blocked, neither of which is true now.
+
+**Launched** a focused finishing workflow (run `wf_8eca2052-692`, task `wdflz1ifv`, script `scratchpad/nimbus-finish.js`, verified LF-only, 0 control chars, `node --check` clean, status confirmed `running`): 5 driver agents in PARALLEL (all Opus, trainer/capture/prepass at high effort) -> integrate (Opus high) -> adversarial review (Opus high, schema'd). Prompts carry hard rules: improve never clobber, stay in your own directory (cross-module asks go to INTEGRATION_REQUESTS.md), grep every referenced symbol because CI is the only compiler, honest REAL/PARTIAL/STUB, no em dashes.
+
+**Next step:** read the reviewer verdict, fix real blockers, then push and let CI produce the unsigned IPA, then hand Bottle the install hooks.
+
+---
+
+## 2026-09-04 : Drivers landed (7/7 agents, 0 errors). Audit found the app was a dead end after capture.
+
+**Run `wf_8eca2052-692` completed clean:** 7 agents, 0 errors, 2.37M subagent tokens, 696 tool uses, ~74 min. All five drivers written. File counts after: Trainer 2 -> 11, Capture 22 -> 28, PrePass 6 -> 11, Viewer 8 -> 13, booster gui 0 -> 4 py. Repo is now ~47,700 lines across 111 Swift + 3 Metal files.
+
+**Every mechanical check the reviewer could run without macOS PASSED:** no duplicate top-level type names; all 12 protocols in Contracts.swift have exactly one conforming type with every required member present; all 40 Metal entry points referenced from Swift exist AND all 40 declared entry points are referenced (perfect 1:1); `TrainerBind` matches the `[[buffer(n)]]` attributes of all 28 trainer kernels argument for argument; Viewer and Capture shader indices match; braces balance everywhere; no Swift 6-only construct, no iOS 18+ API; all ten source dirs and all three .metal files covered by project.yml.
+
+**THE REAL FINDING (verified independently by grep before acting):** `PrePassService.run(bundle:at:)` had ZERO call sites and `SplatTrainer.train(...)` had ZERO call sites. The only pre-pass entry point called anywhere was `quickQCCard`, from CaptureScreen.swift:382. So the app could record a scan and show a quality card, then stop forever. `hasPrePass` could never become true, making the "Ready to build the 3D model" branch unreachable dead code, while every scan sat on "Recorded. Not checked over yet." promising a step that could not start. 4,100 lines of trainer plus the whole pre-pass were unreachable. The services WERE registered correctly in NimbusApp.swift; nothing invoked them.
+
+**Fixed by hand:** `ios/Support/.gitkeep` (the dir was untracked and empty, and project.yml points INFOPLIST_FILE and CODE_SIGN_ENTITLEMENTS into it, so a fresh CI checkout would have died on a missing Info.plist for a reason unrelated to the Swift). Also corrected the false "Depends on nothing" comment on Sources/Core in project.yml: Contracts.swift borrows SHDegree, SplatCloud, ExportFormat from Export and BoosterJobStage from Booster, and extends SHDegree with Codable.
+
+**Launched `wf_1f37af9b-954` (task `wkiaa84ix`, verified running):** 2 parallel Opus agents, then an adversarial audit. (1) build the processing flow: a new Sources/Pipeline coordinator driving prePass.run -> trainer.train with honest progress, resumability, real cancel, budget sized from device tier and measured scan size, plus the library buttons that make each `nextStep` sentence true and the Booster hand-off for scans too big for the phone. (2) verify the one claim nothing in the repo can prove: GLTFExporter.swift asserts it was checked against a RATIFIED Khronos glTF Gaussian-splat spec, and every attribute name and the COLOR_0 fallback in the .glb path is transcribed from it. Agent has web access and must check the Khronos registry itself, fix the code if wrong, and correct the comment if the extension is not actually ratified.
+
+**Deliberately NOT pushed yet.** Pushing before the pipeline is reachable would burn CI on an app that cannot finish a scan.

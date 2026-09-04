@@ -3,14 +3,46 @@
 //  Export
 //
 //  Writes a .glb (binary glTF 2.0) containing one KHR_gaussian_splatting
-//  point primitive. Verified against the RATIFIED Khronos specification
-//  (github.com/KhronosGroup/glTF, extensions/2.0/Khronos/KHR_gaussian_splatting,
-//  status "Complete, Ratified by the Khronos Group" as of 2026-02) fetched
-//  and read in full on 2026-09-03, not reconstructed from memory - the
-//  attribute semantics, accessor types, required properties and coordinate
-//  handling below are transcribed from that spec's README and JSON schema.
+//  point primitive.
 //
-//  Attribute semantics (per spec):
+//  SPEC PROVENANCE (re-checked 2026-09-04, sources named so the next reader
+//  can repeat the check rather than trust this comment):
+//
+//    Registry index:
+//      raw.githubusercontent.com/KhronosGroup/glTF/main/extensions/README.md
+//      lists KHR_gaussian_splatting under "Ratified Khronos Extensions".
+//    Extension README:
+//      raw.githubusercontent.com/KhronosGroup/glTF/main/extensions/2.0/
+//      Khronos/KHR_gaussian_splatting/README.md
+//      header reads: Status "Complete, Ratified by the Khronos Group".
+//      Latest commit touching that README at the time of checking:
+//      81762cc328b160eafaa0d577dd547a998401ade9, 2026-09-03 ("Update
+//      extensions registry (#2642)").
+//    JSON schema:
+//      .../KHR_gaussian_splatting/schema/
+//      mesh.primitive.KHR_gaussian_splatting.schema.json
+//      ("required": ["colorSpace", "kernel"]; optional "projection",
+//      "sortingMethod" defaulting to "perspective" / "cameraDistance").
+//
+//  What is CONFIRMED: the KHR_ vendor prefix (so: a ratified Khronos
+//  extension, covered by the Khronos IP framework), the exact extension
+//  name string, every attribute semantic spelled below, the accessor types,
+//  the POINTS-mode requirement, the extension object's required properties,
+//  and the COLOR_0 fallback formula.
+//
+//  What is NOT confirmed, and is deliberately no longer claimed here: an
+//  exact ratification DATE. The README carries a status but no date. Khronos
+//  announced this extension on 2026-02-03 as a RELEASE CANDIDATE, not as a
+//  ratified spec, and trade coverage at that time said ratification was
+//  expected in Q2 2026. So an earlier version of this comment claiming
+//  "ratified as of 2026-02" was wrong: February 2026 was the release
+//  candidate. All that can honestly be said is that the registry and the
+//  README both describe it as ratified when checked on 2026-09-04.
+//
+//  Attribute semantics (per spec; the spec also permits normalized byte and
+//  short component types for ROTATION, SCALE and OPACITY, and this exporter
+//  deliberately writes only the plain float32 variant, which is legal for
+//  every one of them):
 //    POSITION                                VEC3 float, required
 //    KHR_gaussian_splatting:ROTATION         VEC4 float, unit quaternion (x,y,z,w)
 //    KHR_gaussian_splatting:SCALE            VEC3 float, LINEAR, must not be negative
@@ -39,13 +71,14 @@
 //
 //  Scope: writes only. This module's import-back mandate (per the task
 //  brief) is .ply and .spz, both long-established interchange formats;
-//  KHR_gaussian_splatting was only ratified in February 2026 and this app
-//  is itself the producer of any .glb it would need to read, so a GLB
-//  reader is not implemented. `KHR_spz_gaussian_splats_compression` (a
-//  compression extension building on this base one) was still an open,
-//  unmerged pull request against the glTF repository as of this writing, so
-//  this exporter deliberately emits the RATIFIED uncompressed base
-//  extension only, not that draft.
+//  KHR_gaussian_splatting is recent (release candidate February 2026,
+//  ratified some time after that) and this app is itself the producer of any
+//  .glb it would need to read, so a GLB reader is not implemented.
+//  `KHR_spz_gaussian_splats_compression` (a compression extension building on
+//  this base one, proposed alongside it in KhronosGroup/glTF pull request
+//  #2490) does NOT appear anywhere in the extension registry as of the
+//  2026-09-04 check, so it is not ratified and not published; this exporter
+//  deliberately emits the ratified uncompressed base extension only.
 //
 //  Encoding: STORE, no compression (glTF/GLB has no notion of compressing
 //  the binary chunk itself; a compressed transmission format is a separate,
@@ -122,15 +155,25 @@ enum GLTFExporter {
         appendVec3Block("KHR_gaussian_splatting:SH_DEGREE_0_COEF_0", cloud.colorDC)
 
         // COLOR_0 - core glTF fallback attribute, per this extension's own "Fallback
-        // Behavior" section (verified against the ratified README on 2026-09-03): a
-        // plain point-cloud/model viewer that does not understand
+        // Behavior" section (re-read 2026-09-04, see the file header for the URL and
+        // commit): a plain point-cloud/model viewer that does not understand
         // KHR_gaussian_splatting at all still renders every splat center as a
-        // correctly colored point instead of a black or default-white dot. Per the
-        // spec: RGB = clamp(0.282095 * f_dc + 0.5, 0, 1) in this file's declared
-        // `colorSpace` ("srgb_rec709_display"), decoded to LINEAR because the glTF
-        // core spec requires COLOR_0 to hold linear values; alpha = the same
-        // activated opacity written to KHR_gaussian_splatting:OPACITY above ("the
-        // alpha channel SHOULD contain the opacity of the splat").
+        // correctly colored point instead of a black or default-white dot.
+        //
+        // The spec's own words: the fallback color "can be computed from the
+        // KHR_gaussian_splatting:SH_DEGREE_0_COEF_0 attribute by multiplying each of
+        // the RGB components by the constant spherical harmonic value of 0.282095,
+        // adding 0.5, and clamping the sum to the [0, 1] range; if the color space is
+        // srgb_rec709_display, the clamped values would have to be decoded from sRGB
+        // to linear because the COLOR_0 attribute contains linear values as per the
+        // glTF specification". This file declares exactly that color space, so the
+        // sRGB decode below is required, not optional. Alpha is the same activated
+        // opacity written to KHR_gaussian_splatting:OPACITY above ("the alpha channel
+        // SHOULD contain the opacity of the splat").
+        //
+        // `SplatMath.shDCToColor` is 0.282095_017, the same constant carried to more
+        // digits than the spec prints; the difference is far below float32 color
+        // precision and every other module in this app already uses that symbol.
         do {
             let byteOffset = bin.count
             for i in 0..<n {
@@ -210,6 +253,12 @@ enum GLTFExporter {
                 ("version", .string("2.0")),
                 ("generator", .string("\(BrandConfig.productName) \(BrandConfig.versionString)")),
             ])),
+            // The spec: the extension "MUST also be listed in `extensionsUsed`", and
+            // SHOULD additionally be listed in `extensionsRequired` when the asset
+            // cannot be displayed without it. This exporter always writes the COLOR_0
+            // fallback above, so the asset IS displayable (as a colored point cloud)
+            // without the extension, and listing it as required would needlessly make
+            // older viewers refuse the file outright. Hence extensionsUsed only.
             ("extensionsUsed", .array([.string("KHR_gaussian_splatting")])),
             ("buffers", .array([.object([("byteLength", .int(bin.count))])])),
             ("bufferViews", .array(bufferViewsJSON)),

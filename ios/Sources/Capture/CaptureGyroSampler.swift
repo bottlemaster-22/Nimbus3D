@@ -73,10 +73,9 @@ final class CaptureGyroSampler: @unchecked Sendable {
     @discardableResult
     func start() -> Bool {
         guard motionManager.isDeviceMotionAvailable else {
-            CaptureLog.session.error(
-                "Device motion is unavailable; angular velocity will be zero "
+            let message = "Device motion is unavailable; angular velocity will be zero "
                     + "and the blur meter cannot work."
-            )
+            CaptureLog.session.error("\(message, privacy: .public)")
             return false
         }
         motionManager.deviceMotionUpdateInterval = 1.0 / 100.0

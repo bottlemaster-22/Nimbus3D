@@ -7,9 +7,9 @@
 //  This file is deliberately thin. It owns no scanning, no training, no
 //  rendering and no networking - it decides which screen is on top and gets
 //  out of the way. Every screen it shows comes from a module through
-//  `NimbusUI` (Core/Contracts.swift); anything not registered renders as an
-//  honest placeholder that names the module which will fill it, rather than a
-//  fake screen that looks finished and does nothing.
+//  `NimbusUI` (Core/Contracts.swift). All of them are registered in the
+//  integration block below; if one ever is not, the tab says so in plain words
+//  rather than showing a fake screen that looks finished and does nothing.
 //
 //  The product is never named here. Every string the user reads that contains
 //  the app's name pulls it from `BrandConfig`, which reads it from the one
@@ -21,10 +21,21 @@ import SwiftUI
 // =============================================================================
 //  MARK: - INTEGRATION BLOCK
 //
-//  THE ONE PLACE MODULES ARE WIRED IN. When a module lands, uncomment its
-//  lines here; nothing else in the app changes. A line stays commented out
-//  only while its module does not exist, so this list doubles as an honest,
-//  at-a-glance answer to "what is actually built?".
+//  THE ONE PLACE MODULES ARE WIRED IN. Every module of this app now exists on
+//  disk and every line below is live; nothing here is commented out any more.
+//  This list is the honest, at-a-glance answer to "what is actually built?",
+//  and the one place to look when a screen is missing at runtime.
+//
+//  THE PRE-PASS AND THE TRAINER ARE NOW REACHABLE. `Sources/Pipeline` owns the
+//  screen that starts them: the scan library pushes `ScanProcessingScreen` for
+//  any scan without a model, and that screen calls `PrePassService.run` and
+//  then `SplatTrainer.train` through this registry. It needs no registration of
+//  its own, which is why there is no Pipeline line below.
+//
+//  SAID PLAINLY: reachable is not the same as proven. Neither the pre-pass nor
+//  the trainer has ever been executed on a phone - there is no macOS on the
+//  machine this was written on, so none of it has been compiled either. The
+//  first real test is a device.
 // =============================================================================
 
 @MainActor
@@ -34,32 +45,53 @@ enum NimbusBootstrap {
         let services = NimbusServices.shared
         let ui = NimbusUI.shared
 
-        // --- Booster (Sources/Booster) - BUILT.
-        services.booster = BoosterClient.shared
-        ui.boosterScreen = { AnyView(BoosterTabView()) }
+        // --- Onboarding (Sources/Onboarding).
+        // The module's own front door, so a rename inside Onboarding is not an
+        // edit to this file. It sets exactly two things:
+        //     services.deviceCompatibility = DeviceCompatibilityProbe()
+        //     ui.onboardingFlow            = OnboardingFlowView(report:onFinish:)
+        OnboardingModule.register()
 
-        // --- Export (Sources/Export) - BUILT.
+        // --- Capture (Sources/Capture).
+        // `.shared`, never a fresh instance: this object owns an `ARSession`,
+        // and two sessions competing for the same camera give you neither.
+        services.capture = ARCaptureService.shared
+        ui.captureScreen = { AnyView(CaptureScreen()) }
+
+        // --- PrePass (Sources/PrePass).
+        // The no-training pass: submaps, loop closure, carving, trust fields,
+        // the quality card. `RootView` hands it the device tier once the
+        // compatibility check has one, so its suggested budget is sized for
+        // this phone rather than for a guess.
+        services.prePass = PrePassPipeline()
+
+        // --- Trainer (Sources/Trainer).
+        services.trainer = MetalSplatTrainer()
+
+        // --- Smart (Sources/Smart). Nothing to register, by design.
+        // The trust field, the background model and the edge classifier are
+        // collaborators that PrePass and Trainer construct and own. They are
+        // deliberately not app-wide singletons, so there is nothing here.
+
+        // --- Viewer (Sources/Viewer).
+        //
+        // The review screen builds its own renderer, one per open scan, so it
+        // never touches this instance. Registering one anyway is deliberate
+        // and costs a few milliseconds at launch: it is what makes
+        // `NimbusServices.installedModules` able to say truthfully that Viewer
+        // is in this build, and it compiles the preview shaders early, so a
+        // shader that did not make it into the build shows up in the log at
+        // launch rather than as a black rectangle the first time somebody
+        // opens a scan.
+        services.renderer = MetalSplatRenderer()
+        ui.libraryScreen = { AnyView(ScanLibraryScreen()) }
+
+        // --- Export (Sources/Export).
         services.exporter = ExportService()
 
-        // --- Onboarding (Sources/Onboarding) - not built yet.
-        // services.deviceCompatibility = DeviceCompatibilityProbe()
-        // ui.onboardingFlow = { report, done in
-        //     AnyView(OnboardingFlowView(report: report, onFinish: done))
-        // }
-
-        // --- Capture (Sources/Capture) - not built yet.
-        // services.capture = ARCaptureService()
-        // ui.captureScreen = { AnyView(CaptureScreen()) }
-
-        // --- PrePass (Sources/PrePass) - not built yet.
-        // services.prePass = PrePassPipeline()
-
-        // --- Trainer (Sources/Trainer) - not built yet.
-        // services.trainer = MetalSplatTrainer()
-
-        // --- Viewer (Sources/Viewer) - not built yet.
-        // services.renderer = MetalSplatRenderer()
-        // ui.libraryScreen = { AnyView(ScanLibraryScreen()) }
+        // --- Booster (Sources/Booster). Always optional, never required.
+        services.booster = BoosterClient.shared
+        ui.boosterScreen = { AnyView(BoosterTabView()) }
     }
 }
 
@@ -201,7 +233,19 @@ struct RootView: View {
                 }
 
             case .blocked(let report):
-                IncompatibleDeviceView(report: report)
+                if let flow = NimbusUI.shared.onboardingFlow {
+                    // Onboarding's own incompatible screen says more than the
+                    // shell's can: it has the measurements behind the verdict,
+                    // and it offers a re-check. If that re-check ever comes
+                    // back compatible, the flow itself calls the completion
+                    // and the app opens normally.
+                    flow(report) {
+                        onboardingCompleted = true
+                        phase = .ready(report)
+                    }
+                } else {
+                    IncompatibleDeviceView(report: report)
+                }
 
             case .ready(let report):
                 MainTabView(report: report)
@@ -223,6 +267,17 @@ struct RootView: View {
         }
 
         let report = await service.evaluate()
+
+        // The pre-pass sizes its suggested training budget from the device
+        // tier. It has a weaker fallback (whatever this process can allocate
+        // right now), but the real verdict is better and we have it here.
+        //
+        // This is also the app's ONE copy of the tier: `Sources/Pipeline`'s
+        // processing coordinator reads it back from this same object rather
+        // than keeping a second one, because two copies of a device tier is two
+        // chances to disagree about what this phone can do.
+        (NimbusServices.shared.prePass as? PrePassPipeline)?.deviceTier = report.tier
+
         switch report.tier {
         case .incompatible:
             phase = .blocked(report)
@@ -296,8 +351,12 @@ struct IncompatibleDeviceView: View {
         + "way to make up that measurement from the camera alone."
 }
 
-/// The shell's stand-in for the first-run flow: shows what this phone can and
-/// cannot do, and gets out of the way.
+/// The shell's stand-in for the first-run flow.
+///
+/// `Sources/Onboarding` ships the real one and registers it, so in a normal
+/// build this view is never reached. It stays because the shell must still be
+/// correct if that registration is ever removed: it shows the real report, in
+/// plain language, and gets out of the way.
 struct MinimalCompatibilitySummaryView: View {
     let report: DeviceCapabilityReport
     let onContinue: () -> Void
@@ -320,8 +379,6 @@ struct MinimalCompatibilitySummaryView: View {
             FeatureListView(features: report.features)
 
             Spacer()
-
-            ModuleNotBuiltNote(module: "Onboarding")
 
             Button("Continue", action: onContinue)
                 .buttonStyle(.borderedProminent)
@@ -388,19 +445,7 @@ struct MainTabView: View {
         if let screen = NimbusUI.shared.captureScreen {
             screen()
         } else {
-            ModulePlaceholderView(
-                module: "Capture",
-                title: "Scan a space",
-                summary:
-                    "Points the camera and the laser scanner at a room and "
-                    + "records it, while telling you where to walk next.",
-                willInclude: [
-                    "Live coverage painted onto the room in three colours",
-                    "A blur warning that reacts to how fast you turn",
-                    "Spoken and buzzing guidance so you can watch the room, not the screen",
-                    "A quality report a few seconds after you stop",
-                ]
-            )
+            ScreenUnavailableView(part: "the scanning screen")
         }
     }
 
@@ -409,19 +454,7 @@ struct MainTabView: View {
         if let screen = NimbusUI.shared.libraryScreen {
             screen()
         } else {
-            ModulePlaceholderView(
-                module: "Viewer",
-                title: "Your scans",
-                summary:
-                    "Every scan on this phone: look around it, compare it "
-                    + "against the real photos, and export it.",
-                willInclude: [
-                    "A fly-through that stays where you actually walked",
-                    "Hatching over anything the scan never really saw",
-                    "A photo-versus-scan slider",
-                    "Export to .ply, .spz and .glb",
-                ]
-            )
+            ScreenUnavailableView(part: "your scan library")
         }
     }
 
@@ -430,14 +463,7 @@ struct MainTabView: View {
         if let screen = NimbusUI.shared.boosterScreen {
             screen()
         } else {
-            ModulePlaceholderView(
-                module: "Booster",
-                title: "Use a computer",
-                summary:
-                    "Hands a big scan to a computer on the same Wi-Fi to "
-                    + "finish, then brings the result back. Always optional.",
-                willInclude: []
-            )
+            ScreenUnavailableView(part: "the computer helper")
         }
     }
 }
@@ -456,68 +482,41 @@ private struct LimitedTierBanner: View {
 }
 
 // =============================================================================
-//  MARK: - Placeholders
+//  MARK: - When a screen is missing
+//
+//  Every module of this app is built and registered in the integration block
+//  at the top of this file, so in a working build nothing below is ever shown.
+//  It exists because a registry entry that is nil at runtime is a real fault,
+//  and a black rectangle is the worst possible way to report one.
 // =============================================================================
 
-/// A screen for a module that is not in this build yet.
-///
-/// It says so plainly. It does not show a fake progress bar, a disabled
-/// button, or a "coming soon" splash pretending to be a product - it names the
-/// module, describes what will be there, and stops.
-struct ModulePlaceholderView: View {
-    let module: String
-    let title: String
-    let summary: String
-    let willInclude: [String]
+/// Shown in a tab whose screen did not register. Names what is missing, says
+/// what is safe, and stops. No fake progress bar, no "coming soon".
+struct ScreenUnavailableView: View {
+    /// Plain-language name of the missing part, e.g. "the scanning screen".
+    let part: String
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    Text(summary)
-                        .foregroundStyle(.secondary)
+        VStack(spacing: 14) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
 
-                    if !willInclude.isEmpty {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("What goes here")
-                                .font(.headline)
-                            ForEach(willInclude, id: \.self) { line in
-                                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                    Text("-")
-                                    Text(line)
-                                }
-                                .font(.subheadline)
-                            }
-                        }
-                    }
+            Text("\(BrandConfig.displayName) could not open \(part).")
+                .font(.headline)
+                .multilineTextAlignment(.center)
 
-                    ModuleNotBuiltNote(module: module)
-
-                    Spacer(minLength: 0)
-                }
-                .padding(24)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .navigationTitle(title)
+            Text(
+                "This is a fault in the app, not in anything you have recorded. "
+                + "Your scans are still on this phone. Closing the app and "
+                + "opening it again is worth a try."
+            )
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
         }
-    }
-}
-
-/// The honest one-liner. Kept in one place so every placeholder says it the
-/// same way and it is trivial to grep for what is still missing.
-struct ModuleNotBuiltNote: View {
-    let module: String
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "hammer")
-            Text("Not built yet. This screen comes from the \(module) module.")
-        }
-        .font(.footnote)
-        .foregroundStyle(.secondary)
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 

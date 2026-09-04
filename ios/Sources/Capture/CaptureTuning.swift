@@ -96,6 +96,16 @@ public enum CaptureTuning {
     /// scan with good window pixels.
     public static let bracketTrackingGuardFrames: Int = 6
 
+    /// How long to wait for a requested dark exposure to actually appear in a
+    /// delivered frame before giving up on that request.
+    ///
+    /// `AVCaptureDevice.setExposureModeCustom` normally lands within two or
+    /// three frames. If its completion handler never fires (the device was
+    /// taken away, the session was interrupted mid-request) the request would
+    /// otherwise sit half-applied forever and no further bracket could be
+    /// asked for, so the request is abandoned and the cadence starts again.
+    public static let bracketApplyTimeoutSeconds: Double = 1.5
+
     // MARK: - Coverage (F9)
 
     /// Edge length of a coverage voxel. Coarser than the occupancy grid (5 cm,
@@ -148,6 +158,14 @@ public enum CaptureTuning {
     /// How often the coverage field is updated, Hz. Coverage changes at
     /// walking speed, not at frame rate.
     public static let coverageUpdateHz: Double = 8
+
+    /// How often the coverage PERCENTAGE is recomputed, Hz.
+    ///
+    /// Slower than the field update on purpose: recomputing the fraction walks
+    /// every voxel in the map, and a whole floor is hundreds of thousands of
+    /// them. Twice a second is faster than a person can walk into new geometry
+    /// and cheap enough that the number never competes with the writer.
+    public static let coverageFractionRecomputeHz: Double = 2
 
     // MARK: - Point cloud (`sparse/0/points3D.txt`)
 
@@ -211,6 +229,73 @@ public enum CaptureTuning {
 
     /// Multiplier applied to the minimum keyframe interval when hot.
     public static let thermalKeyframeIntervalMultiplier: Double = 2.0
+
+    /// At or above this thermal level the capture stops itself and writes the
+    /// bundle. `critical` is the level at which iOS starts shutting things
+    /// down on its own; being killed there would leave a scan with no index,
+    /// so the app stops first, finishes the file, and says why.
+    public static let thermalStopAt: ThermalLevel = .critical
+
+    /// How often free disk space is checked while recording, seconds. The
+    /// check is a filesystem call, so it happens on its own slow schedule
+    /// rather than on every HUD tick.
+    public static let diskCheckIntervalSeconds: Double = 2.0
+
+    // MARK: - Camera-to-IMU time offset (F1)
+    //
+    // CONTRACTS.md section 7 fixes the sweep at -50...+50 ms in 5 ms steps.
+    // Capture measures it live by correlating how fast the camera pose says
+    // the phone turned against how fast the gyro says it turned; the pre-pass
+    // re-derives it from reprojection error and may overwrite the answer.
+
+    /// Widest offset considered, seconds, in each direction.
+    public static let timeOffsetSweepMaxSeconds: Double = 0.050
+    /// Step between candidate offsets, seconds.
+    public static let timeOffsetSweepStepSeconds: Double = 0.005
+
+    /// How long a camera sample waits before it is correlated, seconds.
+    ///
+    /// The sweep looks the gyro up at `frameTime + offset`, and the largest
+    /// offset is in the future when the frame arrives. Holding each sample for
+    /// twice the sweep width means every lookup lands on real samples rather
+    /// than on the ring buffer's clamped end.
+    public static let timeOffsetGyroSettleSeconds: Double = 0.100
+
+    /// Fewest correlated samples before an answer is offered at all. At the
+    /// evaluation rate this is roughly eight seconds of walking.
+    public static let timeOffsetMinSamples: Int = 120
+
+    /// Correlation the winning offset has to reach. Below this the two signals
+    /// do not describe the same motion and the honest answer is "not measured".
+    public static let timeOffsetMinCorrelation: Float = 0.5
+
+    /// The camera's turn rate has to vary at least this much, rad/s, for the
+    /// correlation to mean anything. A phone carried perfectly level down a
+    /// corridor gives a flat signal that correlates with everything.
+    public static let timeOffsetMinCameraSpeedStdRadPerSec: Float = 0.10
+
+    // MARK: - Revisit detection at capture time (F1)
+    //
+    // Capture finds revisit CANDIDATES only: two keyframes that sit close
+    // together, look the same way, and are far apart in time. It runs no depth
+    // alignment, so every pair it emits is `RevisitMethod.poseProximity` and
+    // its residuals are unmeasured. The pre-pass's ICP is what turns a
+    // candidate into a measurement.
+
+    /// How close two camera positions have to be to be candidates, metres.
+    public static let revisitMaxCameraDistanceMeters: Float = 0.6
+    /// ...and how closely their view directions have to agree, degrees.
+    public static let revisitMaxViewAngleDegrees: Float = 30
+    /// Minimum time between the two frames of a pair, seconds. Anything
+    /// shorter is the same continuous look at the same wall, not a return to
+    /// it, and it constrains nothing the raw track does not already say.
+    public static let revisitMinTimeGapSeconds: Double = 20
+    /// Minimum spacing between two emitted pairs, seconds, so a slow walk past
+    /// a doorway produces a handful of constraints and not four hundred.
+    public static let revisitMinPairSpacingSeconds: Double = 1.0
+    /// Hard cap on emitted pairs, so a long walk around a loop cannot make the
+    /// bundle enormous.
+    public static let revisitMaxPairs: Int = 2_000
 
     // MARK: - Live HUD
 

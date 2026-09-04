@@ -66,6 +66,20 @@ public struct SmartLossSettings: Codable, Hashable, Sendable {
     /// Half-width, in native pixels, of the window the two local depth modes
     /// are estimated from.
     public var modeWindowRadius: Int
+    /// Extra weight on a GEOMETRIC edge sample. This is the "sharpen" half of
+    /// the WHERE/WHAT split: a real depth step is the most informative sample
+    /// in the frame and is worth more than a sample in the middle of a wall.
+    public var geometricEdgeSharpenBoost: Float
+    /// Weight on the "flatten" half: a penalty on the LAPLACIAN of rendered
+    /// depth at TEXTURE edges. A 3DGS optimiser left alone invents a ridge at
+    /// a hard colour edge, because a ridge is a cheap way to explain one. This
+    /// makes it not cheap.
+    public var textureFlattenWeight: Float
+    /// Authority below which a sample gets no depth supervision at all and is
+    /// routed to the background instead. Deliberately small: the authority
+    /// ramps are already soft, and this is only the floor where the product
+    /// has decayed to numerical noise.
+    public var minimumAuthorityForDepth: Float
 
     // --- F6: trust ----------------------------------------------------------
 

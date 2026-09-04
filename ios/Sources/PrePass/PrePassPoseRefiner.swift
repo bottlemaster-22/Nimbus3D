@@ -1,0 +1,1158 @@
+//
+//  PrePassPoseRefiner.swift
+//  PrePass
+//
+//  F1: POSES FIRST. The single biggest quality lever in the whole product.
+//
+//  Raw ARKit VIO drifts about 0.55 degrees and 19 mm over a long walk. At 2 m
+//  that is roughly 13 px of disagreement between two views of the same wall,
+//  and a Gaussian splat field needs sub-pixel agreement or it hedges: it
+//  builds a soft, semi-transparent cloud that renders every view slightly
+//  blurred because no single sharp surface can satisfy all of them at once.
+//  Every other clever thing in this app is downstream of getting this right.
+//
+//  What this file does NOT do, deliberately:
+//
+//   * It never runs COLMAP or any structure-from-motion from scratch. ARKit's
+//     track is metric, gravity-aligned and locally excellent; throwing it away
+//     to re-derive it from pixels is strictly worse and much slower.
+//   * It never triangulates-then-bundle-adjusts from the ARKit prior. Measured
+//     on 15 of 15 rooms, that made the poses WORSE (arXiv 2608.21008): the
+//     triangulation inherits the prior's error, and the adjustment then fits
+//     the cameras to the bad points.
+//
+//  What it does instead: trust VIO locally, correct it globally. Slice the
+//  walk into 15-30 s submaps (inside which VIO is near-perfect), find the
+//  places the user walked back over (revisits), measure those alignments
+//  against the native LiDAR depth with point-to-plane ICP, and solve for one
+//  rigid SE(3) per submap. A few dozen unknowns instead of a few thousand, and
+//  every one of them is constrained by a real measurement.
+//
+
+import Foundation
+import simd
+
+// MARK: - Adjoint
+
+extension PrePassSE3 {
+    /// The 6x6 adjoint, row-major, for the twist ordering `xi = (omega, v)`:
+    ///
+    ///     Adj(T) = [ R        0 ]
+    ///              [ [t]x R   R ]
+    ///
+    /// It is what lets a perturbation applied on one side of a product be
+    /// rewritten as a perturbation on the other, which is the whole of the
+    /// pose-graph Jacobian derivation below.
+    var adjoint: [Double] {
+        let r = simd_double3x3(rotation.normalized)
+        let tx = PrePassSE3.skew(translation)
+        let txr = tx * r
+        var a = [Double](repeating: 0, count: 36)
+        for row in 0..<3 {
+            for col in 0..<3 {
+                // simd matrices are column-major: m[col][row].
+                a[row * 6 + col] = r[col][row]
+                a[(row + 3) * 6 + col] = txr[col][row]
+                a[(row + 3) * 6 + (col + 3)] = r[col][row]
+            }
+        }
+        return a
+    }
+}
+
+// MARK: - Pose track
+
+/// The raw VIO track as a function of time, so a pose can be asked for at a
+/// timestamp that is not exactly a frame's.
+///
+/// Used by the camera-to-IMU time-offset sweep, which is precisely the
+/// question "what pose really belongs to the light that landed on the sensor
+/// at this moment", and by nothing else - every other stage works at frame
+/// timestamps where no interpolation is needed.
+struct PrePassPoseTrack: Sendable {
+    private let times: [Double]
+    private let poses: [Pose]
+
+    init(frames: [CaptureFrame]) {
+        // Sorted by time, not assumed sorted: a dropped-and-recovered ARKit
+        // session can log a frame out of order and a binary search over an
+        // unsorted array returns nonsense in silence.
+        let sorted = frames.sorted { $0.timestampSeconds < $1.timestampSeconds }
+        times = sorted.map(\.timestampSeconds)
+        poses = sorted.map(\.rawPose)
+    }
+
+    var isEmpty: Bool { times.isEmpty }
+    var duration: Double { (times.last ?? 0) - (times.first ?? 0) }
+
+    /// Pose at an arbitrary time: SLERP on rotation, linear on translation.
+    /// Clamps at both ends rather than extrapolating - a +-50 ms sweep at the
+    /// very first frame would otherwise invent a pose from before the session
+    /// started.
+    func pose(at time: Double) -> Pose {
+        guard !times.isEmpty else { return .identity }
+        if time <= times[0] { return poses[0] }
+        if time >= times[times.count - 1] { return poses[poses.count - 1] }
+
+        var low = 0
+        var high = times.count - 1
+        while high - low > 1 {
+            let mid = (low + high) / 2
+            if times[mid] <= time { low = mid } else { high = mid }
+        }
+        let span = times[high] - times[low]
+        guard span > 1e-9 else { return poses[low] }
+        let t = Float((time - times[low]) / span)
+        return Pose.interpolate(poses[low], poses[high], t: t)
+    }
+}
+
+// MARK: - Submap assignment
+
+/// Which submap OWNS each frame.
+///
+/// Submap time ranges deliberately overlap by 20-30%, so a frame in an overlap
+/// belongs to two submaps' ranges. Exactly one of them owns it for the purpose
+/// of applying a correction, or the same frame would get two different refined
+/// poses. The owner is the submap whose window CENTRE is nearest, which puts
+/// every frame under the submap that saw it furthest from a window edge, where
+/// VIO's local accuracy is best used.
+enum PrePassSubmapAssignment {
+    static func owners(frames: [CaptureFrame], submaps: [Submap]) -> [FrameID: SubmapID] {
+        var result: [FrameID: SubmapID] = [:]
+        guard !submaps.isEmpty else { return result }
+        result.reserveCapacity(frames.count)
+
+        for frame in frames {
+            var bestIndex = submaps[0].index
+            var bestDistance = Double.greatestFiniteMagnitude
+            var found = false
+            for submap in submaps {
+                guard frame.index >= submap.firstFrame, frame.index <= submap.lastFrame else {
+                    continue
+                }
+                let centre = 0.5 * (submap.startTimeSeconds + submap.endTimeSeconds)
+                let distance = abs(frame.timestampSeconds - centre)
+                if distance < bestDistance {
+                    bestDistance = distance
+                    bestIndex = submap.index
+                    found = true
+                }
+            }
+            if !found {
+                // Outside every window: a frame logged before the first
+                // timestamp or after the last (clock hiccup). Give it the
+                // nearest submap by time rather than dropping it, so it still
+                // gets a refined pose.
+                var nearest = submaps[0]
+                var nearestDistance = Double.greatestFiniteMagnitude
+                for submap in submaps {
+                    let centre = 0.5 * (submap.startTimeSeconds + submap.endTimeSeconds)
+                    let distance = abs(frame.timestampSeconds - centre)
+                    if distance < nearestDistance {
+                        nearestDistance = distance
+                        nearest = submap
+                    }
+                }
+                bestIndex = nearest.index
+            }
+            result[frame.index] = bestIndex
+        }
+        return result
+    }
+}
+
+// MARK: - The refiner
+
+/// `PoseRefiner`, owned by `Sources/PrePass` (CONTRACTS.md section 5).
+public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
+
+    /// Every number the refinement depends on, in one visible place.
+    public struct Tuning: Sendable {
+        /// Submap window length, seconds. The spec fixes 15-30 s: short enough
+        /// that VIO has not drifted inside one, long enough that a submap has
+        /// enough geometry to be pinned by a revisit.
+        public var submapWindowSeconds: Double = 20
+        /// Fraction of a window shared with the next one. The spec fixes
+        /// 20-30%.
+        public var submapOverlapFraction: Double = 0.25
+
+        /// Two frames closer than this in time are adjacency, not a revisit.
+        public var revisitMinTimeGapSeconds: Double = 8
+        /// Camera centres must be within this to be candidates.
+        public var revisitMaxCentreDistanceMeters: Float = 1.5
+        /// And must be looking within this many degrees of the same way.
+        public var revisitMaxViewAngleDegrees: Float = 50
+        /// Keyframe spacing for candidate generation: one candidate anchor per
+        /// this much movement OR this much time, whichever comes first.
+        public var revisitKeyframeSpacingMeters: Float = 0.25
+        public var revisitKeyframeSpacingSeconds: Double = 0.5
+        /// Hard ceiling on ICP runs. A four-minute walk round a flat can
+        /// generate tens of thousands of geometrically plausible pairs and
+        /// aligning all of them would take longer than the training does.
+        public var revisitMaxICPRuns = 600
+
+        /// Time-offset sweep, as the spec fixes it.
+        public var timeOffsetMinSeconds: Double = -0.050
+        public var timeOffsetMaxSeconds: Double = 0.050
+        public var timeOffsetStepSeconds: Double = 0.005
+        /// Frame pairs the sweep scores.
+        public var timeOffsetPairCount = 24
+        /// Feature points per pair.
+        public var timeOffsetFeaturesPerPair = 60
+        /// The sweep's best cost has to beat its median by at least this
+        /// fraction, or there was no minimum and the honest answer is nil.
+        public var timeOffsetMinRelativeImprovement: Double = 0.02
+
+        /// Pose-graph noise model. Separate because a radian and a metre are
+        /// not comparable and pretending they are is how a pose graph ends up
+        /// silently rotation-dominated.
+        public var revisitRotationSigmaDegrees: Double = 0.30
+        public var revisitTranslationSigmaMeters: Double = 0.015
+        /// How stiff the "VIO got the relative placement of neighbouring
+        /// submaps right" prior is. Loose enough that a real loop closure can
+        /// overcome it, stiff enough that an unconstrained submap does not
+        /// float away.
+        public var smoothnessRotationSigmaDegrees: Double = 1.0
+        public var smoothnessTranslationSigmaMeters: Double = 0.05
+        /// Huber threshold on the whitened 6-vector residual. Whitened, so
+        /// this is in sigmas, not metres.
+        public var robustDelta: Double = 2.0
+        public var maxIterations = 30
+
+        public init() {}
+    }
+
+    public var tuning: Tuning
+
+    /// Populated by `detectRevisits` and read by the QC card: candidates that
+    /// looked like revisits geometrically but whose depth alignment did not
+    /// converge. A high number here with a low loop count is the signature of
+    /// a scan taken too fast or too far from the surfaces.
+    public private(set) var rejectedRevisitCandidates: Int = 0
+
+    /// Diagnostics from the last time-offset sweep, for the QC card and for
+    /// anyone wondering why the offset came back nil. Cost per candidate
+    /// offset, in sweep order.
+    public private(set) var lastTimeOffsetSweep: [(offsetSeconds: Double, cost: Double)] = []
+
+    public init(tuning: Tuning = Tuning()) {
+        self.tuning = tuning
+    }
+
+    // MARK: Submaps
+
+    /// Slices the capture into overlapping time windows.
+    ///
+    /// `Submap.correction` is defined here and used everywhere else in this
+    /// module: it is a world-to-world rigid transform applied to a world point
+    /// BEFORE the raw pose, so
+    ///
+    ///     refinedPose(frame) = rawPose(frame) * correction(owner(frame))
+    ///
+    /// in the "apply the right-hand one first" reading. Identity therefore
+    /// means "the pose graph left this submap where VIO put it", which is what
+    /// the contract says it means.
+    public func buildSubmaps(bundle: CaptureBundle) -> [Submap] {
+        let frames = bundle.frames.sorted { $0.timestampSeconds < $1.timestampSeconds }
+        guard let first = frames.first, let last = frames.last else { return [] }
+
+        let start = first.timestampSeconds
+        let end = last.timestampSeconds
+        let duration = Swift.max(end - start, 0)
+
+        let window = Swift.min(Swift.max(tuning.submapWindowSeconds, 15), 30)
+        let overlap = Swift.min(Swift.max(tuning.submapOverlapFraction, 0.20), 0.30)
+        let stride = Swift.max(window * (1 - overlap), 1)
+
+        // A capture shorter than one window is one submap. Not an edge case to
+        // route around: scanning a single object takes 20 seconds.
+        let windowCount: Int
+        if duration <= window {
+            windowCount = 1
+        } else {
+            windowCount = Int(((duration - window) / stride).rounded(.up)) + 1
+        }
+
+        var submaps: [Submap] = []
+        submaps.reserveCapacity(windowCount)
+
+        for k in 0..<windowCount {
+            let windowStart = start + Double(k) * stride
+            let windowEnd = Swift.min(windowStart + window, end)
+            let inWindow = frames.filter {
+                $0.timestampSeconds >= windowStart && $0.timestampSeconds <= windowEnd
+            }
+            guard let firstInWindow = inWindow.first, let lastInWindow = inWindow.last else {
+                continue
+            }
+
+            var minimum = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+            var maximum = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+            for frame in inWindow {
+                let centre = frame.rawPose.center.simd
+                minimum = simd_min(minimum, centre)
+                maximum = simd_max(maximum, centre)
+            }
+
+            submaps.append(
+                Submap(
+                    index: SubmapID(submaps.count),
+                    firstFrame: firstInWindow.index,
+                    lastFrame: lastInWindow.index,
+                    startTimeSeconds: firstInWindow.timestampSeconds,
+                    endTimeSeconds: lastInWindow.timestampSeconds,
+                    correction: .identity,
+                    overlapFraction: 0,
+                    bounds: BoundingBox(min: Vector3(minimum), max: Vector3(maximum))
+                )
+            )
+        }
+
+        // Measured overlap, not the nominal target: the last window is short,
+        // and a paused capture leaves a gap where two windows share nothing.
+        for k in 0..<submaps.count {
+            let own = frames.filter {
+                $0.timestampSeconds >= submaps[k].startTimeSeconds
+                    && $0.timestampSeconds <= submaps[k].endTimeSeconds
+            }
+            guard !own.isEmpty else { continue }
+            var shared = 0
+            for frame in own {
+                for j in 0..<submaps.count where j != k {
+                    if frame.timestampSeconds >= submaps[j].startTimeSeconds,
+                       frame.timestampSeconds <= submaps[j].endTimeSeconds {
+                        shared += 1
+                        break
+                    }
+                }
+            }
+            submaps[k].overlapFraction = Float(shared) / Float(own.count)
+        }
+
+        return submaps
+    }
+
+    // MARK: Time-offset calibration
+
+    /// Sweeps the camera-to-IMU offset over -50...+50 ms in 5 ms steps.
+    ///
+    /// HOW, honestly: the spec says "minimise reprojection error of tracked
+    /// features". There is no feature TRACKER in this app and building one
+    /// would be a worse use of the pre-pass budget than what is done instead:
+    /// direct photometric alignment. Corners are picked in frame A, lifted to
+    /// 3D with the frame's own native LiDAR depth (so no triangulation and no
+    /// depth guess), projected into frame B using the poses re-interpolated at
+    /// the candidate offset, and scored by ZNCC of the patch around each. That
+    /// minimises exactly the quantity a tracker's reprojection error is a
+    /// proxy for, and it is immune to the tracker's own failure modes.
+    ///
+    /// CONDITIONING, also honestly: under constant angular velocity the
+    /// relative pose between two nearby frames barely depends on the offset at
+    /// all, and the sweep is flat. The signal lives in changes of angular
+    /// velocity, so pairs are chosen to MAXIMISE the difference in logged gyro
+    /// rate between their two frames. Where the walk was genuinely smooth
+    /// throughout there is no information to recover and this returns nil,
+    /// which is reported to the user, not smoothed over.
+    public func calibrateTimeOffset(
+        bundle: CaptureBundle,
+        at ref: CaptureBundleRef
+    ) async throws -> Double? {
+        lastTimeOffsetSweep = []
+
+        let frames = bundle.frames.sorted { $0.timestampSeconds < $1.timestampSeconds }
+        guard frames.count >= 8 else { return nil }
+        let track = PrePassPoseTrack(frames: frames)
+        guard track.duration > 1 else { return nil }
+
+        let geometry = PrePassDepthGeometry(rgbIntrinsics: bundle.intrinsics, settings: bundle.settings)
+
+        // Work at a resolution between native depth and full RGB: enough
+        // pixels for ZNCC to discriminate a few-pixel shift, few enough that
+        // twenty-one offsets over two dozen pairs is still fast.
+        let workingWidth = Swift.min(bundle.intrinsics.width, 640)
+        guard workingWidth > 0, bundle.intrinsics.width > 0 else { return nil }
+        let workingHeight = Swift.max(
+            1,
+            Int((Double(bundle.intrinsics.height) * Double(workingWidth)
+                 / Double(bundle.intrinsics.width)).rounded())
+        )
+        let workingIntrinsics = bundle.intrinsics.scaled(toWidth: workingWidth, height: workingHeight)
+
+        let pairs = selectTimeOffsetPairs(frames: frames)
+        guard pairs.count >= 4 else { return nil }
+
+        // Everything each pair needs, loaded once. Loading inside the offset
+        // loop would decode the same JPEG twenty-one times.
+        struct Sample {
+            /// Camera-space point in frame A, from A's own native LiDAR
+            /// depth. Never triangulated, never guessed.
+            var cameraPointA: SIMD3<Float>
+            var pixelA: SIMD2<Float>
+        }
+        struct PreparedPair {
+            var frameA: CaptureFrame
+            var frameB: CaptureFrame
+            var imageA: PrePassGrayImage
+            var imageB: PrePassGrayImage
+            var samples: [Sample]
+        }
+
+        var prepared: [PreparedPair] = []
+        prepared.reserveCapacity(pairs.count)
+
+        for pair in pairs {
+            try Task.checkCancellation()
+            guard let depthFrame = try PrePassDepthFrame.load(
+                frame: pair.a, settings: bundle.settings, at: ref
+            ) else { continue }
+            guard let imageA = PrePassImageLoader.loadGray(
+                url: ref.url(forRelativePath: pair.a.imagePath),
+                width: workingWidth, height: workingHeight
+            ) else { continue }
+            guard let imageB = PrePassImageLoader.loadGray(
+                url: ref.url(forRelativePath: pair.b.imagePath),
+                width: workingWidth, height: workingHeight
+            ) else { continue }
+
+            let corners = PrePassImageOps.shiTomasiResponse(imageA, radius: 2)
+            // Pick the strongest corners that also have a LiDAR return, spaced
+            // out so they are not all on one high-contrast object.
+            var candidates: [(response: Float, x: Int, y: Int)] = []
+            let scaleToNativeX = Float(geometry.width) / Float(workingWidth)
+            let scaleToNativeY = Float(geometry.height) / Float(workingHeight)
+            var y = 4
+            while y < workingHeight - 4 {
+                var x = 4
+                while x < workingWidth - 4 {
+                    let response = corners[y * workingWidth + x]
+                    if response > 1 {
+                        candidates.append((response, x, y))
+                    }
+                    x += 3
+                }
+                y += 3
+            }
+            candidates.sort { $0.response > $1.response }
+
+            var samples: [Sample] = []
+            var used = Set<Int>()
+            for candidate in candidates {
+                if samples.count >= tuning.timeOffsetFeaturesPerPair { break }
+                // Coarse spatial spread: at most one feature per 16x16 cell.
+                let cell = (candidate.y / 16) * (workingWidth / 16 + 1) + (candidate.x / 16)
+                if used.contains(cell) { continue }
+
+                let nx = Int(Float(candidate.x) * scaleToNativeX)
+                let ny = Int(Float(candidate.y) * scaleToNativeY)
+                guard nx >= 0, ny >= 0, nx < geometry.width, ny < geometry.height else { continue }
+                let nativeIndex = ny * geometry.width + nx
+                guard depthFrame.hasReturn(at: nativeIndex) else { continue }
+                let z = depthFrame.depthMeters(at: nativeIndex)
+                guard z > 0.2, z < bundle.settings.lidarMaxRangeMeters else { continue }
+
+                // Unproject with the WORKING intrinsics so the pixel the ZNCC
+                // patch is centred on and the ray are the same thing.
+                let cameraPoint = SIMD3<Float>(
+                    (Float(candidate.x) + 0.5 - workingIntrinsics.cx) / workingIntrinsics.fx * z,
+                    (Float(candidate.y) + 0.5 - workingIntrinsics.cy) / workingIntrinsics.fy * z,
+                    z
+                )
+                used.insert(cell)
+                samples.append(
+                    Sample(
+                        cameraPointA: cameraPoint,
+                        pixelA: SIMD2<Float>(Float(candidate.x) + 0.5, Float(candidate.y) + 0.5)
+                    )
+                )
+            }
+
+            guard samples.count >= 12 else { continue }
+            prepared.append(
+                PreparedPair(
+                    frameA: pair.a, frameB: pair.b,
+                    imageA: imageA, imageB: imageB, samples: samples
+                )
+            )
+        }
+
+        guard prepared.count >= 4 else { return nil }
+
+        var scratchA: [Float] = []
+        var scratchB: [Float] = []
+        var offsets: [Double] = []
+        var costs: [Double] = []
+
+        var offset = tuning.timeOffsetMinSeconds
+        while offset <= tuning.timeOffsetMaxSeconds + 1e-9 {
+            try Task.checkCancellation()
+            var total: Double = 0
+            var count = 0
+
+            for pair in prepared {
+                let poseA = track.pose(at: pair.frameA.timestampSeconds + offset)
+                let poseB = track.pose(at: pair.frameB.timestampSeconds + offset)
+                let aToB = PrePassRigid.relative(from: poseA, to: poseB)
+
+                for sample in pair.samples {
+                    // aToB maps camera-A coordinates to camera-B coordinates,
+                    // so the "world point" argument here is A's camera frame.
+                    let inB = PrePassRigid.cameraPoint(worldPoint: sample.cameraPointA, pose: aToB)
+                    guard inB.z > 0.05 else { continue }
+                    let u = workingIntrinsics.fx * (inB.x / inB.z) + workingIntrinsics.cx
+                    let v = workingIntrinsics.fy * (inB.y / inB.z) + workingIntrinsics.cy
+                    guard u >= 5, v >= 5,
+                          u < Float(workingWidth - 5), v < Float(workingHeight - 5) else { continue }
+
+                    let score = PrePassImageOps.zncc(
+                        pair.imageA, centerA: sample.pixelA,
+                        pair.imageB, centerB: SIMD2<Float>(u, v),
+                        radius: 4,
+                        scratchA: &scratchA, scratchB: &scratchB
+                    )
+                    total += Double(1 - score)
+                    count += 1
+                }
+            }
+
+            offsets.append(offset)
+            // Infinity, not a huge finite number: a candidate offset that
+            // reprojected nothing has no cost, and must never be able to win
+            // the sweep by being numerically smallest.
+            costs.append(count > 0 ? total / Double(count) : Double.infinity)
+            offset += tuning.timeOffsetStepSeconds
+        }
+
+        var sweep: [(offsetSeconds: Double, cost: Double)] = []
+        sweep.reserveCapacity(offsets.count)
+        for i in 0..<offsets.count { sweep.append((offsets[i], costs[i])) }
+        lastTimeOffsetSweep = sweep
+
+        // A minimum has to be interior and has to be a real dip, not the
+        // shallowest point of a flat line.
+        guard let minimumIndex = costs.indices.min(by: { costs[$0] < costs[$1] }),
+              costs[minimumIndex].isFinite else { return nil }
+        guard minimumIndex > 0, minimumIndex < costs.count - 1 else { return nil }
+
+        let median = PrePassStats.median(costs.filter { $0.isFinite })
+        guard median > 0 else { return nil }
+        let improvement = (median - costs[minimumIndex]) / median
+        guard improvement >= tuning.timeOffsetMinRelativeImprovement else { return nil }
+
+        // Sub-step refinement: the true offset is very unlikely to land
+        // exactly on a 5 ms grid point.
+        let sub = PrePassStats.parabolicMinimumOffset(
+            previous: costs[minimumIndex - 1],
+            centre: costs[minimumIndex],
+            next: costs[minimumIndex + 1]
+        )
+        let result = offsets[minimumIndex] + sub * tuning.timeOffsetStepSeconds
+        guard result.isFinite,
+              result >= tuning.timeOffsetMinSeconds - tuning.timeOffsetStepSeconds,
+              result <= tuning.timeOffsetMaxSeconds + tuning.timeOffsetStepSeconds
+        else { return nil }
+        return result
+    }
+
+    /// Pairs chosen to maximise sensitivity: a short baseline (so the two
+    /// views still overlap) across the largest available CHANGE in gyro rate
+    /// (so the offset actually moves the relative pose).
+    private func selectTimeOffsetPairs(
+        frames: [CaptureFrame]
+    ) -> [(a: CaptureFrame, b: CaptureFrame)] {
+        var scored: [(score: Float, a: CaptureFrame, b: CaptureFrame)] = []
+        let baseline = 0.25   // seconds
+
+        var j = 0
+        for i in 0..<frames.count {
+            let a = frames[i]
+            guard a.depthPath != nil, a.qc.trackingQuality.isPoseTrustworthy else { continue }
+            // Blurred frames make ZNCC meaningless; 3 px of smear is already
+            // past the point where a 1 px shift is measurable.
+            guard a.qc.motionBlurPixels < 3 else { continue }
+
+            if j < i { j = i }
+            while j < frames.count - 1,
+                  frames[j].timestampSeconds - a.timestampSeconds < baseline {
+                j += 1
+            }
+            guard j < frames.count, j != i else { continue }
+            let b = frames[j]
+            guard b.qc.trackingQuality.isPoseTrustworthy, b.qc.motionBlurPixels < 3 else { continue }
+
+            let deltaOmega = simd_length(a.angularVelocity.simd - b.angularVelocity.simd)
+            scored.append((deltaOmega, a, b))
+        }
+
+        scored.sort { $0.score > $1.score }
+
+        // Spread the winners over the whole capture: twenty-four pairs all
+        // taken from the one moment the user whipped the phone round would
+        // measure that moment's offset, not the session's.
+        var chosen: [(a: CaptureFrame, b: CaptureFrame)] = []
+        var usedTimes: [Double] = []
+        let minimumSeparation = Swift.max(
+            (frames[frames.count - 1].timestampSeconds - frames[0].timestampSeconds)
+                / Double(tuning.timeOffsetPairCount * 2),
+            0.5
+        )
+        for entry in scored {
+            if chosen.count >= tuning.timeOffsetPairCount { break }
+            if usedTimes.contains(where: { abs($0 - entry.a.timestampSeconds) < minimumSeparation }) {
+                continue
+            }
+            usedTimes.append(entry.a.timestampSeconds)
+            chosen.append((entry.a, entry.b))
+        }
+        return chosen
+    }
+
+    // MARK: Revisit detection
+
+    public func detectRevisits(
+        bundle: CaptureBundle,
+        submaps: [Submap],
+        at ref: CaptureBundleRef
+    ) async throws -> [RevisitPair] {
+        rejectedRevisitCandidates = 0
+
+        let frames = bundle.frames.sorted { $0.timestampSeconds < $1.timestampSeconds }
+        guard frames.count >= 4 else { return [] }
+
+        let geometry = PrePassDepthGeometry(rgbIntrinsics: bundle.intrinsics, settings: bundle.settings)
+        let owners = PrePassSubmapAssignment.owners(frames: frames, submaps: submaps)
+
+        // 1. Anchors: a sparse subset of frames, spaced by movement or time.
+        var anchors: [CaptureFrame] = []
+        var lastCentre = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var lastTime = -Double.greatestFiniteMagnitude
+        for frame in frames where frame.depthPath != nil {
+            let centre = frame.rawPose.center.simd
+            let movedFar = simd_distance(centre, lastCentre) >= tuning.revisitKeyframeSpacingMeters
+            let waitedLong = frame.timestampSeconds - lastTime >= tuning.revisitKeyframeSpacingSeconds
+            guard anchors.isEmpty || movedFar || waitedLong else { continue }
+            anchors.append(frame)
+            lastCentre = centre
+            lastTime = frame.timestampSeconds
+        }
+        guard anchors.count >= 2 else { return [] }
+
+        // 2. Geometric gate: near in space, agreeing in view direction, far
+        //    apart in time. The time gap is what makes it a REVISIT rather
+        //    than the trivially-true fact that consecutive frames overlap.
+        struct Candidate {
+            var a: CaptureFrame
+            var b: CaptureFrame
+            var score: Float
+        }
+        var candidates: [Candidate] = []
+        for i in 0..<anchors.count {
+            let a = anchors[i]
+            let centreA = a.rawPose.center.simd
+            let forwardA = a.rawPose.forward.simd
+            let submapA = owners[a.index]
+            for j in (i + 1)..<anchors.count {
+                let b = anchors[j]
+                guard b.timestampSeconds - a.timestampSeconds >= tuning.revisitMinTimeGapSeconds
+                else { continue }
+                // Two frames inside one submap are not a loop closure: the
+                // graph has a single unknown for the pair and the constraint
+                // would be vacuous.
+                if let sa = submapA, let sb = owners[b.index], sa == sb { continue }
+
+                let distance = simd_distance(centreA, b.rawPose.center.simd)
+                guard distance <= tuning.revisitMaxCentreDistanceMeters else { continue }
+                let angle = PrePassAngle.degreesBetween(forwardA, b.rawPose.forward.simd)
+                guard angle <= tuning.revisitMaxViewAngleDegrees else { continue }
+
+                // Prefer close, well-aligned, well-tracked pairs.
+                let quality = a.qc.weight * b.qc.weight
+                let score = quality
+                    * (1 - distance / tuning.revisitMaxCentreDistanceMeters)
+                    * (1 - angle / tuning.revisitMaxViewAngleDegrees)
+                candidates.append(Candidate(a: a, b: b, score: score))
+            }
+        }
+        guard !candidates.isEmpty else { return [] }
+        candidates.sort { $0.score > $1.score }
+        if candidates.count > tuning.revisitMaxICPRuns {
+            candidates.removeSubrange(tuning.revisitMaxICPRuns...)
+        }
+
+        // 3. Align each surviving candidate with point-to-plane ICP.
+        //
+        // Sequential with a tiny cache rather than a task group: each
+        // unprojected frame is ~5 MB, and holding a few hundred of them
+        // resident to parallelise a stage that already fits in the budget is
+        // exactly the "never assume the scene fits memory" mistake this
+        // product is supposed to be better than.
+        candidates.sort {
+            $0.a.index == $1.a.index ? $0.b.index < $1.b.index : $0.a.index < $1.a.index
+        }
+
+        var cache: [FrameID: PrePassFramePoints] = [:]
+        var cacheOrder: [FrameID] = []
+        let cacheLimit = 8
+
+        func points(for frame: CaptureFrame) throws -> PrePassFramePoints? {
+            if let hit = cache[frame.index] { return hit }
+            guard let depthFrame = try PrePassDepthFrame.load(
+                frame: frame, settings: bundle.settings, at: ref
+            ) else { return nil }
+            let built = PrePassFramePoints.build(
+                depthFrame: depthFrame,
+                geometry: geometry,
+                maxRangeMeters: bundle.settings.lidarMaxRangeMeters
+            )
+            cache[frame.index] = built
+            cacheOrder.append(frame.index)
+            if cacheOrder.count > cacheLimit {
+                let evicted = cacheOrder.removeFirst()
+                cache[evicted] = nil
+            }
+            return built
+        }
+
+        var results: [RevisitPair] = []
+        for candidate in candidates {
+            try Task.checkCancellation()
+
+            guard let sourcePoints = try points(for: candidate.a),
+                  let targetPoints = try points(for: candidate.b)
+            else {
+                // No depth for one of them: record the geometric agreement so
+                // the QC card can still count it, but with zero confidence so
+                // the pose graph ignores it. A pose-proximity "measurement" is
+                // just the VIO estimate handed back, and feeding an estimate
+                // to the optimiser as if it were an observation is how a pose
+                // graph convinces itself it is right.
+                results.append(
+                    RevisitPair(
+                        frameA: candidate.a.index,
+                        frameB: candidate.b.index,
+                        method: .poseProximity,
+                        measuredRelativePose: PrePassRigid.relative(
+                            from: candidate.a.rawPose, to: candidate.b.rawPose
+                        ),
+                        translationResidualMeters: 0,
+                        rotationResidualDegrees: 0,
+                        inlierCount: 0,
+                        confidence: 0
+                    )
+                )
+                continue
+            }
+
+            let initial = PrePassRigid.relative(from: candidate.a.rawPose, to: candidate.b.rawPose)
+            let icp = PrePassICP.align(
+                source: sourcePoints,
+                target: targetPoints,
+                geometry: geometry,
+                initial: initial
+            )
+            guard icp.converged else {
+                rejectedRevisitCandidates += 1
+                continue
+            }
+
+            // The residual IS the drift measurement: how far the LiDAR says
+            // the two frames really are apart, minus where VIO put them.
+            let error = PrePassSE3(icp.relativePose) * PrePassSE3(initial).inverse
+            let translationResidual = Float(simd_length(error.translation))
+            let rotationResidual = Float(error.rotationAngleDegrees)
+
+            // Confidence from the alignment's own evidence, not from a guess:
+            // how much of the source found a match, and how tight the fit is.
+            let fitTerm = Float(Swift.max(0, 1 - Double(icp.rmsMeters) / 0.03))
+            let confidence = Swift.min(
+                Swift.max(icp.inlierFraction * 0.6 + fitTerm * 0.4, 0), 1
+            )
+
+            results.append(
+                RevisitPair(
+                    frameA: candidate.a.index,
+                    frameB: candidate.b.index,
+                    method: .depthICP,
+                    measuredRelativePose: icp.relativePose,
+                    translationResidualMeters: translationResidual,
+                    rotationResidualDegrees: rotationResidual,
+                    inlierCount: icp.inlierCount,
+                    confidence: confidence
+                )
+            )
+        }
+
+        return results
+    }
+
+    // MARK: The pose graph
+
+    /// Solves for one rigid SE(3) per submap and returns per-frame refined
+    /// poses.
+    ///
+    /// Unknowns: `M_k` for each submap, with `refined_f = raw_f * M_owner(f)`.
+    ///
+    /// Residuals, whitened by the sigmas in `Tuning` so rotation and
+    /// translation are comparable before the robust loss sees them:
+    ///
+    ///  * one per revisit edge, `log(Z^-1 * P_b * P_a^-1)`, where `Z` is the
+    ///    ICP measurement and `P` the current refined pose;
+    ///  * one per adjacent submap pair, `log(M_{k+1} * M_k^-1)`, encoding "VIO
+    ///    got the relative placement of neighbours right" - loose enough for a
+    ///    real loop closure to overcome, stiff enough that a submap with no
+    ///    closures at all stays where VIO put it instead of drifting off;
+    ///  * one gauge prior, `log(M_0)`, because otherwise the whole solution is
+    ///    free to translate and rotate together. Anchoring submap zero also
+    ///    keeps the result in ARKit's original world frame, which is the frame
+    ///    the anchors and the scene mesh are already in.
+    ///
+    /// Levenberg-Marquardt with an annealed Huber loss: the delta starts wide
+    /// so a genuinely large drift is not clipped away as an outlier on the
+    /// first iteration, and tightens as the solution settles so a bad ICP
+    /// match cannot pull the final answer.
+    public func optimize(
+        bundle: CaptureBundle,
+        submaps: [Submap],
+        revisits: [RevisitPair],
+        timeOffsetSeconds: Double?
+    ) async throws -> [String: Pose] {
+        let frames = bundle.frames.sorted { $0.timestampSeconds < $1.timestampSeconds }
+        guard !frames.isEmpty else { return [:] }
+
+        // Applying the calibrated offset is the first half of F1 and has to
+        // happen BEFORE the graph: the graph corrects drift, and a time offset
+        // is not drift - it is every pose being the pose of a slightly
+        // different moment, which no rigid per-submap correction can absorb.
+        let track = PrePassPoseTrack(frames: frames)
+        var basePoses: [FrameID: Pose] = [:]
+        basePoses.reserveCapacity(frames.count)
+        if let offset = timeOffsetSeconds, abs(offset) > 1e-6 {
+            for frame in frames {
+                basePoses[frame.index] = track.pose(at: frame.timestampSeconds + offset)
+            }
+        } else {
+            for frame in frames { basePoses[frame.index] = frame.rawPose }
+        }
+
+        guard !submaps.isEmpty else {
+            return Dictionary(uniqueKeysWithValues: basePoses.map { (String($0.key), $0.value) })
+        }
+
+        let owners = PrePassSubmapAssignment.owners(frames: frames, submaps: submaps)
+        var slotOfSubmap: [SubmapID: Int] = [:]
+        for (slot, submap) in submaps.enumerated() { slotOfSubmap[submap.index] = slot }
+        let n = submaps.count
+        let dimension = 6 * n
+
+        // Usable edges only. A zero-confidence pair is a geometric note for
+        // the QC card, not an observation (see `detectRevisits`).
+        struct Edge {
+            var slotA: Int
+            var slotB: Int
+            var measurement: PrePassSE3
+            var poseA: PrePassSE3
+            var poseB: PrePassSE3
+            var weight: Double
+        }
+        var edges: [Edge] = []
+        for pair in revisits {
+            guard pair.confidence > 0.05 else { continue }
+            guard let submapA = owners[pair.frameA], let submapB = owners[pair.frameB],
+                  let slotA = slotOfSubmap[submapA], let slotB = slotOfSubmap[submapB],
+                  slotA != slotB,
+                  let rawA = basePoses[pair.frameA], let rawB = basePoses[pair.frameB]
+            else { continue }
+            edges.append(
+                Edge(
+                    slotA: slotA,
+                    slotB: slotB,
+                    measurement: PrePassSE3(pair.measuredRelativePose),
+                    poseA: PrePassSE3(rawA),
+                    poseB: PrePassSE3(rawB),
+                    weight: Double(pair.confidence)
+                )
+            )
+        }
+
+        // Nothing to solve: no loop closures means no evidence that anything
+        // moved, and inventing a correction from a smoothness prior alone
+        // would be fabricating a result. Return the (possibly time-shifted)
+        // VIO poses, which is the honest answer.
+        guard !edges.isEmpty else {
+            return Dictionary(uniqueKeysWithValues: basePoses.map { (String($0.key), $0.value) })
+        }
+
+        var corrections = [PrePassSE3](repeating: .identity, count: n)
+
+        let revisitRotationWeight = 1 / (tuning.revisitRotationSigmaDegrees * .pi / 180)
+        let revisitTranslationWeight = 1 / tuning.revisitTranslationSigmaMeters
+        let smoothRotationWeight = 1 / (tuning.smoothnessRotationSigmaDegrees * .pi / 180)
+        let smoothTranslationWeight = 1 / tuning.smoothnessTranslationSigmaMeters
+        // The gauge prior only has to remove the six-dimensional null space,
+        // so it is deliberately an order of magnitude stiffer than anything
+        // else and applies to one submap alone.
+        let anchorWeight = smoothTranslationWeight * 10
+
+        /// Total robust cost at a given set of corrections. Separate from the
+        /// normal-equation build so Levenberg-Marquardt can compare the cost
+        /// at the CANDIDATE against the cost at the current point, which is
+        /// what makes the damping parameter mean anything. (Comparing this
+        /// iteration's cost against the last one's instead - the easy mistake -
+        /// accepts a step before knowing whether it helped.)
+        func graphCost(_ state: [PrePassSE3], delta: Double) -> Double {
+            var total: Double = 0
+            for edge in edges {
+                let pA = state[edge.slotA].then(edge.poseA)
+                let pB = state[edge.slotB].then(edge.poseB)
+                let error = pA.inverse.then(pB).then(edge.measurement.inverse)
+                var residual = error.logVector()
+                for i in 0..<3 { residual[i] *= revisitRotationWeight }
+                for i in 3..<6 { residual[i] *= revisitTranslationWeight }
+                var norm: Double = 0
+                for value in residual { norm += value * value }
+                norm = norm.squareRoot()
+                total += PrePassStats.huberWeight(residual: norm, delta: delta)
+                    * edge.weight * norm * norm
+            }
+            for k in 0..<(n - 1) {
+                let d = state[k].inverse.then(state[k + 1])
+                var residual = d.logVector()
+                for i in 0..<3 { residual[i] *= smoothRotationWeight }
+                for i in 3..<6 { residual[i] *= smoothTranslationWeight }
+                var norm: Double = 0
+                for value in residual { norm += value * value }
+                norm = norm.squareRoot()
+                total += PrePassStats.huberWeight(residual: norm, delta: delta * 3) * norm * norm
+            }
+            var anchor = state[0].logVector()
+            for i in 0..<6 { anchor[i] *= anchorWeight }
+            for value in anchor { total += value * value }
+            return total
+        }
+
+        var lambda = 1e-4
+
+        for iteration in 0..<tuning.maxIterations {
+            try Task.checkCancellation()
+
+            // Anneal the robust threshold: wide at first so a real 30 cm drift
+            // is fitted rather than rejected, tight at the end so one bad
+            // alignment cannot bend the answer.
+            let progress = Double(iteration) / Double(Swift.max(tuning.maxIterations - 1, 1))
+            let delta = tuning.robustDelta * (3 - 2 * progress)
+            let currentCost = graphCost(corrections, delta: delta)
+
+            var h = [Double](repeating: 0, count: dimension * dimension)
+            var g = [Double](repeating: 0, count: dimension)
+
+            // --- Revisit edges
+            for edge in edges {
+                let mA = corrections[edge.slotA]
+                let mB = corrections[edge.slotB]
+                let pA = mA.then(edge.poseA)      // raw_a * M_a  (apply M first)
+                let pB = mB.then(edge.poseB)
+                let e = pA.inverse.then(pB)       // P_b * P_a^-1
+                let error = e.then(edge.measurement.inverse)   // Z^-1 * (P_b P_a^-1)
+
+                var residual = error.logVector()
+                // Whiten.
+                for i in 0..<3 { residual[i] *= revisitRotationWeight }
+                for i in 3..<6 { residual[i] *= revisitTranslationWeight }
+
+                var norm: Double = 0
+                for value in residual { norm += value * value }
+                norm = norm.squareRoot()
+                let robust = PrePassStats.huberWeight(residual: norm, delta: delta) * edge.weight
+
+                // Jacobians. Deriving once, in full, because a sign error here
+                // is invisible: the optimiser still converges, to the wrong
+                // answer.
+                //
+                //   E   = A_b M_b M_a^-1 A_a^-1                (= P_b P_a^-1)
+                //   M_k <- exp(d_k) M_k                        (left increment)
+                //
+                //   from b:  A_b exp(d_b) X    = exp(Adj(A_b) d_b) A_b X
+                //   from a:  W exp(-d_a) A_a^-1, W = A_b M_b M_a^-1
+                //                              = exp(-Adj(W) d_a) W A_a^-1
+                //
+                //   so E(d) ~ exp( Adj(A_b) d_b - Adj(W) d_a ) E, and after
+                //   pushing through the fixed Z^-1 on the left:
+                //
+                //   J_b =  Adj(Z^-1 A_b)
+                //   J_a = -Adj(Z^-1 W)
+                //
+                // The left-Jacobian factor Jl^-1(r) that belongs in front of
+                // both is approximated by the identity. That is exact at the
+                // solution and accurate to first order near it, which is where
+                // this runs: the initialisation is VIO, not a random guess.
+                let zInverse = edge.measurement.inverse
+                // W = A_b M_b M_a^-1. `then` is "apply, then apply", so the
+                // matrix product is written right-to-left as a left-to-right
+                // chain: apply M_a^-1, then M_b, then A_b.
+                let w = mA.inverse.then(mB).then(edge.poseB)
+                // Z^-1 A_b: apply A_b, then Z^-1.
+                let jacobianB = edge.poseB.then(zInverse).adjoint
+                // Z^-1 W: apply W, then Z^-1.
+                let jacobianAFull = w.then(zInverse).adjoint
+
+                accumulate(
+                    h: &h, g: &g, dimension: dimension,
+                    residual: residual, weight: robust,
+                    blocks: [
+                        (edge.slotB, jacobianB, 1.0),
+                        (edge.slotA, jacobianAFull, -1.0)
+                    ],
+                    rowScales: (revisitRotationWeight, revisitTranslationWeight)
+                )
+            }
+
+            // --- Smoothness between adjacent submaps
+            for k in 0..<(n - 1) {
+                let d = corrections[k].inverse.then(corrections[k + 1])   // M_{k+1} M_k^-1
+                var residual = d.logVector()
+                for i in 0..<3 { residual[i] *= smoothRotationWeight }
+                for i in 3..<6 { residual[i] *= smoothTranslationWeight }
+
+                var norm: Double = 0
+                for value in residual { norm += value * value }
+                norm = norm.squareRoot()
+                let robust = PrePassStats.huberWeight(residual: norm, delta: delta * 3)
+
+                // exp(d_{k+1}) D exp(-d_k):  J_{k+1} = I, J_k = -Adj(D).
+                var identity = [Double](repeating: 0, count: 36)
+                for i in 0..<6 { identity[i * 6 + i] = 1 }
+                accumulate(
+                    h: &h, g: &g, dimension: dimension,
+                    residual: residual, weight: robust,
+                    blocks: [
+                        (k + 1, identity, 1.0),
+                        (k, d.adjoint, -1.0)
+                    ],
+                    rowScales: (smoothRotationWeight, smoothTranslationWeight)
+                )
+            }
+
+            // --- Gauge anchor on submap 0
+            do {
+                var residual = corrections[0].logVector()
+                for i in 0..<3 { residual[i] *= anchorWeight }
+                for i in 3..<6 { residual[i] *= anchorWeight }
+                var identity = [Double](repeating: 0, count: 36)
+                for i in 0..<6 { identity[i * 6 + i] = 1 }
+                accumulate(
+                    h: &h, g: &g, dimension: dimension,
+                    residual: residual, weight: 1,
+                    blocks: [(0, identity, 1.0)],
+                    rowScales: (anchorWeight, anchorWeight)
+                )
+            }
+
+            guard let step = PrePassDenseSolver.solveDamped(
+                h: h, g: g, n: dimension, lambda: lambda
+            ) else {
+                lambda *= 10
+                if lambda > 1e6 { break }
+                continue
+            }
+
+            var candidate = corrections
+            var stepNorm: Double = 0
+            for k in 0..<n {
+                let omega = SIMD3<Double>(step[6 * k], step[6 * k + 1], step[6 * k + 2])
+                let v = SIMD3<Double>(step[6 * k + 3], step[6 * k + 4], step[6 * k + 5])
+                stepNorm += simd_length_squared(omega) + simd_length_squared(v)
+                candidate[k] = candidate[k].then(PrePassSE3.exp(omega: omega, v: v))
+            }
+            stepNorm = stepNorm.squareRoot()
+
+            let candidateCost = graphCost(candidate, delta: delta)
+            if candidateCost.isFinite, candidateCost < currentCost {
+                corrections = candidate
+                lambda = Swift.max(lambda * 0.5, 1e-8)
+                if stepNorm < 1e-7 { break }
+            } else {
+                // The step made things worse: keep the current estimate, damp
+                // harder, try again. This is the whole point of LM, and it is
+                // what stops one wild loop-closure edge from throwing the
+                // solution somewhere it can never recover from.
+                lambda *= 4
+                if lambda > 1e6 { break }
+            }
+        }
+
+        // Sanity gate. A pose graph that wants to move a submap by two metres
+        // has found a wrong loop closure, not two metres of drift, and
+        // shipping that would be much worse than shipping the VIO poses. This
+        // is a real, silent failure mode of every pose-graph SLAM system and
+        // the only defence is a hard, explicit limit.
+        for correction in corrections {
+            let translation = simd_length(correction.translation)
+            if !translation.isFinite || translation > 2.0 || correction.rotationAngleDegrees > 20 {
+                return Dictionary(uniqueKeysWithValues: basePoses.map { (String($0.key), $0.value) })
+            }
+        }
+
+        var refined: [String: Pose] = [:]
+        refined.reserveCapacity(frames.count)
+        for frame in frames {
+            let base = basePoses[frame.index] ?? frame.rawPose
+            guard let submap = owners[frame.index], let slot = slotOfSubmap[submap] else {
+                refined[String(frame.index)] = base
+                continue
+            }
+            // refined = raw * M  (apply M to the world point first).
+            refined[String(frame.index)] = corrections[slot].then(PrePassSE3(base)).pose
+        }
+        return refined
+    }
+
+    /// Accumulates one residual's contribution into the normal equations.
+    ///
+    /// `blocks` is `(slot, 6x6 row-major Jacobian, sign)`. `rowScales` is the
+    /// same whitening already applied to `residual`, applied to the Jacobian
+    /// rows so `H = J^T W J` stays consistent - forgetting this is the classic
+    /// way to get a solver that converges to a wrong minimum with no
+    /// symptom other than a slightly worse result.
+    private func accumulate(
+        h: inout [Double],
+        g: inout [Double],
+        dimension: Int,
+        residual: [Double],
+        weight: Double,
+        blocks: [(slot: Int, jacobian: [Double], sign: Double)],
+        rowScales: (rotation: Double, translation: Double)
+    ) {
+        guard weight > 0 else { return }
+
+        // Whiten each block's rows exactly as the residual was whitened.
+        var scaled: [(offset: Int, jacobian: [Double])] = []
+        scaled.reserveCapacity(blocks.count)
+        for block in blocks {
+            var j = [Double](repeating: 0, count: 36)
+            for row in 0..<6 {
+                let scale = (row < 3 ? rowScales.rotation : rowScales.translation) * block.sign
+                for col in 0..<6 {
+                    j[row * 6 + col] = block.jacobian[row * 6 + col] * scale
+                }
+            }
+            scaled.append((block.slot * 6, j))
+        }
+
+        for (offsetA, ja) in scaled {
+            for row in 0..<6 {
+                var gradient: Double = 0
+                for k in 0..<6 { gradient += ja[k * 6 + row] * residual[k] }
+                g[offsetA + row] += weight * gradient
+            }
+            for (offsetB, jb) in scaled {
+                for row in 0..<6 {
+                    for col in 0..<6 {
+                        var sum: Double = 0
+                        for k in 0..<6 { sum += ja[k * 6 + row] * jb[k * 6 + col] }
+                        h[(offsetA + row) * dimension + (offsetB + col)] += weight * sum
+                    }
+                }
+            }
+        }
+    }
+}

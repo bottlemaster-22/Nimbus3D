@@ -4,17 +4,24 @@
 //
 //  THE MODULE'S OWN MODEL OF A GAUSSIAN SPLAT CLOUD.
 //
-//  There is no Core/Contracts.swift on disk yet (the architect pass that was
-//  meant to produce ios/Sources/Core/Contracts.swift and CONTRACTS.md has not
-//  run). Export cannot sit idle waiting for a contract that does not exist, so
-//  this file defines the minimal, self-contained splat representation Export
-//  needs and documents it as a migration target:
+//  Written before ios/Sources/Core/Contracts.swift existed, when Export could
+//  not sit idle waiting for a contract that had not landed yet, so this file
+//  defined the minimal, self-contained splat representation Export needs.
 //
-//      TODO(nimbus): once Core/Contracts.swift exists, replace SplatCloud with
-//      whatever shared splat type Trainer/Viewer/PrePass agree on, and make
-//      this file a thin typealias + conversion shim instead of the source of
-//      truth. Keep the wire-format math (PLYCodec/SPZCodec/GLTFExporter) as-is
-//      - only the in-memory container should change.
+//  UPDATE: Core/Contracts.swift and CONTRACTS.md now exist. Per CONTRACTS.md
+//  section 6.1, `SplatCloud`, `SHDegree`, `ExportError` and `ExportFormat` are
+//  PROMOTED to contract types in place rather than re-declared in Core (a
+//  duplicate top-level type name in this single-target project is a hard
+//  compile error), so this file stays the source of truth exactly as-is.
+//  Core adds one conformance this file must never also declare:
+//  `extension SHDegree: Codable {}` lives in Contracts.swift - see that file's
+//  comment above it before touching SHDegree here.
+//
+//      Optional, no-risk later tidying (CONTRACTS.md 6.1): move this file
+//      from Sources/Export to Sources/Core unchanged - a file move with no
+//      content or call-site change, since there is no `import` to update in
+//      a single target. Do it when this module is not mid-flight, or never;
+//      it costs nothing to leave as-is.
 //
 //  Storage convention (deliberate, documented so every writer/reader agrees):
 //

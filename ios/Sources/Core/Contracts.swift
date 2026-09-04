@@ -521,16 +521,56 @@ public struct AnchorRecord: Codable, Hashable, Sendable {
     public var firstSeenFrame: FrameID?
     public var classification: SurfaceClass
 
+    /// True when a person put this anchor there by tapping "that is a window"
+    /// in window mode, rather than ARKit's classifier deciding it.
+    ///
+    /// Provenance, not a second opinion. `classification` says the same thing
+    /// either way; this says who said it, so the glass detector (F5) can
+    /// weight a human witness differently from the classifier if it ever wants
+    /// to. Nothing requires it, and a file written before this field existed
+    /// decodes as `false`.
+    public var isUserMarked: Bool
+
     public init(
         identifier: UUID,
         transform: [Float],
         firstSeenFrame: FrameID?,
-        classification: SurfaceClass
+        classification: SurfaceClass,
+        isUserMarked: Bool = false
     ) {
         self.identifier = identifier
         self.transform = transform
         self.firstSeenFrame = firstSeenFrame
         self.classification = classification
+        self.isUserMarked = isUserMarked
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case identifier
+        case transform
+        case firstSeenFrame
+        case classification
+        case isUserMarked
+    }
+
+    /// Written by hand for one reason: `isUserMarked` was added after the
+    /// format existed, and Swift's synthesised decoder treats a missing
+    /// non-optional key as a hard failure rather than as the default. An
+    /// `anchors_session.json` from an earlier build must still open.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        identifier = try container.decode(UUID.self, forKey: .identifier)
+        transform = try container.decode([Float].self, forKey: .transform)
+        firstSeenFrame = try container.decodeIfPresent(
+            FrameID.self,
+            forKey: .firstSeenFrame
+        )
+        classification = try container.decode(
+            SurfaceClass.self,
+            forKey: .classification
+        )
+        isUserMarked =
+            try container.decodeIfPresent(Bool.self, forKey: .isUserMarked) ?? false
     }
 
     public var matrix: simd_float4x4 {

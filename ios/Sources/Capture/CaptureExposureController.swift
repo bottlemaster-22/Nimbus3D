@@ -101,10 +101,9 @@ final class CaptureExposureController: @unchecked Sendable {
         }
         lock.unlock()
         if !hasDevice {
-            CaptureLog.exposure.notice(
-                "No configurable capture device: exposure bracketing is off "
+            let message = "No configurable capture device: exposure bracketing is off "
                     + "for this session and will be recorded as off."
-            )
+            CaptureLog.exposure.notice("\(message, privacy: .public)")
         }
     }
 
@@ -187,10 +186,9 @@ final class CaptureExposureController: @unchecked Sendable {
             lock.unlock()
             return true
         } catch {
-            CaptureLog.exposure.error(
-                "White balance lock failed: "
-                    + "\(error.localizedDescription, privacy: .public)"
-            )
+            let message = "White balance lock failed: "
+                    + "\(error.localizedDescription)"
+            CaptureLog.exposure.error("\(message, privacy: .public)")
             return false
         }
     }
@@ -298,21 +296,19 @@ final class CaptureExposureController: @unchecked Sendable {
                 self.lock.unlock()
             }
             device.unlockForConfiguration()
-            CaptureLog.exposure.debug(
-                "Bracket: ISO \(currentISO, format: .fixed(precision: 0)) -> "
-                    + "\(targetISO, format: .fixed(precision: 0))"
-            )
+            let message = "Bracket: ISO \(String(format: "%.0f", currentISO)) -> "
+                    + "\(String(format: "%.0f", targetISO))"
+            CaptureLog.exposure.debug("\(message, privacy: .public)")
         } catch {
             lock.lock()
             state = .idle
             bracketingEnabled = false
             unavailability = .configurationFailed
             lock.unlock()
-            CaptureLog.exposure.error(
-                "Could not set a dark bracket: "
-                    + "\(error.localizedDescription, privacy: .public). "
+            let message = "Could not set a dark bracket: "
+                    + "\(error.localizedDescription). "
                     + "Bracketing is off for the rest of this session."
-            )
+            CaptureLog.exposure.error("\(message, privacy: .public)")
         }
     }
 
@@ -369,12 +365,35 @@ final class CaptureExposureController: @unchecked Sendable {
             }
             device.unlockForConfiguration()
         } catch {
-            CaptureLog.exposure.error(
-                "Could not restore exposure after a bracket: "
-                    + "\(error.localizedDescription, privacy: .public)"
-            )
+            let message = "Could not restore exposure after a bracket: "
+                    + "\(error.localizedDescription)"
+            CaptureLog.exposure.error("\(message, privacy: .public)")
             finishRestore(at: now)
         }
+    }
+
+    /// Gives up on a dark exposure that was asked for and never arrived.
+    ///
+    /// `beginBracket` moves the controller to `.applying` and only
+    /// `setExposureModeCustom`'s completion handler moves it on. If that
+    /// handler never fires - the session was interrupted, the capture device
+    /// was taken away mid-request - the controller would sit in `.applying`
+    /// for the rest of the session and `shouldBracketNextKeyframe` would never
+    /// return true again. This is the way out: it clears the request, restarts
+    /// the cadence, and does nothing at all if a bracket is genuinely live.
+    func abandonPendingBracket(at now: TimeInterval) {
+        lock.lock()
+        guard case .applying = state else {
+            lock.unlock()
+            return
+        }
+        state = .idle
+        lastBracketEndedAt = now
+        keyframesSinceBracket = 0
+        lock.unlock()
+        let message = "A dark bracket was asked for and never arrived. The request has "
+                + "been dropped and the cadence starts again."
+        CaptureLog.exposure.notice("\(message, privacy: .public)")
     }
 
     private func finishRestore(at now: TimeInterval) {
@@ -397,10 +416,9 @@ final class CaptureExposureController: @unchecked Sendable {
                 bracketingEnabled = false
                 unavailability = .disabledByTrackingGuard
                 lock.unlock()
-                CaptureLog.exposure.notice(
-                    "Tracking degraded right after a dark bracket. Bracketing "
+                let message = "Tracking degraded right after a dark bracket. Bracketing "
                         + "is off for the rest of this session."
-                )
+                CaptureLog.exposure.notice("\(message, privacy: .public)")
                 return
             }
         }
