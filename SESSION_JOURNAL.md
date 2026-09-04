@@ -74,3 +74,78 @@ Append-only continuity log. Newest entry at the bottom. Read the latest entry to
 
 **Next step**
 - Get the two decisions, finalize PLAN.md, then author the single Fable 5 build workflow.
+
+---
+
+## 2026-07-10 : Build executed, repo live, CI at the Brush gate
+
+**Owner decisions (FIRM)**
+- Processing: FULLY ON-DEVICE on iPhone. Build: ONE workflow, everything at once, NO phases. He does not do phases (do not offer staged plans again).
+- Wanted purely Fable 5 agents. RUN THEM IN PARALLEL (he was explicit; do not make them sequential).
+
+**Build workflow saga (lessons)**
+- Script: `workflows/scripts/nimbus3d-build-wf_d65351cd-f29.js` (run id wf_d65351cd-f29).
+- It kept dying because the host Claude Code PROCESS restarted repeatedly (limits + crashes); background workflows run in-process, so they died with it. Verify a task is really running with `TaskOutput block=false` (a resumed Workflow gets a NEW task id; a dead one returns "No task found"). Don't claim "it's running" on faith. [[verify-claims-before-asserting]]
+- ROOT CAUSE of "stalled, no tokens": the `model: 'fable'` override was NOT executing in this session (Fable unresponsive). Switching the module/integrate/review agents OFF fable to the inherited session model fixed it instantly (contracts stayed fable-cached and replayed free). If a workflow shows agents dispatched but burning zero tokens, suspect the model override.
+- The per-agent Tokens column in /workflows only fills in AFTER an agent completes; in-progress agents show blank though they ARE spending tokens. Verify progress by FILES ON DISK, not that column.
+- Final successful run: parallel, on the session model, all 12 agents done, 0 errors, ~1.26M tokens, ~30 min.
+
+**Build result (honest, reviewer verdict = needs-significant-fixes; DOES NOT COMPILE yet)**
+- Whole app on disk under `Nimbus3D/app/` (~40 Swift files + Metal shaders + Rust FFI + CI). See `app/MODULE_STATUS.md` (authoritative per-module REAL/PARTIAL/STUB table) and `app/README.md`.
+- REAL Swift/Metal: SplatRender (Metal EWA renderer + GPU sort), Mesh (marching cubes + QEM + UV), HDRI (hand-rolled OpenEXR writer + Debevec merge), Export (glTF/GLB), Pipeline (actor orchestrator + UI), Capture (ARKit+LiDAR), Materials (POM shader + ambientCG substitution + CoreML classifier path), App shell + DI, CI YAML.
+- THE ONE GATE: SplatEngine Rust/Brush trainer (`app/Sources/SplatEngine/rust/nimbus-splat-core/src/brush_glue.rs`) is written against UNVERIFIED Brush API names, and it is unknown whether brush-process/burn/wgpu even cross-compiles to aarch64-apple-ios (may pull egui/winit/rerun viewer deps). Top fixes are in the reviewer verdict (journal line 55 of the build run).
+- Honest STUBS (not faked): MaterialDelighter (no model; writes `albedo_NOT_delit_passthrough.png`), classifier (returns .unknown until a model bundled), CapturedAlbedoBaker (flat placeholder), PLY->SPZ (deferred). Reviewer found ZERO faked functionality. Nothing device-verified (no macOS here).
+
+**Repo + CI (live)**
+- Private repo: https://github.com/bottlemaster-22/Nimbus3D (git root = `Nimbus3D/`, commit 07bce87, 118 files). gh authed as bottlemaster-22 (repo+workflow scopes).
+- First CI run (29112027764) reached the Brush Rust build step and is actively cross-compiling (did NOT fail fast). Awaiting outcome. Note: duplicate inert `app/.github/` copy exists; clean up later.
+
+**Next step**
+- Get the Brush CI step outcome. If it fails: reconcile brush_glue.rs against a pinned real Brush revision + confirm iOS cross-compile (feature-gate out viewer deps). If it passes: the xcodebuild archive step then tests the Swift/Metal side.
+- Still to do: Bottle "Install Nimbus3D" button (hand `BOTTLE_INTEGRATION.md` to the Bottle Claude session); fill the real `downloadURL` in `BOTTLE_HOOKS.md` after first green tagged build.
+
+---
+
+## 2026-07-10 : CI round 1 failed on `rfd`; forked Brush to fix iOS
+
+**CI run 1 (29112027764) FAILED at the Brush Rust step.** Real error: `error: could not compile 'rfd' due to 12 previous errors` (E0277, dialog traits unimplemented). Root cause: Brush's `crates/rrfd` declares `rfd = "0.17"` for `cfg(all(not(wasm), not(android)))` — iOS is NOT excluded, but rfd has no iOS backend. Chain: brush-process -> brush-vfs -> rrfd -> rfd. No feature to disable it; even Brush's own `apps/brush-c` would hit this (nobody has built Brush for iOS).
+
+**Fix = forked Brush.** Fork: https://github.com/bottlemaster-22/brush (main @ **de605e7**). Changed `crates/rrfd` to treat iOS like Android/wasm: excluded iOS from the `rfd` target-dep in Cargo.toml and added compile-only iOS stubs for pick_file/pick_directory/save_file in src/lib.rs (never called at runtime; training uses DataSource::Path). Fork working copy: `scratchpad/brush-fork` (shallow clone).
+
+**Our repo:** `app/Sources/SplatEngine/rust/nimbus-splat-core/Cargo.toml` now pins `brush-process = { git = "https://github.com/bottlemaster-22/brush", rev = "de605e7862b315d6cd25ee5c94e0997ba6e52157" }` (was upstream branch=main). Pushed -> CI run 2 (29113334942) in progress.
+
+**What CI run 2 tells us:** (a) THE BIG UNKNOWN — does the whole burn/wgpu/brush compute stack actually cross-compile to aarch64-apple-ios past rfd? (b) then our `brush_glue.rs` compiles last and will likely surface the API-name mismatches the reviewer flagged (create_process signature, config fields, ProcessMessage/TrainMessage variants). The real Brush API to reconcile against is readable in `scratchpad/brush-fork/crates/brush-process/src/` (create_process in lib.rs; config/, message/, train_stream/ modules; DataSource re-exported from brush-vfs).
+
+**Next step**
+- Read CI run 2 result. If deps compile + brush_glue errors: reconcile brush_glue.rs against the real Brush source in the fork clone. If another desktop-only dep fails: same fork-and-cfg pattern. If Rust core builds: on to the Swift xcodebuild archive step.
+
+---
+
+## 2026-07-10 : HARD RESET to the user's real vision (SMART LiDAR splatting, his own trainer)
+
+**The reset.** He supplied consolidated context from his France sessions: he is building his OWN ARKit LiDAR capture app + OWN trainer, explicitly declined Brush/Nerfstudio/Postshot/LichtFeld, name "Nimbus3D" NOT final (do not bake in). So the Fable-built Brush-wrapper scaffold + brush fork + Nimbus3D repo from this session are SUPERSEDED (kept, not resumed). New rules: never Fable agents; Opus 5 for hard work, Sonnet 5 for easy; iPhone 17 Pro Max now; "if PC training wouldn't work, do it on the app." Wants 5-10 experimental features proposed FIRST (plain language), he picks, then build everything; UI must be usable.
+
+**His capture/trainer code is NOT on this machine** (only the superseded scaffold; `RenderEngine` is a Blender/Cycles project, unrelated). Asked him where it lives or whether to build fresh around the verified export format. UNANSWERED.
+
+**Research done** (8 parallel Opus agents, ~872k tokens, run wf_374a4b66-405; digest per agent in scratchpad/digest_1..8.md). Consensus headline: **raw ARKit VIO poses (no BA) are the number-one cause of soft edges / ghosting / bad far field** (~13 px misalignment vs sub-pixel need; arXiv 2608.21008 Aug 2026: ARKit 16.55 dB -> refined 17.48 -> GT 18.29). Fix poses FIRST or every trust/edge technique mislabels drift as sensor noise. Naive COLMAP triangulate-then-BA from ARKit prior made poses WORSE in 15/15 rooms; use structureless BA + loop closure + time-sliced submap pose graph.
+
+**Verdicts on his ideas:** dual-path = right philosophy, wrong mechanism (one solver, three witnesses, not two reconstructions voting); 30cm clusters = wrong resolution + neighbour agreement != accuracy (use two scales: coarse bias, per-sample noise); smart edges = correct but 5 causes, pose dominant, and Apple's upsampled depth INVENTS edges (export native 256x192); smart background = two problems (far diffuse vs through-glass at infinity), window is a CAPTURE problem (bracket exposure); no-training pre-pass = his best idea but target is pose consistency not distances; slicing = better than framed, as a TIME-sliced drift absorber, scene fits 8GB unsliced, "train only seams" fixes 1 of 3 seam causes, overlapping splats add opacity (one owner per region); dynamic textures drop = agreed.
+
+**10 features proposed, written to `Nimbus3D/PROPOSALS.md`** (full evidence + build order + honest measurement plan): F1 poses-first (submaps+loop closure+LiDAR-anchored structureless BA), F2 LiDAR free-space carving (biggest overlooked win; UNKNOWN not EMPTY for glass), F3 native-depth + edge band + WHERE/WHAT edge fusion, F4 AbsGS/Mip filters/SAD-GS/bimodal edges, F5 three-regime background (Prompt Depth Anything fits his exact input) + parallax routing + capture-time bracketing, F6 two-scale trust + plane-sweep second opinion + recalibrated ARKit confidence + structural trust, F7 slicing upgraded (doorway cuts, 7-number merge), F8 capture-side logging (time-offset scalar, end-of-session anchors, QC weights, exposure), F9 in-room QC + Fix-this AR + audio/haptic + on-path honest preview + A/B slider, F10 PC trains / phone previews + memory levers (SH 3->1 = 2.5-4x splats; 8GB not binding).
+
+**Next step**
+- Await his picks (or "all") AND the code-location answer. Then build with Opus/Sonnet agents in parallel, no phases.
+
+---
+
+## 2026-07-10 : GO. Mobile-first build launched (Opus/Sonnet, parallel)
+
+**His answers:** F1-F6, F8, F9 yes; F7 optional; F10 accepted once clarified that the phone CAN train (budget-scaled) and PC is optional. Prefers mobile; no money; no cloud. No capture/trainer code exists (prior IPA never installed) -> build fresh. New asks: device-compat onboarding screen ("Why is my device incompatible?"), Blender add-on, PC Booster listener + minimal GUI + configurable save dir. Corrections: don't claim his scene fits 8GB (design measures/adapts); far-background flattening is a LiDAR-logic failure (F5).
+
+**Actions:** moved `app/` (Brush wrapper) to `_superseded/app-brush-wrapper/`. Launched the build workflow: architect (Opus) -> 11 parallel modules (Opus for onboarding/capture/pre-pass/Metal trainer/smart losses/viewer/booster server; Sonnet for export/booster client/Blender/CI) -> integrator (Opus) -> reviewer (Opus). Pure Swift/Metal iOS at `ios/`, Python booster at `booster/`, add-on at `blender_addon/`, CI at `.github/`. Honesty contract enforced (REAL/PARTIAL/STUB, no faking).
+
+**Next step:** on completion: read reviewer verdict + MODULE_STATUS, push, let CI build the IPA, fix what CI surfaces, hand Bottle the hooks.
+
+**Build run 1 result (wf_f3ae4b97-25b):** PARTIAL. 10/14 agents failed on server-side API errors (500 / 529 Overloaded), ALL of them Opus; all 4 Sonnet agents succeeded. On disk and real: ios/Sources/Export (PLY/SPZ/GLB, ~2.5k lines), ios/Sources/Booster client (~2.7k lines), blender_addon (headless-tested on this PC with Blender 5.2), .github/workflows/ios.yml + BOTTLE_HOOKS.md (bundle id com.tombline.nimbus, target/scheme named "App", product name decoupled). Partial architect files: ios/project.yml, ios/Sources/Core/BrandConfig.swift. MISSING: Contracts.swift/docs, onboarding, capture, prepass, metal-trainer, smart-losses, viewer, booster-server, integrate, review. Fix: added an agentRetry wrapper (3 tries) to the script + told architect/modules to build on existing files; resuming.
+
+**Build resumes 2-3 (diagnosis):** the architect NEVER completed (0 results; every attempt hit API 500/529 while Opus was overloaded), but the script did not abort on architect failure: it dispatched all 11 modules with null contracts (42 distinct agent keys in the journal). The 4 Sonnet modules re-ran and correctly preserved prior work. Stopped the run before the 7 contract-less Opus modules got far. FIX: architect now retries 5x with 60s-step backoff and the run THROWS if it still fails (no contract-less module builds). Also: always write the script with LF endings (a CRLF rewrite once broke the permission validator). Host process restarts have also killed runs twice; resume is always safe (cached).

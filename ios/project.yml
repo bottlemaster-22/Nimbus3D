@@ -1,0 +1,284 @@
+# =============================================================================
+#  XcodeGen spec for the iOS app.
+#
+#  Generate with:      cd ios && xcodegen generate
+#  Build in CI with:   xcodebuild -project ios/App.xcodeproj -scheme App \
+#                                 -configuration Release -sdk iphoneos \
+#                                 -archivePath build/App.xcarchive archive \
+#                                 CODE_SIGNING_ALLOWED=NO
+#
+#  The Xcode PROJECT / TARGET / SCHEME are deliberately called "App" so they are
+#  brand-neutral and never need renaming. The user-visible product name, the
+#  bundle id, the Bonjour service type and the on-disk folder names all come
+#  from the ONE settings group below.
+#
+#  CI note: the built product is named $(NIMBUS_PRODUCT_NAME).app, NOT App.app.
+#  Package the IPA by globbing Products/Applications/*.app so a rename never
+#  breaks the workflow.
+# =============================================================================
+
+name: App
+
+# -----------------------------------------------------------------------------
+#  BRAND BLOCK - THE ONLY PLACE THE PRODUCT IS NAMED.
+#  Change these five lines to rename the whole product. Nothing else, anywhere,
+#  hardcodes the name: Info.plist, the entitlements, and Core/BrandConfig.swift
+#  all read from here (BrandConfig reads the generated Info.plist at runtime).
+#
+#  Rules if you rename:
+#    * NIMBUS_PRODUCT_NAME  - no spaces, no punctuation. Becomes the .app bundle
+#                             name, the executable name and the .ipa name.
+#    * NIMBUS_DISPLAY_NAME  - what the user reads on the home screen. May have
+#                             spaces.
+#    * NIMBUS_BUNDLE_ID     - reverse-DNS. TOMBLINE is the brand.
+#    * NIMBUS_BRAND_SLUG    - lowercase a-z0-9 only. Used to build the Bonjour
+#                             type "_<slug>boost._tcp". DNS-SD caps a service
+#                             type label at 15 characters INCLUDING the leading
+#                             underscore, so the slug must be 9 characters or
+#                             fewer while the "boost" suffix stays.
+#    * NIMBUS_DOCS_FOLDER   - the folder created under ~/Documents on the phone
+#                             and under Documents/ on the PC Booster.
+# -----------------------------------------------------------------------------
+settingGroups:
+  brand:
+    NIMBUS_PRODUCT_NAME: Nimbus3D
+    NIMBUS_DISPLAY_NAME: Nimbus3D
+    NIMBUS_BUNDLE_ID: com.tombline.nimbus
+    NIMBUS_BRAND_SLUG: nimbus
+    NIMBUS_DOCS_FOLDER: Nimbus3D
+    # Derived - do not edit these two; they exist so the value is written once.
+    NIMBUS_BOOSTER_SERVICE_TYPE: _$(NIMBUS_BRAND_SLUG)boost._tcp
+    NIMBUS_MARKETING_VERSION: 0.1.0
+    NIMBUS_BUILD_NUMBER: 1
+
+options:
+  bundleIdPrefix: com.tombline
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+  groupSortPosition: top
+  xcodeVersion: "16.0"
+
+# No Swift Package / CocoaPods / Carthage dependencies at all.
+# Pure Swift + Metal + Apple system frameworks, so CI has nothing to resolve,
+# nothing to cross-compile, and no reason to fail. Keep it that way.
+packages: {}
+
+configs:
+  Debug: debug
+  Release: release
+
+targets:
+  App:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+
+    settings:
+      groups:
+        - brand
+      base:
+        PRODUCT_NAME: $(NIMBUS_PRODUCT_NAME)
+        PRODUCT_BUNDLE_IDENTIFIER: $(NIMBUS_BUNDLE_ID)
+        MARKETING_VERSION: $(NIMBUS_MARKETING_VERSION)
+        CURRENT_PROJECT_VERSION: $(NIMBUS_BUILD_NUMBER)
+
+        # iPhone only. 1 = iPhone/iPod. No iPad, no Mac Catalyst, no visionOS.
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
+
+        # Swift 5.10 toolchain, language mode 5.
+        # NOTE: SWIFT_VERSION is the LANGUAGE MODE and only accepts 4.0 / 4.2 /
+        # 5.0 / 6.0 - "5.10" is not a legal value and makes Xcode fail the
+        # build. Xcode 16 ships a Swift 6 compiler running in mode 5, which is
+        # what "Swift 5.10" means for us in practice.
+        SWIFT_VERSION: "5.0"
+        # "targeted", not "complete": every contract here is Sendable, but ARKit
+        # and Metal types are not all Sendable yet and "complete" would drown
+        # eleven modules in warnings that hide the real ones.
+        SWIFT_STRICT_CONCURRENCY: targeted
+        SWIFT_EMIT_LOC_STRINGS: YES
+
+        # Metal shaders. Every .metal file under Sources/ is compiled into the
+        # default.metallib automatically by the compile-sources phase.
+        MTL_LANGUAGE_REVISION: Metal30
+        MTL_FAST_MATH: YES
+
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+        GCC_WARN_UNDECLARED_SELECTOR: YES
+        CLANG_WARN_DOCUMENTATION_COMMENTS: YES
+        DEAD_CODE_STRIPPING: YES
+
+        CODE_SIGN_ENTITLEMENTS: Support/App.entitlements
+        INFOPLIST_FILE: Support/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+
+      configs:
+        Debug:
+          MTL_ENABLE_DEBUG_INFO: INCLUDE_SOURCE
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+        Release:
+          MTL_ENABLE_DEBUG_INFO: NO
+          SWIFT_OPTIMIZATION_LEVEL: "-O"
+          SWIFT_COMPILATION_MODE: wholemodule
+          VALIDATE_PRODUCT: YES
+
+    # -------------------------------------------------------------------------
+    #  Module tree. One directory per owning agent; see CONTRACTS.md.
+    #  A module may add Swift and .metal files inside its own directory and
+    #  nowhere else.
+    # -------------------------------------------------------------------------
+    #  `optional: true` means "skip this directory if it is not on disk yet".
+    #  XcodeGen hard-errors on a missing source path, so a module whose agent
+    #  has not landed yet would break `xcodegen generate` for everybody. Core,
+    #  App, Export and Booster exist and are therefore NOT optional: if one of
+    #  them vanishes, CI must fail loudly. A module that is merely absent
+    #  cannot hide a bug, because App/NimbusApp.swift talks to every module
+    #  through a Core protocol and shows an honest "not installed yet"
+    #  placeholder when the implementation is not registered.
+    sources:
+      # Shared contracts, brand config, math conventions. Depends on nothing.
+      - path: Sources/Core
+        name: Core
+      # App shell: @main, root flow, tab container, service registry.
+      - path: Sources/App
+        name: App
+      # First-launch device compatibility gate + tier explanation screens.
+      - path: Sources/Onboarding
+        name: Onboarding
+        optional: true
+      # ARKit/LiDAR session, sidecar logging, coverage HUD, haptics and audio.
+      - path: Sources/Capture
+        name: Capture
+        optional: true
+      # No-training pre-pass: submaps, loop closure, carving, trust, QC card.
+      - path: Sources/PrePass
+        name: PrePass
+        optional: true
+      # On-device 3DGS: Metal rasterizer + optimizer (.metal shaders live here).
+      - path: Sources/Trainer
+        name: Trainer
+        optional: true
+      # Smart losses, background model, trust field, edge classifier.
+      - path: Sources/Smart
+        name: Smart
+        optional: true
+      # Preview renderer, honesty mask, A/B slider, artifact heatmap.
+      - path: Sources/Viewer
+        name: Viewer
+        optional: true
+      # PLY / SPZ / COLMAP writers.
+      - path: Sources/Export
+        name: Export
+      # Bonjour discovery, pairing, chunked upload, job stream (iOS client).
+      - path: Sources/Booster
+        name: Booster
+      - path: Resources
+        name: Resources
+        optional: true
+
+    # -------------------------------------------------------------------------
+    #  Info.plist, generated by XcodeGen into Support/Info.plist.
+    # -------------------------------------------------------------------------
+    info:
+      path: Support/Info.plist
+      properties:
+        CFBundleName: $(NIMBUS_PRODUCT_NAME)
+        CFBundleDisplayName: $(NIMBUS_DISPLAY_NAME)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleExecutable: $(EXECUTABLE_NAME)
+        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
+        CFBundlePackageType: APPL
+        LSRequiresIPhoneOS: true
+
+        # --- Read by Core/BrandConfig.swift so no Swift file hardcodes a name.
+        NBBrandDisplayName: $(NIMBUS_DISPLAY_NAME)
+        NBBrandProductName: $(NIMBUS_PRODUCT_NAME)
+        NBBrandSlug: $(NIMBUS_BRAND_SLUG)
+        NBBoosterServiceType: $(NIMBUS_BOOSTER_SERVICE_TYPE)
+        NBDocumentsFolderName: $(NIMBUS_DOCS_FOLDER)
+
+        # --- Orientation. Capture is handheld portrait; preview may rotate.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UILaunchScreen:
+          UIColorName: ""
+        UIApplicationSupportsIndirectInputEvents: true
+        UIViewControllerBasedStatusBarAppearance: true
+
+        # --- Hard device requirements. The installer honours these, so a phone
+        #     without ARKit or Metal cannot install a build that can only
+        #     disappoint it. LiDAR itself has no capability key, which is
+        #     exactly why the Onboarding compatibility gate exists.
+        UIRequiredDeviceCapabilities:
+          - arkit
+          - metal
+          - arm64
+
+        # --- Files. Scans are user data; let them reach the Files app.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+
+        # --- Permission strings. Plain language, specific, no jargon.
+        #     There is deliberately NO NSMicrophoneUsageDescription: the ARKit
+        #     session sets providesAudioData = false and nothing in this app
+        #     records audio, so the microphone permission is never requested and
+        #     the string must not exist. An unused usage string is both an App
+        #     Store review rejection and a privacy smell. Audio GUIDANCE is
+        #     output only (AVAudioEngine playback) and needs no permission.
+        NSCameraUsageDescription: >-
+          The camera is how this app sees your space. It records the photos that
+          become your 3D scan. Nothing is uploaded anywhere.
+        NSMotionUsageDescription: >-
+          Motion data tells the app how fast you are turning, so it can warn you
+          when a shot will come out blurry and keep the scan lined up properly.
+        NSPhotoLibraryAddUsageDescription: >-
+          Lets you save a picture or video of a finished scan to your photo
+          library. Only used when you tap Save.
+        NSLocalNetworkUsageDescription: >-
+          Used to find your PC on your own Wi-Fi so it can help finish a large
+          scan. Everything stays on your local network and nothing goes to the
+          internet.
+        NSBonjourServices:
+          - $(NIMBUS_BOOSTER_SERVICE_TYPE)
+
+    # -------------------------------------------------------------------------
+    #  Entitlements.
+    # -------------------------------------------------------------------------
+    entitlements:
+      path: Support/App.entitlements
+      properties:
+        # Large scans allocate far past the normal per-app cap. These raise it
+        # on 6 GB+ devices.
+        #
+        # HONEST WARNING - read this before filing a bug. An entitlement must be
+        # present in the provisioning profile that signs the build. A FREE
+        # personal Apple ID team cannot enable increased-memory-limit, so a
+        # sideloaded re-sign will either strip it or fail outright.
+        # TrainingBudget must therefore NEVER assume it was granted: measure the
+        # real ceiling at runtime with os_proc_available_memory() and degrade.
+        # If sideloading fails on signing, delete these two keys; nothing else
+        # in the app breaks.
+        com.apple.developer.kernel.increased-memory-limit: true
+        com.apple.developer.kernel.extended-virtual-addressing: true
+
+schemes:
+  App:
+    build:
+      targets:
+        App: all
+    run:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

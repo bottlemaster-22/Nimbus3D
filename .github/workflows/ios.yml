@@ -1,16 +1,28 @@
 # Nimbus3D iOS CI
 #
-# Builds an UNSIGNED Nimbus3D.ipa on a macOS runner:
-#   1. Install XcodeGen, generate Nimbus3D.xcodeproj from app/project.yml
-#   2. Build the Rust core (Brush engine) into Frameworks/NimbusSplatCore.xcframework
-#      via the SplatEngine module's build script
-#   3. xcodebuild archive with CODE_SIGNING_ALLOWED=NO (no Apple certs anywhere in CI;
-#      the Bottle stack re-signs the IPA with the user's free Apple ID at install time)
-#   4. Package Payload/Nimbus3D.app into Nimbus3D.ipa by hand
-#      (xcodebuild -exportArchive requires signing, so we zip the archive output instead)
-#   5. Upload the IPA as a build artifact on every run, and as a Release asset on v* tags
-#      (that Release asset URL is what Bottle's source.json points at; see
-#       BOTTLE_HOOKS.md at the repo root)
+# Builds an UNSIGNED .ipa on a macOS runner:
+#   1. Install XcodeGen, generate App.xcodeproj from ios/project.yml
+#      (Xcode PROJECT/TARGET/SCHEME are the brand-neutral name "App"; the
+#      user-visible product name comes from the settingGroups.brand block in
+#      ios/project.yml, so a rename never touches this workflow)
+#   2. xcodebuild archive with CODE_SIGNING_ALLOWED=NO (no Apple certs anywhere
+#      in CI; the Bottle stack re-signs the IPA with the user's free Apple ID
+#      at install time)
+#   3. Package Payload/<Product>.app into <Product>.ipa by hand, discovering
+#      the product name by globbing Products/Applications/*.app instead of
+#      hardcoding it (xcodebuild -exportArchive requires signing, so we zip
+#      the archive output instead)
+#   4. Upload the IPA as a build artifact on every run, and as a Release asset
+#      on v* tags (that Release asset URL is what Bottle's source.json points
+#      at; see BOTTLE_HOOKS.md at the repo root)
+#
+# NO Rust step. Pure Swift + Metal + Apple system frameworks (ios/project.yml
+# `packages: {}`) — nothing here to cross-compile, nothing to fail on target
+# triples. That was the previous attempt's failure mode; do not reintroduce it.
+#
+# A second, independent job (booster-check) sanity-checks the Python PC
+# Booster companion under booster/ on a cheap ubuntu runner. It does not
+# gate or depend on the iOS build.
 
 name: iOS build (unsigned IPA)
 
@@ -31,13 +43,14 @@ permissions:
 
 jobs:
   build:
-    name: Archive unsigned Nimbus3D.ipa
+    name: Archive unsigned IPA
     runs-on: macos-15
     timeout-minutes: 90
 
     env:
-      APP_DIR: app
-      SCHEME: Nimbus3D
+      IOS_DIR: ios
+      PROJECT: App.xcodeproj
+      SCHEME: App
       CONFIGURATION: Release
 
     steps:
@@ -48,65 +61,27 @@ jobs:
         run: |
           sw_vers
           xcodebuild -version
-          rustc --version || echo "rustc not on PATH yet (installed below)"
 
       - name: Install XcodeGen
         run: brew install xcodegen
 
-      - name: Install Rust iOS targets
-        run: |
-          # Rust (rustup) is preinstalled on GitHub macOS runners; we only add the
-          # device/simulator targets the xcframework build needs.
-          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
-
-      - name: Cache cargo registry and Rust build output
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ${{ env.APP_DIR }}/Sources/SplatEngine/**/target
-          key: cargo-ios-${{ runner.os }}-${{ hashFiles('app/Sources/SplatEngine/**/Cargo.lock') }}
-          restore-keys: |
-            cargo-ios-${{ runner.os }}-
-
-      - name: Build Rust core (NimbusSplatCore.xcframework)
-        working-directory: ${{ env.APP_DIR }}
-        run: |
-          set -euo pipefail
-          # Contract (NIMBUS_CONTRACTS.md "Build rules"): the SplatEngine module owns the
-          # Rust crate and a build script that must produce Frameworks/NimbusSplatCore.xcframework.
-          # Conventional location: Sources/SplatEngine/build-xcframework.sh
-          SCRIPT="Sources/SplatEngine/build-xcframework.sh"
-          if [ ! -f "$SCRIPT" ]; then
-            echo "::error file=app/Sources/SplatEngine/build-xcframework.sh::Missing $SCRIPT. The SplatEngine module must provide this script (it builds the Brush-based Rust core into Frameworks/NimbusSplatCore.xcframework). The app cannot link without it; see app/NIMBUS_CONTRACTS.md, Build rules."
-            exit 1
-          fi
-          bash "$SCRIPT"
-          if [ ! -d "Frameworks/NimbusSplatCore.xcframework" ]; then
-            echo "::error::$SCRIPT completed but Frameworks/NimbusSplatCore.xcframework was not produced. Fix the SplatEngine build script so it emits the xcframework at that exact path (project.yml links it from there)."
-            exit 1
-          fi
-          echo "xcframework contents:"
-          find Frameworks/NimbusSplatCore.xcframework -maxdepth 2
-
       - name: Generate Xcode project (XcodeGen)
-        working-directory: ${{ env.APP_DIR }}
+        working-directory: ${{ env.IOS_DIR }}
         run: |
           set -euo pipefail
           xcodegen generate
-          test -d Nimbus3D.xcodeproj
+          test -d "$PROJECT"
 
       - name: Archive (unsigned)
-        working-directory: ${{ env.APP_DIR }}
+        working-directory: ${{ env.IOS_DIR }}
         run: |
           set -euo pipefail
           xcodebuild archive \
-            -project Nimbus3D.xcodeproj \
+            -project "$PROJECT" \
             -scheme "$SCHEME" \
             -configuration "$CONFIGURATION" \
             -destination 'generic/platform=iOS' \
-            -archivePath build/Nimbus3D.xcarchive \
+            -archivePath build/App.xcarchive \
             -derivedDataPath build/DerivedData \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
@@ -115,31 +90,46 @@ jobs:
             DEVELOPMENT_TEAM="" \
             PROVISIONING_PROFILE_SPECIFIER=""
 
-      - name: Package Nimbus3D.ipa (Payload zip, still unsigned)
-        working-directory: ${{ env.APP_DIR }}
+      - name: Package .ipa (Payload zip, still unsigned)
+        working-directory: ${{ env.IOS_DIR }}
         run: |
           set -euo pipefail
-          APP="build/Nimbus3D.xcarchive/Products/Applications/Nimbus3D.app"
-          if [ ! -d "$APP" ]; then
-            echo "::error::Archive did not contain $APP. xcodebuild archive output layout changed or the archive failed silently."
+          # The built product is named after ios/project.yml's
+          # settingGroups.brand.NIMBUS_PRODUCT_NAME (currently "Nimbus3D"), NOT
+          # after the xcodeproj/target/scheme name "App". Discover it by
+          # globbing rather than hardcoding, so a rename never breaks CI.
+          APPS_DIR="build/App.xcarchive/Products/Applications"
+          if [ ! -d "$APPS_DIR" ]; then
+            echo "::error::Archive did not contain $APPS_DIR. xcodebuild archive output layout changed or the archive failed silently."
             exit 1
           fi
+          APP_PATH="$(find "$APPS_DIR" -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app bundle found under $APPS_DIR. Check the archive step output above."
+            exit 1
+          fi
+          APP_NAME="$(basename "$APP_PATH" .app)"
+          echo "Discovered product: $APP_NAME"
+          echo "APP_NAME=$APP_NAME" >> "$GITHUB_ENV"
+
           rm -rf build/ipa
           mkdir -p build/ipa/Payload
-          cp -R "$APP" build/ipa/Payload/
-          (cd build/ipa && zip -qry ../Nimbus3D.ipa Payload)
-          ls -lh build/Nimbus3D.ipa
-          # Bottle's agent enforces MAX_IPA_BYTES (512 MB). Warn early if we blow past it.
-          SIZE=$(stat -f%z build/Nimbus3D.ipa)
+          cp -R "$APP_PATH" build/ipa/Payload/
+          (cd build/ipa && zip -qry "../${APP_NAME}.ipa" Payload)
+          ls -lh "build/${APP_NAME}.ipa"
+
+          # Bottle's agent enforces MAX_IPA_BYTES (512 MB). Warn early if we
+          # blow past it; see BOTTLE_HOOKS.md "Signing notes for the Bottle side".
+          SIZE=$(stat -f%z "build/${APP_NAME}.ipa")
           if [ "$SIZE" -gt 536870912 ]; then
-            echo "::warning::Nimbus3D.ipa is $SIZE bytes (> 512 MB). Bottle's sideload agent will reject it; see Nimbus3D/BOTTLE_INTEGRATION.md 'Honest limits'."
+            echo "::warning::${APP_NAME}.ipa is $SIZE bytes (> 512 MB). Bottle's sideload agent will reject it; see Nimbus3D/BOTTLE_INTEGRATION.md 'Honest limits'."
           fi
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Nimbus3D-unsigned-ipa
-          path: ${{ env.APP_DIR }}/build/Nimbus3D.ipa
+          name: ${{ env.APP_NAME }}-unsigned-ipa
+          path: ${{ env.IOS_DIR }}/build/${{ env.APP_NAME }}.ipa
           if-no-files-found: error
           retention-days: 30
 
@@ -147,6 +137,49 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.APP_DIR }}/build/Nimbus3D.ipa
+          files: ${{ env.IOS_DIR }}/build/${{ env.APP_NAME }}.ipa
           fail_on_unmatched_files: true
           generate_release_notes: true
+
+  booster-check:
+    name: PC Booster sanity check (booster/)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Independent of the iOS archive job: the Booster is an optional PC-side
+    # companion (Python, PySide6 GUI), never required for the phone app to
+    # work. This job just proves booster/ parses and lints clean; it does not
+    # build or sign anything.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check booster/ exists
+        run: |
+          set -euo pipefail
+          if [ ! -d booster ]; then
+            echo "::error::booster/ does not exist at the repo root. The PC Booster module must live at booster/ (see SESSION_JOURNAL.md and BOTTLE_HOOKS.md); this CI job has nothing to check."
+            exit 1
+          fi
+
+      - name: Install pyflakes
+        run: python -m pip install --upgrade pip pyflakes
+
+      - name: Compile check (py_compile)
+        run: |
+          set -euo pipefail
+          echo "Byte-compiling every .py file under booster/ ..."
+          python -m compileall -q booster
+          echo "OK: booster/ compiles."
+
+      - name: Lint (pyflakes)
+        run: |
+          set -euo pipefail
+          echo "Running pyflakes over booster/ ..."
+          python -m pyflakes booster
+          echo "OK: pyflakes found nothing to report."
