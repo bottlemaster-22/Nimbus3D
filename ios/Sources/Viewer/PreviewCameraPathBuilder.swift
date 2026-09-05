@@ -320,12 +320,22 @@ enum PreviewPathSampler {
         let t2: Float = t * t
         let t3: Float = t2 * t
 
-        let a: SIMD3<Float> = p1 * 2
-        let b: SIMD3<Float> = (p2 - p0) * t
-        let c: SIMD3<Float> = (p0 * 2 - p1 * 5 + p2 * 4 - p3) * t2
-        let d: SIMD3<Float> = (p1 * 3 - p0 - p2 * 3 + p3) * t3
+        // The basis is collected into ONE plain Float coefficient per control
+        // point, so every vector operation below is a single
+        // SIMD3<Float> * Float with exactly one overload. Splitting the
+        // original one-liner into four vector terms was not enough: each term
+        // still mixed integer literals with SIMD operators, and the type
+        // checker still ran out of time. Scalars first, vectors last.
+        let c0: Float = -t + 2.0 * t2 - t3
+        let c1: Float = 2.0 - 5.0 * t2 + 3.0 * t3
+        let c2: Float = t + 4.0 * t2 - 3.0 * t3
+        let c3: Float = -t2 + t3
 
-        return (a + b + c + d) * 0.5
+        var sum: SIMD3<Float> = p0 * c0
+        sum += p1 * c1
+        sum += p2 * c2
+        sum += p3 * c3
+        return sum * 0.5
     }
 
     static func closestPointOnSegment(
