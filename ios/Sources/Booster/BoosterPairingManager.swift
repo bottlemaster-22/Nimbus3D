@@ -14,6 +14,7 @@
 //  so future discovery immediately recognises this device as paired.
 //
 
+import Combine
 import Foundation
 import UIKit
 

@@ -18,8 +18,19 @@
 //  * It will not hide a smaller model. If the phone lowered the budget, the
 //    trainer's own sentence about it stays on screen, and the finished model is
 //    described by what it actually is.
-//  * It will not build a second preview. A finished model opens in the review
-//    screen the Viewer already owns.
+//  * It will not write a line of rendering code of its own. While the model is
+//    being built this screen shows a LIVE preview of it, and every pixel of
+//    that is drawn by the Viewer's `MetalSplatRenderer` inside the Viewer's
+//    `SplatPreviewView`. Pipeline owns the instance, so it can put it down
+//    when the run ends without reaching into another module's state, and it
+//    owns none of the drawing. The camera is fixed, so the user sees the scene
+//    sharpen rather than a viewpoint that jumps, and the picture is a
+//    deliberately light one whose caption says so. A finished model still
+//    opens in the review screen the Viewer already owns; that did not change.
+//  * It will not say "Stopped" while something is still running. Stop asks,
+//    and asking is not stopping: the screen reads "Stopping" until the run has
+//    genuinely put itself down, and the buttons stay unavailable for exactly
+//    that long.
 //
 
 import Foundation
@@ -205,10 +216,18 @@ struct ScanProcessingScreen: View {
 
     private var footerText: String {
         var lines: [String] = []
-        if coordinator.isRunning && !coordinator.isShowing(summary.scanID) {
+        if !coordinator.canStartNewRun && !coordinator.isShowing(summary.scanID) {
             lines.append(
                 "Your phone is busy with another scan right now. This one can start as "
                 + "soon as that one is done."
+            )
+        }
+        // Same scan, and the previous run has been asked to stop but has not
+        // finished stopping. Saying so beats a button that looks pressable and
+        // does nothing.
+        if !coordinator.canStartNewRun && coordinator.isShowing(summary.scanID) {
+            lines.append(
+                "The last go is still putting itself down. This can start again in a moment."
             )
         }
         if !prePassAvailable {
@@ -243,6 +262,14 @@ struct ScanProcessingScreen: View {
     @ViewBuilder
     private var progressSection: some View {
         Section {
+            if coordinator.phase == .buildingModel, let preview = coordinator.preview {
+                // A view of its own, not a helper on this screen, because it
+                // has to observe the preview controller: `frameCount` and
+                // `isSettling` change several times a minute and this screen's
+                // own state does not change with them.
+                TrainingPreviewSection(preview: preview)
+            }
+
             switch coordinator.phase {
             case .reading:
                 HStack(spacing: 10) {
@@ -257,19 +284,36 @@ struct ScanProcessingScreen: View {
                 EmptyView()
             }
 
-            Button(role: .destructive) {
-                coordinator.cancel()
-            } label: {
-                Label("Stop", systemImage: "stop.circle")
+            if coordinator.isStopping {
+                // Honest, and the reason the button is gone rather than
+                // disabled: it has already been pressed and the answer is on
+                // its way. Pressing it again would do nothing.
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text("Stopping. It finishes the bit it is in the middle of first.")
+                        .font(.subheadline)
+                }
+            } else {
+                Button(role: .destructive) {
+                    coordinator.cancel()
+                } label: {
+                    Label("Stop", systemImage: "stop.circle")
+                }
             }
         } header: {
             Text(progressHeader)
         } footer: {
-            Text(
-                "This keeps going while you look at other screens in the app, but it "
-                + "stops if you close the app."
-            )
+            Text(progressFooter)
         }
+    }
+
+    private var progressFooter: String {
+        if coordinator.isStopping {
+            return "Your phone finishes the step it is on before it puts everything down, "
+                + "so this takes a moment. Nothing that was already built is thrown away."
+        }
+        return "This keeps going while you look at other screens in the app, but it "
+            + "stops if you close the app."
     }
 
     /// Says which of the two jobs is running, and whether there is another one
@@ -499,7 +543,7 @@ struct ScanProcessingScreen: View {
                         } label: {
                             Label("Send it to \(device.name)", systemImage: "desktopcomputer")
                         }
-                        .disabled(coordinator.isRunning)
+                        .disabled(!coordinator.canStartNewRun)
                     }
                 }
             } header: {
@@ -533,8 +577,12 @@ struct ScanProcessingScreen: View {
         coordinator.isRunning && coordinator.isShowing(summary.scanID)
     }
 
+    /// Not `!isRunning`. A run that has been asked to stop is still holding the
+    /// GPU until it gets to its next check point, and starting a second one in
+    /// that gap is the bug this guard closes: the coordinator's own
+    /// `canStartNewRun` is the single answer to "may I?".
     private var canStart: Bool {
-        !coordinator.isRunning && summary.frameCount > 0 && detail?.bundle != nil
+        coordinator.canStartNewRun && summary.frameCount > 0 && detail?.bundle != nil
     }
 
     private var hasPrePass: Bool { detail?.prePass != nil }
@@ -561,5 +609,96 @@ struct ScanProcessingScreen: View {
         detail = outcome.detail
         modelReady = outcome.modelReady
         reuseExistingPrePass = outcome.detail.prePass != nil
+    }
+}
+
+// MARK: - Watching it being built
+
+/// THE LIVE PREVIEW: the model as it stands right now, from ONE fixed
+/// viewpoint, refreshed every few seconds while it is being built.
+///
+/// The camera does not move, and that is deliberate. Watching a model form is
+/// watching one view of it get sharper, and a viewpoint that drifts between
+/// refreshes hides the very thing worth seeing. Poking around it is the review
+/// screen's job, and that is one tap away as soon as it is finished.
+///
+/// A view of its own rather than a helper on `ScanProcessingScreen`, because
+/// it has to OBSERVE the controller: `frameCount` and `isSettling` change
+/// several times a minute and the screen around them does not.
+@MainActor
+struct TrainingPreviewSection: View {
+
+    @ObservedObject var preview: TrainingPreviewController
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ZStack {
+                if let problem = preview.startupProblem {
+                    SplatPreviewUnavailableView(reason: problem)
+                } else if preview.frameCount == 0 {
+                    waiting
+                } else {
+                    SplatPreviewView(
+                        renderer: preview.renderer,
+                        camera: preview.camera,
+                        // Redrawn in a short burst after each new frame lands,
+                        // then parked. Between bursts the preview costs
+                        // nothing: the GPU belongs to the trainer.
+                        isAnimating: preview.isSettling,
+                        gesturesEnabled: false
+                    )
+                }
+            }
+            .frame(height: 220)
+            .frame(maxWidth: .infinity)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            Text(caption)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if let note = preview.note {
+                Label(note, systemImage: "eye.slash")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
+        .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+    }
+
+    private var waiting: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+            Text("The first picture of your model appears here shortly.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 20)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(white: 0.08))
+    }
+
+    private var caption: String {
+        guard preview.frameCount > 0 else {
+            return "This is your model as it is being built. It starts out rough on purpose."
+        }
+
+        var sentence = "Your model so far, from one fixed viewpoint: "
+            + "\(ProcessingFormat.count(preview.modelSplatCount)) detail points. "
+
+        // Said, not glossed over. The picture is deliberately lighter than the
+        // model, and a user who is judging how it is coming along deserves to
+        // know that what they are looking at is a sketch of it.
+        if preview.drawnSplatCount < preview.modelSplatCount {
+            sentence += "This picture draws a lighter version of it "
+                + "(\(ProcessingFormat.count(preview.drawnSplatCount)) of them, simpler "
+                + "colour) so that watching does not take memory away from the building. "
+        }
+
+        sentence += "It refreshes every few seconds and gets sharper each time. Building "
+            + "always comes first, so a refresh is skipped rather than allowed to slow it down."
+        return sentence
     }
 }

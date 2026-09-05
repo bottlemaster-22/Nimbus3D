@@ -75,7 +75,10 @@ struct ScanSummary: Identifiable, Sendable {
     /// coordinator, both of which are.
     @MainActor
     var nextStep: String {
-        if problem != nil { return "This scan could not be read." }
+        // A scan that could not be read says what is wrong with it, in its own
+        // words, rather than a generic line the user cannot act on. The
+        // sentences written into `problem` are already plain language.
+        if let problem { return problem }
         if ScanProcessingCoordinator.shared.isWorking(on: scanID) {
             return "Working on this one now."
         }
@@ -89,11 +92,48 @@ struct ScanSummary: Identifiable, Sendable {
                 : "Checked over. Ready to build the 3D model."
         }
         if frameCount > 0 {
+            // Both steps are in this build and both are one tap away on the
+            // processing screen, so this says so. Undersell is a lie too: the
+            // old wording ("Not checked over yet") described the scan and left
+            // out that the phone can do it right now.
             return NimbusServices.shared.prePass == nil
                 ? "Recorded. Checking it over is not part of this build yet."
-                : "Recorded. Not checked over yet."
+                : "Recorded. Ready to check over."
         }
         return "This folder has no frames in it."
+    }
+
+    /// The words for the button that starts `nextStep`, kept in the same file
+    /// as the sentence so the two can never drift apart. Nil when there is
+    /// nothing for the user to start: the scan is unreadable, empty, or the
+    /// phone is already working on it.
+    ///
+    /// The button says the same thing the row's sentence promises, so a user
+    /// who read "Ready to check over." taps "Check this scan over" and not
+    /// some generic "Open".
+    @MainActor
+    var primaryActionTitle: String? {
+        if problem != nil { return nil }
+        if ScanProcessingCoordinator.shared.isWorking(on: scanID) { return nil }
+        if hasModel { return "Look at this scan" }
+        if modelFileMissing {
+            return NimbusServices.shared.trainer == nil ? nil : "Build the 3D model again"
+        }
+        if hasPrePass {
+            return NimbusServices.shared.trainer == nil ? nil : "Build the 3D model"
+        }
+        if frameCount > 0 {
+            return NimbusServices.shared.prePass == nil ? nil : "Check this scan over"
+        }
+        return nil
+    }
+
+    /// True when this scan is waiting on the user to start something. The
+    /// library uses it to put the freshly recorded scan forward as the thing
+    /// to do next instead of leaving it as one more identical row.
+    @MainActor
+    var isWaitingOnYou: Bool {
+        primaryActionTitle != nil && !hasModel
     }
 }
 
@@ -218,22 +258,69 @@ enum ScanLibraryReader {
         return summary
     }
 
+    /// The same reads as `readSummary`, plus the heavy indices the review and
+    /// processing screens need.
+    ///
+    /// THE FORMAT-VERSION GATE IS THE SAME ONE `readSummary` APPLIES, and it
+    /// has to be: this is the function `ScanProcessingCoordinator.run` asks
+    /// before deciding an existing pre-pass can be reused. If this reader
+    /// accepted a `prepass_result.json` written by a version it does not
+    /// understand, the same folder would read as "not checked over" in the
+    /// library row and as "reusable check-over" in the pipeline, and the
+    /// trainer would be fed a file nobody checked. `docs/DATA_FORMAT.md`
+    /// section 9 is explicit: a reader seeing a version it does not know must
+    /// refuse and say so, not guess.
+    ///
+    /// The refusal is said out loud rather than swallowed: it goes into
+    /// `summary.problem`, which the row and the screens already display, so a
+    /// scan this build cannot read looks unreadable instead of looking empty.
     static func readDetail(_ summary: ScanSummary) -> ScanDetail {
         let decoder = ContractsJSON.decoder()
         let paths = summary.paths
+        var summary = summary
+        var refusals: [String] = []
 
-        let bundle: CaptureBundle? = {
-            guard let data = try? Data(contentsOf: paths.captureBundleJSON) else { return nil }
-            return try? decoder.decode(CaptureBundle.self, from: data)
-        }()
-        let prePass: PrePassResult? = {
-            guard let data = try? Data(contentsOf: paths.prePassResultJSON) else { return nil }
-            return try? decoder.decode(PrePassResult.self, from: data)
-        }()
-        let model: SplatModel? = {
-            guard let data = try? Data(contentsOf: paths.modelJSON) else { return nil }
-            return try? decoder.decode(SplatModel.self, from: data)
-        }()
+        var bundle: CaptureBundle?
+        if let data = try? Data(contentsOf: paths.captureBundleJSON),
+           let decoded = try? decoder.decode(CaptureBundle.self, from: data) {
+            if decoded.formatVersion == CaptureBundle.currentFormatVersion {
+                bundle = decoded
+            } else {
+                refusals.append(
+                    "The scan's own index is in format version "
+                    + "\(decoded.formatVersion), and this version of the app "
+                    + "understands version \(CaptureBundle.currentFormatVersion)."
+                )
+            }
+        }
+
+        var prePass: PrePassResult?
+        if let data = try? Data(contentsOf: paths.prePassResultJSON),
+           let decoded = try? decoder.decode(PrePassResult.self, from: data) {
+            if decoded.formatVersion == PrePassResult.currentFormatVersion {
+                prePass = decoded
+            } else {
+                refusals.append(
+                    "The check-over saved with this scan is in format version "
+                    + "\(decoded.formatVersion), and this version of the app "
+                    + "understands version \(PrePassResult.currentFormatVersion)."
+                )
+            }
+        }
+
+        var model: SplatModel?
+        if let data = try? Data(contentsOf: paths.modelJSON) {
+            model = try? decoder.decode(SplatModel.self, from: data)
+        }
+
+        if prePass == nil { summary.hasPrePass = false }
+
+        if !refusals.isEmpty {
+            let sentence = refusals.joined(separator: " ")
+                + " Nothing has been lost: the file was written by a different "
+                + "version of the app, and this one will not guess at it."
+            summary.problem = summary.problem.map { $0 + " " + sentence } ?? sentence
+        }
 
         return ScanDetail(summary: summary, bundle: bundle, prePass: prePass, model: model)
     }
@@ -297,6 +384,23 @@ final class ScanLibraryStore: ObservableObject {
 
     /// Total bytes across every scan, for the storage line.
     var totalBytes: Int64 { scans.reduce(0) { $0 + $1.byteCount } }
+
+    /// The scan the library should put forward as the thing to do next: the
+    /// newest one that is waiting on the user to start something. Nil when
+    /// every scan is finished, unreadable, empty, or already being worked on.
+    ///
+    /// `scans` is sorted newest first, so this is the scan that was just
+    /// recorded, which is the whole point: coming back from the Capture tab,
+    /// the user should not have to work out which row is theirs.
+    var nextUpScanID: ScanID? {
+        scans.first { $0.isWaitingOnYou }?.scanID
+    }
+
+    /// The same scan as a summary, for a screen that wants to draw its name
+    /// and its button without searching the list again.
+    var nextUpScan: ScanSummary? {
+        scans.first { $0.isWaitingOnYou }
+    }
 
     func refresh() async {
         isLoading = true

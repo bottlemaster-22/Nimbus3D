@@ -71,6 +71,11 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     private var latestSnapshot: SplatCloud?
     private var latestModel: SplatModel?
     private var activeTask: Task<Void, Never>?
+    /// True from the moment `train` accepts a run until that run's task has
+    /// genuinely returned, cancelled runs included. This is the difference
+    /// between "we asked it to stop" and "it has stopped": see the guard at
+    /// the top of `train`.
+    private var runInFlight = false
 
     // MARK: - Init
 
@@ -91,9 +96,36 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         budget: TrainingBudget
     ) -> AsyncThrowingStream<TrainerProgress, Error> {
 
+        // ONE RUN AT A TIME, AND THIS IS WHAT ENFORCES IT.
+        //
+        // Cancellation in Swift is cooperative, and this trainer only looks at
+        // the flag between GPU steps, so a run that was told to stop a moment
+        // ago can still be unwinding when a second `train` arrives. Resetting
+        // `cancelRequested` blind would UN-CANCEL that first loop, and the two
+        // of them would then share one set of GPU buffers, one `pipelines`,
+        // one `exposureRecords` and one `heldOutFrameIndices`, because the app
+        // registers a single trainer for the life of the process
+        // (NimbusApp.swift). Refusing is the only honest answer.
         lock.lock()
+        if runInFlight {
+            lock.unlock()
+            TrainerLog.general.error("A second train() arrived while one was still running")
+            // Only the error goes out, deliberately: no progress tick. A tick
+            // is built from `resources`, which belongs to the loop that is
+            // still running, and reading it from here would be a race for the
+            // sake of a sentence the thrown error already carries.
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: TrainerError.alreadyRunning.asNimbusError)
+            }
+        }
+        runInFlight = true
         cancelRequested = false
         latestSnapshot = nil
+        // Cleared, not merely overwritten on success. `finishedModel()` hands
+        // back whatever is in here, and this was only ever assigned, so a
+        // model left over from the PREVIOUS scan could be picked up by a run
+        // that ended without building one and written into THIS scan's folder.
+        latestModel = nil
         // Per-run, not per-instance. The app registers one trainer for the
         // life of the process, so leaving these full would write the previous
         // scan's exposures and held-out list into the next scan's model folder.
@@ -107,6 +139,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     continuation.finish()
                     return
                 }
+                // Every way out of the block below ends here, so `runInFlight`
+                // cannot be left stuck on by a throw.
+                defer { self.markRunFinished() }
                 do {
                     try await self.run(
                         bundle: bundle,
@@ -173,8 +208,12 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// a `SplatCloud` every `snapshotIntervalIterations` between command
     /// buffers, and this hands back that copy. It does not stall the GPU and
     /// it does not read a buffer mid-flight, which is what "cheap enough to
-    /// call between iterations" has to mean for a caller that is a SwiftUI
-    /// view refreshing at 60 Hz.
+    /// call between iterations" has to mean.
+    ///
+    /// Cheap is not free: it retains a whole cloud's worth of arrays. The
+    /// caller is `ScanProcessingCoordinator`'s live preview, which asks at
+    /// most once every few seconds and never while a previous one is still
+    /// being uploaded.
     public func snapshot() async throws -> SplatCloud {
         lock.lock()
         let cloud = latestSnapshot
@@ -194,6 +233,49 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // The loop frees the GPU buffers itself on the way out, so that the
         // release happens on the thread that owns them rather than racing the
         // command buffer that may still be in flight.
+        //
+        // This returning does NOT mean the run has stopped. It has been ASKED
+        // to stop, and it notices between GPU steps. `waitUntilIdle()` is how
+        // a caller finds out that it really has.
+    }
+
+    /// True while a run is on the GPU, or still unwinding after a `cancel()`.
+    ///
+    /// A caller about to start a second run must treat this as "no": there is
+    /// one set of GPU buffers on this object and one `latestModel`.
+    public var isTraining: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return runInFlight
+    }
+
+    /// Waits until a run that was told to stop has genuinely stopped.
+    ///
+    /// Cancellation is cooperative, so `cancel()` returning and the GPU going
+    /// quiet are two different moments. This is the second one. It returns
+    /// straight away when nothing is running, and it does not itself cancel
+    /// anything: a caller that wants the run to end must call `cancel()`
+    /// first, or this waits for the run to finish normally.
+    public func waitUntilIdle() async {
+        lock.lock()
+        let task = activeTask
+        lock.unlock()
+        guard let task else { return }
+        _ = await task.value
+    }
+
+    /// Marks the end of a run, however it ended. Paired with the `runInFlight`
+    /// guard at the top of `train`.
+    ///
+    /// `activeTask` is deliberately left pointing at the finished task rather
+    /// than cleared here: `train` assigns it a moment after the task is
+    /// created, and clearing from inside the task could race that assignment
+    /// and leave a live run unreachable by `cancel()`. Awaiting or cancelling
+    /// an already-finished task is free.
+    private func markRunFinished() {
+        lock.lock()
+        runInFlight = false
+        lock.unlock()
     }
 
     // MARK: - Preparation

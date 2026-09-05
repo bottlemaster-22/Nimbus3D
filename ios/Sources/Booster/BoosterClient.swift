@@ -20,6 +20,7 @@
 //  Capture/PrePass/Trainer/Viewer/Export needs to know this type exists.
 //
 
+import Combine
 import Foundation
 import os
 

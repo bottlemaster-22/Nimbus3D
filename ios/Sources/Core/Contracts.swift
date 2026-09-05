@@ -1313,13 +1313,30 @@ public enum ThermalLevel: Int, Codable, Comparable, Sendable {
 /// thing this app does, and a phone that shuts down mid-train has produced
 /// nothing.
 public struct ThermalPolicy: Codable, Hashable, Sendable {
-    /// At or above this level, start shedding work (drop render resolution a
-    /// step, then halve the densification rate).
+    /// At or above this level, start shedding work, one rung per step, in the
+    /// order `TrainerBudgetGovernor.degradeForHeat` actually uses: cut the
+    /// splat cap towards the live splat count, THEN drop render resolution one
+    /// rung, THEN cut iterations. There is no densification-rate lever; an
+    /// earlier version of this comment named one that has never existed.
     public var degradeAt: ThermalLevel
-    /// At or above this level, pause and checkpoint. Training resumes when it
-    /// cools back below `degradeAt`.
+    /// At or above this level, pause. The run resumes once the level falls back
+    /// below THIS level, not below `degradeAt`: `thermalVerdict` returns
+    /// `.pause` while `level >= pauseAt` and the loop simply re-evaluates, so
+    /// there is no hysteresis band and a phone hovering on the boundary can
+    /// flap between pausing and running.
+    ///
+    /// NOTHING IS CHECKPOINTED. This comment used to say "pause and
+    /// checkpoint", and there is no checkpointing anywhere in this app: a run
+    /// killed while paused loses all of its work. Pausing protects the phone,
+    /// not the run.
+    /// TODO(nimbus): real mid-train checkpointing needs the trainer to
+    /// serialise the splat parameter buffer plus both Adam moment buffers and
+    /// the iteration counter to disk, and to reload them on the next launch.
+    /// Until that exists, neither this field nor `abortAt` preserves anything.
     public var pauseAt: ThermalLevel
-    /// Give up and keep the last checkpoint at this level.
+    /// Give up at this level. The trainer stops the loop and then merges,
+    /// writes and reports whatever the live in-memory field had reached, which
+    /// is a real partial model rather than a checkpoint: see `pauseAt`.
     public var abortAt: ThermalLevel
     /// How long to wait between thermal polls, seconds.
     public var sampleIntervalSeconds: Double
@@ -1414,13 +1431,29 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
         sceneExtentMeters: Float,
         availableMemoryBytes: UInt64
     ) -> TrainingBudget {
-        // Roughly 200 bytes per splat resident (position, rotation, scale,
-        // opacity, degree-1 SH, plus Adam moments), then halved again for
-        // safety because the rasteriser's tile lists and the frame cache also
-        // have to fit.
-        let bytesPerSplat: UInt64 = 200
+        // What one splat ACTUALLY costs, measured from the trainer's own GPU
+        // layouts rather than guessed.
+        //
+        // This used to be a flat 200-byte rule of thumb, and that number was
+        // wrong by roughly a factor of three: a splat is resident in the
+        // parameter buffer, the statistics buffer, the per-frame projection
+        // buffer, the Mip-Splatting sampling buffer, THREE gradient-shaped
+        // buffers (gradient plus both Adam moments) and four SH-shaped buffers,
+        // which at SH degree 1 comes to about 550 bytes, not 200. The
+        // consequence was not a crash but something quieter and worse: with a
+        // 200-byte divisor, `capFromMemory` only fell below the smallest
+        // `scaleCap` on a device with under ~60 MB free, so `min(scaleCap,
+        // capFromMemory)` ALWAYS chose the hardcoded scene-extent table and the
+        // budget was never memory-derived at all, while this type's own header
+        // claimed every number here is measured. Asking the trainer keeps the
+        // two in step: change a GPU layout and this follows.
         let memoryForSplats = availableMemoryBytes / 2
-        let capFromMemory = Int(memoryForSplats / bytesPerSplat)
+        func capFromMemory(at shDegree: SHDegree) -> Int {
+            let perSplat = UInt64(Swift.max(1, TrainerResources.bytesPerSplat(
+                shCoefficientCount: 1 + shDegree.restCoefficientCount
+            )))
+            return Int(memoryForSplats / perSplat)
+        }
 
         let scaleCap: Int
         switch sceneExtentMeters {
@@ -1432,7 +1465,7 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
         switch tier {
         case .full:
             return TrainingBudget(
-                splatCap: Swift.max(50_000, Swift.min(scaleCap, capFromMemory)),
+                splatCap: Swift.max(50_000, Swift.min(scaleCap, capFromMemory(at: .one))),
                 iterations: sceneExtentMeters < 8 ? 3_000 : 2_000,
                 renderLongEdgePixels: 720,
                 shDegree: .one,
@@ -1442,7 +1475,7 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
             )
         case .limited:
             return TrainingBudget(
-                splatCap: Swift.max(40_000, Swift.min(150_000, capFromMemory)),
+                splatCap: Swift.max(40_000, Swift.min(150_000, capFromMemory(at: .zero))),
                 iterations: 800,
                 renderLongEdgePixels: 480,
                 shDegree: .zero,
@@ -1574,7 +1607,9 @@ public enum TrainerStage: String, Codable, Sendable {
     /// Stopped for heat; will resume on its own.
     case pausedThermal
     /// Stopped because the memory ceiling was hit; the budget is being cut and
-    /// training will resume from the last checkpoint.
+    /// training then carries on from the live in-memory field. Not a
+    /// checkpoint: nothing has been written to disk, and nothing is rewound.
+    /// See `ThermalPolicy.pauseAt`.
     case pausedMemory
 
     public var isTerminal: Bool {

@@ -13,6 +13,7 @@
 //  rename never desyncs discovery from what the Booster actually advertises.
 //
 
+import Combine
 import Foundation
 import Network
 import os

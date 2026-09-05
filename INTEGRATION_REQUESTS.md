@@ -182,3 +182,90 @@ and the workaround is documented at the site.
   dependencies are Core, Viewer (it reads `ScanLibraryReader` / `ViewerScanPaths`
   and pushes `ScanReviewScreen`) and Booster (the hand-off), and it owns no
   contract type of its own.
+
+### From the app shell and the scan library (defects 3 and 4)
+
+- **`Sources/Capture/CaptureScreen.swift`, the post-capture report.** Where the
+  report panel currently only calls `model.dismissReport()`, also call
+  `AppNavigation.shared.showSavedScan(scanID)` with the saved scan's id (the
+  `CaptureBundleRef.scanID` the capture just wrote). That one call switches the
+  user to the Scans tab and asks the library to lead with the scan they just
+  recorded. `AppNavigation` is declared in `Sources/App/NimbusApp.swift`, is
+  `@MainActor`, and is reachable from Capture: everything is one target.
+  `AppNavigation.shared.showScans()` is there too, for a "See my scans" button
+  that should not single a scan out.
+
+- **`Sources/Viewer/ScanLibraryScreen.swift`, the list.** `ScanLibraryStore`
+  now publishes `nextUpScan` / `nextUpScanID` (the newest scan waiting on the
+  user), and `ScanSummary` publishes `primaryActionTitle` and `isWaitingOnYou`.
+  Please lead the list with that scan: a section above the rows, or a marked
+  first row, with a button whose label is `primaryActionTitle` rather than a
+  generic "Open". The button words are written to match the row's own
+  `nextStep` sentence, so the two must be shown together, not one without the
+  other. If `AppNavigation.shared.scanToLeadWith` names a scan, lead with that
+  one instead and set `scanToLeadWith = nil` once you have.
+
+- **`Sources/Pipeline/ScanProcessingScreen.swift`.** `ScanLibraryReader.readDetail`
+  now writes a plain-language sentence into `detail.summary.problem` when a
+  `capture_bundle.json` or `prepass_result.json` is in a format version this
+  build does not understand. The screen has that string and does not show it
+  yet; showing it would replace an empty-looking screen with the reason.
+
+- **`Sources/Pipeline/ScanProcessingCoordinator.swift`, line ~244.** Now that
+  `readDetail` refuses a bundle whose `formatVersion` is unknown, `detail.bundle`
+  is nil in that case and the user reads "this scan has no readable index
+  (capture_bundle.json) in it", which is not what happened. Consider reporting
+  `detail.summary.problem` when it is non-nil before falling back to that
+  sentence. The version guard at line ~249 stays correct either way; it is now
+  a second line of defence rather than the only one.
+
+### From Pipeline: two contract gaps that "stop" runs into
+
+Both come from the same fact: stopping is cooperative. `Task.cancel()` sets a
+flag, and the work behind it carries on until it reaches a place where it looks
+at that flag. So "cancel returned" and "it has stopped" are two different
+moments, and until now nothing in the contracts let a caller tell them apart.
+
+- **`ios/Sources/Core/Contracts.swift`, `SplatTrainer`.** The protocol has
+  `cancel()` and no way to ask whether the run has actually ended.
+  `ScanProcessingCoordinator` must know, because starting a second run while
+  the first is still on the GPU would put two loops on one set of buffers. Two
+  members would close it, and `MetalSplatTrainer` already implements both under
+  these names, so this is a promotion rather than new work:
+
+      /// True while a run is on the GPU, or still unwinding after a cancel.
+      var isTraining: Bool { get }
+
+      /// Returns once a run that was told to stop has genuinely stopped.
+      func waitUntilIdle() async
+
+  Until they are in the protocol, Pipeline downcasts to `MetalSplatTrainer` and
+  a trainer that is anything else is simply not waited for. That is a real hole,
+  not a tidy workaround: it is safe only because the app registers exactly one
+  trainer and it is that class.
+
+- **`ios/Sources/Core/Contracts.swift`, `PrePassService`.** Same gap, no
+  workaround available: there is no concrete hook to downcast to. A stop during
+  the check-over cancels the stream, which cancels the work behind it, and the
+  coordinator's task then returns without being able to wait for the pre-pass's
+  own task to unwind. The screen is honest about this (it says "Stopping. It
+  finishes the bit it is in the middle of first."), but the guarantee is weaker
+  than the one training now has. The same two members, or a single
+  `func waitUntilIdle() async`, would make it the same guarantee.
+
+### From Pipeline: the live training preview is now wired
+
+Not a request, a note for whoever owns Viewer, because three pieces that had no
+call sites now have one.
+
+- **`ios/Sources/Viewer/MetalSplatRenderer.swift`, `load(_ cloud: SplatCloud)`**
+  is called by `Sources/Pipeline/TrainingPreview.swift` every few seconds during
+  a training run, from a private `MetalSplatRenderer` that Pipeline owns (not
+  the one `NimbusApp` registers, which is left alone).
+- **`ios/Sources/Viewer/SplatPreviewView.swift`** is used as-is, with
+  `gesturesEnabled: false` and `isAnimating` driven by a short burst after each
+  load, so the surface is parked between refreshes rather than redrawing at
+  60 Hz while the trainer needs the GPU. Nothing in Viewer was changed for it.
+- Nothing is asked for. If `SplatPreviewView` ever grows a "draw once and stop"
+  mode, Pipeline would use it instead of the burst, because the burst exists
+  only to let `residencyStep` finish revealing a freshly loaded cloud.

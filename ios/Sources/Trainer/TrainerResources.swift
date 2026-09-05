@@ -293,9 +293,13 @@ final class TrainerResources {
     }
 
     /// What ONE Gaussian costs across every per-Gaussian buffer, measured from
-    /// the layouts rather than guessed. `TrainingBudget.recommended` uses a
-    /// 200-byte rule of thumb; this is the real number for this SH degree, and
-    /// it is what the budget governor steps down against.
+    /// the layouts rather than guessed. This is the single source of truth for
+    /// the figure: `TrainingBudget.recommended` (Core) and
+    /// `ProcessingBudgetPlanner` (Pipeline) both call it rather than keeping
+    /// their own copy, and it is what the budget governor steps down against.
+    /// They used to hardcode 200, which was low by roughly a factor of three
+    /// and quietly stopped both the memory-derived cap and the "this will be
+    /// tight" warning from ever doing anything.
     static func bytesPerSplat(shCoefficientCount: Int) -> Int {
         let shFloats = Swift.max(shCoefficientCount, 1) * 3
         return MemoryLayout<TrainerSplat>.stride           // parameters

@@ -41,6 +41,13 @@ enum ProcessingLog {
         subsystem: BrandConfig.loggingSubsystem,
         category: "pipeline.budget"
     )
+    /// The live training preview. Everything it says is a note, never a
+    /// failure: a preview that cannot be refreshed leaves the last good frame
+    /// on screen and the training run carries on untouched.
+    static let preview = Logger(
+        subsystem: BrandConfig.loggingSubsystem,
+        category: "pipeline.preview"
+    )
 }
 
 // MARK: - Turning an error into a sentence
@@ -274,10 +281,20 @@ struct ProcessingBudgetPlan: Sendable {
 
 enum ProcessingBudgetPlanner {
 
-    /// Bytes per resident splat, matching the figure
-    /// `TrainingBudget.recommended` is built on so two parts of the app cannot
-    /// quietly disagree about how big a splat is.
-    static let bytesPerSplat: UInt64 = 200
+    /// Bytes per resident splat, asked of the trainer's own GPU layouts so no
+    /// two parts of the app can quietly disagree about how big a splat is.
+    ///
+    /// This was a hardcoded 200 that mirrored an equally wrong 200 in
+    /// `TrainingBudget.recommended`. Because both sides used the same wrong
+    /// number, the "this will be tight" warning below could never fire: the
+    /// budget's own cap was derived by dividing available memory by 200, so
+    /// multiplying it back by 200 could never exceed the memory it came from.
+    /// Two agreeing wrong numbers looked exactly like a working check.
+    static func bytesPerSplat(at shDegree: SHDegree) -> UInt64 {
+        UInt64(Swift.max(1, TrainerResources.bytesPerSplat(
+            shCoefficientCount: 1 + shDegree.restCoefficientCount
+        )))
+    }
 
     /// Sizes a budget from the device tier, the scan's own measured extent, its
     /// frame count and the memory this process may actually allocate.
@@ -344,7 +361,8 @@ enum ProcessingBudgetPlanner {
         )
         budget.target = .onDevice
 
-        let estimatedBytes = UInt64(Swift.max(0, budget.splatCap)) * bytesPerSplat
+        let estimatedBytes = UInt64(Swift.max(0, budget.splatCap))
+            * bytesPerSplat(at: budget.shDegree)
 
         var lines: [String] = []
         lines.append(

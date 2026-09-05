@@ -55,6 +55,10 @@ enum TrainerError: LocalizedError {
     case allocationFailed(name: String, bytes: Int)
     case nothingToTrain(String)
     case noKeyframes
+    /// A second `train` arrived while the previous run was still on the GPU or
+    /// still unwinding after a stop. There is one trainer and one set of GPU
+    /// buffers, so this is refused rather than allowed to share them.
+    case alreadyRunning
 
     var errorDescription: String? {
         switch self {
@@ -77,6 +81,9 @@ enum TrainerError: LocalizedError {
             return "There is nothing to build a 3D model from: \(why)"
         case .noKeyframes:
             return "None of the photos in this scan could be used for training."
+        case .alreadyRunning:
+            return "Your phone is still putting the last one down. Give it a moment "
+                + "and start this again."
         }
     }
 

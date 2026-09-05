@@ -86,7 +86,15 @@ public struct CaptureScreen: View {
                 case .report:
                     if let report = model.report {
                         CaptureReportPanel(report: report) {
+                            // Finishing a capture used to end here, leaving the
+                            // user on this tab with the check-over and
+                            // model-building flow one tab away and nothing
+                            // pointing at it. Hand them straight to the scan
+                            // they just recorded. This starts no work: the user
+                            // still chooses whether to check it over, and when.
+                            let scanID = report.ref.scanID
                             model.dismissReport()
+                            AppNavigation.shared.showSavedScan(scanID)
                         }
                     }
                 case .failed:

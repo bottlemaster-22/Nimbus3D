@@ -4,6 +4,11 @@
 //
 //  The app shell: @main, the first-run compatibility gate, and the tab bar.
 //
+//  The tab bar's selection lives in `AppNavigation` near the bottom of this
+//  file, so a screen that finishes its job (a capture that has just been
+//  saved) can hand the user on to the tab that continues it instead of
+//  leaving them where they were.
+//
 //  This file is deliberately thin. It owns no scanning, no training, no
 //  rendering and no networking - it decides which screen is on top and gets
 //  out of the way. Every screen it shows comes from a module through
@@ -419,19 +424,78 @@ private struct FeatureListView: View {
 //  MARK: - Main tabs
 // =============================================================================
 
+/// WHICH TAB IS ON SCREEN, AND WHICH SCAN THE LIBRARY SHOULD LEAD WITH.
+///
+/// This exists because finishing a capture used to be a dead end: the report
+/// panel dismissed itself and left the user on the Capture tab, with the whole
+/// check-over and model-building flow sitting one tab away with nothing
+/// pointing at it. A tab bar with no selection binding cannot be driven from
+/// code, so it gets one, and the binding lives here rather than in `Capture`
+/// so no module has to reach into another module's view.
+///
+/// It is a plain shared object rather than a `NimbusUI` entry because
+/// `NimbusUI` (Core/Contracts.swift) publishes screens, not state, and this is
+/// state. Every module in this app is compiled into the one target, so
+/// `Capture` can call this directly.
+///
+/// `@MainActor` because it drives SwiftUI and nothing else.
+@MainActor
+final class AppNavigation: ObservableObject {
+
+    static let shared = AppNavigation()
+
+    enum Tab: Hashable {
+        case capture
+        case scans
+        case booster
+    }
+
+    @Published var selectedTab: Tab = .capture
+
+    /// The scan a screen asked the library to lead with, usually the one just
+    /// recorded. The library clears it once it has acted on it; nothing here
+    /// clears it, because this object cannot know when that has happened.
+    @Published var scanToLeadWith: ScanID?
+
+    private init() {}
+
+    /// WHAT THE CAPTURE FLOW CALLS ONCE A SCAN IS SAFELY ON DISK.
+    ///
+    /// Switches to the Scans tab and asks the library to put that scan
+    /// forward. It does not start any work: the user still chooses whether to
+    /// check the scan over, and when.
+    func showSavedScan(_ scanID: ScanID) {
+        scanToLeadWith = scanID
+        selectedTab = .scans
+    }
+
+    /// Switches to the Scans tab without singling out a scan.
+    func showScans() {
+        selectedTab = .scans
+    }
+}
+
+@MainActor
 struct MainTabView: View {
     let report: DeviceCapabilityReport?
 
+    /// Shared, not owned: `Capture` writes to this same object when a scan is
+    /// saved, and that write is what moves the user to their new scan.
+    @ObservedObject private var navigation = AppNavigation.shared
+
     var body: some View {
-        TabView {
+        TabView(selection: $navigation.selectedTab) {
             captureTab
                 .tabItem { Label("Scan", systemImage: "camera.viewfinder") }
+                .tag(AppNavigation.Tab.capture)
 
             libraryTab
                 .tabItem { Label("Scans", systemImage: "square.stack.3d.up") }
+                .tag(AppNavigation.Tab.scans)
 
             boosterTab
                 .tabItem { Label("Booster", systemImage: "bolt.horizontal.circle") }
+                .tag(AppNavigation.Tab.booster)
         }
         .safeAreaInset(edge: .top, spacing: 0) {
             if report?.tier == .limited {

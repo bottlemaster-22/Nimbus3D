@@ -193,3 +193,45 @@ Append-only continuity log. Newest entry at the bottom. Read the latest entry to
 **Launched `wf_1f37af9b-954` (task `wkiaa84ix`, verified running):** 2 parallel Opus agents, then an adversarial audit. (1) build the processing flow: a new Sources/Pipeline coordinator driving prePass.run -> trainer.train with honest progress, resumability, real cancel, budget sized from device tier and measured scan size, plus the library buttons that make each `nextStep` sentence true and the Booster hand-off for scans too big for the phone. (2) verify the one claim nothing in the repo can prove: GLTFExporter.swift asserts it was checked against a RATIFIED Khronos glTF Gaussian-splat spec, and every attribute name and the COLOR_0 fallback in the .glb path is transcribed from it. Agent has web access and must check the Khronos registry itself, fix the code if wrong, and correct the comment if the extension is not actually ratified.
 
 **Deliberately NOT pushed yet.** Pushing before the pipeline is reachable would burn CI on an app that cannot finish a scan.
+
+---
+
+## 2026-09-04 : Pipeline is reachable end to end. Audit says buildReady, with four real defects to fix.
+
+**Run `wf_1f37af9b-954` completed clean** (3 agents, 0 errors, 611k tokens, ~34 min).
+
+**The pipeline is now genuinely reachable, traced by hand by the auditor, not asserted:** Your scans tab (NimbusApp.swift:87, rendered :454) -> tap a scan with no model -> ScanProcessingScreen (ScanLibraryScreen.swift:94-98, second route from ScanReviewScreen.swift:152-153) -> three buttons (ScanProcessingScreen.swift:147/159/173) -> ScanProcessingCoordinator.start (:202, :235) -> prePass.run at :343 into the real PrePassPipeline (:250) -> trainer.train at :395 into the real MetalSplatTrainer (:87). Both services registered non-nil (NimbusApp.swift:66, :69). New `Sources/Pipeline` module; `optional: true` removed from all twelve source dirs in project.yml now that every one exists.
+
+**glTF VERIFIED against the live Khronos registry** (this was the one claim nothing in the repo could prove). Checked `extensions/README.md`, the `KHR_gaussian_splatting` README and its JSON schema, plus the commit log (81762cc, 2026-09-03). Result: extension name correct, KHR_ prefix correct, listed under "Ratified Khronos Extensions", and EVERY field matches: mode POINTS(0), required colorSpace/kernel, ROTATION VEC4 (x,y,z,w), SCALE VEC3 with expf activation, OPACITY sigmoid, SH band layout (bandStartIndex 1:0/2:3/3:8, bandCoeffCount 1:3/2:5/3:7 matching restCoefficientCount 3/8/15), and the COLOR_0 fallback including the sRGB decode most implementations skip. ONE claim was FALSE: "ratified as of 2026-02" was the RELEASE CANDIDATE announcement (2026-02-03), not ratification. Comments corrected; no executable line changed.
+
+**FOUR DEFECTS FOUND (now dispatched as `wf_2494865d-344`, task `wd5ivc3uo`, verified running):**
+1. **Cancel re-entrancy (real).** `cancel()` sets `runTask = nil` and phase `.cancelled` synchronously, so `isRunning` goes false before anything has stopped. Swift cancellation is cooperative and the trainer only checks between GPU steps. User can press Stop then immediately Start: the old task's unwind clobbers the new run's phase, and `train()` resets `cancelRequested = false`, UN-cancelling the old loop. Single registered trainer instance, no re-entrancy guard, so two loops would share one set of GPU resources. The header comment claiming "nothing is left running behind a screen that says it stopped" is stronger than the code.
+2. **Cross-scan model contamination (latent).** `runTraining` writes `trainer.finishedModel()` into this scan's folder without checking `model.scanID`. `latestModel` is never cleared between runs. Every current failure path throws so it cannot bite today, but any clean-exit-without-model path would write scan A's model into scan B.
+3. **Format-version gate inconsistent.** `readSummary` refuses an unknown `formatVersion`; `readDetail` does not, and the coordinator uses `readDetail`. A future-version prepass reads as "not checked over" in the library but "reusable" in the coordinator, which feeds it to the trainer. DATA_FORMAT.md section 9 says refuse, do not guess.
+4. **No route from capture to processing.** TabView has no selection binding and the capture report only dismisses itself. The whole flow is reachable only if you work out unaided that you must leave the Capture tab.
+
+**Also dispatched:** wire the live training preview. `snapshot()`, `load(_ cloud:)` and `previewAvailable` are all written and have zero call sites, so the user watches a spinner while the model forms, which is what F9 existed to prevent.
+
+**Checkpoint `1aa3082`** (296 files tracked, __pycache__ now gitignored). Still NOT pushed.
+
+---
+
+## 2026-09-04 : Four defects fixed. Then owner raised the bar: exhaustive audit, not three-agent workflows.
+
+**The four audit blockers were fixed** (`wf_2494865d-344`, both fix agents succeeded; the verify agent died on a StructuredOutput retry cap, a tooling failure not a code one, and the schema was dropped in favour of plain text). Verified on disk by hand:
+- **Cancel re-entrancy CLOSED.** `canStartNewRun` is a genuine three-way guard (`runTask == nil`, `!isStopping`, and asks the trainer `metal.isTraining`). `cancel()` now KEEPS runTask and sets `isStopping`, so the window where the screen said "stopped" while the GPU was live is gone. The agent added something not asked for and correct: a **generation counter**, so a cancel whose async hop lands after this run finished and a later one began refuses rather than stopping the wrong run. `MetalSplatTrainer` now throws `TrainerError.alreadyRunning` on a re-entrant `train()` instead of blindly resetting `cancelRequested`.
+- **Cross-scan contamination CLOSED** at both ends: `guard model.scanID == bundle.scanID` before writing (coordinator:549), and `latestModel = nil` per run (trainer:128) alongside `exposureRecords` and the held-out list, which were also carrying over.
+- **Format-version gate + capture-to-processing route** fixed in ScanLibraryStore and NimbusApp.
+- **Live preview WIRED** via new `Sources/Pipeline/TrainingPreview.swift`: refreshes from `trainer.snapshot()` on `previewAvailable` (coordinator:523), with an explicit "a failed refresh is not a failed build" rule so a bad snapshot keeps the last good frame rather than killing the run.
+
+**Checkpoint `1aa3082`** (296 files). Push path confirmed ready: remote `bottlemaster-22/Nimbus3D`, gh authenticated as bottlemaster-22, CI triggers on push to main, PR to main, or workflow_dispatch. Remote main still at the old Brush-wrapper commit aef06f2; 3 commits unpushed.
+
+**OWNER DIRECTIVE (new, standing):** *"If you're running workflows, do many more agents. If you are deploying three agents in a workflow, forget the workflow and simply do it yourself."* Ultracode also enabled: optimise for the most exhaustive correct answer, token cost is not a constraint. Stopped the 3-agent verify run mid-flight and replaced it.
+
+**Launched `wf_36e0a9ff-76e` (task `wpz630w5d`, verified running): the exhaustive audit.**
+- **60 finders** = 50 Swift (11 modules crossed with 6 lenses: compile-blockers, strict-concurrency, framework/availability legality, algorithmic/mathematical correctness, faked-functionality, and Swift-to-Metal ABI) + 10 cross-cutting slices (Python correctness, Python protocol agreement, Python trainer maths vs the iOS versions of the same algorithms, Blender add-on vs the Swift writer itself rather than its own fixtures, build/CI on a fresh checkout, DATA_FORMAT agreement across all six readers/writers, brand rename-in-one-place, every user-facing string as a body of writing, and cross-module contract seams).
+- **Three-lens adversarial verification** on every blocker/major finding: a refuter checking the code says what the finding claims, one checking a real user can actually reach it, and one judging against THIS project's rules (language mode 5.0, targeted not complete concurrency, labelled STUBs are legitimate). Majority rules, default-to-refuted, because a false finding sends a repair agent to break working code.
+- **Repair partitioned by owning directory** so no two agents can touch the same file.
+- **Five critics**: final compile gate over the parallel edits, completeness critic (what could this audit's structure not see?), first-run simulation on a phone, second-scan singleton state survival, and contract drift + draining INTEGRATION_REQUESTS.md.
+
+Sizes audited: Trainer 9193 lines, Capture 8988, PrePass 7463, Viewer 6414, Smart 4148, Onboarding 3403, Booster 2728, Export 2688, Core 2432, Pipeline 2308, App 623; Python 10196; Blender 1923.

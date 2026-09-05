@@ -19,12 +19,25 @@ import UIKit
 
 // MARK: - The screen
 
+/// `@MainActor` on the whole view, matching `CaptureScreen` and `MainTabView`:
+/// it holds two main-actor-isolated observed objects (`ScanProcessingCoordinator`
+/// and `AppNavigation`) and mutates one of them from a `.task`, so isolating the
+/// view rather than relying on `body`'s implicit isolation keeps every helper
+/// property and method on the same actor.
+@MainActor
 struct ScanLibraryScreen: View {
 
     @StateObject private var store = ScanLibraryStore()
     /// Watched, not driven: when a check-over or a build starts or ends, the
     /// rows have to change what they say about themselves.
     @ObservedObject private var processing = ScanProcessingCoordinator.shared
+    /// Set by another screen (the capture report) when it wants this list to
+    /// put one scan forward. Consumed and cleared below: nothing else clears
+    /// it, because only this screen knows when it has acted on it.
+    @ObservedObject private var navigation = AppNavigation.shared
+    /// The scan we were asked to lead with, kept after the request is cleared
+    /// so the row can stay highlighted while the user looks at it.
+    @State private var leadScanID: ScanID?
     @State private var renaming: ScanSummary?
     @State private var newName = ""
     @State private var deleting: ScanSummary?
@@ -83,6 +96,32 @@ struct ScanLibraryScreen: View {
     // MARK: List
 
     private var list: some View {
+        ScrollViewReader { proxy in
+            listBody
+                // A scan handed over from the capture report will not be in
+                // `store.scans` yet, so refresh first, then scroll to it. The
+                // request is cleared either way: leaving it set would drag the
+                // user back to the same row every time they opened this tab.
+                .task(id: navigation.scanToLeadWith) {
+                    guard let wanted = navigation.scanToLeadWith else { return }
+                    navigation.scanToLeadWith = nil
+                    leadScanID = wanted
+                    if !store.scans.contains(where: { $0.scanID == wanted }) {
+                        await store.refresh()
+                    }
+                    guard store.scans.contains(where: { $0.scanID == wanted }) else {
+                        // The scan is genuinely not on disk. Say nothing and
+                        // drop the highlight rather than scrolling to a row
+                        // that is not there.
+                        leadScanID = nil
+                        return
+                    }
+                    withAnimation { proxy.scrollTo(wanted, anchor: .center) }
+                }
+        }
+    }
+
+    private var listBody: some View {
         List {
             Section {
                 ForEach(store.scans) { scan in
@@ -100,6 +139,13 @@ struct ScanLibraryScreen: View {
                     } label: {
                         ScanLibraryRow(scan: scan)
                     }
+                    // The scan the user has just recorded, marked so it is
+                    // obvious which row the app has brought them to.
+                    .listRowBackground(
+                        scan.scanID == leadScanID
+                            ? Color.accentColor.opacity(0.14)
+                            : Color.clear
+                    )
                     .swipeActions(edge: .trailing) {
                         Button("Delete", role: .destructive) { deleting = scan }
                         Button("Rename") {
