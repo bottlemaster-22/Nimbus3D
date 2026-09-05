@@ -271,3 +271,38 @@ The PC Booster job (`python -m compileall` + pyflakes) passed on ALL FOUR rounds
 **PR:** https://github.com/bottlemaster-22/Nimbus3D/pull/1 (branch `build/first-ci`, not merged to main).
 
 **Next step:** sign via Bottle and install on the iPhone 17 Pro Max. THEN the real unknowns start, because compiling is not running: nothing in this app has ever executed. Expect the first real failures at ARSession start, Metal pipeline construction (TrainerGPULayouts.verify() throws on any Swift/Metal stride disagreement), and the first training loop.
+
+---
+
+## 2026-09-05 : First hardware feedback. Four real bugs found, all fixed, CI green first try.
+
+**The owner installed v0.1.0 and reported three things.** This is the first real feedback this project has ever had, and it was worth more than every audit combined.
+
+1. *"you have to move so super slowly or it yells at you for being blurry... my hands shake a lot"*
+2. *"the preview comes out on it's side as if it were rotated left on the (z?) axis"*
+3. *"it looks REALLY sparse, I did a 3 min scan of my room and it came out looking like nothing"*
+
+He also asked, unprompted and correctly reasoned: *"Can you run the camera at 240 fps like my camera supports?"*
+
+**Two workflows, 32 diagnosis agents.** `wf_aef4e7b7-0cc` (13 agents: 7 rotation hypotheses, 6 blur) and `wf_86a737ab-a43` (14 agents, one per stage where a splat can die). Both lost their final agent to the session limit; everything else landed.
+
+### THE SPARSE SCAN: four bugs, in order of damage
+
+**1. DENSIFICATION NEVER FIRED ONCE.** `absGradThreshold = 0.0006` was copied from the reference 3DGS implementation, which multiplies its gradient by `0.5 * width` BEFORE storing, making it an NDC number. This rasteriser accumulates `length(dLdMean2D)` raw, in PIXELS (`TrainerShaders.metal` builds delta as `mean2D - pixelCenter`), which at 720 px is smaller by a factor of a few hundred. Nothing ever cleared the bar. Zero splats created, split or cloned, ever. **The stage whose entire job is growing a sparse seed into a dense model was a silent no-op.** Fixed: gate on `> 0` and let the ranked truncation to budget do the cutting (scale-free, cannot break on units again). Threshold constant dropped to 1e-9 with the units documented.
+
+**2. THE THERMAL CAP WAS A ONE-WAY RATCHET THAT ATE LIVE GEOMETRY.** `degradeForHeat` cut towards `min(current.splatCap, currentSplatCount) * 0.75`. Live count is always below the ceiling early (seeder aims for splatCap/2), so `min()` picked the LIVE count and 0.75 of it landed BELOW the existing population. `applyBudgetChange` then TRIMMED real Gaussians and `resizeSplatCapacity` rebuilt the GPU buffer smaller: geometry physically deleted, not merely disallowed. Then `headroom = splatCap - splatCount == 0` switched densification off permanently. One warm phone in minute one and the model could never grow again. Fixed: cut the CEILING, never below the live count, floor is now `ceiling.splatCap / 4` (scene-derived) instead of a flat 20,000.
+
+**3. THE PRUNE SCHEDULE WAS DEAD CODE.** `pruneStartFraction` (0.15) and `pruneEndFraction` (0.80) were declared, defaulted, assigned, and read NOWHERE (repo-wide grep). Pruning rode the densify interval: every 100 iterations from 100 to the end, 29 passes on a 3,000-iteration run instead of ~10, including before convergence and during late opacity binarization (deleting splats only briefly pushed toward zero). Fixed with an `allowPrune` window. Non-finite pruning still runs every pass: hygiene, not judgement.
+
+**4. THE TRUST GATE REJECTED ~100% OF A SHAKY SCAN.** `trustedWeight = 0.5` needs measured sigma under ~2 cm even at perfect confidence. That sigma comes from cross-frame residuals so it absorbs POSE error, and `PrePassPipeline.swift:19-20` says so itself: "A 2 cm pose error reads as 2 cm of sensor noise everywhere." On a first handheld scan 2-4 cm is ordinary, so every seed became a stretched translucent blob instead of a solid disc. Fixed: relative to the scan (better half by trust) with a low absolute floor.
+
+### ROTATION
+`rot-display-transform` **confirmed cause**. Critically, `rot-trainer-frame` was **RULED OUT**, so the model was never rotated and exports were always fine: only the preview. Also ruled out: colmap writer, viewer camera, preview path, metal viewport. This mattered enormously, because "fixing" it in two places would have looked right in the preview while corrupting every .ply and .glb.
+
+### 240 FPS
+`blur-framerate` **ruled out**, as suspected: that is an AVFoundation slow-motion path, not something ARKit offers alongside sceneDepth and tracking. But his reasoning was right from the wrong end. At 240 fps a hand-held phone moves ~2 mm between frames, which is no new parallax; splatting wants viewpoint DIVERSITY, not temporal density. The lever he actually wanted is SHORTER EXPOSURE at a normal frame rate, which is the real cure for tremor and is now in the blur fix.
+
+### RESULT
+Commit `85e3f09`, ~20 files. **CI run 33988092964 GREEN ON THE FIRST ATTEMPT** despite the size of the change. Artifact verified by reading it: arm64 Mach-O 3,305,248 bytes, default.metallib 299,112 bytes, com.tombline.nimbus, minOS 17.0. Published as release **v0.1.1** and handed to the owner.
+
+**Next step:** he scans again. That is the only test that matters. If it is still sparse, the instrumentation agent's splat census (frames -> keyframes -> seeds -> after densify -> after prune -> after carve -> final) is the next thing to build, because we are still inferring where geometry goes instead of measuring it. Also outstanding: the `gate` and `converge` agents never ran (session limit), so nothing has re-audited these fixes as a set.
