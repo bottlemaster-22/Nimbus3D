@@ -313,14 +313,19 @@ enum PreviewPathSampler {
         _ p3: SIMD3<Float>,
         _ t: Float
     ) -> SIMD3<Float> {
-        let t2 = t * t
-        let t3 = t2 * t
-        return 0.5 * (
-            (2 * p1)
-                + (-p0 + p2) * t
-                + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
-                + (-p0 + 3 * p1 - 3 * p2 + p3) * t3
-        )
+        // Each Catmull-Rom basis term is its own typed local. Written as one
+        // expression, the integer literals mixed with SIMD3<Float> operators
+        // gave the type checker too many overload combinations to resolve in
+        // reasonable time and it refused to compile it. Identical arithmetic.
+        let t2: Float = t * t
+        let t3: Float = t2 * t
+
+        let a: SIMD3<Float> = p1 * 2
+        let b: SIMD3<Float> = (p2 - p0) * t
+        let c: SIMD3<Float> = (p0 * 2 - p1 * 5 + p2 * 4 - p3) * t2
+        let d: SIMD3<Float> = (p1 * 3 - p0 - p2 * 3 + p3) * t3
+
+        return (a + b + c + d) * 0.5
     }
 
     static func closestPointOnSegment(

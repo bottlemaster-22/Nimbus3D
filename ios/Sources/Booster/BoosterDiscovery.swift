@@ -227,7 +227,10 @@ public final class BoosterDiscovery: ObservableObject {
         }
     }
 
-    private static func hostString(_ host: NWEndpoint.Host) -> String {
+    /// `nonisolated` because it is called from `stateUpdateHandler`, which
+    /// Network delivers on its own queue rather than the main actor. It reads
+    /// nothing but its argument, so there is no state to protect.
+    nonisolated private static func hostString(_ host: NWEndpoint.Host) -> String {
         switch host {
         case .ipv4(let address):
             return "\(address)"

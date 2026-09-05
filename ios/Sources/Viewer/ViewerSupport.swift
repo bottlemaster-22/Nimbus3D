@@ -322,7 +322,7 @@ extension Data {
     /// Appends `value` little-endian. Used by the honesty-mask writer.
     mutating func appendLittle<T: FixedWidthInteger>(_ value: T) {
         var v = value.littleEndian
-        withUnsafeBytes(of: &v) { append(contentsOf: $0) }
+        Swift.withUnsafeBytes(of: &v) { append(contentsOf: $0) }
     }
 
     mutating func appendLittle(_ value: Float) {

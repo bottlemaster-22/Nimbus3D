@@ -155,11 +155,16 @@ actor BoosterUploadManager {
 
             let chunkHash = Self.sha256Hex(chunk)
             // Sendable closures cannot capture a mutable local var, so pass
-            // this iteration's offset in as a `let` snapshot.
+            // this iteration's offset in as a `let` snapshot. `address` is
+            // snapshotted for the neighbouring reason: reaching it through
+            // `self` inside an escaping closure on an actor needs an explicit
+            // capture, and a local `let` says what is captured and keeps the
+            // closure from holding the manager alive.
             let chunkOffset = offset
+            let chunkAddress = self.address
             let response = try await withRetry {
                 try await BoosterHTTP.putChunk(
-                    address,
+                    chunkAddress,
                     path: path,
                     offset: chunkOffset,
                     sha256: chunkHash,

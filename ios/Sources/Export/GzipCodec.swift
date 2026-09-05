@@ -73,9 +73,9 @@ enum Gzip {
         out.append(deflated)
 
         let crc = CRC32.checksum(data)
-        out.append(littleEndianBytes(crc))
+        out.append(contentsOf: littleEndianBytes(crc))
         let isize = UInt32(truncatingIfNeeded: data.count)
-        out.append(littleEndianBytes(isize))
+        out.append(contentsOf: littleEndianBytes(isize))
         return out
     }
 

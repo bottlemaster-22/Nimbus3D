@@ -79,7 +79,16 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
     // MARK: - Init
 
-    public init(
+    /// The initializer the app uses. `TrainerTuning` is an internal knob bag,
+    /// so it cannot appear in a public signature or as a public default
+    /// argument: this stays public and takes the internal designated init's
+    /// defaults, and anything inside the module that wants to override the
+    /// tuning uses that one directly.
+    public convenience init() {
+        self.init(tuning: TrainerTuning(), settings: .default)
+    }
+
+    init(
         tuning: TrainerTuning = TrainerTuning(),
         settings: SmartLossSettings = .default
     ) {

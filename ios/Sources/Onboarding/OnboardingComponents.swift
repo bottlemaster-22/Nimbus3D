@@ -35,6 +35,14 @@ struct OnboardingFeatureListView: View {
 
     let features: [FeatureAvailability]
 
+    /// Whether to show the "does not work on this iPhone" group.
+    ///
+    /// Defaults to true, which is what the normal onboarding pages want. The
+    /// incompatible screen can pass false: there the whole page is already an
+    /// explanation of what will not work, and repeating it as a list underneath
+    /// reads as piling on.
+    var showsUnavailable: Bool = true
+
     private var available: [FeatureAvailability] {
         features.filter(\.isAvailable)
     }

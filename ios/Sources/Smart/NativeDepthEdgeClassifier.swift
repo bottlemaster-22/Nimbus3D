@@ -191,7 +191,9 @@ public final class NativeDepthEdgeClassifier: EdgeClassifier {
         }
 
         var classes = [EdgeClass](repeating: .none, count: expected)
-        data.withUnsafeBytes { raw in
+        // The closure parameter is annotated on purpose: without it the
+        // compiler cannot choose between Data's two withUnsafeBytes overloads.
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             for i in 0..<expected {
                 classes[i] = EdgeClass(rawValue: raw[i]) ?? .none
             }

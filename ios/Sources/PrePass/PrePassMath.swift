@@ -171,7 +171,7 @@ struct PrePassSE3 {
             axis = SIMD3<Double>(0, 0, 0)
         } else {
             // atan2 keeps full precision across the whole range, unlike acos(w).
-            theta = 2 * Foundation.atan2(vecNorm, Foundation.abs(w))
+            theta = 2 * Foundation.atan2(vecNorm, Swift.abs(w))
             axis = q.vector4Imaginary / vecNorm
             if w < 0 { axis = -axis }   // shortest arc
         }
@@ -206,7 +206,7 @@ struct PrePassSE3 {
         let q = rotation.normalized
         let vecNorm = simd_length(q.vector4Imaginary)
         guard vecNorm > 1e-12 else { return 0 }
-        let theta = 2 * Foundation.atan2(vecNorm, Foundation.abs(q.vector.w))
+        let theta = 2 * Foundation.atan2(vecNorm, Swift.abs(q.vector.w))
         return theta * 180 / .pi
     }
 
@@ -461,9 +461,9 @@ enum PrePassEigen {
         for _ in 0..<24 {
             // Largest off-diagonal magnitude.
             var p = 0, q = 1
-            var maxOff = Foundation.abs(a[0][1])
-            if Foundation.abs(a[0][2]) > maxOff { maxOff = Foundation.abs(a[0][2]); p = 0; q = 2 }
-            if Foundation.abs(a[1][2]) > maxOff { maxOff = Foundation.abs(a[1][2]); p = 1; q = 2 }
+            var maxOff = Swift.abs(a[0][1])
+            if Swift.abs(a[0][2]) > maxOff { maxOff = Swift.abs(a[0][2]); p = 0; q = 2 }
+            if Swift.abs(a[1][2]) > maxOff { maxOff = Swift.abs(a[1][2]); p = 1; q = 2 }
             if maxOff < 1e-18 { break }
 
             let apq = a[p][q]
@@ -568,7 +568,7 @@ enum PrePassStats {
     /// gradient, which is what the Gauss-Newton normal equations want.
     @inline(__always)
     static func huberWeight(residual: Double, delta: Double) -> Double {
-        let absolute = Foundation.abs(residual)
+        let absolute = Swift.abs(residual)
         guard absolute > delta, delta > 0 else { return 1 }
         return delta / absolute
     }
@@ -579,7 +579,7 @@ enum PrePassStats {
     /// throw the estimate into the neighbouring bin.
     static func parabolicMinimumOffset(previous: Double, centre: Double, next: Double) -> Double {
         let denominator = previous - 2 * centre + next
-        guard Foundation.abs(denominator) > 1e-12 else { return 0 }
+        guard Swift.abs(denominator) > 1e-12 else { return 0 }
         let offset = 0.5 * (previous - next) / denominator
         guard offset.isFinite else { return 0 }
         return Swift.min(Swift.max(offset, -0.5), 0.5)

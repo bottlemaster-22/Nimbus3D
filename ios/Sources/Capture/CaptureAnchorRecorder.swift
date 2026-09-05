@@ -105,7 +105,14 @@ final class CaptureAnchorRecorder {
     // MARK: - Writing
 
     /// `anchors/anchors_session.json` and `anchors/anchors_final.json`.
-    static func write(
+    ///
+    /// `nonisolated` even though the type is `@MainActor`: the isolation exists
+    /// to protect the anchor lists this class ACCUMULATES from ARSession
+    /// callbacks, and this method touches none of that. It takes both lists as
+    /// arguments and writes them to disk, which `CaptureBundleWriter` does off
+    /// the main thread on purpose, because bundle writing must never block the
+    /// capture UI.
+    nonisolated static func write(
         session sessionAnchors: [AnchorRecord],
         final finalAnchors: [AnchorRecord],
         to folder: CaptureScanFolder
