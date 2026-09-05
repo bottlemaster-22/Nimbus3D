@@ -198,12 +198,36 @@ final class TrainerBudgetGovernor {
     func degradeForHeat(level: ThermalLevel, currentSplatCount: Int) -> TrainerBudgetChange? {
         let reason = TrainerBudgetChange.Reason.thermal(level)
 
-        // 1. Splat cap. Cut towards what is actually live rather than towards
-        // an abstract fraction: cutting a cap the run is nowhere near saves
-        // nothing and reads as a fake response.
+        // 1. Splat cap. Cut the CEILING, and never below the living population.
+        //
+        // This used to read `min(current.splatCap, currentSplatCount) * 0.75`,
+        // and that was a one-way ratchet that destroyed the scan. The live
+        // count is always below the ceiling early in a run (the seeder aims for
+        // splatCap/2), so the min() picked the LIVE count, and 0.75 of it
+        // landed BELOW the population that already existed. `applyBudgetChange`
+        // then trimmed real Gaussians to fit and rebuilt the GPU buffer at the
+        // smaller size, so the geometry was physically deleted rather than
+        // merely disallowed. Worse, `headroom = splatCap - splatCount` was then
+        // exactly 0, which switched densification off for the rest of the run.
+        // One warm phone in the first minute and the model could never grow
+        // again, which is what "a three minute scan that looks like nothing"
+        // actually was.
+        //
+        // Cutting the ceiling gives back exactly the memory a thermal cut is
+        // for, because `resizeSplatCapacity` allocates what the cap says AFTER
+        // the cut. An unused ceiling costs nothing to hold, so lowering one the
+        // run has not reached is a real response, not a fake one.
+        //
+        // The floor is scene-derived rather than a flat 20,000. `ceiling`
+        // already scales with scene extent (150k for one object, 300k for a
+        // room, 500k for a floor), so a quarter of it keeps a surface a
+        // surface. A model may get smaller under heat; it must never get so
+        // small it stops describing the room.
+        let splatFloor = Swift.max(20_000, ceiling.splatCap / 4)
         let capTarget = Swift.max(
-            Int(Float(Swift.min(current.splatCap, Swift.max(currentSplatCount, 1))) * 0.75),
-            20_000
+            Int(Float(current.splatCap) * 0.75),
+            currentSplatCount,
+            splatFloor
         )
         if let change = lower(.splatCap(from: current.splatCap, to: capTarget), reason: reason) {
             return change

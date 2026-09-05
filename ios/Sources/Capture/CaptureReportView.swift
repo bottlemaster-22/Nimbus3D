@@ -331,9 +331,10 @@ struct CaptureReportPanel: View {
             if smearyShare >= 0.15 {
                 result.append(
                     CaptureReportNote(
-                        text: "About \(Int((smearyShare * 10).rounded())) shots in 10 were "
-                            + "smeared from moving too fast. Walking more slowly is the "
-                            + "whole fix.",
+                        text: "About \(Int((smearyShare * 10).rounded())) shots in 10 came "
+                            + "out smeared. Smear is how fast the phone turned "
+                            + "multiplied by how long the shutter was open, so in a "
+                            + "dim room more light helps as much as moving slower.",
                         color: CaptureHUDPalette.problem
                     )
                 )
@@ -342,7 +343,9 @@ struct CaptureReportPanel: View {
                     CaptureReportNote(
                         text: "Your shots were steady: a typical one smeared by "
                             + String(format: "%.1f", summary.medianBlurPixels)
-                            + " pixels, and 2 is the point where detail starts to go.",
+                            + " pixels, and "
+                            + String(format: "%.0f", CaptureTuning.blurAmberPixels)
+                            + " is the point where detail starts to go.",
                         color: CaptureHUDPalette.satisfied
                     )
                 )

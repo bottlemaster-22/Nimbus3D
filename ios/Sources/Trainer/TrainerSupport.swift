@@ -446,12 +446,22 @@ struct TrainerTuning: Sendable {
 
     // --- Densification --------------------------------------------------------
 
-    /// AbsGS gradient threshold. The reference 3DGS number is 0.0002 on the
-    /// SIGNED statistic; AbsGS accumulates magnitudes, which run larger, so
-    /// the threshold is raised to match. It is also treated as a floor, not
-    /// as the operating point: the real cut is a percentile, so the budget
-    /// decides how many are split, never the scene's absolute gradient scale.
-    var absGradThreshold: Float = 0.0006
+    /// AbsGS gradient floor, in the PIXEL units this rasteriser actually
+    /// accumulates. Effectively "greater than zero": the real cut is the ranked
+    /// truncation to the budget in `TrainerDensifier`, never this number.
+    ///
+    /// It was 0.0006, borrowed from the reference 3DGS implementation, and that
+    /// was a units error that silently disabled densification for entire runs.
+    /// The reference multiplies its gradient by 0.5 * width before storing it,
+    /// so its numbers are in normalised device coordinates. This rasteriser
+    /// stores `length(dLdMean2D)` raw, in pixels, which at a 720 px render is
+    /// smaller by a factor of a few hundred. Nothing ever cleared 0.0006, so
+    /// zero Gaussians were ever created and every model stayed as sparse as its
+    /// LiDAR seed.
+    ///
+    /// Keep this at or near zero. If a real floor is ever wanted, derive it
+    /// from the render width so it cannot drift out of units again.
+    var absGradThreshold: Float = 1e-9
     /// A Gaussian larger than this fraction of the scene extent is SPLIT;
     /// smaller ones are CLONED.
     var splitScaleFraction: Float = 0.01

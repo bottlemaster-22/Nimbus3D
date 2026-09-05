@@ -106,13 +106,24 @@ final class CaptureQCEvaluator {
         exposureJumpEV: Float,
         trackingQuality: TrackingQuality
     ) -> Float {
-        // Blur: full marks up to the amber threshold, falling linearly to zero
-        // at twice the red threshold. At 8 px of smear there is no detail left
-        // to supervise against.
-        let blurFactor = Self.ramp(
+        // Blur: full marks up to the amber threshold, falling linearly to a
+        // floor at `blurWeightFloorPixels`.
+        //
+        // The floor matters more than the slope, and it is the same 0.35 that
+        // sharpness gets two lines below, for the same reason. `blurPixels` is
+        // a PREDICTION (gyro rate times shutter, open loop); `sharpness` is a
+        // MEASUREMENT of the same defect on the pixels that actually arrived.
+        // Multiplying a prediction and a measurement of one problem squares
+        // the penalty, so the measured term has to be free to have the last
+        // word. Blur used to be the only one of the five factors allowed to
+        // reach zero, and because the weight is a product that meant one
+        // instantaneous gyro sample could delete a frame's whole photometric
+        // contribution. A soft view of a corner nothing else saw is worth far
+        // more than no view of it.
+        let blurFactor = 0.35 + 0.65 * Self.ramp(
             value: motionBlurPixels,
             fullBelow: CaptureTuning.blurAmberPixels,
-            zeroAbove: CaptureTuning.blurRedPixels * 2
+            zeroAbove: CaptureTuning.blurWeightFloorPixels
         )
 
         // Sharpness: normalised against the session, so this is "how sharp for

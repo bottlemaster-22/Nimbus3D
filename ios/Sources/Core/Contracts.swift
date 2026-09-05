@@ -46,6 +46,38 @@
 //                 `Pose.fromARKitCameraTransform(_:)` does the conversion and
 //                 is the only place it may be done.
 //
+//  Sensor frame:  the camera frame above is the camera's NATIVE SENSOR frame,
+//                 and on an iPhone that frame is LANDSCAPE (1920 x 1440, say)
+//                 no matter which way the phone was being held. ARKit's
+//                 `imageResolution`, `intrinsics` and `camera.transform` are
+//                 all published in it, and none of them change when the user
+//                 turns the device, which is exactly why ARKit has separate
+//                 `viewMatrix(for:)`, `projectionMatrix(for:)` and
+//                 `displayTransform(for:viewportSize:)` calls for anything
+//                 that has to end up on a screen.
+//
+//                 EVERYTHING THIS APP PERSISTS IS IN THAT ONE FRAME, and the
+//                 three legs agree with each other: the JPEG pixels, the
+//                 `CameraIntrinsics`, and every `Pose`. That is what COLMAP,
+//                 the pre-pass and the trainer all want, and it has to stay
+//                 that way. So a scan shot in portrait holds landscape
+//                 photographs described by landscape cameras, and the splat
+//                 trained from them still comes out gravity-upright, because
+//                 the quarter turn in the pixels and the quarter turn in the
+//                 poses cancel.
+//
+//                 The consequence is the whole of the "the preview came out on
+//                 its side" bug: ANY code that puts a captured image, or a
+//                 captured pose used as a camera, in front of a person has to
+//                 turn it upright ITSELF. That turn is presentation. It is
+//                 never applied to the data, never written to disk, and never
+//                 handed to the trainer or an exporter. The two helpers that
+//                 do it, with signs that are guaranteed to agree, are
+//                 `Pose.rolledForDisplay(quarterTurnsClockwise:)` and
+//                 `CameraIntrinsics.rotatedForDisplay(quarterTurnsClockwise:)`.
+//                 How many turns a scan needs is recorded once per capture, in
+//                 `CaptureSettings.imageQuarterTurnsClockwiseToUpright`.
+//
 //  A `Pose` is world -> camera:      X_cam = R * X_world + t
 //  so the camera centre in world space is  C = -R^T * t  (`Pose.center`).
 //
@@ -223,6 +255,35 @@ public struct Pose: Codable, Hashable, Sendable {
         )
     }
 
+    /// The same camera, described for a display that is turned `turns` quarter
+    /// turns CLOCKWISE relative to the stored image.
+    ///
+    /// PRESENTATION ONLY. Nothing written to disk, handed to the pre-pass or
+    /// handed to the trainer may come through here. The persisted pixels,
+    /// intrinsics and poses are all in the sensor frame and already agree with
+    /// each other, so rolling one of the three without the other two would
+    /// turn a cosmetic problem into a real geometry bug, and rolling all three
+    /// would double-rotate the preview while corrupting every export.
+    ///
+    /// Turning the picture one quarter turn clockwise sends the image's +X to
+    /// the display's +Y and the image's +Y to the display's -X, which is a
+    /// right-handed rotation of +90 degrees about the camera's +Z (optical)
+    /// axis. The roll goes on the camera side, so `center` is untouched: the
+    /// camera turns on the spot, it does not move. That matters, because the
+    /// fly-through promises to stay within ~0.20 m of where the user walked.
+    ///
+    /// This is a rotation, not a stray minus sign, so it does not breach the
+    /// "only `fromARKitCameraTransform` may negate an axis" rule above.
+    public func rolledForDisplay(quarterTurnsClockwise turns: Int) -> Pose {
+        let steps = ((turns % 4) + 4) % 4
+        guard steps != 0 else { return self }
+        let roll = simd_quatf(angle: Float(steps) * .pi / 2, axis: SIMD3<Float>(0, 0, 1))
+        return Pose(
+            rotation: Quaternion((roll * rotation.simd).normalized),
+            translation: Vector3(roll.act(translation.simd))
+        )
+    }
+
     /// Shortest-arc interpolation between two poses. Used when re-sampling
     /// poses at a shifted timestamp during camera-to-IMU time-offset
     /// calibration (F1) - rotation slerps, translation lerps.
@@ -261,6 +322,14 @@ public struct BoundingBox: Codable, Hashable, Sendable {
 /// A single shared PINHOLE camera model, as written to `sparse/0/cameras.txt`.
 /// One per capture: the RGB stream is a fixed format for the whole session, so
 /// there is exactly one camera and every image references it.
+///
+/// These are SENSOR-FRAME numbers, so on an iPhone they are landscape
+/// (`width` greater than `height`) even for a scan shot in portrait, and they
+/// describe the JPEGs on disk exactly as those JPEGs are stored. Nothing may
+/// swap `width` and `height` to match how the phone was held: see the
+/// orientation note at the top of this file, and use
+/// `rotatedForDisplay(quarterTurnsClockwise:)` when something has to go on a
+/// screen.
 public struct CameraIntrinsics: Codable, Hashable, Sendable {
     /// Pixel width of the RGB frames these intrinsics describe.
     public var width: Int
@@ -295,8 +364,43 @@ public struct CameraIntrinsics: Codable, Hashable, Sendable {
         )
     }
 
-    /// Horizontal field of view in degrees. Used by the preview camera path,
-    /// which deliberately widens it (F9).
+    /// The same camera, described for a display that is turned `turns` quarter
+    /// turns CLOCKWISE relative to the stored image. On an odd number of turns
+    /// width and height swap, fx and fy swap, and the principal point travels
+    /// with them.
+    ///
+    /// PRESENTATION ONLY, and it has to be applied together with
+    /// `Pose.rolledForDisplay(quarterTurnsClockwise:)`, or the picture ends up
+    /// somewhere different from the geometry. Never write the result to
+    /// `cameras.txt`.
+    public func rotatedForDisplay(quarterTurnsClockwise turns: Int) -> CameraIntrinsics {
+        var result = self
+        var remaining = ((turns % 4) + 4) % 4
+        while remaining > 0 {
+            // One quarter turn clockwise sends source pixel (x, y) to
+            // (height - 1 - y, x), so the new cx is the old cy measured
+            // backwards from the source height, and the new cy is the old cx.
+            // On the usual 1920 x 1440 frame with the principal point at
+            // (959.5, 719.5) that gives 1440 x 1920 with the point at
+            // (719.5, 959.5), which is still dead centre.
+            result = CameraIntrinsics(
+                width: result.height,
+                height: result.width,
+                fx: result.fy,
+                fy: result.fx,
+                cx: Float(result.height) - 1 - result.cy,
+                cy: result.cx
+            )
+            remaining -= 1
+        }
+        return result
+    }
+
+    /// Horizontal field of view in degrees, measured across `width`, which is
+    /// the SENSOR frame's horizontal axis. Anything that has rotated a camera
+    /// for display must read this from the rotated copy, or it will be fitting
+    /// a landscape field of view across a portrait screen. Used by the preview
+    /// camera path, which deliberately widens it (F9).
     public var horizontalFOVDegrees: Float {
         2 * atan(Float(width) / (2 * fx)) * 180 / .pi
     }
@@ -361,10 +465,25 @@ public enum ExposureBracket: String, Codable, Sendable {
 public struct FrameQC: Codable, Hashable, Sendable {
     /// Gyro magnitude at exposure midpoint, radians/second.
     public var angularSpeedRadPerSec: Float
-    /// The live blur meter, in pixels of smear (F9):
-    /// `degreesPerSecond * exposureDuration / 0.0426`, where 0.0426 deg/px is
-    /// the angular pixel pitch of the wide camera at 1920 px. Amber at 2 px,
-    /// red at 4 px.
+    /// The blur meter, in pixels of smear AT CAPTURE RESOLUTION (F9): the gyro
+    /// rate over the shutter, divided by the camera's angular pixel pitch.
+    /// `CaptureTuning.motionBlurPixels(...)` is the one implementation and
+    /// `CaptureTuning.angularPixelPitchDegrees` is the pitch.
+    ///
+    /// This field is a physical prediction of how far the image smeared, and
+    /// it stays one. It is not softened to be kinder to an unsteady hand, and
+    /// it is not rescaled to the smaller size the trainer supervises at. A
+    /// consumer that wants a gentler number computes it from this one; it does
+    /// not redefine this one, because the QC card, the pre-pass and anything
+    /// reading the bundle later all expect the honest figure.
+    ///
+    /// Where amber and red sit, how much `weight` smear costs, and when the
+    /// HUD says anything out loud are CALIBRATION, and all of it lives in
+    /// `CaptureTuning`, deliberately not here, so it can be re-tuned without
+    /// changing what this field means. It has to move as one piece, though:
+    /// the HUD colour, the spoken guidance, `weight` below, the keyframe gate
+    /// and the QC card all read this same number, so making only the HUD
+    /// kinder would look fixed while frames were still being thrown away.
     public var motionBlurPixels: Float
     /// Variance-of-Laplacian sharpness, normalised 0...1 against the running
     /// maximum for this session. Higher is sharper.
@@ -674,6 +793,41 @@ public struct CaptureSettings: Codable, Hashable, Sendable {
     /// means "unknown", never "empty" (F2).
     public var lidarMaxRangeMeters: Float
 
+    /// How many quarter turns CLOCKWISE a frame from this scan needs before it
+    /// looks upright to someone holding the phone the way it was held while
+    /// scanning. 0 is the sensor's own landscape, 1 the ordinary portrait
+    /// hold, 2 upside down, 3 the other landscape.
+    ///
+    /// PRESENTATION ONLY. The geometry must ignore it. The JPEGs, the
+    /// `CameraIntrinsics` and every `Pose` in this bundle are all in the
+    /// sensor frame and already agree with each other, so rolling one of them
+    /// by this and not the others would break a dataset that is correct today
+    /// (see the orientation note at the top of this file). It is here for one
+    /// reason: so that a screen showing a captured photo, or replaying a
+    /// captured pose as a preview camera, can turn it upright EXACTLY, with
+    /// `Pose.rolledForDisplay(quarterTurnsClockwise:)` and
+    /// `CameraIntrinsics.rotatedForDisplay(quarterTurnsClockwise:)`, instead
+    /// of inferring the angle from the poses and getting it wrong on a scan of
+    /// a floor or a ceiling.
+    ///
+    /// Optional, and `nil` means "not recorded", never "zero": scans written
+    /// before this field existed do not carry it, and a viewer that finds nil
+    /// should fall back to whatever it did before rather than assume the phone
+    /// was held in landscape. Being optional is also what keeps those older
+    /// scans decoding, since a synthesised `Codable` only tolerates a missing
+    /// key for an Optional property. Adding an optional field does not bump
+    /// `CaptureBundle.currentFormatVersion` (docs/DATA_FORMAT.md section 9).
+    ///
+    /// One value for the whole session, because that is what the capture
+    /// session knows at the moment it starts. The honest limit of that, worth
+    /// knowing before someone trusts it: the app allows portrait and both
+    /// landscapes, so a user who turns the phone mid-scan will have later
+    /// frames a quarter turn out on screen. The frames themselves stay
+    /// correct, because none of this touches the data. If that ever matters,
+    /// the fix is a second optional field on `CaptureFrame`, added the same
+    /// additive way.
+    public var imageQuarterTurnsClockwiseToUpright: Int?
+
     public init(
         bracketEveryNFrames: Int,
         bracketStops: Float,
@@ -681,7 +835,8 @@ public struct CaptureSettings: Codable, Hashable, Sendable {
         whiteBalanceLocked: Bool,
         depthWidth: Int,
         depthHeight: Int,
-        lidarMaxRangeMeters: Float
+        lidarMaxRangeMeters: Float,
+        imageQuarterTurnsClockwiseToUpright: Int? = nil
     ) {
         self.bracketEveryNFrames = bracketEveryNFrames
         self.bracketStops = bracketStops
@@ -690,6 +845,7 @@ public struct CaptureSettings: Codable, Hashable, Sendable {
         self.depthWidth = depthWidth
         self.depthHeight = depthHeight
         self.lidarMaxRangeMeters = lidarMaxRangeMeters
+        self.imageQuarterTurnsClockwiseToUpright = imageQuarterTurnsClockwiseToUpright
     }
 }
 
@@ -1669,6 +1825,14 @@ public struct TrainerProgress: Codable, Sendable {
 /// the user artefacts they will never see again and cannot fix.
 public struct PreviewCameraPath: Codable, Sendable {
     public struct Keyframe: Codable, Hashable, Sendable {
+        /// Where the camera is and which way it points. A keyframe derived
+        /// from a captured frame inherits that frame's SENSOR frame, which is
+        /// landscape whichever way the phone was held, so whoever turns this
+        /// into a camera on a portrait screen has to roll it upright first,
+        /// with `Pose.rolledForDisplay(quarterTurnsClockwise:)` and the turn
+        /// count on `CaptureSettings.imageQuarterTurnsClockwiseToUpright`.
+        /// See the orientation note at the top of this file: this is the pose
+        /// that put the first fly-through on its side.
         public var pose: Pose
         /// Seconds from the start of the fly-through.
         public var timeSeconds: Double
@@ -1864,7 +2028,11 @@ public struct CaptureLiveState: Sendable {
     public var elapsedSeconds: Double
     /// 0...1, the "done" number.
     public var coverageFraction: Float
-    /// The live blur meter in pixels of smear. Amber at 2, red at 4.
+    /// The live blur meter, in pixels of smear at capture resolution: the same
+    /// physical number as `FrameQC.motionBlurPixels`. Where amber and red sit
+    /// is calibration and lives in `CaptureTuning`, not here, and the HUD, the
+    /// spoken guidance and the per-frame QC weight all have to read the same
+    /// calibration or the app will say one thing and do another.
     public var motionBlurPixels: Float
     public var trackingQuality: TrackingQuality
     public var thermalLevel: ThermalLevel
@@ -1980,6 +2148,13 @@ public protocol SplatRenderer: AnyObject {
     func load(_ cloud: SplatCloud) async throws
 
     /// Sets the camera for the next frame.
+    ///
+    /// `pose` is a DISPLAY camera: its +X is drawn to the right of the
+    /// drawable and its +Y downward. A caller replaying a captured pose is
+    /// handing over a sensor-frame camera, which on a portrait screen is a
+    /// quarter turn out, so it must roll it upright first (see the
+    /// orientation note at the top of this file). Renderers draw what they are
+    /// given and must not go looking for an orientation of their own.
     func setCamera(pose: Pose, intrinsics: CameraIntrinsics)
 
     /// Diagonal hatching over never-observed directions (F9).

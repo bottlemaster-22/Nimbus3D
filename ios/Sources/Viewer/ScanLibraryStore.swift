@@ -57,6 +57,14 @@ struct ScanSummary: Identifiable, Sendable {
     var byteCount: Int64
     /// Relative path of a representative frame, used as the row's thumbnail.
     var thumbnailRelativePath: String?
+    /// Quarter turns clockwise that photo needs before it is the right way up
+    /// on screen: `CaptureSettings.imageQuarterTurnsClockwiseToUpright` where
+    /// the scan records it, measured from the scan's own poses where it does
+    /// not (see `ViewerPoseMath.uprightQuarterTurns(of:)`). The frames on disk
+    /// are the raw sensor buffer, which is landscape however the phone was
+    /// held, so a portrait scan needs one quarter turn before its thumbnail
+    /// looks like the room the user was standing in.
+    var photoQuarterTurns: Int = 0
 
     /// Set when the folder is there but something in it could not be read.
     /// Shown on the row rather than swallowed, so a scan that is quietly
@@ -209,6 +217,15 @@ enum ScanLibraryReader {
                     )
                 }
                 summary.thumbnailRelativePath = representativeFrame(of: bundle)?.imagePath
+                if let recorded = bundle.settings.imageQuarterTurnsClockwiseToUpright {
+                    summary.photoQuarterTurns = ((recorded % 4) + 4) % 4
+                } else {
+                    // Written before captures recorded which way up the phone
+                    // was, so it is measured back out of the scan's own poses.
+                    summary.photoQuarterTurns = ViewerPoseMath.uprightQuarterTurns(
+                        of: bundle.frames.lazy.map { $0.refinedPose ?? $0.rawPose }
+                    )
+                }
             } catch {
                 summary.problem = "The scan index could not be read: \(error.localizedDescription)"
             }

@@ -262,6 +262,11 @@ public final class ARCaptureService: NSObject, CaptureService {
 
     private var lastTrackingQuality: TrackingQuality = .notAvailable
     private var lastQC: FrameQC?
+    /// Shutter length of the last frame that was measured, seconds. Half of
+    /// the smear product, and the half the user cannot do anything about, so
+    /// guidance needs it to say whether the room or the hand is the problem.
+    /// Zero until a frame has been measured.
+    private var lastExposureDurationSeconds: Double = 0
     private var lastDepthSize: (width: Int, height: Int)?
     private var lastCameraTransform: simd_float4x4?
     private var lastCoverageDispatch: TimeInterval = 0
@@ -384,6 +389,7 @@ public final class ARCaptureService: NSObject, CaptureService {
         didStartExposureController = false
         lastTrackingQuality = .notAvailable
         lastQC = nil
+        lastExposureDurationSeconds = 0
         lastDepthSize = nil
         lastCameraTransform = nil
         lastCoverageDispatch = 0
@@ -568,6 +574,7 @@ public final class ARCaptureService: NSObject, CaptureService {
         let intrinsics = resolvedIntrinsics(from: camera)
         let pose = Pose.fromARKitCameraTransform(camera.transform)
         let exposureDuration = camera.exposureDuration
+        lastExposureDurationSeconds = exposureDuration
 
         // Fed before the in-flight gate below, because it costs two quaternion
         // multiplies and the clock measurement is only as good as the number
@@ -954,6 +961,7 @@ public final class ARCaptureService: NSObject, CaptureService {
         if phase == .recording {
             guidance.update(
                 blurPixels: blur,
+                exposureSeconds: lastExposureDurationSeconds,
                 trackingQuality: lastTrackingQuality,
                 worstChannel: coverageField.worstChannel,
                 windowHint: windowMode.guidanceHint,

@@ -61,10 +61,41 @@ public enum CaptureTuning {
     /// QC card downstream are calibrated against this exact number.
     public static let angularPixelPitchDegrees: Float = 0.0426
 
-    /// Smear in pixels at which the HUD goes amber ("slow down").
-    public static let blurAmberPixels: Float = 2.0
+    /// Smear in pixels at which the HUD goes amber.
+    ///
+    /// WHY 4 AND NOT 2, which is what the first draft used. These numbers are
+    /// CALIBRATION, not contract: the formula and the 0.0426 divisor above are
+    /// what CONTRACTS.md fixes, and `FrameQC.motionBlurPixels` still records
+    /// the raw figure, so nothing on disk changes when these move.
+    ///
+    /// They are quoted in CAPTURE pixels, against a stream this app asks to be
+    /// about 1920 px wide (`ARCaptureService.preferredVideoFormat`). The
+    /// trainer never sees that. `TrainerBudget.resolutionLadder` is
+    /// [720, 600, 480, 384] and `TrainerBudget.lower` is a one-way valve, so
+    /// 720 px on the long edge is the most supervision ever gets, and every
+    /// number here is divided by 1920/720 = 2.67 before it can touch a
+    /// Gaussian. The old amber of 2 px was three quarters of one pixel in the
+    /// image being fitted, which is below what that grid can even represent,
+    /// and the old red of 4 px interrupted the user at 1.5 trainer pixels.
+    ///
+    /// So: amber at 1.5 trainer px (4.0 here) is where smear starts costing
+    /// real detail, and red at 3 trainer px (8.0 here) is where a trainer with
+    /// no blur model starts explaining the smear with geometry instead. The
+    /// 3 px ceiling is judgement, not a measurement, and it is written down as
+    /// judgement so it can be argued with.
+    public static let blurAmberPixels: Float = 4.0
+
     /// Smear in pixels at which the HUD goes red and guidance interrupts.
-    public static let blurRedPixels: Float = 4.0
+    /// See `blurAmberPixels` for where this number comes from.
+    public static let blurRedPixels: Float = 8.0
+
+    /// Smear at which the blur term of the QC weight reaches its floor.
+    ///
+    /// Named separately, and deliberately NOT derived from `blurRedPixels`, so
+    /// that moving a HUD threshold can never silently drag the weight curve
+    /// with it. 12 capture px is 4.5 px in the trainer's 720 px supervision
+    /// image: past that there is genuinely nothing left to supervise against.
+    public static let blurWeightFloorPixels: Float = 12.0
 
     // MARK: - Exposure bracketing (F5)
 
@@ -215,8 +246,51 @@ public enum CaptureTuning {
     public static let guidanceSpeechMinIntervalSeconds: Double = 4.0
     /// A hint must stay true for this long before it is worth saying out loud.
     public static let guidanceHintDebounceSeconds: Double = 1.2
-    /// Gap between the repeating "too fast" ticks while blur is red.
-    public static let guidanceBlurTickIntervalSeconds: Double = 0.45
+    /// Gap between the repeating smear ticks while blur is red.
+    public static let guidanceBlurTickIntervalSeconds: Double = 0.9
+
+    /// The same sentence is not said again inside this window, even while the
+    /// thing that caused it is still true.
+    ///
+    /// Without this, `setHint` re-speaks an unchanged sentence every
+    /// `guidanceSpeechMinIntervalSeconds`, so a scan that has not finished
+    /// covering the room (which is most of a scan) hears the same coverage
+    /// sentence fifteen times a minute from the first second to the last.
+    public static let guidanceHintRepeatSeconds: Double = 25.0
+
+    /// Smear at which an active smear warning CLEARS.
+    ///
+    /// The gap below `blurRedPixels` is a dead band. Blur is sampled once per
+    /// frame with no smoothing, so a reading sitting on the line would
+    /// otherwise flip the warning on and off at the HUD's 10 Hz, which for
+    /// someone whose hands shake is a strobe rather than a warning.
+    public static let blurRedClearPixels: Float = 6.0
+
+    /// How long smear has to stay red before guidance says anything at all.
+    /// A single spike is not worth interrupting for.
+    public static let guidanceBlurEnterSeconds: Double = 0.8
+
+    /// How long the smear ticks keep going before they give up. If someone has
+    /// not slowed down in three seconds, a fourth second of ticking is not
+    /// information, it is nagging.
+    public static let guidanceBlurMaxTickSeconds: Double = 3.0
+
+    /// Quiet after the smear ticks give up, before they may start again. The
+    /// meter stays on screen throughout, so nothing is hidden by the silence.
+    public static let guidanceBlurCooldownSeconds: Double = 20.0
+
+    /// Minimum quiet between two falling chimes, so a tracking state that
+    /// flickers around the edge of `.limited` cannot ring repeatedly.
+    public static let guidanceChimeMinIntervalSeconds: Double = 6.0
+
+    /// Shutter at or above which the ROOM, not the hand, is the larger half of
+    /// the smear product, and the copy should say so.
+    ///
+    /// Smear is turn rate multiplied by how long the shutter was open. Telling
+    /// someone to move more slowly when the real problem is that the light is
+    /// low is both useless and untrue, and to a person with a tremor it reads
+    /// as being told they are doing it wrong.
+    public static let dimShutterSeconds: Double = 1.0 / 40.0
 
     // MARK: - Storage and heat
 

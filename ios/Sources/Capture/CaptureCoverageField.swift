@@ -81,7 +81,7 @@ enum CaptureCoverageChannel: Int, CaseIterable {
         switch self {
         case .angles: return "Walk around it a bit more"
         case .distance: return "Move a little closer"
-        case .sharpness: return "Slow down"
+        case .sharpness: return "Give this bit a steadier look"
         }
     }
 }

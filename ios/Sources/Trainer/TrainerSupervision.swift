@@ -82,7 +82,7 @@ final class TrainerSupervisionBuilder {
     private let edges: NativeDepthEdgeClassifier?
     private let background: DirectionalBackgroundModel?
 
-    private let imageCache: SmartImageCache
+    private var imageCache: SmartImageCache
     private let depthCache: SmartDepthCache
 
     private let depthWidth: Int
@@ -95,7 +95,16 @@ final class TrainerSupervisionBuilder {
     private(set) var renderSize: TrainerRenderSize?
     private(set) var renderIntrinsics: CameraIntrinsics?
 
-    private let requestedLongEdge: Int
+    /// Set once a photo has come back a different shape from the camera that
+    /// describes it, so that failure is reported once instead of once per
+    /// iteration.
+    private var loggedShapeMismatch = false
+
+    /// The long edge the photos are decoded at. Not fixed for the life of the
+    /// run: the budget governor can lower the render resolution mid-run to cool
+    /// the phone or free memory, and the supervision grid has to follow it down
+    /// (see `lowerLongEdge(to:)`).
+    private var requestedLongEdge: Int
 
     init(
         bundle: CaptureBundle,
@@ -134,6 +143,37 @@ final class TrainerSupervisionBuilder {
         depthCache = SmartDepthCache(capacity: 3, sampleCount: depthWidth * depthHeight)
     }
 
+    /// Adopts a smaller supervision grid part way through a run.
+    ///
+    /// The budget governor lowers the render resolution when the phone is hot
+    /// or short of memory, and it resizes the GPU buffers itself. It cannot
+    /// resize THIS, and this is where the pixel grid is actually decided: the
+    /// grid is fixed from the first photo decoded and every later frame is
+    /// measured against it. Without this call the next frame arrives at the old
+    /// size, the training loop grows the buffers straight back to match it, and
+    /// the cut that was made to cool the phone is undone a moment later, over
+    /// and over, with a full buffer reallocation each time.
+    ///
+    /// Only downward, and only when it really is smaller: the governor's
+    /// resolution ladder is one way, and re-decoding a run's photos larger part
+    /// way through would spend memory at exactly the moment there is none.
+    ///
+    /// The cached decodes are dropped with the old grid, because they are at
+    /// the old size. Returns whether anything changed, for the caller's log.
+    @discardableResult
+    func lowerLongEdge(to pixels: Int) -> Bool {
+        let target = Swift.max(pixels, 64)
+        guard target < requestedLongEdge else { return false }
+        requestedLongEdge = target
+        imageCache = SmartImageCache(capacity: 3, longEdge: target)
+        // Cleared, not recomputed: the next decodable frame fixes the new grid
+        // and rescales the intrinsics to it, by the same path the first frame
+        // of the run took.
+        renderSize = nil
+        renderIntrinsics = nil
+        return true
+    }
+
     /// The pose the trainer should render this frame from: the pre-pass's
     /// refined pose when there is one, otherwise the frame's own.
     func pose(for frame: CaptureFrame) -> Pose {
@@ -158,6 +198,41 @@ final class TrainerSupervisionBuilder {
 
         let size = TrainerRenderSize(width: image.width, height: image.height)
         if renderSize == nil {
+            // The photo has to be the same SHAPE as the intrinsics that
+            // describe it. `scaled(toWidth:height:)` scales fx and fy by
+            // width and height separately, so a photo that came back turned a
+            // quarter turn (a landscape sensor frame decoded as portrait,
+            // which is what an EXIF orientation tag would do) is not caught by
+            // that scale: it is absorbed into a camera that is wrong in both
+            // axes, and the run trains against it without ever complaining.
+            //
+            // Capture writes its JPEGs with no orientation tag precisely so
+            // that pixels, intrinsics and poses stay in one frame, so this
+            // should never fire. If it ever does, the cause is upstream and
+            // saying so is far better than quietly fitting a wrong camera.
+            let sourceWidth = bundle.intrinsics.width
+            let sourceHeight = bundle.intrinsics.height
+            let sourceAspect = Float(sourceWidth) / Float(Swift.max(sourceHeight, 1))
+            let decodedAspect = Float(size.width) / Float(Swift.max(size.height, 1))
+            guard sourceAspect > 0,
+                  abs(decodedAspect - sourceAspect) <= sourceAspect * 0.02
+            else {
+                // Said once. The grid stays unfixed while this is true, so
+                // every frame of the run comes back here, and a line per
+                // iteration would bury the one line that matters.
+                if !loggedShapeMismatch {
+                    loggedShapeMismatch = true
+                    let frameIndex = frame.index
+                    TrainerLog.general.error(
+                        """
+                        Photo for frame \(frameIndex) decoded \(size.width)x\(size.height), \
+                        which is not the shape of the capture's \
+                        \(sourceWidth)x\(sourceHeight) camera; those frames are skipped
+                        """
+                    )
+                }
+                return nil
+            }
             renderSize = size
             renderIntrinsics = bundle.intrinsics.scaled(
                 toWidth: image.width, height: image.height

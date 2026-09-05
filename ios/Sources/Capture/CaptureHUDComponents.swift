@@ -108,7 +108,7 @@ struct CaptureStartPanel: View {
 
             VStack(alignment: .leading, spacing: 8) {
                 Toggle("Talk to me", isOn: $model.soundOn)
-                Toggle("Buzz when I go too fast", isOn: $model.hapticsOn)
+                Toggle("Buzz when the picture smears", isOn: $model.hapticsOn)
             }
             .tint(CaptureHUDPalette.satisfied)
             .foregroundStyle(.white)
@@ -421,7 +421,7 @@ struct CaptureBottomPanel: View {
     private var settings: some View {
         VStack(alignment: .leading, spacing: 10) {
             Toggle("Talk to me", isOn: $model.soundOn)
-            Toggle("Buzz when I go too fast", isOn: $model.hapticsOn)
+            Toggle("Buzz when the picture smears", isOn: $model.hapticsOn)
             VStack(alignment: .leading, spacing: 4) {
                 Text("How strong the colour is")
                     .font(.footnote)
@@ -479,9 +479,12 @@ struct CaptureBottomPanel: View {
 ///
 /// The number is the turn rate the gyro measured multiplied by how long the
 /// shutter was open, divided by how much of the picture one pixel covers
-/// (0.0426 of a degree on this camera). Two pixels is where detail starts to
-/// go; four is where it is gone. It is the only thing on the HUD that answers
-/// to what your hands are doing this second, which is why it gets its own bar.
+/// (0.0426 of a degree on this camera). The amber and red marks come from
+/// `CaptureTuning`, which explains where they are and why: the trainer only
+/// ever looks at these photographs shrunk to 720 px on the long edge, so a few
+/// pixels of smear at capture size is a fraction of a pixel where it counts.
+/// It is the only thing on the HUD that answers to what your hands are doing
+/// this second, which is why it gets its own bar.
 struct CaptureBlurMeter: View {
 
     let pixels: Float
@@ -497,9 +500,10 @@ struct CaptureBlurMeter: View {
         return CaptureHUDPalette.satisfied
     }
 
+    /// Describes the picture, never the person holding the phone.
     private var verdict: String {
-        if pixels >= CaptureTuning.blurRedPixels { return "too fast" }
-        if pixels >= CaptureTuning.blurAmberPixels { return "getting smeary" }
+        if pixels >= CaptureTuning.blurRedPixels { return "smearing" }
+        if pixels >= CaptureTuning.blurAmberPixels { return "softening" }
         return "sharp"
     }
 
@@ -513,7 +517,10 @@ struct CaptureBlurMeter: View {
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.7))
                 Spacer()
-                Text("px means pixels; under 2 is fine")
+                // A gauge, not a test. The old wording stated a pass mark
+                // ("under 2 is fine"), which someone with shaky hands cannot
+                // clear indoors and which then reads as failing.
+                Text("px means pixels of smear; lower is sharper")
                     .font(.caption2)
                     .foregroundStyle(.white.opacity(0.5))
             }

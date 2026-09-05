@@ -17,11 +17,19 @@
 //
 //    TICKS      a short, dry haptic tap plus a click, repeating while motion
 //               blur is in the red. Rate is fixed, intensity tracks the blur.
-//               This is the "you are moving too fast" channel and it needs no
+//               This is the "the picture is smearing" channel and it needs no
 //               interpretation at all - it is the sound of the scan being
-//               damaged, and it stops the instant you slow down.
+//               damaged, and it stops as soon as the smear comes back down.
+//               It is also BOUNDED: it needs the red to hold for most of a
+//               second before it starts, it gives up after three seconds, and
+//               then it stays quiet for twenty. Someone who cannot hold the
+//               phone any steadier than they already are must not be ticked
+//               at indefinitely for it, and this branch suppresses every other
+//               hint while it runs, so an unbounded one would also leave them
+//               with no guidance at all.
 //    SPEECH     one plain sentence, at most one every four seconds, only after
-//               the condition has held for over a second. "Walk around it a
+//               the condition has held for over a second, and never the SAME
+//               sentence twice inside twenty five seconds. "Walk around it a
 //               bit more." Not jargon, not a code, not a beep the user has to
 //               learn.
 //    CHIMES     a rising two-note figure when coverage crosses the done line;
@@ -83,11 +91,22 @@ final class CaptureGuidanceEngine {
     // MARK: - Pacing
 
     private var lastSpokenAt: TimeInterval = 0
+    private var lastSpokenText: String?
     private var candidateHint: String?
     private var candidateSince: TimeInterval = 0
     private var lastTickAt: TimeInterval = 0
     private var announcedDone = false
     private var lastTrackingWasNormal = true
+    private var lastChimeAt: TimeInterval = 0
+
+    /// The smear warning's own small state machine. It has a different
+    /// threshold to enter than to leave (a dead band), has to hold before it
+    /// starts, gives up after a few seconds, and then stays quiet for a while.
+    /// See `updateBlurWarning`.
+    private var blurWarningActive = false
+    private var blurRedSince: TimeInterval?
+    private var blurWarningStartedAt: TimeInterval = 0
+    private var blurQuietUntil: TimeInterval = 0
 
     init() {
         toneParameters[0] = 660
@@ -130,9 +149,15 @@ final class CaptureGuidanceEngine {
         candidateHint = nil
         candidateSince = 0
         lastSpokenAt = 0
+        lastSpokenText = nil
         lastTickAt = 0
         announcedDone = false
         lastTrackingWasNormal = true
+        lastChimeAt = 0
+        blurWarningActive = false
+        blurRedSince = nil
+        blurWarningStartedAt = 0
+        blurQuietUntil = 0
     }
 
     // MARK: - The one entry point
@@ -142,8 +167,13 @@ final class CaptureGuidanceEngine {
     /// Called at the HUD's rate, not at frame rate. Everything inside is
     /// priority-ordered and debounced, so calling it more often changes
     /// nothing except how quickly a genuinely new condition is noticed.
+    /// - Parameter exposureSeconds: how long the shutter was open on the last
+    ///   measured frame. Smear is turn rate multiplied by that, so this is what
+    ///   lets the smear hint say whether the room or the hand is the bigger
+    ///   half of it. Zero when nothing has been measured yet.
     func update(
         blurPixels: Float,
+        exposureSeconds: Double,
         trackingQuality: TrackingQuality,
         worstChannel: CaptureCoverageChannel?,
         windowHint: String?,
@@ -155,7 +185,14 @@ final class CaptureGuidanceEngine {
         //    saying about a scan that has stopped knowing where it is.
         if trackingQuality != .normal {
             if lastTrackingWasNormal {
-                playChime(rising: false)
+                // Rate limited: a tracking state that flickers around the edge
+                // of `.limited` would otherwise ring this several times a
+                // second, each ring stomping the last through the shared tone
+                // buffer.
+                if now - lastChimeAt >= CaptureTuning.guidanceChimeMinIntervalSeconds {
+                    lastChimeAt = now
+                    playChime(rising: false)
+                }
                 lastTrackingWasNormal = false
             }
             setHint(Self.trackingHint(for: trackingQuality), now: now, urgent: true)
@@ -165,21 +202,35 @@ final class CaptureGuidanceEngine {
             lastTrackingWasNormal = true
         }
 
-        // 2. Blur ticks. Continuous, not debounced: this is feedback on what
-        //    the user's hands are doing right now, and a delay would make it
-        //    feel like it belonged to some earlier movement.
-        if blurPixels >= CaptureTuning.blurRedPixels {
-            if now - lastTickAt >= CaptureTuning.guidanceBlurTickIntervalSeconds {
-                lastTickAt = now
-                let intensity = Swift.min(
-                    1,
-                    blurPixels / (CaptureTuning.blurRedPixels * 2)
+        // 2. Smear ticks, on the warning's own state machine rather than on a
+        //    bare comparison. Feedback on what the hands are doing right now
+        //    still has to be immediate, but it must also be able to stop: this
+        //    branch suppresses every other hint while it holds, so an
+        //    unbounded one would leave someone with no guidance at all.
+        if updateBlurWarning(blurPixels: blurPixels, now: now) {
+            if now - blurWarningStartedAt >= CaptureTuning.guidanceBlurMaxTickSeconds {
+                // Saying it again has not worked. Go quiet, leave the meter on
+                // screen, and let the scan carry on.
+                blurWarningActive = false
+                blurRedSince = nil
+                blurQuietUntil = now + CaptureTuning.guidanceBlurCooldownSeconds
+            } else {
+                if now - lastTickAt >= CaptureTuning.guidanceBlurTickIntervalSeconds {
+                    lastTickAt = now
+                    let intensity = Swift.min(
+                        1,
+                        blurPixels / (CaptureTuning.blurRedPixels * 2)
+                    )
+                    playTap(intensity: intensity)
+                    playBlip(frequency: 1_100, seconds: 0.05, amplitude: 0.18)
+                }
+                setHint(
+                    Self.blurHint(exposureSeconds: exposureSeconds),
+                    now: now,
+                    urgent: true
                 )
-                playTap(intensity: intensity)
-                playBlip(frequency: 1_100, seconds: 0.05, amplitude: 0.18)
+                return
             }
-            setHint("Slow down, the picture is smearing", now: now, urgent: true)
-            return
         }
 
         // 3. Coverage done, announced exactly once.
@@ -210,6 +261,56 @@ final class CaptureGuidanceEngine {
         candidateHint = nil
     }
 
+    // MARK: - The smear warning
+
+    /// Whether the smear warning should be sounding this tick.
+    ///
+    /// Turning it ON needs red held for `guidanceBlurEnterSeconds`, and needs
+    /// the cooldown from the last one to have expired. Turning it OFF only
+    /// needs a fall below `blurRedClearPixels`. Those are two different
+    /// numbers on purpose: blur is one unsmoothed gyro sample per frame, and
+    /// a reading that hovers on a single threshold would flip the warning on
+    /// and off at the HUD's rate. Someone whose hands shake would live on that
+    /// line, so the shape of this matters more to them than the numbers do.
+    private func updateBlurWarning(blurPixels: Float, now: TimeInterval) -> Bool {
+        if blurWarningActive {
+            if blurPixels < CaptureTuning.blurRedClearPixels {
+                blurWarningActive = false
+                blurRedSince = nil
+            }
+            return blurWarningActive
+        }
+
+        guard blurPixels >= CaptureTuning.blurRedPixels else {
+            blurRedSince = nil
+            return false
+        }
+        guard now >= blurQuietUntil else { return false }
+
+        let since = blurRedSince ?? now
+        blurRedSince = since
+        guard now - since >= CaptureTuning.guidanceBlurEnterSeconds else { return false }
+
+        blurWarningActive = true
+        blurWarningStartedAt = now
+        return true
+    }
+
+    /// What to say about smear.
+    ///
+    /// Smear is turn rate multiplied by how long the shutter was open. In a
+    /// dim room the shutter half is the larger one, and someone can be over
+    /// the line while barely moving. Telling that person to slow down is both
+    /// useless and untrue, so when the shutter is long the sentence says which
+    /// half it is. Neither version tells anyone they are doing it wrong.
+    private static func blurHint(exposureSeconds: Double) -> String {
+        if exposureSeconds >= CaptureTuning.dimShutterSeconds {
+            return "It is dim in here, so the shutter is slow. "
+                + "A bit more light helps more than moving slower."
+        }
+        return "Ease off a touch and the detail comes back."
+    }
+
     // MARK: - Hints
 
     /// Debounces, then speaks. A hint must stay true for over a second before
@@ -233,9 +334,18 @@ final class CaptureGuidanceEngine {
 
         currentHint = text
 
-        // One sentence every four seconds at most, whether it is the same
-        // sentence again or a different one. A hint repeated sooner is
-        // nagging; a new hint sooner is chatter.
+        // The same sentence is not said again just because the condition is
+        // still true. It was heard the first time, and the hint is still on
+        // screen. Without this the coverage sentence, which is true for
+        // almost the whole of a scan, is spoken every four seconds from the
+        // first second to the last.
+        if text == lastSpokenText,
+            now - lastSpokenAt < CaptureTuning.guidanceHintRepeatSeconds {
+            return
+        }
+
+        // One sentence every four seconds at most. A new hint sooner than that
+        // is chatter.
         guard now - lastSpokenAt >= CaptureTuning.guidanceSpeechMinIntervalSeconds
         else { return }
 
@@ -245,7 +355,7 @@ final class CaptureGuidanceEngine {
     private static func trackingHint(for quality: TrackingQuality) -> String {
         switch quality {
         case .limitedExcessiveMotion:
-            return "Moving too fast to keep track. Slow right down."
+            return "Lost the thread for a second. Slow and steady picks it back up."
         case .limitedInsufficientFeatures:
             return "Not enough detail here. Point at something with pattern on it."
         case .limitedRelocalizing:
@@ -263,6 +373,7 @@ final class CaptureGuidanceEngine {
 
     private func speak(_ text: String, now: TimeInterval) {
         lastSpokenAt = now
+        lastSpokenText = text
         guard isSoundEnabled, !text.isEmpty else { return }
         // A new sentence replaces an old one rather than queueing behind it:
         // guidance about what the user was doing four seconds ago is worse

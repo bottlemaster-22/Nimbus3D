@@ -94,12 +94,24 @@ final class TrainerDensifier {
     ///   - carver: asked for certified-empty indices when non-nil. Nil means
     ///     no occupancy grid was carved for this scan, and then nothing is
     ///     deleted on free-space grounds, because "no grid" is not "empty".
+    /// - Parameter allowPrune: whether this pass may DELETE Gaussians for low
+    ///   opacity or bad size. Separate from `allowGrowth` because the two have
+    ///   different windows: `SmartLossSettings.pruneStartFraction` (0.15) and
+    ///   `pruneEndFraction` (0.80) were declared, defaulted and assigned but
+    ///   read nowhere in the repository, so pruning was in fact ungated. It ran
+    ///   every 100 iterations from iteration 100 to the very end, which is 29
+    ///   passes on a 3,000 iteration run instead of the ~10 the settings
+    ///   describe, including passes before anything had converged and passes
+    ///   during late opacity binarization, where they delete splats that were
+    ///   only briefly pushed towards zero. Carving is deliberately NOT gated by
+    ///   this: certified empty space is evidence at any point in the run.
     func run(
         resources: TrainerResources,
         splatCount: Int,
         splatCap: Int,
         sceneExtentMeters: Float,
         allowGrowth: Bool,
+        allowPrune: Bool,
         carver: FreeSpaceCarver?
     ) throws -> TrainerDensifyOutcome {
 
@@ -144,8 +156,28 @@ final class TrainerDensifier {
         // The threshold is a floor, not the operating point. The real cut is
         // "the best N that fit", which is what makes the cap a wall rather
         // than a thing to grow into.
+        // The gate is "did anything look at this and want it to move", not a
+        // magnitude in some particular unit.
+        //
+        // It used to be `score[i] >= tuning.absGradThreshold` with the
+        // threshold at 6e-4, a number copied from the reference 3DGS
+        // implementation. That reference stores its gradient AFTER multiplying
+        // by 0.5 * width, which converts it to normalised device coordinates.
+        // This rasteriser accumulates `length(dLdMean2D)` raw, and its `delta`
+        // and conic are both in PIXELS (TrainerShaders.metal builds delta as
+        // `mean2D - pixelCenter`). A pixel-space gradient is smaller than the
+        // same quantity in NDC by a factor of roughly half the render width, so
+        // at 720 px nothing ever cleared the bar. Densification therefore never
+        // fired ONCE: zero splats created, zero split, zero cloned, for the
+        // whole run. The model stayed exactly as sparse as the LiDAR seed.
+        //
+        // Comparing against zero and letting the ranked truncation below do the
+        // cutting is scale-free: it cannot be broken again by a units change
+        // anywhere upstream, and it is what the header of this file already
+        // said the design was ("the threshold is a floor, not the operating
+        // point. The real cut is the best N that fit").
         var candidates: [Int] = []
-        for i in 0..<splatCount where score[i] >= tuning.absGradThreshold {
+        for i in 0..<splatCount where score[i] > 0 {
             // A Gaussian nothing has seen has nothing to say about where
             // detail is missing.
             if stats[i].visAccum <= 0 { continue }
@@ -327,6 +359,9 @@ final class TrainerDensifier {
             let splat = splats[i]
             let mean = splat.mean
             let logScale = splat.logScale
+            // A non-finite Gaussian is deleted in EVERY pass, gated or not: it
+            // is not a judgement about quality, it is a value that would poison
+            // the next gradient step and every splat it touches.
             if !mean.x.isFinite || !mean.y.isFinite || !mean.z.isFinite
                 || !logScale.x.isFinite || !logScale.y.isFinite || !logScale.z.isFinite
                 || !splat.opacityLogit.isFinite
@@ -335,6 +370,11 @@ final class TrainerDensifier {
                 outcome.prunedNonFinite += 1
                 continue
             }
+            // The two JUDGEMENT prunes below are the ones that respect the
+            // window. Outside it, a faint or fat Gaussian is left alone to
+            // carry on being optimised rather than deleted for how it looks
+            // part way through.
+            guard allowPrune else { continue }
             if TrainerMath.sigmoid(splat.opacityLogit) < tuning.pruneOpacity {
                 keep[i] = false
                 outcome.prunedLowOpacity += 1

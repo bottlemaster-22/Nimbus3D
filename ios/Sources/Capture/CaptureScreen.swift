@@ -26,14 +26,17 @@
 //  THE PAINTED ROOM     ARKit's mesh, coloured by whichever of the three
 //                       coverage channels is furthest behind. Violet means
 //                       walk around it, blue means get closer, amber means
-//                       slow down, green means done, teal means glass (which
-//                       has no fix and is not held against you). The picker
+//                       give it a steadier look, green means done, teal means
+//                       glass (which has no fix and is not held against you). The picker
 //                       lets someone ask for one channel on its own.
 //  THE BLUR METER       Pixels of smear, live: the turn rate from the gyro
 //                       times the shutter time, divided by the wide camera's
-//                       0.0426 degrees per pixel. Amber at 2, red at 4. It is
-//                       the only number on screen that reacts to what your
-//                       hands are doing this instant.
+//                       0.0426 degrees per pixel. The amber and red marks come
+//                       from `CaptureTuning`, which explains where they sit and
+//                       why (the trainer only ever sees these photographs at
+//                       720 px on the long edge, so capture pixels are not
+//                       trainer pixels). It is the only number on screen that
+//                       reacts to what your hands are doing this instant.
 //  COVERAGE             One percentage, and the line where it counts as done.
 //                       This is the finish criterion, not a decoration.
 //  THE WINDOW CARD      When ARKit says the middle of the screen is a window,
@@ -110,6 +113,18 @@ public struct CaptureScreen: View {
             .onAppear { model.viewportSize = geometry.size }
         }
         .task { await model.prepare() }
+        .onAppear {
+            // `UIDevice.orientationDidChangeNotification` is only posted while
+            // something has asked for orientation generation. Nothing else in
+            // the app asks, so without this the subscription below never fires
+            // and the live camera keeps whatever orientation it read once, at
+            // `prepare()`, however the phone is turned afterwards.
+            UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+            model.refreshOrientation()
+        }
+        .onDisappear {
+            UIDevice.current.endGeneratingDeviceOrientationNotifications()
+        }
         .onReceive(
             NotificationCenter.default.publisher(
                 for: UIDevice.orientationDidChangeNotification
@@ -276,11 +291,28 @@ final class CaptureScreenModel: ObservableObject {
         }
     }
 
+    /// Re-reads which way up the interface is, for the live camera layer.
+    ///
+    /// Two things this deliberately does NOT do. It does not take the first
+    /// scene it finds: an app with a second scene (an external display, a
+    /// Stage Manager window) can hand back one that is not the one being
+    /// looked at, so the foreground-active scene is preferred. And it never
+    /// lets `.unknown` through: `ARFrame.displayTransform(for:viewportSize:)`
+    /// and `ARCamera.viewMatrix(for:)` both take this value, and what they do
+    /// with `.unknown` is not documented, so an unusable answer becomes
+    /// portrait (which is how this is held) rather than a guess passed on to
+    /// ARKit.
+    ///
+    /// This is presentation only. Nothing that reaches the disk reads it: the
+    /// intrinsics, the poses and the JPEG pixels are all in ARKit's own
+    /// landscape sensor frame and they agree with each other there.
     func refreshOrientation() {
-        interfaceOrientation = UIApplication.shared.connectedScenes
+        let scenes = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
-            .first?
-            .interfaceOrientation ?? .portrait
+        let scene = scenes.first { $0.activationState == .foregroundActive }
+            ?? scenes.first
+        let reported = scene?.interfaceOrientation ?? .portrait
+        interfaceOrientation = reported == .unknown ? .portrait : reported
     }
 
     // MARK: - Running a scan

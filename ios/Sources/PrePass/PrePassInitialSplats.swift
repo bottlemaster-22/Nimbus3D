@@ -95,12 +95,31 @@ enum PrePassInitialSplatBuilder {
         /// Never finer than the laser itself sampled.
         var minSpacingMeters: Float = 0.010
         var maxSpacingMeters: Float = 0.120
-        /// Trust weight at or above which a sample is treated as trusted.
-        /// `TrustField.weight` is an inverse-variance weight in 0...1, so 0.5
-        /// is "the measurement is at least as good as the field's reference
-        /// noise", which is what `SmartLossSettings.noiseReferenceMeters`
-        /// (2 cm) defines.
-        var trustedWeight: Float = 0.5
+        /// ABSOLUTE FLOOR for trust. Deliberately low, because the real
+        /// decision is made RELATIVE to the scan (see `trustedQuantile`).
+        ///
+        /// This was 0.5, which sounds reasonable and was not. `TrustField`
+        /// computes `w = 1/(1 + (sigma/0.02)^2) * (0.25 + 0.75 * confidence)`,
+        /// so clearing 0.5 needs a measured sigma under about 2 cm even at
+        /// perfect confidence. That sigma comes from cross-frame residuals, so
+        /// it absorbs POSE error as well as sensor noise, and this pipeline's
+        /// own header says as much: "a 2 cm pose error reads as 2 cm of sensor
+        /// noise everywhere". On a first handheld scan by someone whose hands
+        /// shake, 2 to 4 cm of residual is entirely ordinary, so the gate
+        /// failed for essentially every sample at once and every seed became a
+        /// stretched translucent blob instead of a solid disc. A threshold that
+        /// rejects 100 percent of real input is a badly placed threshold, not a
+        /// high standard.
+        var trustedWeight: Float = 0.20
+        /// The REAL decision: a sample is trusted if it is in the better half
+        /// of THIS scan and clears the floor above.
+        ///
+        /// Relative rather than absolute, so a scan is judged against what it
+        /// actually achieved rather than against a fixed bar that depends on
+        /// how steady the hands were. It also preserves the ordering the trust
+        /// field genuinely measured, which is the useful part of it: the good
+        /// half of a shaky scan is still meaningfully better than the bad half.
+        var trustedQuantile: Float = 0.5
         /// Opacity a trusted splat starts at. High, because the laser says
         /// something solid is there; not 1, because the optimiser still has to
         /// be able to fade a wrong one out.
@@ -340,6 +359,23 @@ enum PrePassInitialSplatBuilder {
         let doubtfulLogit = SplatMath.invSigmoid(settings.doubtfulOpacity)
         let nativeFX = Swift.max(geometry.intrinsics.fx, 1)
 
+        // Where the trusted/doubtful line actually falls for THIS scan: the
+        // better half of the samples, but never below the absolute floor.
+        //
+        // Computed once over all samples rather than per sample, so it is a
+        // property of the scan and not of the order the loop happens to visit.
+        // A steady, well lit scan puts the quantile well above the floor and
+        // the floor does nothing. A shaky first scan puts it below, and the
+        // floor stops the model calling genuinely bad geometry solid.
+        let trustCut: Float = {
+            let finite = weight.prefix(count).filter { $0.isFinite }
+            guard !finite.isEmpty else { return settings.trustedWeight }
+            let sorted = finite.sorted()
+            let q = Swift.max(0, Swift.min(1, settings.trustedQuantile))
+            let index = Swift.min(sorted.count - 1, Int(Float(sorted.count - 1) * q))
+            return Swift.max(sorted[index], settings.trustedWeight)
+        }()
+
         for i in 0..<count {
             let p = position[i]
             positions[i] = p
@@ -353,7 +389,7 @@ enum PrePassInitialSplatBuilder {
             let sensorSpacing = rangeMeters[i] / nativeFX
             let radius = 0.5 * Swift.max(spacing, sensorSpacing)
 
-            let trusted = weight[i] >= settings.trustedWeight && hasNormal[i]
+            let trusted = weight[i] >= trustCut && hasNormal[i]
             let axis: SIMD3<Float>
             let thirdScale: Float
             if trusted {

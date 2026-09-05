@@ -100,6 +100,16 @@ final class ViewerCameraController: ObservableObject {
     }
 
     /// Switches to the walked-path fly-through.
+    ///
+    /// The keyframe poses must ALREADY be rolled the right way up, with
+    /// `Pose.rolledForDisplay(quarterTurnsClockwise:)`. A capture pose is in
+    /// the sensor's landscape frame however the phone was held, so a portrait
+    /// scan replayed raw draws the room on its side. It is done once where the
+    /// path is made (`PreviewCameraPathBuilder.build`, and `ScanReviewModel`
+    /// for the single-frame compare path) rather than here, so the sampler,
+    /// the deviation measurement and the switch back to free look all see one
+    /// consistent set of poses. Do not roll it a second time in `recompute()`:
+    /// that would turn the picture through half a turn instead of a quarter.
     func adopt(path: PreviewCameraPath) {
         self.path = path
         pathTime = path.keyframes.first?.timeSeconds ?? 0

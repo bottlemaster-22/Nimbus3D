@@ -58,6 +58,19 @@ enum PreviewCameraPathBuilder {
         /// Replay speed. Below 1 the fly-through is slower than the walk,
         /// which is almost always what a reviewer wants.
         var timeScale: Double = 0.75
+        /// Quarter turns clockwise the recorded poses need before they are the
+        /// right way up on screen: the capture's own
+        /// `CaptureSettings.imageQuarterTurnsClockwiseToUpright` where a scan
+        /// has one, and `ViewerPoseMath.uprightQuarterTurns(of:)` measured
+        /// back out of the poses where it does not.
+        ///
+        /// ARKit records every pose in the sensor's landscape frame however
+        /// the phone was held, so a portrait scan has a quarter turn baked
+        /// into it that would otherwise be replayed as a room lying on its
+        /// side. Applying it here, once, means the sampler, the deviation
+        /// measurement and every consumer of the path all see one consistent
+        /// set of poses. The default of 0 replays exactly what was recorded.
+        var uprightQuarterTurns: Int = 0
 
         init() {}
     }
@@ -183,7 +196,12 @@ enum PreviewCameraPathBuilder {
             previousTime = sample.time
             keyframes.append(
                 PreviewCameraPath.Keyframe(
-                    pose: sample.pose,
+                    // A roll about the camera's own optical axis: it turns the
+                    // picture the right way up without moving the camera off
+                    // the walked track by so much as a millimetre.
+                    pose: sample.pose.rolledForDisplay(
+                        quarterTurnsClockwise: options.uprightQuarterTurns
+                    ),
                     timeSeconds: elapsed,
                     sourceFrame: sample.frame
                 )

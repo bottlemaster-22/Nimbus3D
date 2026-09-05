@@ -725,6 +725,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         gpu: &gpu,
                         splatCount: &splatCount,
                         renderSize: &renderSize,
+                        supervision: supervision,
                         bundle: bundle,
                         governor: governor
                     )
@@ -772,6 +773,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         gpu: &gpu,
                         splatCount: &splatCount,
                         renderSize: &renderSize,
+                        supervision: supervision,
                         bundle: bundle,
                         governor: governor
                     )
@@ -844,6 +846,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
             let inDensifyWindow = progressFraction >= tuning.densifyStartFraction
                 && progressFraction <= tuning.densifyEndFraction
+            // `SmartLossSettings.pruneStartFraction` and `pruneEndFraction`
+            // existed, were defaulted and were assigned, and were then read
+            // nowhere at all, so pruning ran on the densify interval from the
+            // first pass to the last. Reading them here is what makes the two
+            // settings mean something.
+            let inPruneWindow = progressFraction >= settings.pruneStartFraction
+                && progressFraction <= settings.pruneEndFraction
             if iteration > 0,
                iteration % Swift.max(tuning.densifyIntervalIterations, 1) == 0
             {
@@ -860,6 +869,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     ),
                     sceneExtentMeters: sceneExtent,
                     allowGrowth: inDensifyWindow,
+                    allowPrune: inPruneWindow,
                     carver: carveDue ? smart.carver : nil
                 )
                 splatCount = outcome.splatCountAfter
@@ -1310,6 +1320,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         gpu: inout TrainerGPU,
         splatCount: inout Int,
         renderSize: inout TrainerRenderSize,
+        supervision: TrainerSupervisionBuilder,
         bundle: CaptureBundle,
         governor: TrainerBudgetGovernor
     ) throws {
@@ -1327,6 +1338,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             gpu = TrainerGPU(pipelines: pipelines, resources: resources)
 
         case .resolution(_, let to):
+            // The supervision builder decodes the photos and fixes the pixel
+            // grid every frame is measured against, so it has to be told too.
+            // Resizing only the buffers would last exactly one iteration: the
+            // next frame would arrive at the old size and the training loop
+            // would grow them straight back, reallocating both ways each time
+            // and leaving the phone doing the very work the governor just cut.
+            supervision.lowerLongEdge(to: to)
             let size = TrainerBudgetGovernor.renderSize(
                 forLongEdge: to, intrinsics: bundle.intrinsics
             )

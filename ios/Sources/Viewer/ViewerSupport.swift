@@ -194,10 +194,82 @@ enum ViewerPoseMath {
     }
 
     /// The camera's world-space "up" (which is minus its +Y axis, because +Y
-    /// is down). Used by the fly-through smoother to keep the horizon level.
+    /// is down).
+    ///
+    /// Levelling the fly-through is NOT done with this. The fly-through must
+    /// replay the direction the user really looked, tilted wrist and all, so
+    /// the only thing straightened out is the phone's own orientation, one
+    /// quarter turn of it, by `uprightQuarterTurns(of:)` below.
     static func worldUp(of pose: Pose) -> SIMD3<Float> {
         -pose.rotation.simd.inverse.act(SIMD3<Float>(0, 1, 0))
     }
+
+    // MARK: Display orientation
+
+    /// How many quarter turns CLOCKWISE a capture's own pictures (and the
+    /// poses that go with them) need before they are the right way up on
+    /// screen. 0, 1, 2 or 3.
+    ///
+    /// THE FALLBACK, NOT THE FIRST ANSWER. A capture records the real number
+    /// in `CaptureSettings.imageQuarterTurnsClockwiseToUpright`, and that is
+    /// what should be used whenever it is there: it is exact, and it is right
+    /// even for a scan of nothing but a ceiling. This measures the same number
+    /// out of the poses instead, for scans written before that field existed,
+    /// which includes every scan already on the phone.
+    ///
+    /// Why there is a number to recover at all: ARKit reports
+    /// `camera.transform`, `camera.intrinsics` and `camera.imageResolution` in
+    /// the sensor's own LANDSCAPE frame however the phone is held, and capture
+    /// writes all three to disk unchanged. That is correct and must stay: the
+    /// pixels, the intrinsics and the poses agree with each other, so
+    /// `sparse/0/*`, the trainer and every export are right, and the splats
+    /// land gravity-upright in the world. What the older files do not say is
+    /// which way up the phone was, so a scan shot in portrait carries a
+    /// quarter turn about the view axis inside every pose it wrote, and a
+    /// viewer that replays those poses straight into a drawable draws the room
+    /// on its side.
+    ///
+    /// The measurement leans on the world frame being gravity aligned (world
+    /// +Y is up), so where world up lands in the image says how the phone was
+    /// held. Every pose votes, weighted by how much of world up was in the
+    /// image plane at all, so frames pointed at the ceiling or the floor
+    /// (which say nothing about roll) drop out of the average on their own
+    /// rather than needing a threshold. A scan that is ENTIRELY floor or
+    /// ceiling has nothing to measure and gets 0, which replays exactly what
+    /// was recorded: the same as before this existed, never worse.
+    ///
+    /// Quantised to a quarter turn on purpose. A tilted wrist is part of the
+    /// walk and gets replayed exactly as it happened; only the phone's
+    /// orientation is undone.
+    static func uprightQuarterTurns<S: Sequence>(of poses: S) -> Int
+    where S.Element == Pose {
+        var towardsScreenRight: Float = 0
+        var towardsScreenUp: Float = 0
+        for pose in poses {
+            // World up in camera axes. +Y is DOWN in this camera convention,
+            // so the up-the-screen component is minus y.
+            let up = pose.rotation.simd.act(SIMD3<Float>(0, 1, 0))
+            guard up.x.isFinite, up.y.isFinite else { continue }
+            towardsScreenRight += up.x
+            towardsScreenUp += -up.y
+        }
+        let strength = towardsScreenRight * towardsScreenRight
+            + towardsScreenUp * towardsScreenUp
+        // Nothing to go on (no poses, or every one of them looking straight up
+        // or straight down): leave the poses exactly as they were recorded.
+        guard strength.isFinite, strength > 1e-8 else { return 0 }
+        // Angle of world up, measured CLOCKWISE from straight up the screen.
+        // Turning the picture back by that much is what puts it upright.
+        let angle = atan2(towardsScreenRight, towardsScreenUp)
+        let turns = Int((-angle / (Float.pi / 2)).rounded())
+        return ((turns % 4) + 4) % 4
+    }
+
+    // Applying the turn is Core's `Pose.rolledForDisplay(quarterTurnsClockwise:)`
+    // and `CameraIntrinsics.rotatedForDisplay(quarterTurnsClockwise:)`, and it
+    // stays there. One implementation of the roll is what guarantees the pose
+    // and the picture turn the same way; a second one here, however carefully
+    // written, would be a sign waiting to disagree with it.
 }
 
 // MARK: - Morton codes

@@ -109,6 +109,32 @@ final class ScanReviewModel: ObservableObject {
     /// Wipe position, 0 = all photo, 1 = all scan.
     @Published var compareWipe: Double = 0.5
 
+    // MARK: - Which way up the phone was
+
+    /// Quarter turns clockwise this scan's pictures and poses need before they
+    /// are the right way up on screen.
+    ///
+    /// ARKit hands out poses, intrinsics and pixels in the sensor's own
+    /// LANDSCAPE frame however the phone is held, and capture writes all three
+    /// to disk unchanged, which is right: they agree with each other, so the
+    /// COLMAP files, the trainer and every export are correct and the model
+    /// itself stands up straight. The one thing missing from the record is
+    /// which way up the phone was. A capture now records it, in
+    /// `CaptureSettings.imageQuarterTurnsClockwiseToUpright`, and that is what
+    /// is used where a scan has it; a scan written before that field existed
+    /// (which is every scan already on the phone) has it measured back out of
+    /// its own poses instead, by `ViewerPoseMath.uprightQuarterTurns(of:)`.
+    ///
+    /// DISPLAY only, either way. Nothing on disk is touched, and nothing
+    /// exported moves.
+    private(set) var displayQuarterTurns = 0
+
+    /// The capture camera as it is being SHOWN: the recorded intrinsics turned
+    /// by `displayQuarterTurns`, so width, height, fx, fy and the principal
+    /// point all describe the picture the user is actually looking at. The
+    /// recorded ones stay untouched on `detail`.
+    private(set) var displayIntrinsics: CameraIntrinsics?
+
     // MARK: - Private
 
     private var hasOpened = false
@@ -135,7 +161,14 @@ final class ScanReviewModel: ObservableObject {
             ScanLibraryReader.readDetail(target)
         }.value
         detail = loaded
-        camera.sourceIntrinsics = loaded.bundle?.intrinsics
+        displayQuarterTurns = Self.uprightQuarterTurns(of: loaded.bundle)
+        displayIntrinsics = loaded.bundle?.intrinsics.rotatedForDisplay(
+            quarterTurnsClockwise: displayQuarterTurns
+        )
+        // The renderer takes only the PIXEL aspect from these, so handing it
+        // the turned copy is what stops a non-square-pixel capture being
+        // stretched the wrong way once the preview camera is rolled upright.
+        camera.sourceIntrinsics = displayIntrinsics
 
         if let bundle = loaded.bundle {
             heldOut = HeldOutFrameSelector.resolve(bundle: bundle, paths: loaded.paths)
@@ -177,6 +210,7 @@ final class ScanReviewModel: ObservableObject {
         }
         loadingMessage = "Working out the path you walked..."
         let prePass = loaded.prePass
+        let quarterTurns = displayQuarterTurns
 
         // Deliberately returns a plain pair rather than the builder's own
         // `Outcome`: that enum is not declared Sendable, and a value crossing
@@ -184,7 +218,13 @@ final class ScanReviewModel: ObservableObject {
         // a non-Sendable payload to.
         let built = await Task.detached(priority: .userInitiated) {
             () -> (path: PreviewCameraPath?, problem: String?, worst: Float) in
-            switch PreviewCameraPathBuilder.build(bundle: bundle, prePass: prePass) {
+            var options = PreviewCameraPathBuilder.Options()
+            options.uprightQuarterTurns = quarterTurns
+            switch PreviewCameraPathBuilder.build(
+                bundle: bundle,
+                prePass: prePass,
+                options: options
+            ) {
             case .path(let path):
                 return (path, nil, PreviewPathSampler.worstDeviation(path))
             case .unavailable(let reason):
@@ -264,11 +304,19 @@ final class ScanReviewModel: ObservableObject {
             ?? frame.refinedPose
             ?? frame.rawPose
 
-        let fov = detail?.bundle?.intrinsics.horizontalFOVDegrees ?? 65
+        // Read from the TURNED camera, because the render is rolled upright
+        // and so is the photo beside it. On a portrait scan the capture's
+        // picture runs up the panel, so it is the turned camera's horizontal
+        // field of view that has to span the panel's width. Framing it with
+        // the sensor's own would leave the two halves of the wipe out of step,
+        // which would make the scan look worse than it really is.
+        let fov = displayIntrinsics?.horizontalFOVDegrees ?? 65
         let stillPath = PreviewCameraPath(
             keyframes: [
                 PreviewCameraPath.Keyframe(
-                    pose: pose,
+                    pose: pose.rolledForDisplay(
+                        quarterTurnsClockwise: displayQuarterTurns
+                    ),
                     timeSeconds: 0,
                     sourceFrame: frame.index
                 )
@@ -306,17 +354,58 @@ final class ScanReviewModel: ObservableObject {
                     "The photo for this moment of the walk (\(relative)) could not be opened."
                 return
             }
-            self?.comparePhoto = image
+            guard let self else { return }
+            self.comparePhoto = ViewerPhoto.upright(
+                image,
+                quarterTurnsClockwise: self.displayQuarterTurns
+            )
         }
     }
 
-    /// Aspect ratio the comparison should be shown at: the photo's, so the
-    /// render and the photo frame the same rectangle of the world.
+    /// Aspect ratio the comparison should be shown at: the photo's as it is
+    /// SHOWN, so the render and the photo frame the same rectangle of the
+    /// world.
+    ///
+    /// The turned camera's, because the recorded size is the sensor's, which
+    /// is landscape whatever way the phone was held. Turning the picture
+    /// upright turns the frame around it too, or the photo would sit
+    /// letterboxed inside a panel the wrong shape and would no longer line up
+    /// with the render.
     var compareAspectRatio: CGFloat {
-        guard let intrinsics = detail?.bundle?.intrinsics,
+        guard let intrinsics = displayIntrinsics,
               intrinsics.width > 0, intrinsics.height > 0
         else { return 4.0 / 3.0 }
         return CGFloat(intrinsics.width) / CGFloat(intrinsics.height)
+    }
+
+    /// Which way up the phone was held for this scan: what the capture
+    /// recorded, or, for a scan written before captures recorded it, what its
+    /// own poses say.
+    ///
+    /// When a scan has both, the recorded number wins (it is exact, and it is
+    /// right even for a scan of nothing but a ceiling) but the measured one is
+    /// still worked out and a disagreement is logged. The two are derived
+    /// completely differently, one from the interface orientation at session
+    /// start and one from where gravity ended up in the pictures, so if they
+    /// ever disagree on a scan with a horizon in it, something is wrong and
+    /// this is the line that says so instead of leaving someone to guess from
+    /// a sideways preview.
+    private static func uprightQuarterTurns(of bundle: CaptureBundle?) -> Int {
+        guard let bundle else { return 0 }
+        let measured = ViewerPoseMath.uprightQuarterTurns(
+            of: bundle.frames.lazy.map { $0.refinedPose ?? $0.rawPose }
+        )
+        guard let recorded = bundle.settings.imageQuarterTurnsClockwiseToUpright
+        else { return measured }
+        let turns = ((recorded % 4) + 4) % 4
+        if turns != measured {
+            // Built as a String first: an os.Logger message is one literal,
+            // and two of them joined with + is not one.
+            let note = "capture recorded \(turns) quarter turns to upright, "
+                + "the poses measure \(measured); using the recorded one"
+            ViewerLog.review.notice("\(note, privacy: .public)")
+        }
+        return turns
     }
 
     // MARK: - Honesty record

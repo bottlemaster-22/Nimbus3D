@@ -366,6 +366,14 @@ struct ScanThumbnailView: View {
         }.value
 
         didTry = true
-        if let data { image = UIImage(data: data) }
+        // Turned upright only as it is shown. The file itself is the raw
+        // sensor frame and stays that way, because the intrinsics and poses
+        // beside it describe that frame.
+        if let data, let decoded = UIImage(data: data) {
+            image = ViewerPhoto.upright(
+                decoded,
+                quarterTurnsClockwise: scan.photoQuarterTurns
+            )
+        }
     }
 }
