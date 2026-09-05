@@ -167,6 +167,9 @@ public struct SmartLossSettings: Codable, Hashable, Sendable {
         bimodalWeight: Float = 1.0,
         transitionWidthWeight: Float = 0.35,
         modeWindowRadius: Int = 2,
+        geometricEdgeSharpenBoost: Float = 2.0,
+        textureFlattenWeight: Float = 0.5,
+        minimumAuthorityForDepth: Float = 0.05,
         noiseReferenceMeters: Float = 0.02,
         huberDeltaMeters: Float = 0.02,
         depthScheduleFloor: Float = 0.05,
@@ -201,6 +204,9 @@ public struct SmartLossSettings: Codable, Hashable, Sendable {
         self.bimodalWeight = bimodalWeight
         self.transitionWidthWeight = transitionWidthWeight
         self.modeWindowRadius = modeWindowRadius
+        self.geometricEdgeSharpenBoost = geometricEdgeSharpenBoost
+        self.textureFlattenWeight = textureFlattenWeight
+        self.minimumAuthorityForDepth = minimumAuthorityForDepth
         self.noiseReferenceMeters = noiseReferenceMeters
         self.huberDeltaMeters = huberDeltaMeters
         self.depthScheduleFloor = depthScheduleFloor
