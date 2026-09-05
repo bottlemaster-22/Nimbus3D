@@ -235,3 +235,39 @@ Append-only continuity log. Newest entry at the bottom. Read the latest entry to
 - **Five critics**: final compile gate over the parallel edits, completeness critic (what could this audit's structure not see?), first-run simulation on a phone, second-scan singleton state survival, and contract drift + draining INTEGRATION_REQUESTS.md.
 
 Sizes audited: Trainer 9193 lines, Capture 8988, PrePass 7463, Viewer 6414, Smart 4148, Onboarding 3403, Booster 2728, Export 2688, Core 2432, Pipeline 2308, App 623; Python 10196; Blender 1923.
+
+---
+
+## 2026-09-05 : IT BUILDS. Unsigned IPA produced and verified.
+
+**Owner pushback that changed the approach:** *"When am I gonna have a base app cause currently I have nothing"* and, earlier, *"If you're running workflows, do many more agents. If you are deploying three agents in a workflow, forget the workflow and simply do it yourself."* Both correct. I had been running audits as a PROXY for a compiler when the real compiler was one push away. The exhaustive 316-agent audit (`wf_36e0a9ff-76e`) died on the session limit with 19/316 done, and its 24 findings were reported as "refuted" only because all their verifiers had died (`survived 0/0`) - a bug in my own workflow logic, since verifier death is not refutation.
+
+**Pushed and let CI be the compiler. Four rounds, about 40 minutes.**
+
+| Round | Run | Result |
+|---|---|---|
+| 1 | 33972909584 | 25 errors, 9 files |
+| 2 | 33973151718 | 1 error |
+| 3 | 33973240389 | 1 error (new, previously masked) |
+| 4 | 33973412814 | **SUCCESS** |
+
+The PC Booster job (`python -m compileall` + pyflakes) passed on ALL FOUR rounds, untouched.
+
+**What CI found that no amount of grepping would have:**
+1. **`Foundation.abs` is C's `abs(Int32) -> Int32`**, not Swift's generic `abs`. 9 occurrences in PrePassMath poisoned 12 of the 25 errors. Needs real overload resolution to see.
+2. **Two expressions the type checker refused to finish**: the DOS timestamp packing (ZipWriter) and the Catmull-Rom spline (PreviewCameraPathBuilder). Splitting the spline into 4 SIMD terms was NOT enough (round 2 still failed on it); it took collecting the basis into one plain `Float` coefficient per control point so every vector op has exactly one overload. Verified algebraically identical over 20k random inputs: max diff 7.1e-14.
+3. **Actor isolation**: `CaptureAnchorRecorder.write` and `BoosterDiscovery.hostString` are pure functions on their arguments; their types' `@MainActor` protects accumulated state neither touches. Now `nonisolated`.
+4. **`SmartLossSettings` never initialized 3 of its own properties** (`geometricEdgeSharpenBoost`, `textureFlattenWeight`, `minimumAuthorityForDepth`), and `minimumAuthorityForDepth` IS read by the trainer twice. Masked in rounds 1-2 by earlier errors in the module.
+5. Missing Combine imports (found and fixed pre-push), `Data.append` with no `[UInt8]` overload, `withUnsafeBytes` binding to the instance method inside `extension Data`, a public init exposing internal `TrainerTuning`, an actor property needing explicit capture, and `showsUnavailable` used but never declared.
+
+**Bug-class sweep instead of one-per-round:** wrote a scanner for "non-optional stored property with no default, never assigned in a designated init". It was WRONG three times (470 hits counting optionals; 342 with broken multi-line-init body capture; 54 demanding `self.x =` when bare `x =` is legal) and then VACUOUSLY clean (Windows Python could not see the `/tmp` test path). Validated against the pre-fix file until it found exactly the 3 real bugs, then confirmed the rest of ios/Sources is clean. Scanner kept at `scratchpad/initscan.py`.
+
+**THE ARTIFACT, verified not assumed:**
+- `Payload/Nimbus3D.app/Nimbus3D` - Mach-O `0xfeedfacf` MH_MAGIC_64, cputype arm64, 3,287,720 bytes
+- `Payload/Nimbus3D.app/default.metallib` - 299,112 bytes, so all three .metal files compiled AND linked
+- Info.plist: `com.tombline.nimbus`, MinimumOSVersion 17.0, UIDeviceFamily [1], UIRequiredDeviceCapabilities [arkit, metal, arm64], NSBonjourServices [_nimbusboost._tcp], all three usage strings present in plain language, and the NBBrand* keys proving the single brand block flowed through.
+- Built with Xcode 16F6 / iOS SDK 18.5 on macos-15.
+
+**PR:** https://github.com/bottlemaster-22/Nimbus3D/pull/1 (branch `build/first-ci`, not merged to main).
+
+**Next step:** sign via Bottle and install on the iPhone 17 Pro Max. THEN the real unknowns start, because compiling is not running: nothing in this app has ever executed. Expect the first real failures at ARSession start, Metal pipeline construction (TrainerGPULayouts.verify() throws on any Swift/Metal stride disagreement), and the first training loop.

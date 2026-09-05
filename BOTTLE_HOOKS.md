@@ -98,13 +98,29 @@ and `resolveUnsignedIpa()` must select by `bundleIdentifier`, step 2):
 
 ## Status
 
-`.github/workflows/ios.yml` is written and should be correct, but has never run
-(no CI build yet as of this writing). It has no Rust/Brush step to fail on —
-that was the previous scaffold's (`_superseded/app-brush-wrapper/`) failure
-mode, not this one's. A green build now depends only on the Swift modules under
-`ios/Sources/*` actually compiling (Core, App, Onboarding, Capture, PrePass,
-Trainer, Smart, Viewer, Export, Booster — each owned by a separate module per
-`CONTRACTS.md`), which is those modules' responsibility, not CI's. Wire Bottle
-with the `source.json` entry above now (owner/repo is real, release asset is
-not yet); swap nothing else once the first tagged green build publishes
-`Nimbus3D.ipa` — the `releases/latest/download/` URL already points at it.
+**SUPERSEDED IN PART BY `BOTTLE_PROMPT.md`** (same directory), which is the
+self-contained prompt to hand to the Bottle session and carries the verified
+post-build facts. Read that first; this file remains the Nimbus3D-side reference.
+
+**CI HAS NOW RUN AND SUCCEEDED.** Run 33973412814 on 2026-09-05 produced a real
+unsigned IPA on macos-15 (Xcode 16F6, iOS SDK 18.5), after four rounds fixing 27
+compile errors. Verified by reading the artifact itself:
+
+- `Payload/Nimbus3D.app/Nimbus3D` - Mach-O `MH_MAGIC_64`, cputype arm64, 3,287,720 bytes
+- `Payload/Nimbus3D.app/default.metallib` - 299,112 bytes, so all three .metal files compiled AND linked
+- `CFBundleIdentifier` = `com.tombline.nimbus`, confirming the value this file predicted
+- `MinimumOSVersion` 17.0, `UIDeviceFamily` [1], `UIRequiredDeviceCapabilities` [arkit, metal, arm64]
+
+**The release asset now EXISTS** and is no longer a placeholder:
+`https://github.com/bottlemaster-22/Nimbus3D/releases/download/v0.1.0/Nimbus3D.ipa`
+
+**CORRECTION to the signing notes above:** this file warned that Nimbus3D "ships a
+large Metal/GPU payload" and to check `maxIpaBytes` / `MAX_IPA_BYTES` (512 MB).
+The real IPA is **1.5 MB**. Size limits are a non-issue. The warning was written
+before a build existed and was wrong.
+
+**NEW BLOCKER this file could not have known:** `bottlemaster-22/Nimbus3D` is a
+PRIVATE repo, so an unauthenticated GET of the release asset returns HTTP 404
+(tested). `BOTTLE_PROMPT.md` lists the three ways to handle that.
+
+**Still true:** the app compiles but has NEVER RUN on hardware.
