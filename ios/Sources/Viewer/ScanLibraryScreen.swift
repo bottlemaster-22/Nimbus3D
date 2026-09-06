@@ -157,7 +157,14 @@ struct ScanLibraryScreen: View {
                     }
                 }
             } footer: {
-                Text(storageLine)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(storageLine)
+                    // Which build is this? Selectable so it can be
+                    // pasted into a bug report rather than transcribed
+                    // from a photograph of the screen.
+                    Text(BrandConfig.buildIdentity)
+                        .textSelection(.enabled)
+                }
             }
         }
         .listStyle(.insetGrouped)

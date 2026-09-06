@@ -33,7 +33,7 @@ public enum BrandConfig {
         static let productName = "LiKOVA"
         static let bundleIdentifier = "com.tombline.likova"
         static let slug = "likova"
-        static let boosterServiceType = "_nimbusboost._tcp"
+        static let boosterServiceType = "_likovaboost._tcp"
         static let documentsFolderName = "LiKOVA"
     }
 
@@ -43,6 +43,7 @@ public enum BrandConfig {
         static let slug = "NBBrandSlug"
         static let boosterServiceType = "NBBoosterServiceType"
         static let documentsFolderName = "NBDocumentsFolderName"
+        static let sourceRevision = "NBSourceRevision"
     }
 
     // MARK: - Identity
@@ -76,6 +77,25 @@ public enum BrandConfig {
 
     /// `0.1.0 (1)` - for the About screen and for the Booster handshake.
     public static var versionString: String { "\(version) (\(build))" }
+
+    /// The commit this binary was built from, short form, or `dev` for a
+    /// local build that CI did not stamp.
+    public static let sourceRevision: String =
+        string(PlistKey.sourceRevision) ?? "dev"
+
+    /// `LiKOVA 0.1.0 (42) fd77296` - the one line that identifies exactly
+    /// which build is running.
+    ///
+    /// This MUST stay visible somewhere the user can reach without
+    /// developer tools. Seven builds shipped reporting an identical
+    /// `0.1.0 (1)`, a bug was reported against a build three releases
+    /// behind its own fix, and the only way to work out what had actually
+    /// been installed was to pull Mach-O UUIDs out of the release
+    /// artefacts and match them against the resource reports. Never
+    /// again.
+    public static var buildIdentity: String {
+        "\(displayName) \(versionString) \(sourceRevision)"
+    }
 
     // MARK: - Networking
 

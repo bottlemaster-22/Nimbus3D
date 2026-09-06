@@ -187,6 +187,15 @@ jobs:
         working-directory: ${{ env.IOS_DIR }}
         run: |
           set -euo pipefail
+
+          # The commit the binary is built from, stamped into the
+          # Info.plist and shown at the bottom of the Scans tab. Seven
+          # builds shipped indistinguishable from each other and a bug
+          # got reported against a build three releases behind its fix;
+          # identifying it afterwards meant matching Mach-O UUIDs to
+          # release artefacts. This makes the running app say so itself.
+          REVISION=$(git -C "$GITHUB_WORKSPACE" rev-parse --short HEAD)
+
           xcodebuild archive \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
@@ -200,7 +209,8 @@ jobs:
             CODE_SIGN_ENTITLEMENTS="" \
             DEVELOPMENT_TEAM="" \
             PROVISIONING_PROFILE_SPECIFIER="" \
-            CURRENT_PROJECT_VERSION="${{ github.run_number }}"
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            NIMBUS_SOURCE_REVISION="$REVISION"
 
       - name: Package .ipa (Payload zip, still unsigned)
         working-directory: ${{ env.IOS_DIR }}
@@ -306,9 +316,18 @@ jobs:
           SHORT_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")
           BUILD_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")
           BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")
+          REVISION=$(/usr/libexec/PlistBuddy -c 'Print :NBSourceRevision' "$PLIST")
 
           if [ "$BUILD_VERSION" = "1" ] && [ "${{ github.run_number }}" != "1" ]; then
             echo "::error::CFBundleVersion is 1 but this is CI run ${{ github.run_number }}. The version override has been lost and update detection is broken. Refusing to publish."
+            exit 1
+          fi
+
+          # Same defect, second field. "dev" is the local default, so a
+          # published build carrying it means the stamp never happened
+          # and the app on the phone cannot name its own source.
+          if [ "$REVISION" = "dev" ]; then
+            echo "::error::NBSourceRevision is dev in a CI build. The NIMBUS_SOURCE_REVISION override has been lost, so the installed app cannot identify which commit it came from. Refusing to publish."
             exit 1
           fi
 
@@ -319,6 +338,7 @@ jobs:
           echo "  bundle id : $BUNDLE_ID"
           echo "  version   : $SHORT_VERSION"
           echo "  build     : $BUILD_VERSION"
+          echo "  revision  : $REVISION"
           echo "  size      : $SIZE bytes"
           echo "  sha256    : $SHA"
 
@@ -327,6 +347,7 @@ jobs:
             -F "bundleIdentifier=$BUNDLE_ID" \
             -F "version=$SHORT_VERSION" \
             -F "buildVersion=$BUILD_VERSION" \
+            -F "sourceRevision=$REVISION" \
             -F "minOSVersion=17.0" \
             -F "size=$SIZE" \
             -F "sha256=$SHA" \

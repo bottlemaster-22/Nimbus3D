@@ -64,6 +64,18 @@ settingGroups:
     # has been lost and update detection is broken again.
     NIMBUS_BUILD_NUMBER: 1
 
+    # The commit the binary was built from, short form. CI overrides it.
+    #
+    # This exists because of a real incident. Seven builds all reported
+    # `0.1.0 (1)` and there was NO way, on the phone or in a crash report,
+    # to tell which one was installed. A bug was reported against a build
+    # three releases behind its own fix and neither side could see it. A
+    # build number alone would not have been enough: the ambiguity was
+    # only resolved afterwards by matching Mach-O UUIDs against the
+    # release artefacts. The commit is the thing that maps a running app
+    # back to source, so it is now on screen.
+    NIMBUS_SOURCE_REVISION: dev
+
 options:
   bundleIdPrefix: com.tombline
   deploymentTarget:
@@ -231,6 +243,7 @@ targets:
         NBBrandSlug: $(NIMBUS_BRAND_SLUG)
         NBBoosterServiceType: $(NIMBUS_BOOSTER_SERVICE_TYPE)
         NBDocumentsFolderName: $(NIMBUS_DOCS_FOLDER)
+        NBSourceRevision: $(NIMBUS_SOURCE_REVISION)
 
         # --- Orientation. Capture is handheld portrait; preview may rotate.
         UISupportedInterfaceOrientations:
