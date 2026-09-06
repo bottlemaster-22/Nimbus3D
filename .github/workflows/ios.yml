@@ -356,9 +356,17 @@ jobs:
             exit 1
           fi
 
-          # The values Bottle needs for the manifest entry. It recomputes size
-          # and sha256 itself server-side; these are sent so a mismatch is
-          # detectable rather than assumed.
+          # The values Bottle needs for the manifest entry. It recomputes
+          # sha256 over the bytes it actually receives and requires BOTH
+          # size and sha256 to match, so a corrupted upload is a 400 rather
+          # than a silently bad publish. It also opens the IPA and checks
+          # the real CFBundleIdentifier equals the one declared here.
+          #
+          # EIGHT PARTS, and that is the tested contract. Do not add a
+          # ninth without agreeing it with the broker first: a
+          # sourceRevision part was added here and removed again for
+          # exactly that reason, and it was redundant anyway because
+          # commit carries the same identity in full.
           echo "Publishing $IPA"
           echo "  bundle id : $BUNDLE_ID"
           echo "  version   : $SHORT_VERSION"
@@ -372,11 +380,10 @@ jobs:
             -F "bundleIdentifier=$BUNDLE_ID" \
             -F "version=$SHORT_VERSION" \
             -F "buildVersion=$BUILD_VERSION" \
-            -F "sourceRevision=$REVISION" \
             -F "minOSVersion=17.0" \
             -F "size=$SIZE" \
             -F "sha256=$SHA" \
-            -F "commit=${{ github.sha }}" \
+            -F "commit=${{ github.event.pull_request.head.sha || github.sha }}" \
             -F "ipa=@$IPA;type=application/octet-stream"
 
           echo "Published."
