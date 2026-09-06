@@ -105,7 +105,7 @@ Smart/NativeDepthEdgeClassifier.swift:422  # SAFE: `sy` is `Float(image.width or
 Smart/NativeDepthEdgeClassifier.swift:424  # SAFE: the x axis of the same box filter, same reasoning against `sx`.
 Smart/SmartAuthorityMap.swift:841  # SAFE: reached only inside `if confirmedGlass >= Self.glassDominatedFraction`, which excludes NaN, and `confirmedFraction` is a count over a non-empty verdict array, so it is in 0...1.
 Smart/SmartCore.swift:392  # SAFE: `simd_clamp` is `fmin(fmax(...))`, which Apple documents as returning the non-NaN operand, so it is the absorbing form and a NaN percentile clamps to 0. The result is bounded by `v.count - 1`.
-Smart/TwoScaleTrustField.swift:766  # SAFE: `total` is an iteration count with `guard total > 0` on the line above, so this is an integer times 0.35 and is further capped at 7000 on the same line.
+Smart/TwoScaleTrustField.swift:775  # SAFE: `total` is an iteration count with `guard total > 0` on the line above, so this is an integer times 0.35 and is further capped at 7000 on the same line.
 
 # ---------------------------------------------------------------------------
 # Trainer

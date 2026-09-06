@@ -110,8 +110,16 @@ final class CaptureFrameWriter: @unchecked Sendable {
             throw NimbusError.captureFailed("A camera frame could not be encoded.")
         }
 
+        // Not .atomic, and deliberately so. An atomic write is a write to
+        // a temp file followed by a rename, which buys crash safety this
+        // path already has: frames.jsonl is appended only AFTER this
+        // function returns, so a torn file is never named by any log line
+        // and never reaches the bundle. The cost was two extra directory
+        // and inode dirtyings per file and three renames per keyframe, at
+        // five keyframes a second, against a phone already over its daily
+        // write budget.
         let imageURL = folder.imagesDirectory.appendingPathComponent("\(stamp).jpg")
-        try jpeg.write(to: imageURL, options: .atomic)
+        try jpeg.write(to: imageURL)
         bytesWritten += Int64(jpeg.count)
 
         var depthPath: String?
@@ -121,14 +129,14 @@ final class CaptureFrameWriter: @unchecked Sendable {
             let depthBytes = depth.depthSidecarBytes
             let depthURL = folder.depthDirectory
                 .appendingPathComponent("\(stamp).depth16")
-            try depthBytes.write(to: depthURL, options: .atomic)
+            try depthBytes.write(to: depthURL)
             bytesWritten += Int64(depthBytes.count)
             depthPath = CaptureScanFolder.depthRelativePath(stamp: stamp)
 
             let confidenceBytes = depth.confidenceSidecarBytes
             let confidenceURL = folder.confidenceDirectory
                 .appendingPathComponent("\(stamp).conf8")
-            try confidenceBytes.write(to: confidenceURL, options: .atomic)
+            try confidenceBytes.write(to: confidenceURL)
             bytesWritten += Int64(confidenceBytes.count)
             confidencePath = CaptureScanFolder.confidenceRelativePath(stamp: stamp)
         }

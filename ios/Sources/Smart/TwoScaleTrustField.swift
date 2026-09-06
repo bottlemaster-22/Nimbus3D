@@ -270,7 +270,28 @@ public final class TwoScaleTrustField: TrustField {
         var affines: [(FrameID, SmartDepthAffine)] = []
 
         let noiseWriter = try SmartChunkedWriter(url: ref.url(forRelativePath: noisePath))
-        let confidenceWriter = try SmartChunkedWriter(url: ref.url(forRelativePath: confidencePath))
+
+        // There is no confidence writer here on purpose.
+        //
+        // This loop used to stream a placeholder pass into
+        // confidence_recal.bin, one full frame of floats per slot, and
+        // step 5 then called rewriteConfidence, whose first act is to
+        // DELETE that file and build it again from nothing. Every byte of
+        // the first pass was thrown away unread: 196,608 bytes per frame,
+        // so about 177 MB on a 900-frame scan, a quarter of everything
+        // the whole pre-pass writes.
+        //
+        // iOS was already complaining. The phone reported 1 GB of file
+        // writes in a 32-minute session and 4 GB across one day, breaching
+        // both tiers of its daily write budget, which costs real flash
+        // endurance on the user's phone.
+        //
+        // Nothing is lost by not writing it. The real remap needs the
+        // residual statistics of the whole scan, which is exactly why it
+        // cannot run until this loop has finished, and rewriteConfidence
+        // walks every slot from 0 itself rather than patching what was
+        // here. If build() throws before step 5 the file is now absent
+        // rather than full of zeros, which is the more honest of the two.
 
         let depthCache = SmartDepthCache(
             capacity: Swift.max(4, cost.trustPartnerFrames + 2), sampleCount: perFrame
@@ -285,7 +306,6 @@ public final class TwoScaleTrustField: TrustField {
         for slot in 0..<slotCount {
             if Task.isCancelled {
                 try? noiseWriter.close()
-                try? confidenceWriter.close()
                 throw NimbusError.cancelled
             }
 
@@ -297,7 +317,6 @@ public final class TwoScaleTrustField: TrustField {
                 try noiseWriter.appendFloats(
                     [Float](repeating: Self.hopelessSigma, count: perFrame)
                 )
-                try confidenceWriter.appendFloats([Float](repeating: 0, count: perFrame))
                 continue
             }
 
@@ -488,19 +507,9 @@ public final class TwoScaleTrustField: TrustField {
             }
 
             try noiseWriter.appendFloats(sigma)
-
-            // Placeholder confidence pass. The real remap needs the residual
-            // statistics of the WHOLE scan, which only exist once every frame
-            // has been walked, so this file is rewritten in step 5.
-            var recal = [Float](repeating: 0, count: perFrame)
-            for i in 0..<perFrame where sigma[i] < Self.hopelessSigma {
-                recal[i] = Float(i < confidence.count ? confidence[i] : 1) / 2
-            }
-            try confidenceWriter.appendFloats(recal)
         }
 
         try noiseWriter.close()
-        try confidenceWriter.close()
 
         // --- 5. Recalibrate ARKit confidence. -----------------------------
         let levelProbabilities = Self.recalibrate(residualsByLevel: residualsByLevel)
