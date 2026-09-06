@@ -199,7 +199,8 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
             DEVELOPMENT_TEAM="" \
-            PROVISIONING_PROFILE_SPECIFIER=""
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}"
 
       - name: Package .ipa (Payload zip, still unsigned)
         working-directory: ${{ env.IOS_DIR }}

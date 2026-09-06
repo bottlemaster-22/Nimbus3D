@@ -38,7 +38,43 @@ calls. This app uses several:
 Cheap to write, and cheap to keep correct while the code is fresh. Retrofitting it
 means auditing 125 files for API calls nobody remembers making.
 
-### 3. The name is taken. CHECKED 2026-09-06, verdict: RENAME.
+### 3. NAME DECIDED 2026-09-06: **LiKOVA**
+
+The owner chose it after four candidates died on checks. His reasoning, and it
+answers the objection raised against it:
+
+- Pronunciation ambiguity (LIE-kova vs LEE-kova) is ACCEPTABLE to him. Intended
+  is "Lie-KOH-vah", and he considers "Lee-KOH-vah" fine too. Precedent: Lichess,
+  which has the same ambiguity and does not suffer for it.
+- He judges LiKOVA genuinely distinguishable from the bare "Kova" that the UK
+  register killed.
+
+Root: Finnish `kova`, "hard, solid, firm", from Proto-Finnic `*kova`, with
+cognates in Finnish, Karelian, Ingrian, Estonian (`kõva`) and Livonian. A
+scanner's whole job is separating solid from empty, which is also exactly what
+the free-space carving feature does, so the etymology is defensible in one
+sentence rather than invented.
+
+STILL TO CHECK BEFORE ANY ART IS COMMISSIONED: run the UKIPO and USPTO searches
+on "LiKOVA" filtered to classes 9 and 42, the same search that killed Kova. Bare
+KOVA has at least three LIVE UK class 9 registrations (UK00003341089,
+UK00003377484, and UK00004205547 filed May 2025 for class 9 alone), so the
+question is whether the Li prefix is enough separation. That is a real question
+and it is unanswered.
+
+BRAND BLOCK VALUES when the rename is made (ios/project.yml, settingGroups.brand):
+  NIMBUS_PRODUCT_NAME: LiKOVA
+  NIMBUS_DISPLAY_NAME: LiKOVA
+  NIMBUS_BUNDLE_ID:    com.tombline.likova
+  NIMBUS_BRAND_SLUG:   likova          (6 chars, inside the 9-char DNS-SD limit)
+  NIMBUS_DOCS_FOLDER:  LiKOVA
+Note the slug must stay lowercase a-z0-9: the Bonjour type becomes
+`_likovaboost._tcp`, which is 14 characters including the underscore, inside the
+15-character cap with one to spare.
+
+### WHY THE PREVIOUS NAMES DIED (kept as the record)
+
+Original verdict on Nimbus3D:
 
 Not merely crowded. Taken by directly adjacent products:
 

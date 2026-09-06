@@ -49,6 +49,19 @@ settingGroups:
     # Derived - do not edit these two; they exist so the value is written once.
     NIMBUS_BOOSTER_SERVICE_TYPE: _$(NIMBUS_BRAND_SLUG)boost._tcp
     NIMBUS_MARKETING_VERSION: 0.1.0
+    # LOCAL DEFAULT ONLY. CI OVERRIDES THIS AND MUST KEEP DOING SO.
+    #
+    # `.github/workflows/ios.yml` passes
+    # `CURRENT_PROJECT_VERSION=${{ github.run_number }}` on the xcodebuild
+    # command line, which beats this value. That matters because
+    # CFBundleVersion is the ONLY field an update manifest can use to say "this
+    # build is newer than that one", and it sat hardcoded at 1 for the first
+    # seven builds. Every one of them reported CFBundleVersion 1 with a
+    # different binary inside, so nothing downstream could tell them apart and
+    # the Bottle sideload pipeline could not do update detection at all.
+    #
+    # If you ever build locally, expect 1. If CI ever produces 1, the override
+    # has been lost and update detection is broken again.
     NIMBUS_BUILD_NUMBER: 1
 
 options:
