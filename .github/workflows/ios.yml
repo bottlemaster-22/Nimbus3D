@@ -212,6 +212,22 @@ jobs:
           REVISION_FULL="${{ github.event.pull_request.head.sha || github.sha }}"
           REVISION="${REVISION_FULL:0:7}"
 
+          # Development self-update. Both empty unless the secrets exist,
+          # and empty means BrandConfig.selfUpdate is nil and the app has
+          # no update UI at all, so a fork build or a secretless build is
+          # not a broken build, it is a build without the feature.
+          #
+          # Read into shell variables rather than interpolated straight
+          # into the xcodebuild line, so the token is never part of the
+          # command text that Actions echoes into the log.
+          SELFUPDATE_URL="${{ secrets.BOTTLE_SELFUPDATE_URL }}"
+          SELFUPDATE_TOKEN="${{ secrets.BOTTLE_SELFUPDATE_TOKEN }}"
+          if [ -z "$SELFUPDATE_URL" ] || [ -z "$SELFUPDATE_TOKEN" ]; then
+            echo "::notice::Self-update not configured; building without it."
+            SELFUPDATE_URL=""
+            SELFUPDATE_TOKEN=""
+          fi
+
           xcodebuild archive \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
@@ -226,7 +242,9 @@ jobs:
             DEVELOPMENT_TEAM="" \
             PROVISIONING_PROFILE_SPECIFIER="" \
             CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
-            NIMBUS_SOURCE_REVISION="$REVISION"
+            NIMBUS_SOURCE_REVISION="$REVISION" \
+            NIMBUS_SELFUPDATE_URL="${SELFUPDATE_URL}" \
+            NIMBUS_SELFUPDATE_TOKEN="${SELFUPDATE_TOKEN}"
 
       - name: Package .ipa (Payload zip, still unsigned)
         working-directory: ${{ env.IOS_DIR }}

@@ -44,6 +44,8 @@ public enum BrandConfig {
         static let boosterServiceType = "NBBoosterServiceType"
         static let documentsFolderName = "NBDocumentsFolderName"
         static let sourceRevision = "NBSourceRevision"
+        static let selfUpdateURL = "NBSelfUpdateURL"
+        static let selfUpdateToken = "NBSelfUpdateToken"
     }
 
     // MARK: - Identity
@@ -96,6 +98,36 @@ public enum BrandConfig {
     public static var buildIdentity: String {
         "\(displayName) \(versionString) \(sourceRevision)"
     }
+
+    // MARK: - Development self-update
+
+    /// Where this build may ask to be reinstalled, and what it presents to
+    /// be allowed to.
+    public struct SelfUpdateEndpoint: Sendable {
+        public let url: URL
+        public let token: String
+    }
+
+    /// nil unless CI injected BOTH an endpoint and a token, which is every
+    /// local build and any build made without the GitHub secrets.
+    ///
+    /// This is the off switch for the whole self-update feature, and it is
+    /// an absence rather than a flag on purpose. The owner agreed to this
+    /// only as a development convenience and asked that it be easy to
+    /// strip; a build with no secrets simply has no update UI, because
+    /// `SelfUpdateService.isConfigured` reads this and the Booster tab
+    /// renders nothing when it is false.
+    ///
+    /// The token genuinely ships inside the binary. See the note at the top
+    /// of SelfUpdateService.swift for why that trade is acceptable for
+    /// THIS token and would not be for an account token.
+    public static let selfUpdate: SelfUpdateEndpoint? = {
+        guard let raw = string(PlistKey.selfUpdateURL), !raw.isEmpty,
+              let url = URL(string: raw),
+              let token = string(PlistKey.selfUpdateToken), !token.isEmpty
+        else { return nil }
+        return SelfUpdateEndpoint(url: url, token: token)
+    }()
 
     // MARK: - Networking
 

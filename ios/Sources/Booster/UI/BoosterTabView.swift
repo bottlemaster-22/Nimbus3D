@@ -29,6 +29,10 @@ public struct BoosterTabView: View {
     @State private var scanPickerDevice: BoosterDevice?
     @State private var jobs: [BoosterJobRecord] = []
     @State private var localError: BoosterError?
+    // DEVELOPMENT ONLY. Removing the self-update feature is this line, the
+    // `selfUpdateSection` below, its one use in the List, and
+    // SelfUpdateService.swift. Nothing else refers to it.
+    @StateObject private var selfUpdate = SelfUpdateService()
 
     public init() {}
 
@@ -80,6 +84,7 @@ public struct BoosterTabView: View {
 
                 BoosterProgressSection(client: client)
                 BoosterResultsSection(jobs: jobs)
+                selfUpdateSection
             }
             .navigationTitle("Booster")
             .onAppear {
@@ -126,6 +131,78 @@ public struct BoosterTabView: View {
                 Button("OK") {}
             } message: { error in
                 Text(error.errorDescription ?? "Please try again.")
+            }
+        }
+    }
+
+    // MARK: - Development self-update
+
+    /// Asks the Bottle broker to reinstall this app over the air.
+    ///
+    /// Renders NOTHING on a build CI did not configure, which is every
+    /// local build, because a button that cannot work is worse than no
+    /// button. See SelfUpdateService for why the whole feature is designed
+    /// to be deleted rather than switched off.
+    @ViewBuilder
+    private var selfUpdateSection: some View {
+        if SelfUpdateService.isConfigured {
+            Section {
+                // Which build this is, so a report about it can name it.
+                // Selectable for the same reason it is on the Scans tab.
+                Text(BrandConfig.buildIdentity)
+                    .font(.footnote.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+
+                if selfUpdate.isWorking {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text(selfUpdate.status == .updating
+                             ? "Installing the new build..."
+                             : "Asking for the newest build...")
+                    }
+                } else {
+                    Button("Check for a new build") {
+                        Task { await selfUpdate.update() }
+                    }
+                }
+
+                // The broker writes these sentences for a screen, so they
+                // are shown as sent rather than reworded here. It cannot
+                // know this app is a scanner, and this app cannot know why
+                // a relay is offline.
+                if let message = selfUpdate.message {
+                    Text(message)
+                        .font(.footnote)
+                        .foregroundStyle(
+                            selfUpdate.status == .failed ? Color.red : Color.secondary
+                        )
+                }
+
+                if selfUpdate.status == .updated {
+                    Text("Installed. Reopen the app to run the new build.")
+                        .font(.footnote)
+                }
+
+                // Only offered after a failure, and worded for the one case
+                // it is for. The broker skips work when the installed build
+                // is already newest, which is what makes an ordinary check
+                // cheap, but that same skip would refuse the seven-day
+                // certificate re-sign a lapsed app needs. Force asks anyway.
+                if selfUpdate.status == .failed, !selfUpdate.isWorking {
+                    Button("Reinstall anyway") {
+                        Task { await selfUpdate.update(force: true) }
+                    }
+                    .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("This build")
+            } footer: {
+                Text(
+                    "Development only. The update is signed and installed by "
+                        + "your own Bottle relay at home, so it needs that "
+                        + "machine powered on and on the same network."
+                )
             }
         }
     }

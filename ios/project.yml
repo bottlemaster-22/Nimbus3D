@@ -76,6 +76,20 @@ settingGroups:
     # back to source, so it is now on screen.
     NIMBUS_SOURCE_REVISION: dev
 
+    # Development self-update, injected by CI from GitHub secrets and
+    # EMPTY here on purpose. An empty endpoint or token means
+    # BrandConfig.selfUpdate is nil and the feature does not exist in the
+    # build, which is how a local build gets no update UI and how the
+    # feature is stripped later: clear the secrets, or delete these two
+    # lines with SelfUpdateService.swift and its Section in BoosterTabView.
+    #
+    # The token is NOT written here. It ships inside the binary once CI
+    # injects it, which is a real exposure and is argued for at the top of
+    # SelfUpdateService.swift; putting it in source control as well would
+    # be exposure with nothing bought for it.
+    NIMBUS_SELFUPDATE_URL: ""
+    NIMBUS_SELFUPDATE_TOKEN: ""
+
 options:
   bundleIdPrefix: com.tombline
   deploymentTarget:
@@ -244,6 +258,8 @@ targets:
         NBBoosterServiceType: $(NIMBUS_BOOSTER_SERVICE_TYPE)
         NBDocumentsFolderName: $(NIMBUS_DOCS_FOLDER)
         NBSourceRevision: $(NIMBUS_SOURCE_REVISION)
+        NBSelfUpdateURL: $(NIMBUS_SELFUPDATE_URL)
+        NBSelfUpdateToken: $(NIMBUS_SELFUPDATE_TOKEN)
 
         # --- Orientation. Capture is handheld portrait; preview may rotate.
         UISupportedInterfaceOrientations:
