@@ -139,14 +139,50 @@ def nan_absorbed(arg):
     return bool(re.match(r'^(?:Swift\.)?(?:max|min)\(-?[0-9.]+,', a))
 
 
+# Separator between the file and the exact source text that was triaged.
+ENTRY_SEP = ' :: '
+
+
+def entry_key(rel, text):
+    """What an allowlist entry is keyed on.
+
+    The file plus the SOURCE TEXT of the conversion, not the file plus a
+    line number. Line numbers were the original key and they were wrong:
+    inserting anything above a triaged line detached its entry and turned
+    CI red on a file nobody had touched. That happened four separate times
+    in one afternoon, twice by hand and twice caught by reviewers reading
+    patches that would have done it again.
+
+    The text is also the honest key. What a person read and judged was the
+    conversion, not its position in the file, so moving a line should keep
+    its verdict and CHANGING one should lose it. That is exactly what this
+    key does, and the line-number key had it backwards on both counts.
+
+    Two identical conversions in one file share an entry. That is correct:
+    identical code in the same file has the same argument for or against
+    it, and writing the reason twice would only create a chance to write it
+    differently the second time.
+    """
+    return (rel, ' '.join(text.split()))
+
+
 def load_allowlist():
     seen = set()
     if not os.path.exists(ALLOWLIST):
         return seen
-    for line in io.open(ALLOWLIST, encoding='utf-8'):
-        line = line.split('#')[0].strip()
-        if line:
-            seen.add(line)
+    for raw in io.open(ALLOWLIST, encoding='utf-8'):
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        key = line.split('  # ', 1)[0].strip()
+        if ENTRY_SEP not in key:
+            # A stale File:line entry. Not silently tolerated: it would
+            # read as coverage that no longer exists.
+            print('  allowlist entry is not in File%scode form: %s'
+                  % (ENTRY_SEP, key))
+            continue
+        rel, text = key.split(ENTRY_SEP, 1)
+        seen.add(entry_key(rel.strip(), text))
     return seen
 
 
@@ -185,7 +221,7 @@ def main(argv):
     hits = scan(root)
     allow = load_allowlist()
 
-    untriaged = [h for h in hits if '%s:%d' % (h[0], h[1]) not in allow]
+    untriaged = [h for h in hits if entry_key(h[0], h[2]) not in allow]
 
     print('trapconv: scanning %s' % root)
     print('  trapping float-to-int conversions found: %d' % len(hits))
@@ -195,7 +231,7 @@ def main(argv):
 
     if listing:
         for rel, line, text in hits:
-            mark = ' ' if '%s:%d' % (rel, line) in allow else '*'
+            mark = ' ' if entry_key(rel, text) in allow else '*'
             print('%s %s:%d  %s' % (mark, rel, line, text))
         return 0
 
@@ -205,7 +241,11 @@ def main(argv):
         print('with a written reason if it is genuinely unreachable.')
         print()
         for rel, line, text in untriaged:
-            print('  %s:%d  %s' % (rel, line, text))
+            # Printed in allowlist form so triaging one is a copy, a paste
+            # and a reason, rather than a transcription with a chance to
+            # get the line number wrong.
+            print('  %s:%d' % (rel, line))
+            print('    %s%s%s  # WHY IS THIS SAFE?' % (rel, ENTRY_SEP, text))
         return 1
 
     print('PASS: every trapping conversion has been looked at by a person.')

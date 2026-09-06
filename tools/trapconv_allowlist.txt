@@ -44,100 +44,100 @@
 # ---------------------------------------------------------------------------
 # Booster
 # ---------------------------------------------------------------------------
-Booster/BoosterUploadManager.swift:213  # SAFE: `withRetry` is private with one call site that never passes `attempts`, so the default 3 stands and the delay is only computed while `attempt < attempts - 1`. The exponent is 0 or 1, giving 5e8 or 1e9 nanoseconds.
+Booster/BoosterUploadManager.swift :: let delay = UInt64(pow(2.0, Double(attempt)) * 500_000_000)  # SAFE: `withRetry` is private with one call site that never passes `attempts`, so the default 3 stands and the delay is only computed while `attempt < attempts - 1`. The exponent is 0 or 1, giving 5e8 or 1e9 nanoseconds.
 
 # ---------------------------------------------------------------------------
 # Capture
 # ---------------------------------------------------------------------------
-Capture/ARCaptureService.swift:1017  # SAFE: `Swift.max(1, CaptureTuning.liveStateHz)` has the LITERAL first, so a NaN rate would be absorbed to 1. liveStateHz is a `static let Double = 10`, so the quotient is 1e8 and cannot exceed 1e9.
-Capture/CaptureCOLMAPWriter.swift:167  # SAFE: not a float at all. `CapturePointCloudAccumulator.Point.color` is `SIMD3<UInt8>`, so this is UInt8 -> Int. The detector matches on `.x`.
-Capture/CaptureCOLMAPWriter.swift:168  # SAFE: same, the green channel of a `SIMD3<UInt8>`.
-Capture/CaptureCOLMAPWriter.swift:169  # SAFE: same, the blue channel of a `SIMD3<UInt8>`.
-Capture/CaptureCoverageField.swift:226  # SAFE: `azimuthTurn` is `Swift.max(0, Swift.min(1, rawTurn))`, literals first in both, so a NaN from `atan2` absorbs to 1 rather than reaching the conversion. Bounded by `azimuthBins`.
-Capture/CaptureCoverageField.swift:230  # SAFE: `elevation` is `Swift.max(-1, Swift.min(1, direction.y))` in the same absorbing order, so `elevationTurn` is in 0...1 for every input including NaN.
-Capture/CapturePixelBuffer.swift:167  # SAFE: `clampedU` is `Swift.max(0, Swift.min(0.999_999, u))`, literals first, so NaN absorbs to 0.999999. The product is strictly below `width`.
-Capture/CapturePixelBuffer.swift:168  # SAFE: `clampedV` is the same shape, so the product is strictly below `height`.
-Capture/CaptureScanFolder.swift:180  # SAFE: `t - t.rounded(.down)` on a `Date`'s epoch seconds is the fractional part, so the product is in 0..<1000 by construction. A system clock does not produce a NaN Date.
-Capture/CaptureTimeOffsetCalibrator.swift:94  # SAFE: both operands are `static let Double` tuning constants (0.050 and 0.005), so this is the compile-time constant 20.
+Capture/ARCaptureService.swift :: let interval = UInt64(1_000_000_000 / Swift.max(1, CaptureTuning.liveStateHz))  # SAFE: `Swift.max(1, CaptureTuning.liveStateHz)` has the LITERAL first, so a NaN rate would be absorbed to 1. liveStateHz is a `static let Double = 10`, so the quotient is 1e8 and cannot exceed 1e9.
+Capture/CaptureCOLMAPWriter.swift :: Int(point.color.x),  # SAFE: not a float at all. `CapturePointCloudAccumulator.Point.color` is `SIMD3<UInt8>`, so this is UInt8 -> Int. The detector matches on `.x`.
+Capture/CaptureCOLMAPWriter.swift :: Int(point.color.y),  # SAFE: same, the green channel of a `SIMD3<UInt8>`.
+Capture/CaptureCOLMAPWriter.swift :: Int(point.color.z),  # SAFE: same, the blue channel of a `SIMD3<UInt8>`.
+Capture/CaptureCoverageField.swift :: let azimuthBin = Int((azimuthTurn * Float(azimuthCount)).rounded(.down))  # SAFE: `azimuthTurn` is `Swift.max(0, Swift.min(1, rawTurn))`, literals first in both, so a NaN from `atan2` absorbs to 1 rather than reaching the conversion. Bounded by `azimuthBins`.
+Capture/CaptureCoverageField.swift :: let elevationBin = Int((elevationTurn * Float(elevationCount)).rounded(.down))  # SAFE: `elevation` is `Swift.max(-1, Swift.min(1, direction.y))` in the same absorbing order, so `elevationTurn` is in 0...1 for every input including NaN.
+Capture/CapturePixelBuffer.swift :: let x = Int(clampedU * Float(width))  # SAFE: `clampedU` is `Swift.max(0, Swift.min(0.999_999, u))`, literals first, so NaN absorbs to 0.999999. The product is strictly below `width`.
+Capture/CapturePixelBuffer.swift :: let y = Int(clampedV * Float(height))  # SAFE: `clampedV` is the same shape, so the product is strictly below `height`.
+Capture/CaptureScanFolder.swift :: let millis = Int(  # SAFE: `t - t.rounded(.down)` on a `Date`'s epoch seconds is the fractional part, so the product is in 0..<1000 by construction. A system clock does not produce a NaN Date.
+Capture/CaptureTimeOffsetCalibrator.swift :: let steps = Int((2 * maximum / step).rounded())  # SAFE: both operands are `static let Double` tuning constants (0.050 and 0.005), so this is the compile-time constant 20.
 
 # ---------------------------------------------------------------------------
 # Core
 # ---------------------------------------------------------------------------
-Core/Contracts.swift:1648  # SAFE: UInt64 integer division, not a float. The divisor is `UInt64(Swift.max(1, ...))` so it cannot be zero, and the dividend is `availableMemoryBytes / 2`, which cannot exceed Int.max.
+Core/Contracts.swift :: return Int(memoryForSplats / perSplat)  # SAFE: UInt64 integer division, not a float. The divisor is `UInt64(Swift.max(1, ...))` so it cannot be zero, and the dividend is `availableMemoryBytes / 2`, which cannot exceed Int.max.
 
 # ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
-Export/SPZCodec.swift:361  # SAFE: the quaternion is validated fourteen lines above (`simd_length_squared` checked `.isFinite && > 1e-12`, a failing rotation replaced with identity) BEFORE `simd_normalize`, so each non-largest component is in 0...sqrt(1/2) and the argument is at most 512.
+Export/SPZCodec.swift :: let mag = UInt32((Float((1 << 9) - 1) * (abs(q[i]) / sqrt1_2) + 0.5))  # SAFE: the quaternion is validated fourteen lines above (`simd_length_squared` checked `.isFinite && > 1e-12`, a failing rotation replaced with identity) BEFORE `simd_normalize`, so each non-largest component is in 0...sqrt(1/2) and the argument is at most 512.
 
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
-Pipeline/TrainingPreview.swift:239  # SAFE: `settleSeconds` is `private let settleSeconds: TimeInterval = 0.7`, a constant nothing writes.
+Pipeline/TrainingPreview.swift :: let nanoseconds = UInt64(settleSeconds * 1_000_000_000)  # SAFE: `settleSeconds` is `private let settleSeconds: TimeInterval = 0.7`, a constant nothing writes.
 
 # ---------------------------------------------------------------------------
 # PrePass
 # ---------------------------------------------------------------------------
-PrePass/PrePassBundleAdjuster.swift:312  # SAFE: a ratio of two positive integers (`sampleCount` is width x height, the divisor is `Swift.max(..., 1)`), square-rooted and rounded. No division by zero and no float from disk.
-PrePass/PrePassBundleAdjuster.swift:419  # SAFE: `pixel` comes from `PrePassDepthGeometry.project`, which returns an Optional and is guarded here. That function rejects NaN and negative Z with `guard p.z > 1e-4`, then rejects the pixel with `guard u >= 0, v >= 0, u < Float(width), v < Float(height)`: a NaN fails the first pair, an infinity the second. A non-nil return is finite and already inside the image.
-PrePass/PrePassBundleAdjuster.swift:883  # SAFE: the second copy of the same guarded `project` call, same reasoning.
-PrePass/PrePassGlassDetector.swift:150  # SAFE: `sampleCount` is width x height and `maxComponentSampleFraction` is a `Float = 0.35` default on a plain (non-Codable) Settings struct that nothing decodes. The product is well under a frame's sample count.
-PrePass/PrePassICP.swift:299  # SAFE: `pixel` is a guarded non-nil `PrePassDepthGeometry.project` result, so both axes are finite and inside the image. Same upstream proof as the bundle adjuster's two sites.
-PrePass/PrePassInitialSplats.swift:481  # SAFE: `q` is `Swift.max(0, Swift.min(1, settings.trustedQuantile))`, literals first in both, so it is in 0...1 even for a NaN setting. The product is bounded by `sortedWeights.count - 1`.
-PrePass/PrePassInitialSplats.swift:490  # SAFE: the local `quantile(_:)` is called only with literal arguments (0.05, 0.50, 0.95 and friends) and the result is clamped to the array's index range on the same line.
-PrePass/PrePassMath.swift:338  # SAFE: integer conversion, not a float. `cell` is `SIMD3<Int32>` and the three coordinates are range-checked against 0 and `axisLimit` on the two lines directly above.
-PrePass/PrePassMath.swift:560  # FIXED 2026-09-06, now SAFE: the clamp was `Swift.min(Swift.max(p, 0), 1)`, which is the NaN-PROPAGATING order and would have fed a NaN quantile straight to this conversion. Rewritten as `Swift.min(1, Swift.max(0, p))`; identical for every finite input. Callers pass literals today, but this is a shared helper.
-PrePass/PrePassPipeline.swift:1017  # SAFE: `upsampleRatio` is a ratio of two `Swift.max(..., 1)` integers, so it is finite and at least a small positive number. The dividend is the literal 8, so the result is at most 8.
-PrePass/PrePassPoseRefiner.swift:295  # FIXED 2026-09-06, now SAFE: `duration` used to be `Swift.max(end - start, 0)` over two `timestampSeconds` decoded from the frame sidecar with no validation, and that order propagates NaN. It is now `(span.isFinite && span > 0) ? Swift.min(span, 86_400) : 0`, and `stride` is at least 1, so the quotient is at most 86400.
-PrePass/PrePassPoseRefiner.swift:417  # SAFE: `bundle.intrinsics.height` and `.width` are integers, `workingWidth` is `Swift.min(width, 640)` and the line above returns early unless `width > 0`. Integer-derived throughout.
-PrePass/PrePassPoseRefiner.swift:489  # SAFE: `scaleToNativeX` is `Float(geometry.width) / Float(workingWidth)` with `workingWidth > 0` already guarded, and `candidate.x` is an Int pixel index inside the working image.
-PrePass/PrePassPoseRefiner.swift:490  # SAFE: `scaleToNativeY` is the same shape over `workingHeight`, which is `Swift.max(1, ...)`.
-PrePass/PrePassSurvey.swift:659  # FIXED 2026-09-06, now SAFE: `coverageFraction` was `Float(coveredCellCount) / Float(hash.count)` with no divisor guard, and 0/0 is NaN, which reached this conversion whenever a scan recorded depth but not one usable cell. It now matches the guarded ceiling line beside it, so the value is a genuine 0...1 ratio.
-PrePass/PrePassSurvey.swift:702  # SAFE: reached only inside `if survey.medianAngularSpreadDegrees < thresholds.lowAngularSpreadDegrees`, and NaN fails that comparison. The value is a median of `acos` results, so it is in 0...180.
-PrePass/PrePassSurvey.swift:716  # SAFE: reached only inside `if survey.cameraHeightSpreadMeters < thresholds.lowCameraHeightSpreadMeters`, which excludes NaN and every large value. The field itself is written as `isFinite ? Swift.max(0, spread) : 0`.
-PrePass/PrePassSurvey.swift:759  # SAFE: reached only inside `if glassAreaFraction >= thresholds.notableGlassFraction`, which excludes NaN, and the value is a fraction of counted depth samples, so it is in 0...1.
-PrePass/PrePassSurvey.swift:862  # FIXED 2026-09-06, now SAFE: the guard was `value.isFinite` alone, which lets through every finite Float up to 3.4e38 while `Int(_: Float)` traps above 9.2e18. Widened to `value.isFinite, value.magnitude < 1_000_000`, the same correction `ProcessingFormat.meters` needed.
+PrePass/PrePassBundleAdjuster.swift :: Int((Double(sampleCount) / Double(Swift.max(settings.observationsPerKeyframe, 1)))  # SAFE: a ratio of two positive integers (`sampleCount` is width x height, the divisor is `Swift.max(..., 1)`), square-rooted and rounded. No division by zero and no float from disk.
+PrePass/PrePassBundleAdjuster.swift :: let targetSample = Int(pixel.y) * width + Int(pixel.x)  # SAFE: `pixel` comes from `PrePassDepthGeometry.project`, which returns an Optional and is guarded here. That function rejects NaN and negative Z with `guard p.z > 1e-4`, then rejects the pixel with `guard u >= 0, v >= 0, u < Float(width), v < Float(height)`: a NaN fails the first pair, an infinity the second. A non-nil return is finite and already inside the image.
+PrePass/PrePassBundleAdjuster.swift :: let targetSample = Int(pixel.y) * width + Int(pixel.x)  # SAFE: the second copy of the same guarded `project` call, same reasoning.
+PrePass/PrePassGlassDetector.swift :: let maxComponent = Int(Float(sampleCount) * settings.maxComponentSampleFraction)  # SAFE: `sampleCount` is width x height and `maxComponentSampleFraction` is a `Float = 0.35` default on a plain (non-Codable) Settings struct that nothing decodes. The product is well under a frame's sample count.
+PrePass/PrePassICP.swift :: let x = Int(pixel.x), y = Int(pixel.y)  # SAFE: `pixel` is a guarded non-nil `PrePassDepthGeometry.project` result, so both axes are finite and inside the image. Same upstream proof as the bundle adjuster's two sites.
+PrePass/PrePassInitialSplats.swift :: sortedWeights.count - 1, Int(Float(sortedWeights.count - 1) * q)  # SAFE: `q` is `Swift.max(0, Swift.min(1, settings.trustedQuantile))`, literals first in both, so it is in 0...1 even for a NaN setting. The product is bounded by `sortedWeights.count - 1`.
+PrePass/PrePassInitialSplats.swift :: Swift.max(0, Int(Float(sortedWeights.count - 1) * q))  # SAFE: the local `quantile(_:)` is called only with literal arguments (0.05, 0.50, 0.95 and friends) and the result is clamped to the array's index range on the same line.
+PrePass/PrePassMath.swift :: return key(x: UInt32(cell.x), y: UInt32(cell.y), z: UInt32(cell.z))  # SAFE: integer conversion, not a float. `cell` is `SIMD3<Int32>` and the three coordinates are range-checked against 0 and `axisLimit` on the two lines directly above.
+PrePass/PrePassMath.swift :: let index = Int((clamped * Float(sorted.count - 1)).rounded())  # FIXED 2026-09-06, now SAFE: the clamp was `Swift.min(Swift.max(p, 0), 1)`, which is the NaN-PROPAGATING order and would have fed a NaN quantile straight to this conversion. Rewritten as `Swift.min(1, Swift.max(0, p))`; identical for every finite input. Callers pass literals today, but this is a shared helper.
+PrePass/PrePassPipeline.swift :: let radius = Int((bandRGBPixels / Swift.max(upsampleRatio, 1)).rounded())  # SAFE: `upsampleRatio` is a ratio of two `Swift.max(..., 1)` integers, so it is finite and at least a small positive number. The dividend is the literal 8, so the result is at most 8.
+PrePass/PrePassPoseRefiner.swift :: windowCount = Int(((duration - window) / stride).rounded(.up)) + 1  # FIXED 2026-09-06, now SAFE: `duration` used to be `Swift.max(end - start, 0)` over two `timestampSeconds` decoded from the frame sidecar with no validation, and that order propagates NaN. It is now `(span.isFinite && span > 0) ? Swift.min(span, 86_400) : 0`, and `stride` is at least 1, so the quotient is at most 86400.
+PrePass/PrePassPoseRefiner.swift :: Int((Double(bundle.intrinsics.height) * Double(workingWidth)  # SAFE: `bundle.intrinsics.height` and `.width` are integers, `workingWidth` is `Swift.min(width, 640)` and the line above returns early unless `width > 0`. Integer-derived throughout.
+PrePass/PrePassPoseRefiner.swift :: let nx = Int(Float(candidate.x) * scaleToNativeX)  # SAFE: `scaleToNativeX` is `Float(geometry.width) / Float(workingWidth)` with `workingWidth > 0` already guarded, and `candidate.x` is an Int pixel index inside the working image.
+PrePass/PrePassPoseRefiner.swift :: let ny = Int(Float(candidate.y) * scaleToNativeY)  # SAFE: `scaleToNativeY` is the same shape over `workingHeight`, which is `Swift.max(1, ...)`.
+PrePass/PrePassSurvey.swift :: let percent = Int((survey.coverageFraction * 100).rounded())  # FIXED 2026-09-06, now SAFE: `coverageFraction` was `Float(coveredCellCount) / Float(hash.count)` with no divisor guard, and 0/0 is NaN, which reached this conversion whenever a scan recorded depth but not one usable cell. It now matches the guarded ceiling line beside it, so the value is a genuine 0...1 ratio.
+PrePass/PrePassSurvey.swift :: let degrees = Int(survey.medianAngularSpreadDegrees.rounded())  # SAFE: reached only inside `if survey.medianAngularSpreadDegrees < thresholds.lowAngularSpreadDegrees`, and NaN fails that comparison. The value is a median of `acos` results, so it is in 0...180.
+PrePass/PrePassSurvey.swift :: let centimetres = Int((survey.cameraHeightSpreadMeters * 100).rounded())  # SAFE: reached only inside `if survey.cameraHeightSpreadMeters < thresholds.lowCameraHeightSpreadMeters`, which excludes NaN and every large value. The field itself is written as `isFinite ? Swift.max(0, spread) : 0`.
+PrePass/PrePassSurvey.swift :: let percent = Int((glassAreaFraction * 100).rounded())  # SAFE: reached only inside `if glassAreaFraction >= thresholds.notableGlassFraction`, which excludes NaN, and the value is a fraction of counted depth samples, so it is in 0...1.
+PrePass/PrePassSurvey.swift :: if value == value.rounded() { return String(Int(value.rounded())) }  # FIXED 2026-09-06, now SAFE: the guard was `value.isFinite` alone, which lets through every finite Float up to 3.4e38 while `Int(_: Float)` traps above 9.2e18. Widened to `value.isFinite, value.magnitude < 1_000_000`, the same correction `ProcessingFormat.meters` needed.
 
 # ---------------------------------------------------------------------------
 # Smart
 # ---------------------------------------------------------------------------
-Smart/NativeDepthEdgeClassifier.swift:436  # SAFE: `sy` is `Float(image.width or height) / Float(width or height)` where both are validated image dimensions (`width > 1, height > 1` is thrown on at line 76), and `y < height` bounds the product by the image height. Integer-derived throughout.
-Smart/NativeDepthEdgeClassifier.swift:438  # SAFE: the x axis of the same box filter, same reasoning against `sx`.
-Smart/SmartAuthorityMap.swift:841  # SAFE: reached only inside `if confirmedGlass >= Self.glassDominatedFraction`, which excludes NaN, and `confirmedFraction` is a count over a non-empty verdict array, so it is in 0...1.
-Smart/SmartCore.swift:392  # SAFE: `simd_clamp` is `fmin(fmax(...))`, which Apple documents as returning the non-NaN operand, so it is the absorbing form and a NaN percentile clamps to 0. The result is bounded by `v.count - 1`.
-Smart/TwoScaleTrustField.swift:775  # SAFE: `total` is an iteration count with `guard total > 0` on the line above, so this is an integer times 0.35 and is further capped at 7000 on the same line.
+Smart/NativeDepthEdgeClassifier.swift :: let y0 = Int(Float(y) * sy), y1 = Swift.max(y0 + 1, Int(Float(y + 1) * sy))  # SAFE: `sy` is `Float(image.width or height) / Float(width or height)` where both are validated image dimensions (`width > 1, height > 1` is thrown on at line 76), and `y < height` bounds the product by the image height. Integer-derived throughout.
+Smart/NativeDepthEdgeClassifier.swift :: let x0 = Int(Float(x) * sx), x1 = Swift.max(x0 + 1, Int(Float(x + 1) * sx))  # SAFE: the x axis of the same box filter, same reasoning against `sx`.
+Smart/SmartAuthorityMap.swift :: let percent = Int((confirmedGlass * 100).rounded())  # SAFE: reached only inside `if confirmedGlass >= Self.glassDominatedFraction`, which excludes NaN, and `confirmedFraction` is a count over a non-empty verdict array, so it is in 0...1.
+Smart/SmartCore.swift :: let idx = Int((Float(v.count - 1) * simd_clamp(p, 0, 1)).rounded())  # SAFE: `simd_clamp` is `fmin(fmax(...))`, which Apple documents as returning the non-NaN operand, so it is the absorbing form and a NaN percentile clamps to 0. The result is bounded by `v.count - 1`.
+Smart/TwoScaleTrustField.swift :: let strongEnd = Swift.min(Int(Float(total) * 0.35), 7000)  # SAFE: `total` is an iteration count with `guard total > 0` on the line above, so this is an integer times 0.35 and is further capped at 7000 on the same line.
 
 # ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
-Trainer/MetalSplatTrainer.swift:766  # SAFE: guarded by `spacingMetres.isFinite, spacingMetres > 0` and then run through `TrainerMath.clamp(..., 0, 1_000_000)`, which is `simd_clamp` and therefore absorbs NaN and infinity from either side.
-Trainer/MetalSplatTrainer.swift:922  # SAFE: `sliceFraction` is `Float(slice.iterationBudget) / Float(Swift.max(governor.ceiling.iterations, 1))`, a ratio of two integers with a divisor that cannot be zero.
-Trainer/MetalSplatTrainer.swift:1007  # FIXED 2026-09-06, now SAFE: was `Swift.max(sampleIntervalSeconds, 1)`, the propagating order. Now `Swift.min(60, Swift.max(1, ...))` with the literals first, so a NaN poll interval becomes 1 second and the sleep is at most 60 seconds.
-Trainer/MetalSplatTrainer.swift:1734  # SAFE: `totalIterations` is an Int and `tuning.warmupFraction` is a `Float = 0.15` on `TrainerTuning`, which is `Sendable` and not `Codable`, so nothing decodes it from disk.
-Trainer/MetalSplatTrainer.swift:1834  # SAFE: `shGate` is `TrainerMath.clamp(..., 0, 1)`, which is `simd_clamp` and absorbs NaN, and its input is `Float(iteration) / Float(Swift.max(totalIterations, 1))`, a ratio of integers.
-Trainer/TrainerBudget.swift:403  # SAFE: `current.splatCap` is an Int and 0.75 is a literal, so the product is a quarter under an existing splat count.
-Trainer/TrainerBudget.swift:419  # SAFE: `current.iterations` is an Int and 0.8 is a literal.
-Trainer/TrainerBudget.swift:475  # SAFE: `reading.availableBytes` is a measured UInt64 and `memoryUseFraction` is `private let Float = 0.6`, so the product is well inside UInt64 for any real memory reading.
-Trainer/TrainerBudget.swift:485  # SAFE: UInt64 arithmetic, not a float. `safeBytes > pixelBytes` and `perSplat > 0` are both guarded on the line above, and dividing by bytes-per-splat brings the result far below Int.max.
-Trainer/TrainerBudget.swift:551  # SAFE: the iterations rung of the memory ladder, the same `Int * literal` shape as line 419.
-Trainer/TrainerBudget.swift:570  # SAFE: `budgetCeiling` is a UInt64 memory reading and `memoryUseFraction` is the 0.6 constant.
-Trainer/TrainerBudget.swift:579  # SAFE: UInt64 arithmetic with `usable > pixelBytes` guarded above and a divisor forced to at least 1 by `Swift.max(..., 1)`.
-Trainer/TrainerBudget.swift:605  # SAFE: three integer image dimensions, with `sourceLong > 0, sourceShort > 0` guarded four lines above, so the divisor cannot be zero.
-Trainer/TrainerDensifier.swift:411  # SAFE: `splatCap` is an Int and `maxGrowthFractionPerPass` is a `TrainerTuning` default (Sendable, never decoded), so the product is bounded by the cap.
-Trainer/TrainerDensifier.swift:420  # SAFE: `splatCount` is an Int and `maxRelocationFractionPerPass` is the same kind of in-code tuning constant.
-Trainer/TrainerDensifier.swift:734  # SAFE: `liveCount` is an Int and `pruneMaxFractionPerPass` is a `SmartLossSettings` field. That type is `Codable` for the census wire only: it is constructed exclusively from `.default` and `.economy` in code, and nothing anywhere decodes it.
-Trainer/TrainerInitializer.swift:173  # SAFE: guarded on the line above by `medianSpacingMeters > 0, medianSpacingMeters < 1_000`, which rejects NaN as well as an out-of-range magnitude.
-Trainer/TrainerInitializer.swift:637  # SAFE: `clamped` is `Swift.max(0, Swift.min(1, q))`, literals first in both, so it is in 0...1 for every input, and the product is bounded by `trustScores.count - 1`.
-Trainer/TrainerSlices.swift:167  # SAFE: `share` is `Float(frames.count) / Float(totalAssigned)` with `guard totalAssigned > 0` fifteen lines above, and `budget.iterations` is an Int.
-Trainer/TrainerSlices.swift:168  # SAFE: the same `share`, applied to the integer `budget.splatCap`.
-Trainer/TrainerSlices.swift:221  # SAFE: `fraction` is `tuning.heldOutFraction`, a `Float = 0.05` on the non-Codable `TrainerTuning`, and `guard fraction > 0` is on the line above. The reciprocal is 20.
-Trainer/TrainerSupervision.swift:333  # SAFE: every term is an integer cast to Float, and the divisor `depthWidth` cannot be zero here because the enclosing `for u in 0..<depthWidth` would not run.
-Trainer/TrainerSupervision.swift:334  # SAFE: the same rescale on the other axis, with `depthHeight` non-zero for the same reason.
+Trainer/MetalSplatTrainer.swift :: census.slices[censusRow].seedMedianSpacingMillimetres = Int(millimetres.rounded())  # SAFE: guarded by `spacingMetres.isFinite, spacingMetres > 0` and then run through `TrainerMath.clamp(..., 0, 1_000_000)`, which is `simd_clamp` and therefore absorbs NaN and infinity from either side.
+Trainer/MetalSplatTrainer.swift :: Int(Float(governor.current.iterations) * sliceFraction)  # SAFE: `sliceFraction` is `Float(slice.iterationBudget) / Float(Swift.max(governor.ceiling.iterations, 1))`, a ratio of two integers with a divisor that cannot be zero.
+Trainer/MetalSplatTrainer.swift :: try await Task.sleep(nanoseconds: UInt64(pollSeconds * 1_000_000_000))  # FIXED 2026-09-06, now SAFE: was `Swift.max(sampleIntervalSeconds, 1)`, the propagating order. Now `Swift.min(60, Swift.max(1, ...))` with the literals first, so a NaN poll interval becomes 1 second and the sleep is at most 60 seconds.
+Trainer/MetalSplatTrainer.swift :: let warmupEnd = Int(Float(totalIterations) * tuning.warmupFraction)  # SAFE: `totalIterations` is an Int and `tuning.warmupFraction` is a `Float = 0.15` on `TrainerTuning`, which is `Sendable` and not `Codable`, so nothing decodes it from disk.
+Trainer/MetalSplatTrainer.swift :: let activeCoefficients = 1 + Int(Float(shCoefficientCount - 1) * shGate)  # SAFE: `shGate` is `TrainerMath.clamp(..., 0, 1)`, which is `simd_clamp` and absorbs NaN, and its input is `Float(iteration) / Float(Swift.max(totalIterations, 1))`, a ratio of integers.
+Trainer/TrainerBudget.swift :: Int(Float(current.splatCap) * 0.75),  # SAFE: `current.splatCap` is an Int and 0.75 is a literal, so the product is a quarter under an existing splat count.
+Trainer/TrainerBudget.swift :: let iterationTarget = Swift.max(Int(Float(current.iterations) * 0.8), 200)  # SAFE: `current.iterations` is an Int and 0.8 is a literal.
+Trainer/TrainerBudget.swift :: safeBytes = UInt64(Float(reading.availableBytes) * memoryUseFraction * 0.9)  # SAFE: `reading.availableBytes` is a measured UInt64 and `memoryUseFraction` is `private let Float = 0.6`, so the product is well inside UInt64 for any real memory reading.
+Trainer/TrainerBudget.swift :: let affordable = Int((safeBytes - pixelBytes) / perSplat)  # SAFE: UInt64 arithmetic, not a float. `safeBytes > pixelBytes` and `perSplat > 0` are both guarded on the line above, and dividing by bytes-per-splat brings the result far below Int.max.
+Trainer/TrainerBudget.swift :: let iterationTarget = Swift.max(Int(Float(current.iterations) * 0.8), 200)  # SAFE: the iterations rung of the memory ladder, the same `Int * literal` shape as line 419.
+Trainer/TrainerBudget.swift :: let usable = UInt64(Float(budgetCeiling) * memoryUseFraction)  # SAFE: `budgetCeiling` is a UInt64 memory reading and `memoryUseFraction` is the 0.6 constant.
+Trainer/TrainerBudget.swift :: let affordable = Int((usable - pixelBytes) / perSplat)  # SAFE: UInt64 arithmetic with `usable > pixelBytes` guarded above and a divisor forced to at least 1 by `Swift.max(..., 1)`.
+Trainer/TrainerBudget.swift :: Int((Float(effectiveLong) * Float(sourceShort) / Float(sourceLong)).rounded()), 1  # SAFE: three integer image dimensions, with `sourceLong > 0, sourceShort > 0` guarded four lines above, so the divisor cannot be zero.
+Trainer/TrainerDensifier.swift :: ? Swift.min(headroom, Int(Float(splatCap) * tuning.maxGrowthFractionPerPass))  # SAFE: `splatCap` is an Int and `maxGrowthFractionPerPass` is a `TrainerTuning` default (Sendable, never decoded), so the product is bounded by the cap.
+Trainer/TrainerDensifier.swift :: ? Swift.max(Int(Float(splatCount) * tuning.maxRelocationFractionPerPass), 0)  # SAFE: `splatCount` is an Int and `maxRelocationFractionPerPass` is the same kind of in-code tuning constant.
+Trainer/TrainerDensifier.swift :: let capOnDeletes = Swift.max(Int(Float(liveCount) * settings.pruneMaxFractionPerPass), 1)  # SAFE: `liveCount` is an Int and `pruneMaxFractionPerPass` is a `SmartLossSettings` field. That type is `Codable` for the census wire only: it is constructed exclusively from `.default` and `.economy` in code, and nothing anywhere decodes it.
+Trainer/TrainerInitializer.swift :: let millimetres = Int((medianSpacingMeters * 1000).rounded())  # SAFE: guarded on the line above by `medianSpacingMeters > 0, medianSpacingMeters < 1_000`, which rejects NaN as well as an out-of-range magnitude.
+Trainer/TrainerInitializer.swift :: Swift.max(0, Int(Float(trustScores.count - 1) * clamped))  # SAFE: `clamped` is `Swift.max(0, Swift.min(1, q))`, literals first in both, so it is in 0...1 for every input, and the product is bounded by `trustScores.count - 1`.
+Trainer/TrainerSlices.swift :: let iterations = Swift.max(Int(Float(budget.iterations) * share), 200)  # SAFE: `share` is `Float(frames.count) / Float(totalAssigned)` with `guard totalAssigned > 0` fifteen lines above, and `budget.iterations` is an Int.
+Trainer/TrainerSlices.swift :: let capShare = Swift.max(Int(Float(budget.splatCap) * share), 20_000)  # SAFE: the same `share`, applied to the integer `budget.splatCap`.
+Trainer/TrainerSlices.swift :: let step = Swift.max(Int(1 / fraction), 2)  # SAFE: `fraction` is `tuning.heldOutFraction`, a `Float = 0.05` on the non-Codable `TrainerTuning`, and `guard fraction > 0` is on the line above. The reciprocal is 20.
+Trainer/TrainerSupervision.swift :: let px = Int((Float(u) + 0.5) * Float(size.width) / Float(depthWidth))  # SAFE: every term is an integer cast to Float, and the divisor `depthWidth` cannot be zero here because the enclosing `for u in 0..<depthWidth` would not run.
+Trainer/TrainerSupervision.swift :: let py = Int((Float(v) + 0.5) * Float(size.height) / Float(depthHeight))  # SAFE: the same rescale on the other axis, with `depthHeight` non-zero for the same reason.
 
 # ---------------------------------------------------------------------------
 # Viewer
 # ---------------------------------------------------------------------------
-Viewer/ObservedDirectionField.swift:145  # SAFE: `rel.x >= 0` and `rel.y >= 0` and `rel.z >= 0` reject negatives AND NaN (NaN compares false), `.isFinite` is checked as well, and `rel < maxCoord` rejects infinity and anything past the encodable range.
-Viewer/ObservedDirectionField.swift:542  # SAFE: the same guard shape, `rel >= 0` rejecting NaN and negatives and `rel < maxCoordinate` rejecting infinity, on all three axes before the conversion.
-Viewer/ScanCensus.swift:1610  # SAFE: `fraction` is `Double(part) / Double(whole)` with `guard whole > 0` on the line above, so it is a finite ratio of two counts.
-Viewer/ViewerSupport.swift:272  # SAFE: only `isFinite` components are summed, `guard strength.isFinite, strength > 1e-8` rejects both the NaN and the infinite case, and `atan2` of two finite values is in -pi...pi, so the result is in -2...2.
+Viewer/ObservedDirectionField.swift :: return SIMD3<UInt32>(UInt32(rel.x), UInt32(rel.y), UInt32(rel.z))  # SAFE: `rel.x >= 0` and `rel.y >= 0` and `rel.z >= 0` reject negatives AND NaN (NaN compares false), `.isFinite` is checked as well, and `rel < maxCoord` rejects infinity and anything past the encodable range.
+Viewer/ObservedDirectionField.swift :: SIMD3<UInt32>(UInt32(rel.x), UInt32(rel.y), UInt32(rel.z))  # SAFE: the same guard shape, `rel >= 0` rejecting NaN and negatives and `rel < maxCoordinate` rejecting infinity, on all three axes before the conversion.
+Viewer/ScanCensus.swift :: let percent = Int((fraction * 100).rounded())  # SAFE: `fraction` is `Double(part) / Double(whole)` with `guard whole > 0` on the line above, so it is a finite ratio of two counts.
+Viewer/ViewerSupport.swift :: let turns = Int((-angle / (Float.pi / 2)).rounded())  # SAFE: only `isFinite` components are summed, `guard strength.isFinite, strength > 1e-8` rejects both the NaN and the infinite case, and `atan2` of two finite values is in -pi...pi, so the result is in -2...2.
