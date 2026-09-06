@@ -221,6 +221,19 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
     /// The last completed result, for a caller that missed the stream.
     public private(set) var lastResult: PrePassResult?
 
+    /// THE SPLAT CENSUS: what every stage of the last run counted about
+    /// itself. Also written to `prepass/census.json`, and readable later with
+    /// `PrePassCensus.read(at:)`.
+    ///
+    /// It is a separate object from `lastResult` because `PrePassResult` lives
+    /// in `Sources/Core`, which this module does not own. Nothing outside this
+    /// module had to change to make room for the census, and nothing outside
+    /// this module can break by ignoring it.
+    ///
+    /// Set once, at the end of the pass, from counters the stages kept. See
+    /// `PrePassCensus` for why this exists at all.
+    public private(set) var lastCensus: PrePassCensus?
+
     private let log = Logger(
         subsystem: BrandConfig.loggingSubsystem, category: "PrePass"
     )
@@ -312,6 +325,17 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
         emit: (PrePassResult) -> Void
     ) async throws {
         report(.preparing)
+        let startedAt = Date()
+        // The census is built up as the stages run and written ONCE at the
+        // end, next to the result. Nothing in a hot loop touches it.
+        var census = PrePassCensus()
+        census.scanID = bundle.scanID
+        census.input = inputCensus(bundle: bundle)
+        // Published immediately, so a pass that dies halfway leaves THIS run's
+        // input counts and a set of stages marked "not attempted", rather than
+        // the previous run's numbers. A stale census would be worse than none.
+        lastCensus = census
+
         try FileManager.default.createDirectory(
             at: ref.url(forRelativePath: PrePassPaths.directory),
             withIntermediateDirectories: true
@@ -387,11 +411,20 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
                 )
             )
         }
+        census.timeOffset = poseRefiner.lastTimeOffsetCensus
+        if timeOffset == nil, let carried = bundle.cameraToIMUTimeOffsetSeconds {
+            // The capture measured one and the pre-pass did not. Later stages
+            // read it off the bundle, so the census has to say so, otherwise
+            // it reports "none" while the pass quietly uses a number.
+            census.timeOffset.settledSeconds = carried
+            census.timeOffset.source = "carriedFromCapture"
+        }
 
         // --- 3. Revisits.
         try Task.checkCancellation()
         report(.revisits)
         var revisits: [RevisitPair] = []
+        var revisitsCameFromCapture = false
         do {
             revisits = try await poseRefiner.detectRevisits(
                 bundle: bundle, submaps: submaps, at: ref
@@ -399,6 +432,7 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
         } catch is CancellationError {
             throw NimbusError.cancelled
         } catch {
+            revisitsCameFromCapture = true
             // Fall back to whatever the capture itself logged. Losing loop
             // closures costs accuracy; it must not cost the whole pass.
             revisits = bundle.revisitPairs
@@ -412,7 +446,30 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
                 )
             )
         }
-        if revisits.isEmpty { revisits = bundle.revisitPairs }
+        if revisits.isEmpty, !bundle.revisitPairs.isEmpty {
+            revisits = bundle.revisitPairs
+            revisitsCameFromCapture = true
+        }
+        census.revisits = poseRefiner.lastRevisitCensus
+        census.revisits.usedCaptureFallback = revisitsCameFromCapture
+        if revisitsCameFromCapture {
+            // The counts from the detector describe a run whose answer was
+            // then thrown away. What the rest of the pass actually got is the
+            // capture's own list, so that is what the census reports.
+            census.revisits.pairsReturned = revisits.count
+            let fallbackConfirmed = revisits.filter {
+                $0.method == .depthICP && $0.confidence > 0.2
+            }
+            census.revisits.confirmedPairs = fallbackConfirmed.count
+            if !fallbackConfirmed.isEmpty {
+                census.revisits.medianConfidence = PrePassStats.median(
+                    fallbackConfirmed.map { $0.confidence }
+                )
+                census.revisits.medianTranslationResidualCentimeters = PrePassStats.median(
+                    fallbackConfirmed.map { $0.translationResidualMeters * 100 }
+                )
+            }
+        }
 
         // --- 4. The submap pose graph.
         try Task.checkCancellation()
@@ -423,6 +480,7 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
             revisits: revisits,
             timeOffsetSeconds: timeOffset
         )
+        census.poseGraph = poseRefiner.lastPoseGraphCensus
 
         // --- 4b. Optional LiDAR-anchored, triangulation-free refinement.
         //
@@ -434,6 +492,7 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
         if tuning.useLiDARAnchoredBundleAdjustment {
             try Task.checkCancellation()
             report(.fineRefinement)
+            census.poseGraph.fineRefinementRan = true
             do {
                 let adjusted = try PrePassBundleAdjuster.refine(
                     bundle: bundle,
@@ -443,10 +502,13 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
                     trustWeight: { _, _ in 1 }
                 )
                 if adjusted.accepted { refinedPoses = adjusted.poses }
+                census.poseGraph.fineRefinementAccepted = adjusted.accepted
+                census.poseGraph.fineRefinementNote = adjusted.note
                 log.info("Fine refinement: \(adjusted.note, privacy: .public)")
             } catch is CancellationError {
                 throw NimbusError.cancelled
             } catch {
+                census.poseGraph.fineRefinementNote = "did not finish"
                 stageFindings.append(
                     QCFinding(
                         code: "fine_refinement_failed",
@@ -601,6 +663,10 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
                     consequence: "Floating specks will not be cleaned up automatically."
                 ))
             }
+            // Read on both paths. The carver resets its counters at the start
+            // of every carve, so even a carve that threw halfway reports how
+            // far it got rather than the previous run's numbers.
+            census.carving = carver.lastCensus
         }
 
         // --- 6. F6 trust fields.
@@ -695,6 +761,12 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
         if tuning.buildInitialSplats {
             try Task.checkCancellation()
             report(.initialSplats)
+            // Filled by the builder as it goes, and kept even when the builder
+            // throws: the run where no seed survived is the run whose funnel
+            // matters most, and a thrown error must not take it with it.
+            var seedingCensus = PrePassCensus.Seeding()
+            seedingCensus.trustFieldLoaded = trustLoaded
+            seedingCensus.edgeMapsLoaded = edgesLoaded
             do {
                 let area = Float(survey.surfaceCellCount)
                     * survey.voxelSizeMeters * survey.voxelSizeMeters
@@ -717,7 +789,8 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
                         edgesLoaded ? classifier.map(for: frame) : []
                     },
                     surfaceAreaSquareMeters: area,
-                    targetSplatCount: budget.splatCap
+                    targetSplatCount: budget.splatCap,
+                    census: &seedingCensus
                 )
                 result.initialSplats = splats.ref
 
@@ -757,6 +830,52 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
                         + "which takes longer and comes out softer."
                 ))
             }
+            census.seeding = seedingCensus
+        }
+
+        // --- The census, finished and turned into findings.
+        //
+        // The alarms go onto the QC card the owner already looks at, so a
+        // stage that produced nothing says so on the screen he opens after
+        // every scan, rather than waiting to be found in a JSON file.
+        census.recordedAt = Date()
+        census.durationSeconds = Date().timeIntervalSince(startedAt)
+        // Two alarms would repeat a finding this pipeline already adds in
+        // plainer words. One card, one sentence per problem.
+        let alreadySaid: [String: String] = [
+            "census_carving_capped": "occupancy_capped",
+            "census_no_trust_field": "splats_untrusted"
+        ]
+        let existingCodes = Set(stageFindings.map { $0.code })
+        let alarms = census.alarms
+        for alarm in alarms {
+            if let duplicate = alreadySaid[alarm.code], existingCodes.contains(duplicate) {
+                continue
+            }
+            stageFindings.append(
+                QCFinding(
+                    code: alarm.code,
+                    severity: .problem,
+                    message: alarm.message,
+                    fixHint: alarm.fixHint
+                )
+            )
+        }
+        lastCensus = census
+        log.info("Census: \(census.headline, privacy: .public)")
+        for alarm in alarms {
+            // Built as a plain String first: an os.Logger message is a literal
+            // with its own interpolation type and two of them cannot be joined
+            // with `+`.
+            let line = "Census alarm \(alarm.code): \(alarm.message)"
+            log.error("\(line, privacy: .public)")
+        }
+        do {
+            try census.write(at: ref)
+        } catch {
+            // A report about the work must never be able to fail the work.
+            let reason = error.localizedDescription
+            log.error("The census could not be written: \(reason, privacy: .public)")
         }
 
         // --- Write the index and finish.
@@ -779,6 +898,44 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
     }
 
     // MARK: - Pieces
+
+    /// What arrived from capture, counted here rather than in `Sources/Capture`.
+    ///
+    /// These are the numbers THE PRE-PASS SAW, which is the only version that
+    /// can explain the pre-pass's own output. A frame the capture wrote whose
+    /// depth sidecar never landed on disk is invisible in a capture-side count
+    /// and obvious here, and the difference between those two counts is
+    /// exactly the kind of thing that used to take a day to find.
+    private func inputCensus(bundle: CaptureBundle) -> PrePassCensus.Input {
+        var input = PrePassCensus.Input()
+        input.framesInBundle = bundle.frames.count
+        for frame in bundle.frames {
+            if frame.depthPath != nil { input.framesWithDepthPath += 1 }
+            if frame.confidencePath != nil { input.framesWithConfidencePath += 1 }
+            switch frame.qc.trackingQuality {
+            case .notAvailable: input.framesTrackingNotAvailable += 1
+            case .normal: input.framesTrackingNormal += 1
+            default: break
+            }
+        }
+        // From the extremes rather than from the first and last elements: the
+        // array is not guaranteed to be in time order and a negative duration
+        // would be a lie rather than a measurement.
+        var earliest = Double.greatestFiniteMagnitude
+        var latest = -Double.greatestFiniteMagnitude
+        for frame in bundle.frames {
+            earliest = Swift.min(earliest, frame.timestampSeconds)
+            latest = Swift.max(latest, frame.timestampSeconds)
+        }
+        let span = latest - earliest
+        input.captureDurationSeconds = span.isFinite && span > 0 ? span : 0
+        input.depthWidth = bundle.settings.depthWidth
+        input.depthHeight = bundle.settings.depthHeight
+        input.lidarMaxRangeMeters = bundle.settings.lidarMaxRangeMeters
+        input.depthSamplesAvailable = input.framesWithDepthPath
+            * Swift.max(input.depthWidth, 0) * Swift.max(input.depthHeight, 0)
+        return input
+    }
 
     /// Drift, in centimetres, preferring the measured revisit residual and
     /// falling back to the free anchor difference (F8). `nil` when neither

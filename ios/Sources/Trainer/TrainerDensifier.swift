@@ -45,6 +45,15 @@ import simd
 
 /// What one densification pass did. Every number is a count of something that
 /// actually happened, so the log and the progress message can be specific.
+///
+/// The second block exists for the census (TrainerCensus.swift). A pass that
+/// adds nothing is not evidence of anything on its own: it could be a full
+/// budget, a shut window, or a scoring stage that produced no candidates at
+/// all, and those are a normal run, a schedule bug and a units bug
+/// respectively. Recording WHY there was nothing to add is what turns "zero
+/// splats created" from a shrug into a diagnosis. Every one of these is a
+/// value this function already computed; none of them costs an extra pass over
+/// the buffers and none of them touches the GPU.
 struct TrainerDensifyOutcome {
     var splatCountBefore = 0
     var splatCountAfter = 0
@@ -56,6 +65,33 @@ struct TrainerDensifyOutcome {
     var prunedNonFinite = 0
     var carvedFromEmptySpace = 0
     var trimmedToCap = 0
+
+    // --- Why this pass could or could not do anything -----------------------
+
+    /// The flags this pass was called with, echoed back so one census row is
+    /// self-contained rather than needing the caller's state to interpret.
+    var growthAllowed = false
+    var pruneAllowed = false
+    /// True when a carver was handed in, which is the only case where free
+    /// space may delete anything.
+    var carveAttempted = false
+    /// The wall this pass was working against, and the room under it.
+    var splatCapInForce = 0
+    var headroomAtStart = 0
+    /// How many the pass was permitted to create, after the cap and the
+    /// per-pass growth fraction. Zero here with an open window is a budget
+    /// problem; non-zero here with nothing added is a scoring problem.
+    var growthAllowance = 0
+    /// How many Gaussians were scored at all.
+    var splatsScored = 0
+    /// How many of those scored above zero, and how many of THOSE survived the
+    /// "something actually looked at it" filter and became candidates.
+    var splatsWithNonZeroScore = 0
+    var candidatesAfterVisibilityFilter = 0
+    /// How many Gaussians were faint or unseen enough to be relocation donors.
+    /// Only counted on the relocation path, which is the only place it is
+    /// computed.
+    var relocationDonorsAvailable = 0
 
     var changedTopology: Bool {
         cloned + split + prunedLowOpacity + prunedOversized
@@ -118,6 +154,14 @@ final class TrainerDensifier {
         var outcome = TrainerDensifyOutcome()
         outcome.splatCountBefore = splatCount
         outcome.splatCountAfter = splatCount
+        // Recorded before the early return, so a pass that did nothing because
+        // there was nothing there still says so in the census rather than
+        // arriving as a row of zeroes with no explanation.
+        outcome.growthAllowed = allowGrowth
+        outcome.pruneAllowed = allowPrune
+        outcome.carveAttempted = carver != nil
+        outcome.splatCapInForce = splatCap
+        outcome.headroomAtStart = Swift.max(splatCap - splatCount, 0)
         guard splatCount > 0 else { return outcome }
 
         let shPerSplat = resources.shFloatsPerSplat
@@ -139,6 +183,11 @@ final class TrainerDensifier {
         // AbsGS mean magnitude per observation. A Gaussian nothing looked at
         // this interval scores zero rather than infinity.
         var score = [Float](repeating: 0, count: splatCount)
+        // Set here rather than at the top of the function on purpose: a pass
+        // that returned early because the buffers read short scored NOTHING,
+        // and recording it as "scored everything, nothing passed" would make a
+        // failed read look identical to a dead gradient signal.
+        outcome.splatsScored = splatCount
         for i in 0..<splatCount {
             let denominator = Swift.max(stats[i].denom, 1)
             let value = stats[i].absGrad2D / denominator
@@ -177,18 +226,26 @@ final class TrainerDensifier {
         // said the design was ("the threshold is a floor, not the operating
         // point. The real cut is the best N that fit").
         var candidates: [Int] = []
+        var scoredAboveZero = 0
         for i in 0..<splatCount where score[i] > 0 {
+            scoredAboveZero += 1
             // A Gaussian nothing has seen has nothing to say about where
             // detail is missing.
             if stats[i].visAccum <= 0 { continue }
             candidates.append(i)
         }
         candidates.sort { score[$0] > score[$1] }
+        // Two counts, not one: "nothing scored" and "everything that scored
+        // was invisible" are different faults with different fixes, and a
+        // single "candidates: 0" cannot tell them apart.
+        outcome.splatsWithNonZeroScore = scoredAboveZero
+        outcome.candidatesAfterVisibilityFilter = candidates.count
 
         let headroom = Swift.max(splatCap - splatCount, 0)
         let growthAllowance = allowGrowth
             ? Swift.min(headroom, Int(Float(splatCap) * tuning.maxGrowthFractionPerPass))
             : 0
+        outcome.growthAllowance = growthAllowance
 
         var newSplats: [TrainerSplat] = []
         var newSH: [Float] = []
@@ -275,6 +332,7 @@ final class TrainerDensifier {
             }
             donors.sort { TrainerMath.sigmoid(splats[$0].opacityLogit)
                 < TrainerMath.sigmoid(splats[$1].opacityLogit) }
+            outcome.relocationDonorsAvailable = donors.count
 
             let allowance = Swift.min(
                 donors.count,

@@ -71,6 +71,21 @@ struct ScanSummary: Identifiable, Sendable {
     /// broken is visibly broken.
     var problem: String?
 
+    /// Everything the splat census needs, read off disk at the same time as
+    /// the rest of this row and kept as a plain value.
+    ///
+    /// Defaulted so that adding it did not change a single existing call site,
+    /// and so that a summary built by anything that does not know about the
+    /// census produces "nothing has been read yet" rather than a row of zeros.
+    var censusInputs: ScanCensus.Inputs = ScanCensus.Inputs()
+
+    /// Where this scan's geometry went, worked out from `censusInputs`.
+    ///
+    /// Computed rather than stored: making one touches no files (see
+    /// `ScanCensus.make`), and a stored copy would be one more thing that can
+    /// disagree with the numbers it was derived from.
+    var census: ScanCensus { ScanCensus.make(censusInputs) }
+
     var paths: ViewerScanPaths { ViewerScanPaths(scanID: scanID, root: rootURL) }
     var ref: CaptureBundleRef { CaptureBundleRef(scanID: scanID, rootURL: rootURL) }
 
@@ -204,12 +219,33 @@ enum ScanLibraryReader {
                         "This scan is in format version \(bundle.formatVersion); "
                         + "this version of the app understands version "
                         + "\(CaptureBundle.currentFormatVersion)."
+                    summary.censusInputs.captureIndexProblem = summary.problem
                     return summary
                 }
                 summary.displayName = bundle.displayName.isEmpty ? scanID : bundle.displayName
                 summary.createdAt = bundle.createdAt
                 summary.frameCount = bundle.frames.count
                 summary.sceneBounds = bundle.sceneBounds
+
+                // The census's photo rungs. Counted here rather than later
+                // because the frames are already decoded and in memory at this
+                // exact moment; re-reading a 4000-frame index to count two
+                // things would be the expensive way round.
+                //
+                // "Contributing" is `FrameQC.weight > 0`, and that is Core's
+                // own definition rather than a rule invented here: the header
+                // on that field says a zero weight "contributes nothing
+                // photometric", and `TrainerSupervision` multiplies every
+                // sample weight by it, so a zero-weight photo genuinely cannot
+                // move a single Gaussian.
+                summary.censusInputs.hasCaptureIndex = true
+                summary.censusInputs.frameCount = bundle.frames.count
+                summary.censusInputs.contributingPhotoCount = bundle.frames.reduce(into: 0) {
+                    $0 += ($1.qc.weight > 0 ? 1 : 0)
+                }
+                summary.censusInputs.lostTrackingPhotoCount = bundle.frames.reduce(into: 0) {
+                    $0 += ($1.qc.trackingQuality == .normal ? 0 : 1)
+                }
                 if let first = bundle.frames.first, let last = bundle.frames.last {
                     summary.durationSeconds = Swift.max(
                         0,
@@ -238,13 +274,38 @@ enum ScanLibraryReader {
         // version this build does not know reads as "not checked over" rather
         // than being decoded on a guess (docs/DATA_FORMAT.md section 9).
         if let data = try? Data(contentsOf: paths.prePassResultJSON),
-           let prePass = try? decoder.decode(PrePassResult.self, from: data),
-           prePass.formatVersion == PrePassResult.currentFormatVersion {
-            summary.hasPrePass = true
-            summary.coverageFraction = prePass.qcCard.coverageFraction
-            summary.qcFindingCount = prePass.qcCard.findings.count
-            summary.worstFindingSeverity = worstSeverity(prePass.qcCard.findings)
+           let prePass = try? decoder.decode(PrePassResult.self, from: data) {
+            if prePass.formatVersion == PrePassResult.currentFormatVersion {
+                summary.hasPrePass = true
+                summary.coverageFraction = prePass.qcCard.coverageFraction
+                summary.qcFindingCount = prePass.qcCard.findings.count
+                summary.worstFindingSeverity = worstSeverity(prePass.qcCard.findings)
+
+                summary.censusInputs.hasPrePass = true
+                summary.censusInputs.seedSplatCount = prePass.initialSplats?.splatCount
+                summary.censusInputs.suggestedBudget = prePass.suggestedBudget
+            } else {
+                // The version gate above is unchanged: a pre-pass this build
+                // does not understand still reads as "not checked over". What
+                // is new is that the census SAYS SO instead of quietly
+                // reporting no starting points, which would look identical to
+                // a check-over that produced none.
+                summary.censusInputs.prePassProblem =
+                    "The check-over saved with this scan is in format version "
+                    + "\(prePass.formatVersion), and this version of the app understands "
+                    + "version \(PrePassResult.currentFormatVersion)."
+            }
         }
+
+        // The two optional build records. Absent on every scan built so far,
+        // which the census states in words rather than filling in with zeros.
+        let prePassRecord = ScanCensus.readRecord(at: paths.prePassCensusJSON)
+        summary.censusInputs.prePassRecord = prePassRecord.record
+        summary.censusInputs.prePassRecordProblem = prePassRecord.problem
+
+        let trainRecord = ScanCensus.readRecord(at: paths.modelCensusJSON)
+        summary.censusInputs.trainRecord = trainRecord.record
+        summary.censusInputs.trainRecordProblem = trainRecord.problem
 
         // model/model.json - written last by whoever built the model, so it
         // existing means the build finished. The splat file it points at is
@@ -259,6 +320,9 @@ enum ScanLibraryReader {
             summary.hasModel = hasSplatFile
             summary.modelFileMissing = !hasSplatFile
             summary.modelSource = model.source
+            summary.censusInputs.hasModel = hasSplatFile
+            summary.censusInputs.modelFileMissing = !hasSplatFile
+            summary.censusInputs.modelSource = model.source
             // Only quoted when there is a file to back them up. Printing
             // "480k splats" for a model whose splat file has gone would be a
             // number about something that is not there.
@@ -266,6 +330,13 @@ enum ScanLibraryReader {
                 summary.splatCount = model.splatCount
                 summary.iterationsCompleted = model.iterationsCompleted
                 summary.heldOutPSNR = model.heldOutPSNR
+
+                summary.censusInputs.modelSplatCount = model.splatCount
+                summary.censusInputs.iterationsCompleted = model.iterationsCompleted
+                // The budget the run ACTUALLY ended on, which is the one number
+                // that betrays a ceiling that came down mid-run when it is put
+                // next to the pre-pass's suggestion.
+                summary.censusInputs.usedBudget = model.budgetUsed
             }
             let observed = model.observedDirectionsPath.map { paths.url($0) }
                 ?? paths.observedDirectionsBin

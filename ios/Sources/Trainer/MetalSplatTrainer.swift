@@ -360,6 +360,31 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
         let governor = TrainerBudgetGovernor(budget: budget)
 
+        // --- THE CENSUS -------------------------------------------------------
+        //
+        // Where this run's geometry goes, counted as it happens and written
+        // once at the end to `model/train_census.json`. See TrainerCensus.swift
+        // for why: four separate faults each destroyed most of the owner's
+        // first scan and not one of them logged, warned or failed.
+        //
+        // The write is in a `defer` on purpose. A run that THREW is the run you
+        // most want this for, and a run that was cancelled or stopped by heat
+        // is the second. Putting the write on the success path only would give
+        // us a census for exactly the runs that did not need one.
+        var census = TrainerCensus(scanID: bundle.scanID, requested: budget)
+        defer {
+            if census.outcome == TrainerCensus.unfinishedOutcome,
+               isCancelled || Task.isCancelled
+            {
+                census.outcome = "cancelled"
+            }
+            // Read at the last possible moment, so a budget the governor
+            // lowered on the way out is still the one that gets recorded.
+            census.budgetAsRun = TrainerCensusBudget(governor.current)
+            census.budgetReductions = governor.changes.map { TrainerCensusBudgetReduction($0) }
+            TrainerCensusWriter.write(census, at: ref)
+        }
+
         emit(
             progressTick(
                 stage: .preparing,
@@ -399,6 +424,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         TrainerLog.general.info(
             "Training \(slices.count) time slice(s) from \(keyframes.count) keyframes"
         )
+        census.keyframesSelected = keyframes.count
+        census.sliceCount = slices.count
 
         // --- Train each slice --------------------------------------------------
         var parts: [(slice: TrainerSlice, cloud: SplatCloud)] = []
@@ -419,7 +446,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 completedParts: mergedSoFar,
                 emit: emit,
                 iterationsRunSoFar: &totalIterationsRun,
-                heldOutPSNR: &lastPSNR
+                heldOutPSNR: &lastPSNR,
+                census: &census
             )
             parts.append((slice, cloud))
             mergedSoFar.append(cloud)
@@ -450,6 +478,22 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             TrainerLog.general.info("\(merged.report.summary, privacy: .public)")
         }
 
+        // The merge is the last place a Gaussian can quietly disappear, and on
+        // a multi-slice run it can delete a lot of them for a reason that is
+        // entirely correct (one owner per region) or entirely wrong (the
+        // regions do not match the geometry). The census cannot tell those
+        // apart, but it can put the number where somebody will see it.
+        let splatsHandedToMerge = parts.map { $0.cloud.count }
+        census.merge = TrainerCensusMerge(
+            splatsInPerSlice: splatsHandedToMerge,
+            splatsIn: splatsHandedToMerge.reduce(0, +),
+            kept: merged.report.kept,
+            droppedToAnotherOwner: merged.report.droppedToOtherOwners,
+            trimmedToCap: merged.report.trimmedToCap,
+            splatsOut: merged.cloud.count
+        )
+        census.finalSplatCount = merged.cloud.count
+
         lock.lock()
         latestSnapshot = merged.cloud
         lock.unlock()
@@ -470,6 +514,15 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         lock.unlock()
 
         releaseGPU()
+
+        // Set here rather than in the `defer`: reaching this line is the only
+        // thing that makes "completed" true.
+        // The same 95 per cent tolerance the census's own alert uses: slice
+        // iteration budgets are integer shares of the whole and round down, so
+        // a full run legitimately lands a few iterations short.
+        census.outcome = totalIterationsRun * 100 < governor.current.iterations * 95
+            ? "stopped early"
+            : "completed"
 
         emit(
             progressTick(
@@ -499,7 +552,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         completedParts: [SplatCloud],
         emit: @escaping @Sendable (TrainerProgress) -> Void,
         iterationsRunSoFar: inout Int,
-        heldOutPSNR: inout Float?
+        heldOutPSNR: inout Float?,
+        census: inout TrainerCensus
     ) async throws -> SplatCloud {
 
         guard let device, let queue, let pipelines else { throw TrainerError.noMetalDevice }
@@ -527,6 +581,24 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             forLongEdge: governor.current.renderLongEdgePixels,
             intrinsics: bundle.intrinsics
         )
+
+        // --- Census: open this slice's row now ---------------------------------
+        // Opened before anything can go wrong and filled in as the slice runs,
+        // so a slice that throws half way through still leaves behind
+        // everything it had managed to measure.
+        census.slices.append(
+            TrainerCensusSlice(
+                index: slice.index,
+                label: sliceLabel,
+                keyframesTrained: slice.keyframes.count,
+                keyframesHeldOut: slice.heldOutKeyframes.count,
+                splatCapAsked: slice.splatCapShare,
+                renderWidth: renderSize.width,
+                renderHeight: renderSize.height,
+                iterationsRequested: slice.iterationBudget
+            )
+        )
+        let censusRow = census.slices.count - 1
 
         emit(
             progressTick(
@@ -577,6 +649,23 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             settings: settings
         )
         TrainerLog.general.info("\(seedResult.summary, privacy: .public)")
+
+        // What the seeder actually produced, including the disc-versus-blob
+        // split, which is the seeder's trust gate made countable.
+        census.slices[censusRow].seedSource = seedResult.source
+        census.slices[censusRow].seedFramesUsed = seedResult.framesUsed
+        census.slices[censusRow].seedSamplesConsidered = seedResult.samplesConsidered
+        census.slices[censusRow].seedSamplesRejected = seedResult.samplesRejected
+        census.slices[censusRow].seedsPinnedAsDiscs = seedResult.seedsPinnedAsDiscs
+        census.slices[censusRow].seedsStretchedAlongRay = seedResult.seedsStretchedAlongRay
+        census.slices[censusRow].seedsBuilt = seedResult.seeds.count
+        census.slices[censusRow].seedMedianSpacingMillimetres =
+            Int((seedResult.medianSpacingMeters * 1000).rounded())
+        census.slices[censusRow].splatCapMeasuredAffordable = measuredCap
+        census.slices[censusRow].splatCapEffective = effectiveCap
+        census.slices[censusRow].renderWidth = renderSize.width
+        census.slices[censusRow].renderHeight = renderSize.height
+
         try checkCancellation()
 
         // --- Allocate ---------------------------------------------------------------
@@ -602,6 +691,15 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         var gpu = TrainerGPU(pipelines: pipelines, resources: resources)
 
         var splatCount = TrainerInitializer.upload(seedResult.seeds, into: resources)
+        // Recorded BEFORE the guard: "the seeder built 180,000 and 0 reached
+        // the GPU" is a different fault from "the seeder built 0", and the
+        // throw below cannot tell them apart on its own.
+        census.slices[censusRow].seedsUploaded = splatCount
+        // The flag is what tells `model/census.json` that the zero above is a
+        // measurement. A slice row is opened before seeding, so without it a
+        // run that died in allocation would report "the build started with 0
+        // points" as a confident fact about a number nobody took.
+        census.slices[censusRow].seedsUploadedCounted = true
         guard splatCount > 0 else {
             throw TrainerError.nothingToTrain("no starting points survived the memory budget")
         }
@@ -637,6 +735,38 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         var consecutivePauses = 0
         let maximumConsecutivePauses = 120
 
+        // --- Census: the gates, copied from the point of use --------------------
+        // Written from here, immediately above the loop that reads them, rather
+        // than from wherever the structs were built. A setting that is declared
+        // and never read looks exactly like a setting that works, and the only
+        // way to tell them apart on paper is to put the value next to the
+        // behaviour it is supposed to be producing.
+        if census.gates == nil {
+            census.gates = TrainerCensusGates(
+                densifyStartFraction: tuning.densifyStartFraction,
+                densifyEndFraction: tuning.densifyEndFraction,
+                densifyIntervalIterations: tuning.densifyIntervalIterations,
+                pruneStartFraction: settings.pruneStartFraction,
+                pruneEndFraction: settings.pruneEndFraction,
+                carveIntervalIterations: tuning.carveIntervalIterations,
+                // Zero, because zero is what `TrainerDensifier` compares
+                // against. See `TrainerCensusGates.densifyScoreFloor`:
+                // `tuning.absGradThreshold` is a leftover the densifier no
+                // longer reads, and printing it here would be a dead setting
+                // dressed up as a live one.
+                densifyScoreFloor: 0,
+                pruneOpacity: tuning.pruneOpacity,
+                pruneMaxWorldScaleFraction: tuning.pruneMaxWorldScaleFraction,
+                pruneMaxScreenRadiusPx: tuning.pruneMaxScreenRadiusPx,
+                maxGrowthFractionPerPass: tuning.maxGrowthFractionPerPass,
+                maxRelocationFractionPerPass: tuning.maxRelocationFractionPerPass,
+                pruneMaxFractionPerPass: settings.pruneMaxFractionPerPass,
+                warmupFraction: tuning.warmupFraction,
+                binarizeLastFraction: tuning.binarizeLastFraction,
+                minimumAuthorityForDepth: settings.minimumAuthorityForDepth
+            )
+        }
+
         iterationLoop: while true {
             let effectiveTotal = Swift.max(
                 Swift.min(
@@ -648,11 +778,24 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             if iteration >= effectiveTotal { break iterationLoop }
             try checkCancellation()
 
+            // Three integer stores. The governor never reads these to make a
+            // decision; they are there so that every budget reduction it makes
+            // below can record WHEN it happened and how many Gaussians were
+            // alive at the time, which is the difference between "the cap was
+            // cut" and "the cap was cut below the population and deleted it".
+            governor.mark(
+                sliceIndex: slice.index,
+                iteration: iterationsRunSoFar + iteration,
+                splatCount: splatCount
+            )
+
             // --- Heat and memory, measured -------------------------------------
             let thermal = governor.thermalVerdict()
             switch thermal.verdict {
             case .abort:
                 TrainerLog.budget.error("Thermal abort at iteration \(iteration)")
+                census.slices[censusRow].stopReason =
+                    "the phone got too hot to keep going (thermal abort)"
                 emit(
                     progressTick(
                         stage: .pausedThermal,
@@ -674,6 +817,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     TrainerLog.budget.error(
                         "Still too hot after \(consecutivePauses) checks; stopping and keeping what is built"
                     )
+                    census.slices[censusRow].stopReason =
+                        "the phone never cooled down (paused \(consecutivePauses) times in a row)"
                     emit(
                         progressTick(
                             stage: .pausedThermal,
@@ -731,7 +876,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     )
                     emit(
                         progressTick(
-                            stage: stage(for: iteration, of: totalIterations),
+                            stage: stage(for: iteration, of: effectiveTotal),
                             iteration: iterationsRunSoFar + iteration,
                             total: governor.current.iterations,
                             splatCount: splatCount,
@@ -788,8 +933,17 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             guard let frameSupervision = supervision.build(
                 frame: frame,
                 iteration: iteration,
-                totalIterations: totalIterations
+                // The run that will actually happen, for the same reason
+                // `progressFraction` uses it: this drives the depth-loss decay
+                // and the SH degree schedule, and keying those to a length the
+                // run will never reach means their tails never execute.
+                totalIterations: effectiveTotal
             ) else {
+                // A frame whose photo would not decode. Counted rather than
+                // skipped in silence: a run where most iterations land here is
+                // a run that trained on almost nothing, and the wall clock
+                // looks identical either way.
+                census.slices[censusRow].iterationsSkippedNoSupervision += 1
                 iteration += 1
                 continue
             }
@@ -805,7 +959,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
             let exposure = exposures[frame.index] ?? SIMD2<Float>(1, 0)
 
-            try runIteration(
+            let step = try runIteration(
                 gpu: gpu,
                 resources: resources,
                 queue: queue,
@@ -824,9 +978,31 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 background: smart.background,
                 frame: frame
             )
+            switch step {
+            case .stepped:
+                break
+            case .skippedNothingToRender:
+                census.slices[censusRow].iterationsSkippedNothingToRender += 1
+            case .grewTileBufferAndRetried:
+                census.slices[censusRow].iterationsSkippedGrowingTileBuffer += 1
+            }
 
             // --- Periodic work -----------------------------------------------------
-            let progressFraction = Float(iteration) / Float(Swift.max(totalIterations, 1))
+            //
+            // Measured against the run that is ACTUALLY GOING TO HAPPEN, not
+            // against the one originally planned.
+            //
+            // This divided by `totalIterations` (the planned slice budget) while
+            // the loop exits at `effectiveTotal` (what heat and memory have left
+            // of it). So a run cut from 3,000 to 1,500 did not do half the work:
+            // it stopped at progressFraction 0.5 and everything scheduled past
+            // that point NEVER RAN AT ALL. Late opacity binarization (the last
+            // 20 percent), the final spherical-harmonic degree, the tail of the
+            // learning-rate decay and the end of the prune window were simply
+            // deleted from the run, silently, while the app still reported
+            // success. Compressing the schedule instead means a shortened run
+            // is a faster version of the same run rather than a truncated one.
+            let progressFraction = Float(iteration) / Float(Swift.max(effectiveTotal, 1))
 
             if iteration > 0,
                iteration % Swift.max(tuning.filter3DIntervalIterations, 1) == 0
@@ -873,6 +1049,22 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     carver: carveDue ? smart.carver : nil
                 )
                 splatCount = outcome.splatCountAfter
+
+                // One census row per pass. This is the whole ledger of where
+                // the geometry went: what the windows said, what room there
+                // was, what scored, what was created, and what each prune
+                // reason and the carve removed. Appending a small struct every
+                // hundred iterations is the entire cost.
+                census.densifyPasses.append(
+                    TrainerCensusDensifyPass(
+                        sliceIndex: slice.index,
+                        iteration: iteration,
+                        progressFraction: progressFraction,
+                        carverAvailable: smart.carver != nil,
+                        outcome: outcome
+                    )
+                )
+
                 if outcome.changedTopology || outcome.relocated > 0 {
                     try resetDensifyStats(
                         gpu: gpu, resources: resources, queue: queue, splatCount: splatCount
@@ -896,7 +1088,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
             // --- Progress ------------------------------------------------------------
             let now = Date()
-            if now.timeIntervalSince(lastEmit) > 0.5 || iteration == totalIterations - 1 {
+            if now.timeIntervalSince(lastEmit) > 0.5 || iteration == effectiveTotal - 1 {
                 lastEmit = now
                 emit(
                     progressTick(
@@ -918,6 +1110,18 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         }
 
         iterationsRunSoFar += iteration
+
+        census.iterationsCompleted += iteration
+        census.slices[censusRow].iterationsCompleted = iteration
+        census.slices[censusRow].splatCountAtEndOfTraining = splatCount
+        // The size the buffers were actually at when the slice ended, which is
+        // not the size it started at if the governor stepped the resolution
+        // down mid-run.
+        census.slices[censusRow].renderWidth = renderSize.width
+        census.slices[censusRow].renderHeight = renderSize.height
+        if census.slices[censusRow].stopReason == TrainerCensus.unfinishedOutcome {
+            census.slices[censusRow].stopReason = "ran out its iterations"
+        }
 
         // The learned per-frame exposures belong to the whole run, not to this
         // slice: `model/exposure.bin` is keyed by frame index and a frame in
@@ -949,6 +1153,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 shCoefficientCount: shCoefficientCount,
                 renderSize: renderSize
             )
+            census.slices[censusRow].heldOutPSNR = psnr
             if let psnr {
                 heldOutPSNR = heldOutPSNR.map { Swift.min($0, psnr) } ?? psnr
                 let formatted = String(format: "%.2f", psnr)
@@ -960,6 +1165,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
         let cloud = readCloud(resources: resources, count: splatCount, shDegree: shDegree)
 
+        // `readCloud` drops a non-finite Gaussian rather than exporting a NaN,
+        // and it does that silently. The difference between what went in and
+        // what came out is the count of those, and it should always be zero.
+        census.slices[censusRow].droppedNonFiniteOnReadback =
+            Swift.max(splatCount - cloud.count, 0)
+        census.slices[censusRow].splatsHandedToMerge = cloud.count
+
         // The next slice allocates its own buffers, so this one's go now
         // rather than at the end of the whole run.
         self.resources = nil
@@ -968,6 +1180,23 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     }
 
     // MARK: - One iteration
+
+    /// What one call to `runIteration` actually did.
+    ///
+    /// Two of these three cases used to be a bare `return` in the middle of the
+    /// function, which is a whole iteration doing no work and saying nothing.
+    /// A run where most iterations end that way is a run that trained on almost
+    /// nothing, and from the outside it looks exactly like a slow one, so the
+    /// loop counts them.
+    private enum StepResult {
+        /// A full forward, backward and Adam step happened.
+        case stepped
+        /// There was nothing to render: no pixels or no Gaussians.
+        case skippedNothingToRender
+        /// The tile-instance buffer was too small, so it was grown and this
+        /// frame was abandoned to be retried on the next iteration.
+        case grewTileBufferAndRetried
+    }
 
     // swiftlint:disable:next function_body_length function_parameter_count
     private func runIteration(
@@ -988,11 +1217,11 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         cameraDeltas: inout [FrameID: Pose],
         background: DirectionalBackgroundModel?,
         frame: CaptureFrame
-    ) throws {
+    ) throws -> StepResult {
 
         let size = resources.renderSize
         let pixelCount = size.pixelCount
-        guard pixelCount > 0, splatCount > 0 else { return }
+        guard pixelCount > 0, splatCount > 0 else { return .skippedNothingToRender }
 
         // --- Upload this frame's supervision -------------------------------------
         resources.gtColor.writeArray(supervision.groundTruth)
@@ -1070,7 +1299,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 "Tile instances needed \(instanceCount), had \(resources.instanceCapacity); growing"
             )
             try resources.growInstanceCapacity(to: instanceCount + instanceCount / 4)
-            return
+            return .grewTileBufferAndRetried
         }
         instanceCount = Swift.max(instanceCount, 0)
 
@@ -1164,6 +1393,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             background.freeze()
             TrainerLog.general.info("Background field frozen at iteration \(iteration)")
         }
+
+        return .stepped
     }
 
     // MARK: - Uniform construction

@@ -90,6 +90,20 @@ public final class MetalSplatRenderer: SplatRenderer {
     /// Bounds of the loaded cloud, for framing the camera.
     private(set) var contentBounds: BoundingBox?
 
+    /// What was actually in the last splat file this renderer opened: how many
+    /// of its points can draw at all, and what shape they came out.
+    ///
+    /// Measured here because this is the only place in the app that already has
+    /// the whole cloud in memory - counting it anywhere else would mean parsing
+    /// a half-gigabyte .ply a second time. It is measured even for a cloud that
+    /// then fails to load, because "the file has 400,000 points and none of
+    /// them can draw" is the single most useful sentence this app could say
+    /// about a scan that looks like nothing.
+    ///
+    /// Nil until a file has been opened. The review screen prints "not counted
+    /// yet" for nil rather than a zero.
+    private(set) var loadedCloudMeasurement: ScanCensus.Drawable?
+
     /// Set by the view; the renderer never guesses a size.
     private(set) var drawableSize: CGSize = .zero
 
@@ -366,6 +380,12 @@ public final class MetalSplatRenderer: SplatRenderer {
 
         try await load(cloud)
 
+        // `load(_:)` counts the cloud but is handed no path, so the file it was
+        // counted in is stamped on here. The census prints this name next to
+        // every number it took from the file, and this is the one place that
+        // knows whether the .ply or the .spz fallback was the one opened.
+        loadedCloudMeasurement?.sourceFile = relativePath
+
         // The honesty mask is a separate, optional file. Its absence is a
         // labelled fact on screen, never a silent pass.
         await loadObservationField(model: model, paths: paths)
@@ -375,15 +395,27 @@ public final class MetalSplatRenderer: SplatRenderer {
         guard startupProblem == nil, let device else {
             throw ViewerError.metalUnavailable(startupProblem ?? "The GPU is not available.")
         }
+
+        // Flattening for the GPU and counting for the census happen in the same
+        // detached task, off the main actor. The census is a separate walk of
+        // the same arrays (two of them: one for the model's extent, one for the
+        // per-splat tests) rather than a second parse of the file, which is the
+        // part that costs seconds.
+        //
+        // Deliberately BEFORE the empty check below: a cloud with no splats in
+        // it is exactly the case the census exists for, and throwing first
+        // would leave the review screen with nothing to say about it.
+        let outcome = await Task.detached(priority: .userInitiated) {
+            () -> (upload: ViewerCloudUpload, measurement: ScanCensus.Drawable) in
+            (ViewerCloudUpload.prepare(cloud), ScanCensus.Drawable.measure(cloud))
+        }.value
+        loadedCloudMeasurement = outcome.measurement
+
         guard cloud.count > 0 else {
             throw ViewerError.emptyModel
         }
 
-        let prepared = await Task.detached(priority: .userInitiated) {
-            ViewerCloudUpload.prepare(cloud)
-        }.value
-
-        try uploadPrepared(prepared, device: device)
+        try uploadPrepared(outcome.upload, device: device)
     }
 
     private func uploadPrepared(_ prepared: ViewerCloudUpload, device: MTLDevice) throws {
@@ -477,6 +509,7 @@ public final class MetalSplatRenderer: SplatRenderer {
         residentSplatCount = 0
         totalSplatCount = 0
         contentBounds = nil
+        loadedCloudMeasurement = nil
     }
 
     // MARK: - SplatRenderer: camera and overlays

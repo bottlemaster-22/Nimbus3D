@@ -273,6 +273,13 @@ struct ScanLibraryRow: View {
                         .font(.caption)
                         .foregroundStyle(severity == .problem ? Color.orange : .secondary)
                 }
+
+                // One line, and only when the census has something to say. A
+                // scan that built cleanly says nothing here on purpose: a green
+                // tick on every row teaches the eye to skip the row that
+                // matters. Tapping through to the review screen is where the
+                // full sentence and the breakdown live.
+                ScanCensusLibraryLine(census: scan.census)
             }
         }
         .padding(.vertical, 4)

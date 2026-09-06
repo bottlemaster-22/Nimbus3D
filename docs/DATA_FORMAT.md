@@ -56,6 +56,7 @@ tree is identical in both places; the Booster receives a byte-for-byte mirror.
     chunk_0000.cls             one classification byte per face
   prepass/                     everything the no-training pre-pass produced
     prepass_result.json        the index (Core.PrePassResult)
+    census.json                what every pre-pass stage counted (diagnostic)
     sparse_refined/
       cameras.txt              identical to sparse/0/cameras.txt
       images.txt               REFINED poses
@@ -78,6 +79,8 @@ tree is identical in both places; the Booster receives a byte-for-byte mirror.
     exposure.bin
     observed_directions.bin
     held_out_frames.json
+    train_census.json        where the trainer's geometry went (diagnostic)
+    census.json                the flat build record the review screen reads
   export/                      user-facing files
     <scanID>.ply
     <scanID>.spz
@@ -595,6 +598,120 @@ per-voxel bitmask of which directions each part of the scene was actually
 looked at from. The viewer hatches any pixel whose viewing ray falls in an
 unobserved direction. Showing the user which parts of their scan are invented
 is not a nice-to-have; it is the difference between a tool and a toy.
+
+### `model/train_census.json` - where the geometry went
+
+Written by `Sources/Trainer` (`TrainerCensus.swift`) once per training run, at
+the very end. It is a **diagnostic sidecar**: nothing reads it to render or
+export anything, and its absence changes no behaviour. It exists because the
+first real scan this app produced came out looking like nothing, and four
+separate faults had each destroyed most of the model without one of them
+logging, warning or failing. The census is the trainer measuring its own
+behaviour so the next fault of that shape is a five second read instead of a
+day of archaeology.
+
+**Written even when the run fails.** The trainer writes it from a `defer`, so a
+run that threw, was cancelled, or was stopped by heat still leaves one behind.
+`outcome` says which: `"completed"`, `"stopped early"`, `"cancelled"` or
+`"did not reach the end"`.
+
+**It is cheap by construction.** Every field is an integer counter accumulated
+in memory during the run. There is exactly one file write, at the end. Nothing
+in it forces a GPU synchronisation the trainer would not have performed anyway.
+
+Top level:
+
+| key | what it is |
+| --- | --- |
+| `formatVersion` | `1`. Bumped only when a field changes MEANING. |
+| `scanID`, `startedAt`, `finishedAt`, `outcome` | which run this was and how it ended |
+| `alerts` | ordered worst first: `{severity, code, detail}`. The five second read. |
+| `ledger` | ordered plain sentences, seeds to final count, one per stage |
+| `budgetRequested` / `budgetAsRun` | the budget asked for, and the one actually run |
+| `budgetReductions` | every lowering event, with its reason, the iteration, and the live splat count at that moment |
+| `gates` | the schedule constants the loop actually READ, captured at the point of use |
+| `slices` | one row per time slice: seeding, caps, iterations, skips, what it handed to the merge |
+| `densifyPasses` | one row per densification / prune / carve pass |
+| `merge` | what the slice merge kept, dropped to another owner, and trimmed |
+| `keyframesSelected`, `sliceCount`, `iterationsRequested`, `iterationsCompleted`, `finalSplatCount` | the totals |
+
+A `densifyPasses` row carries the counts AND the context that makes them
+readable: `growthWindowOpen`, `pruneWindowOpen`, `carveRan`, `carverAvailable`,
+`capInForce`, `headroom`, `growthAllowance`, `splatsScored`,
+`splatsWithNonZeroScore`, `candidatesAfterVisibilityFilter`,
+`relocationDonorsAvailable`, then `splatCountBefore`, `addedBySplit`,
+`addedByClone`, `relocated`, `splatCountAfterGrowth`, `prunedNonFinite`,
+`prunedLowOpacity`, `prunedOversized`, `carvedFromEmptySpace`, `trimmedToCap`
+and `splatCountAfter`. Growth, pruning and carving all happen inside one pass,
+so one row covers all three. `splatCountAfterGrowth` is the only derived value
+and it is exact arithmetic, not an estimate: `before + split + clone`.
+
+`alerts[].code` is stable and machine-readable, so a screen can match on it
+without parsing English. The current set:
+
+`densification_created_nothing`, `growth_window_never_open`,
+`no_headroom_whenever_growth_was_allowed`,
+`splat_cap_cut_below_live_population`,
+`splat_cap_cut_to_exactly_the_live_population`,
+`judgement_pruning_outside_its_window`,
+`seeding_rejected_almost_every_sample`, `no_seed_was_trusted`,
+`almost_no_seed_was_trusted`, `most_of_the_model_disappeared`,
+`final_count_far_below_the_cap`, `free_space_carving_removed_the_most`,
+`non_finite_points_reached_the_readback`, `merge_dropped_most_of_the_parts`,
+`run_ended_before_its_budget`, `many_iterations_did_no_work`.
+
+An empty `alerts` array means the census ran its checks and none of them
+tripped. A MISSING file means nobody wrote one, which is a different and weaker
+statement, and a reader must not report it as "clean".
+
+### `prepass/census.json` and `model/census.json` - the build record
+
+Two small, FLAT files with the same key set, each written by the stage that
+owns its folder. The review screen in `Sources/Viewer` reads both, through
+`ScanCensus.Record`. They exist so that "which step lost the geometry" is a
+line on a screen rather than a day of reading code.
+
+The rules are the whole design and a writer must follow them exactly:
+
+* **Every key is optional.** Write only what was genuinely counted.
+* **An absent key means "not counted"** and renders as "not recorded", naming
+  the stage as the reason.
+* **A key written as `0` is a MEASURED ZERO**, which is a much stronger claim.
+  Never write `0` for a number nobody took. This is not a style preference: it
+  is the one rule that stops this file from reproducing the fault it was built
+  to catch.
+* Unknown extra keys are ignored, so a writer may run ahead of the reader.
+* Keys are camelCase, `formatVersion` is `1`, encoded with
+  `ContractsJSON.encoder()`. A higher version is refused and the refusal is
+  shown, not guessed at.
+
+| key | written by | what it is |
+| --- | --- | --- |
+| `formatVersion`, `writtenBy` | both | `1`, and `"prepass"` or `"trainer"` |
+| `seedsWritten` | pre-pass | starting points written to `init_splats.ply` |
+| `seedsShapedAsConfidentDiscs` | pre-pass | of those, how many were pinned flat rather than stretched along the viewing ray |
+| `trustGateSigmaMeters` | pre-pass | the depth accuracy the trust test demanded, metres |
+| `measuredMedianSigmaMeters` | pre-pass | the accuracy this scan actually measured, metres. Written ONLY when the trust field really measured it; the physics prior is a prediction and is never reported under this name |
+| `splatsAtStart` | trainer | points on the GPU when training began |
+| `splatsCreatedByDensification`, `densificationPassCount`, `densificationCandidateCount` | trainer | the step that adds detail: what it created, how often it ran, how many points it considered |
+| `splatsDeletedByPruning`, `pruningPassCount` | trainer | what tidying removed and in how many passes |
+| `splatsDeletedByHeatCut`, `heatCutCount` | trainer | Gaussians above the ceiling at the moment a warm phone lowered it, and how many times that happened. Always written, so the screen can RULE HEAT OUT rather than say it cannot tell |
+| `splatsAtEnd` | trainer | points alive when the run finished. Absent unless the run reached the merge |
+| `plannedSplatCap`, `finalSplatCap` | trainer | the cap asked for and the cap ended on. `finalSplatCap` below `splatsAtEnd` is an impossible state and the screen reports it by name |
+
+`depthSamplesOffered` and `depthSamplesAccepted` are in the reader and are
+**deliberately not written by this pipeline.** They are defined as the counts
+either side of a trust gate that REJECTS depth readings, and there is no such
+gate: `PrePassInitialSplatBuilder` uses the trust weight to decide whether a
+seed is laid as a disc or as a ray-stretched blob, never to discard a reading.
+Writing the seeding funnel's numbers under those two names would put true
+numbers under a false label. The funnel itself lives in
+`prepass/census.json` under `seeding`, in full.
+
+The trainer writes `model/census.json` from the SAME sealed census as
+`model/train_census.json`, so the two files cannot disagree, and every
+loop-derived key is left absent until at least one slice has actually put its
+seeds on the GPU.
 
 ---
 

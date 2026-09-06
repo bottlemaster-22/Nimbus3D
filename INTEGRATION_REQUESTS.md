@@ -770,3 +770,235 @@ the phone today.
 - **Nothing in `Sources/Capture`, `Sources/Trainer` or `Sources/Export` was
   touched**, and no persisted file changed shape. The blur meter is not the
   Viewer's and nothing in the Viewer reads `motionBlurPixels`.
+
+---
+
+## From Viewer (the splat census), 2026-09-05
+
+The Viewer now shows a **splat census**: one plain sentence at the top of the
+review screen naming the step that lost the most geometry, with the full ladder
+of counts behind a tap. It exists because the first real scan took a day of
+code reading to explain, and all four faults that caused it were "a number went
+down at a named step" - invisible only because nobody was counting.
+
+**Everything the Viewer can measure on its own, it already measures.** Nothing
+below is needed for the census to work today. What is below is the part of the
+ladder only PrePass and the Trainer can see, and each missing rung currently
+reads "not recorded" on screen (never zero, and the headline says the breakdown
+is incomplete). Filling these in is what turns the next bug of this shape from a
+day of archaeology into a five second read.
+
+### The ask, in one line
+
+Write one small JSON file at the end of your stage. PrePass writes
+`prepass/census.json`; the Trainer writes `model/census.json`. Two files, each
+in the folder its writer already owns, so nothing races.
+
+### The schema
+
+Declared as `ScanCensus.Record` in `ios/Sources/Viewer/ScanCensus.swift`.
+**Do not re-declare that type in your module** - this is one Xcode target and a
+duplicate top-level type name is a hard link error. Write the JSON with a local
+private struct, or a dictionary, or whatever suits you. The reader does not care
+what wrote it.
+
+Rules the reader already enforces, so you do not have to be careful:
+
+- **Every key is optional.** Write only what you genuinely counted. A missing
+  key renders as "not recorded" with your stage named as the reason. A key you
+  write as `0` renders as a measured zero, which is a much stronger claim -
+  please do not write 0 for "I did not count this".
+- Unknown extra keys are ignored, so you may add fields ahead of this reader.
+- Keys are camelCase, encoded with `ContractsJSON.encoder()`.
+- `formatVersion` should be `1`. A file with a higher version is refused and
+  the refusal is shown on screen rather than guessed at.
+
+```json
+{
+  "formatVersion": 1,
+  "writtenBy": "trainer",
+
+  "depthSamplesOffered": 812004,
+  "depthSamplesAccepted": 796110,
+  "seedsWritten": 43112,
+  "seedsShapedAsConfidentDiscs": 41980,
+  "trustGateSigmaMeters": 0.02,
+  "measuredMedianSigmaMeters": 0.031,
+
+  "splatsAtStart": 43112,
+  "splatsCreatedByDensification": 268430,
+  "densificationPassCount": 27,
+  "densificationCandidateCount": 291004,
+  "splatsDeletedByPruning": 31004,
+  "pruningPassCount": 10,
+  "splatsDeletedByHeatCut": 0,
+  "heatCutCount": 0,
+  "splatsAtEnd": 280538,
+
+  "plannedSplatCap": 300000,
+  "finalSplatCap": 300000
+}
+```
+
+### For `ios/Sources/PrePass` (the first six keys)
+
+- **`depthSamplesOffered` / `depthSamplesAccepted`.** Counted either side of the
+  trust gate in `PrePassInitialSplats`. This is the pair that makes a misplaced
+  gate obvious: the census prints "94% of the depth readings were rejected
+  before the build even began" instead of leaving someone to work out from a
+  photograph of a smear that `trustedWeight` was set at a sigma no handheld
+  phone reaches.
+- **`trustGateSigmaMeters` / `measuredMedianSigmaMeters`.** The sigma the gate
+  demanded, and the sigma this scan actually measured. When both are present the
+  census says, in the user's language, that the test asked for 2 cm and the scan
+  delivers 3 cm, so the test is in the wrong place. Neither number can be
+  recovered from anything on disk today.
+- **`seedsWritten`** is a cross-check against
+  `InitialSplatSetRef.splatCount`, which the Viewer already reads. If the two
+  ever disagree, one of them is wrong and it is worth knowing which.
+- **`seedsShapedAsConfidentDiscs`.** How many seeds came out as pinned discs
+  rather than ray-elongated blobs (`InitialSplatSetRef.flagsPath` bit 0 / bit 1).
+  A field of blobs with almost no discs is the exact fingerprint of the trust
+  gate rejecting everything, and the Viewer can only see the CONSEQUENCE of it
+  in the finished model, hours later.
+
+### For `ios/Sources/Trainer` (the rest)
+
+- **`splatsCreatedByDensification` and `densificationPassCount` are the most
+  valuable two numbers in this whole file.** The densification threshold in the
+  wrong units made that step a no-op on every run that has ever happened, and
+  nothing anywhere said so. With these two, the census leads with "The step that
+  adds detail ran 27 times and created nothing at all", which is the entire
+  investigation.
+- **`densificationCandidateCount`** separates two different faults that look
+  identical from outside: zero candidates means the test that chooses points is
+  wrong; many candidates and zero created means the creation path is wrong.
+- **`splatsDeletedByPruning` / `pruningPassCount`.** The pruning-window settings
+  that were declared and read by nothing are fixed, but a pass count on screen
+  is what makes a regression obvious rather than inferred.
+- **`splatsDeletedByHeatCut` / `heatCutCount`.** `TrainerBudgetGovernor` already
+  computes exactly this when it lowers the cap; it just does not write it down.
+  The Viewer can already see that the final `splatCap` is below the pre-pass's
+  suggestion, but it CANNOT tell heat from an ordinary lower starting budget, so
+  without `heatCutCount` the census deliberately refuses to say heat was the
+  cause. It says "a build lowers its own limit when the phone gets warm or when
+  memory runs short; this one did not record which".
+- **`splatsAtStart` / `splatsAtEnd` / `plannedSplatCap` / `finalSplatCap`.**
+  The end-to-end arithmetic. `finalSplatCap` below `splatsAtEnd` is the
+  signature of the thermal ratchet that destroyed the first scan, and the census
+  calls that out by name as an impossible state worth reporting.
+- **Iterations are deliberately NOT asked for.** `model.json` already records
+  `iterationsCompleted` and `budgetUsed.iterations`, and the census reads both
+  from there. Asking a second writer for the same number would only create a
+  disagreement nobody would know how to resolve.
+
+### Names this module has taken
+
+New top-level type names now declared in `ios/Sources/Viewer`, listed so nobody
+picks the same one: `ScanCensus`, `ScanCensusSummarySection`, `ScanCensusCard`,
+`ScanCensusDetailSheet`, `ScanCensusStageRow`, `ScanCensusLibraryLine`.
+Everything else the census uses is nested inside `ScanCensus`.
+
+### Nothing else is asked for
+
+No Core change is needed and none was made. `ScanSummary` gained
+`censusInputs` with a default value, so no existing call site changed, and
+`ScanLibraryReader.readDetail` carries it through unaltered for
+`ScanProcessingCoordinator` and `ScanProcessingScreen`.
+
+---
+
+## Resolved by the integrator (the census sweep), 2026-09-06
+
+All four census requests above are now closed. Two were actioned, one was
+rejected with its reasoning, and one was already done. Nothing is left open.
+
+### ACTIONED: the trainer was writing the wrong filename, in the wrong shape
+
+`TrainerCensusWriter.relativePath` was `model/train_census.json`, and
+`ViewerScanPaths.modelCensusJSON` reads `model/census.json`. Two different
+files. The Viewer would have found nothing on every scan ever built, and every
+trainer rung of the ladder would have read "this build did not write
+model/census.json" for good.
+
+The shapes did not match either. `TrainerCensus` is a deep diagnostic:
+`finalSplatCount`, `slices[]`, `densifyPasses[]`. `ScanCensus.Record` is flat:
+`splatsAtEnd`, `splatsCreatedByDensification`. Because every `Record` field is
+optional, decoding `train_census.json` into it would have SUCCEEDED and
+produced a record with nothing in it, which is worse than failing.
+
+Fixed by keeping both files. `model/train_census.json` stays exactly as it was
+and is the Trainer's own. `model/census.json` is new, flat, and is derived
+from the same sealed `TrainerCensus` by `TrainerCensus.sharedRecord`, so the
+two physically cannot disagree. See `TrainerCensusSharedRecord` in
+`ios/Sources/Trainer/TrainerCensus.swift`.
+
+Honesty rules applied to that mapping:
+
+- Every loop-derived key is ABSENT until `trainingBegan` is true, which needs
+  at least one slice to have actually put its seeds on the GPU. A run that
+  died during buffer allocation has an empty `densifyPasses` array for reasons
+  that have nothing to do with densification, and "0 points created" would be
+  a number nobody took. `TrainerCensusSlice.seedsUploadedCounted` is the flag,
+  set on the same line as the count it vouches for.
+- `heatCutCount` and `splatsDeletedByHeatCut` are written ALWAYS, including as
+  zero, because the governor records every reduction from the moment the run
+  starts, so an empty list really is "no thermal cut happened". That measured
+  zero is what lets `capAlert` rule heat out instead of saying it cannot tell.
+- `splatsAtEnd` is absent unless the run reached the merge.
+- `pruningPassCount` now counts passes where pruning of ANY kind removed
+  something, matching `splatsDeletedByPruning`, which is pruning of any kind.
+  Counting the numerator one way and the denominator another produced two
+  numbers that looked like a pair and were not.
+- The thermal reason string is now `TrainerCensusBudgetReduction.heatReason`,
+  referenced by `TrainerBudgetChange.Reason.censusReason` rather than repeated.
+  `model/census.json` decides whether a cap cut was thermal by matching that
+  exact string, and two copies of a phrase is how a heat report silently
+  becomes a zero when somebody rewords one of them.
+
+### REJECTED: `depthSamplesOffered` and `depthSamplesAccepted`
+
+PrePass declined these and PrePass is right. Confirmed against the source
+rather than the note: in `PrePassInitialSplatBuilder.build`, the trust weight
+is used at two places and neither of them drops a sample. It picks the better
+of two samples competing for one voxel (`if !slot.inserted, sampleWeight <=
+weight[slot.index] { continue }`), and it decides a seed's SHAPE
+(`let trusted = weight[i] >= trustCut && hasNormal[i]`). There is no gate
+either side of which a sample count could be taken. Those two keys describe a
+step this pipeline does not have, and they will stay absent.
+
+Two consequences, both fixed in `ios/Sources/Viewer/ScanCensus.swift`:
+
+1. **The sigma comparison was dead code.** `trustGateAlert` guarded on the two
+   sample counts before it would print the sigma pair, so
+   `trustGateSigmaMeters` and `measuredMedianSigmaMeters` - which the pre-pass
+   DOES write, and which are the two numbers that name the fourth fault from
+   the first real scan - could never reach the screen. They are now their own
+   alert, `trustGateSigmaAlert`, which fires whenever the gate is tighter than
+   the measurement, and it is attached to the "Starting points pinned to a
+   surface" rung next to `discAlert`. It can also lead the headline.
+
+2. **Two permanent "not recorded" rows.** The two depth-reading rungs now
+   appear only when a writer actually supplied one of the keys. This is a
+   deliberate exception to the "a missing key reads as not recorded" rule, and
+   the only one: printing two blanks on every scan forever, for a step that
+   does not exist, teaches the eye to skip a screen whose whole job is to be
+   read.
+
+### ALREADY DONE: the other four pre-pass keys, and the reader
+
+`seedsWritten`, `seedsShapedAsConfidentDiscs`, `trustGateSigmaMeters` and
+`measuredMedianSigmaMeters` are written at the top level of
+`prepass/census.json` by `PrePassCensus.fillSharedKeys()`, from the same
+source as the detailed `seeding` section, so they cannot drift. The sigma is
+written only when it was genuinely measured (`seeding.sigmaIsMeasured`); the
+physics prior is a prediction and is never reported under a name that says
+"measured". `ScanLibraryReader.readDetail` reads both sidecars into
+`ScanSummary.censusInputs`. Verified end to end, by name, in the source.
+
+### Documentation
+
+`docs/DATA_FORMAT.md` section 8 now documents `prepass/census.json` and
+`model/census.json` as one shared format with one key table, and states in
+writing that an absent key means "not counted" while a written `0` is a
+measured zero. Both files are in the folder tree at the top of that document.

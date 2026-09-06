@@ -236,6 +236,17 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
     /// offset, in sweep order.
     public private(set) var lastTimeOffsetSweep: [(offsetSeconds: Double, cost: Double)] = []
 
+    /// The census sections this type owns. Each is assigned by its own method,
+    /// on EVERY exit path including the ones that give up early, so "the stage
+    /// ran and found nothing" and "the stage never ran" are different readings
+    /// rather than the same silence. See `PrePassCensus`.
+    ///
+    /// Nothing here is touched from a hot loop: the loops increment locals and
+    /// the struct is filled once at the end.
+    public private(set) var lastTimeOffsetCensus = PrePassCensus.TimeOffset()
+    public private(set) var lastRevisitCensus = PrePassCensus.Revisits()
+    public private(set) var lastPoseGraphCensus = PrePassCensus.PoseGraph()
+
     public init(tuning: Tuning = Tuning()) {
         self.tuning = tuning
     }
@@ -360,10 +371,26 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
     ) async throws -> Double? {
         lastTimeOffsetSweep = []
 
+        // Filled on every path out of this function, including the seven that
+        // return nil. Before the census, all seven were indistinguishable from
+        // each other and from "the offset really is zero".
+        var census = PrePassCensus.TimeOffset()
+        census.attempted = true
+        census.requiredRelativeImprovement = tuning.timeOffsetMinRelativeImprovement
+        census.outcome = "did not finish"
+        lastTimeOffsetCensus = census
+        defer { lastTimeOffsetCensus = census }
+
         let frames = bundle.frames.sorted { $0.timestampSeconds < $1.timestampSeconds }
-        guard frames.count >= 8 else { return nil }
+        guard frames.count >= 8 else {
+            census.outcome = "only \(frames.count) frames, at least 8 are needed"
+            return nil
+        }
         let track = PrePassPoseTrack(frames: frames)
-        guard track.duration > 1 else { return nil }
+        guard track.duration > 1 else {
+            census.outcome = "the scan is under a second long"
+            return nil
+        }
 
         let geometry = PrePassDepthGeometry(rgbIntrinsics: bundle.intrinsics, settings: bundle.settings)
 
@@ -371,7 +398,10 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         // pixels for ZNCC to discriminate a few-pixel shift, few enough that
         // twenty-one offsets over two dozen pairs is still fast.
         let workingWidth = Swift.min(bundle.intrinsics.width, 640)
-        guard workingWidth > 0, bundle.intrinsics.width > 0 else { return nil }
+        guard workingWidth > 0, bundle.intrinsics.width > 0 else {
+            census.outcome = "the capture recorded no image width"
+            return nil
+        }
         let workingHeight = Swift.max(
             1,
             Int((Double(bundle.intrinsics.height) * Double(workingWidth)
@@ -380,7 +410,10 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         let workingIntrinsics = bundle.intrinsics.scaled(toWidth: workingWidth, height: workingHeight)
 
         let pairs = selectTimeOffsetPairs(frames: frames)
-        guard pairs.count >= 4 else { return nil }
+        guard pairs.count >= 4 else {
+            census.outcome = "only \(pairs.count) usable frame pairs, at least 4 are needed"
+            return nil
+        }
 
         // Everything each pair needs, loaded once. Loading inside the offset
         // loop would decode the same JPEG twenty-one times.
@@ -476,7 +509,13 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
             )
         }
 
-        guard prepared.count >= 4 else { return nil }
+        guard prepared.count >= 4 else {
+            census.outcome = "only \(prepared.count) of \(pairs.count) pairs had enough "
+                + "matchable detail, at least 4 are needed"
+            return nil
+        }
+        census.pairsPrepared = prepared.count
+        census.samplesPerSweepPoint = prepared.reduce(0) { $0 + $1.samples.count }
 
         var scratchA: [Float] = []
         var scratchB: [Float] = []
@@ -527,17 +566,39 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         sweep.reserveCapacity(offsets.count)
         for i in 0..<offsets.count { sweep.append((offsets[i], costs[i])) }
         lastTimeOffsetSweep = sweep
+        census.sweepPoints = costs.count
+        census.sweepPointsWithFiniteCost = costs.filter { $0.isFinite }.count
 
         // A minimum has to be interior and has to be a real dip, not the
         // shallowest point of a flat line.
         guard let minimumIndex = costs.indices.min(by: { costs[$0] < costs[$1] }),
-              costs[minimumIndex].isFinite else { return nil }
-        guard minimumIndex > 0, minimumIndex < costs.count - 1 else { return nil }
+              costs[minimumIndex].isFinite else {
+            census.outcome = "not one of the \(costs.count) timings compared anything"
+            return nil
+        }
+        census.bestCost = costs[minimumIndex]
+        guard minimumIndex > 0, minimumIndex < costs.count - 1 else {
+            census.outcome = "the best timing was at the end of the range, which means the "
+                + "real offset is outside the range that was searched"
+            return nil
+        }
 
         let median = PrePassStats.median(costs.filter { $0.isFinite })
-        guard median > 0 else { return nil }
+        census.medianCost = median
+        guard median > 0 else {
+            census.outcome = "every timing scored the same, so there was nothing to choose"
+            return nil
+        }
         let improvement = (median - costs[minimumIndex]) / median
-        guard improvement >= tuning.timeOffsetMinRelativeImprovement else { return nil }
+        census.relativeImprovement = improvement
+        guard improvement >= tuning.timeOffsetMinRelativeImprovement else {
+            census.outcome = "the best timing was only "
+                + PrePassCensusFormat.percent(improvement)
+                + " better than the middle one, and it has to be "
+                + PrePassCensusFormat.percent(tuning.timeOffsetMinRelativeImprovement)
+                + " better to be believed"
+            return nil
+        }
 
         // Sub-step refinement: the true offset is very unlikely to land
         // exactly on a 5 ms grid point.
@@ -550,7 +611,15 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         guard result.isFinite,
               result >= tuning.timeOffsetMinSeconds - tuning.timeOffsetStepSeconds,
               result <= tuning.timeOffsetMaxSeconds + tuning.timeOffsetStepSeconds
-        else { return nil }
+        else {
+            census.outcome = "the refined answer landed outside the range that was searched"
+            return nil
+        }
+        census.settledSeconds = result
+        census.source = "measured"
+        census.outcome = "settled, "
+            + PrePassCensusFormat.percent(improvement)
+            + " better than the middle timing"
         return result
     }
 
@@ -616,6 +685,14 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
     ) async throws -> [RevisitPair] {
         rejectedRevisitCandidates = 0
 
+        // Every funnel step below is counted. A run that returns no revisits
+        // could have failed at any of four places, and until now they all
+        // looked the same from outside: an empty array.
+        var census = PrePassCensus.Revisits()
+        census.attempted = true
+        lastRevisitCensus = census
+        defer { lastRevisitCensus = census }
+
         let frames = bundle.frames.sorted { $0.timestampSeconds < $1.timestampSeconds }
         guard frames.count >= 4 else { return [] }
 
@@ -635,6 +712,7 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
             lastCentre = centre
             lastTime = frame.timestampSeconds
         }
+        census.anchorFrames = anchors.count
         guard anchors.count >= 2 else { return [] }
 
         // 2. Geometric gate: near in space, agreeing in view direction, far
@@ -673,11 +751,13 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
                 candidates.append(Candidate(a: a, b: b, score: score))
             }
         }
+        census.geometricCandidates = candidates.count
         guard !candidates.isEmpty else { return [] }
         candidates.sort { $0.score > $1.score }
         if candidates.count > tuning.revisitMaxICPRuns {
             candidates.removeSubrange(tuning.revisitMaxICPRuns...)
         }
+        census.candidatesAfterCap = candidates.count
 
         // 3. Align each surviving candidate with point-to-plane ICP.
         //
@@ -726,6 +806,7 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
                 // just the VIO estimate handed back, and feeding an estimate
                 // to the optimiser as if it were an observation is how a pose
                 // graph convinces itself it is right.
+                census.candidatesWithoutDepth += 1
                 results.append(
                     RevisitPair(
                         frameA: candidate.a.index,
@@ -752,8 +833,10 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
             )
             guard icp.converged else {
                 rejectedRevisitCandidates += 1
+                census.icpRejected += 1
                 continue
             }
+            census.icpConverged += 1
 
             // The residual IS the drift measurement: how far the LiDAR says
             // the two frames really are apart, minus where VIO put them.
@@ -779,6 +862,19 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
                     inlierCount: icp.inlierCount,
                     confidence: confidence
                 )
+            )
+        }
+
+        // One pass over the finished list. The medians are what turn "3 loop
+        // closures" into "3 loop closures that still disagree by 4 cm", which
+        // is the difference between a number and a diagnosis.
+        census.pairsReturned = results.count
+        let confirmed = results.filter { $0.method == .depthICP && $0.confidence > 0.2 }
+        census.confirmedPairs = confirmed.count
+        if !confirmed.isEmpty {
+            census.medianConfidence = PrePassStats.median(confirmed.map { $0.confidence })
+            census.medianTranslationResidualCentimeters = PrePassStats.median(
+                confirmed.map { $0.translationResidualMeters * 100 }
             )
         }
 
@@ -816,8 +912,25 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         revisits: [RevisitPair],
         timeOffsetSeconds: Double?
     ) async throws -> [String: Pose] {
+        // Four of the five ways out of this function hand back the VIO poses
+        // unchanged, and every one of them used to do it in complete silence:
+        // no frames, no submaps, no usable edges, and the 2 metre sanity gate
+        // that throws a finished solution away. `exitReason` is set on all of
+        // them, so "the pose graph ran" and "the pose graph gave up" stop
+        // looking identical from outside.
+        var census = PrePassCensus.PoseGraph()
+        census.attempted = true
+        census.submaps = submaps.count
+        census.exitReason = "notRun"
+        lastPoseGraphCensus = census
+        defer { lastPoseGraphCensus = census }
+
         let frames = bundle.frames.sorted { $0.timestampSeconds < $1.timestampSeconds }
-        guard !frames.isEmpty else { return [:] }
+        census.framesPosed = frames.count
+        guard !frames.isEmpty else {
+            census.exitReason = "noFrames"
+            return [:]
+        }
 
         // Applying the calibrated offset is the first half of F1 and has to
         // happen BEFORE the graph: the graph corrects drift, and a time offset
@@ -835,6 +948,7 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         }
 
         guard !submaps.isEmpty else {
+            census.exitReason = "noSubmaps"
             return Dictionary(uniqueKeysWithValues: basePoses.map { (String($0.key), $0.value) })
         }
 
@@ -878,7 +992,10 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         // moved, and inventing a correction from a smoothness prior alone
         // would be fabricating a result. Return the (possibly time-shifted)
         // VIO poses, which is the honest answer.
+        census.usableEdges = edges.count
+        census.discardedEdges = revisits.count - edges.count
         guard !edges.isEmpty else {
+            census.exitReason = "noEdges"
             return Dictionary(uniqueKeysWithValues: basePoses.map { (String($0.key), $0.value) })
         }
 
@@ -931,9 +1048,16 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         }
 
         var lambda = 1e-4
+        // "Converged" means one specific thing here and it is worth being
+        // strict about: the solver stopped because its own step got tiny.
+        // Running out of iterations is not convergence, and a damping
+        // parameter that blew up is the opposite of it.
+        census.exitReason = "iterationLimit"
+        census.initialCost = graphCost(corrections, delta: tuning.robustDelta * 3)
 
         for iteration in 0..<tuning.maxIterations {
             try Task.checkCancellation()
+            census.iterationsRun = iteration + 1
 
             // Anneal the robust threshold: wide at first so a real 30 cm drift
             // is fitted rather than rejected, tight at the end so one bad
@@ -1051,7 +1175,10 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
                 h: h, g: g, n: dimension, lambda: lambda
             ) else {
                 lambda *= 10
-                if lambda > 1e6 { break }
+                if lambda > 1e6 {
+                    census.exitReason = "solverFailed"
+                    break
+                }
                 continue
             }
 
@@ -1069,14 +1196,55 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
             if candidateCost.isFinite, candidateCost < currentCost {
                 corrections = candidate
                 lambda = Swift.max(lambda * 0.5, 1e-8)
-                if stepNorm < 1e-7 { break }
+                if stepNorm < 1e-7 {
+                    census.converged = true
+                    census.exitReason = "converged"
+                    break
+                }
             } else {
                 // The step made things worse: keep the current estimate, damp
                 // harder, try again. This is the whole point of LM, and it is
                 // what stops one wild loop-closure edge from throwing the
                 // solution somewhere it can never recover from.
                 lambda *= 4
-                if lambda > 1e6 { break }
+                if lambda > 1e6 {
+                    census.exitReason = "dampingBlewUp"
+                    break
+                }
+            }
+        }
+
+        // --- What the solve actually achieved, in metres and degrees rather
+        //     than in whitened cost units. One pass over the edges and one
+        //     over the submaps: a few hundred iterations, once per scan.
+        census.finalCost = graphCost(corrections, delta: tuning.robustDelta)
+        var residualCentimeters: [Float] = []
+        var residualDegrees: [Float] = []
+        residualCentimeters.reserveCapacity(edges.count)
+        residualDegrees.reserveCapacity(edges.count)
+        for edge in edges {
+            let pA = corrections[edge.slotA].then(edge.poseA)
+            let pB = corrections[edge.slotB].then(edge.poseB)
+            let error = pA.inverse.then(pB).then(edge.measurement.inverse)
+            residualCentimeters.append(Float(simd_length(error.translation) * 100))
+            residualDegrees.append(Float(error.rotationAngleDegrees))
+        }
+        if !residualCentimeters.isEmpty {
+            census.finalResidualMedianCentimeters = PrePassStats.median(residualCentimeters)
+            census.finalResidualMedianDegrees = PrePassStats.median(residualDegrees)
+        }
+        for correction in corrections {
+            let metres = Float(simd_length(correction.translation))
+            let degrees = Float(correction.rotationAngleDegrees)
+            if metres.isFinite {
+                census.maxSubmapCorrectionCentimeters = Swift.max(
+                    census.maxSubmapCorrectionCentimeters, metres * 100
+                )
+            }
+            if degrees.isFinite {
+                census.maxSubmapCorrectionDegrees = Swift.max(
+                    census.maxSubmapCorrectionDegrees, degrees
+                )
             }
         }
 
@@ -1088,6 +1256,11 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         for correction in corrections {
             let translation = simd_length(correction.translation)
             if !translation.isFinite || translation > 2.0 || correction.rotationAngleDegrees > 20 {
+                // The whole solution is discarded here. Silent until the
+                // census: the pass reported success, wrote refined poses that
+                // were byte-identical to the raw ones, and every later stage
+                // attributed the leftover drift to sensor noise.
+                census.rejectedBySanityGate = true
                 return Dictionary(uniqueKeysWithValues: basePoses.map { (String($0.key), $0.value) })
             }
         }
@@ -1102,6 +1275,22 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
             }
             // refined = raw * M  (apply M to the world point first).
             refined[String(frame.index)] = corrections[slot].then(PrePassSE3(base)).pose
+        }
+
+        // How far the cameras actually moved. A graph with edges that moves
+        // nothing has a correction that never reached the poses, which is a
+        // real and completely silent failure: the numbers all look solved.
+        var shifts: [Float] = []
+        shifts.reserveCapacity(frames.count)
+        for frame in frames {
+            guard let base = basePoses[frame.index],
+                  let out = refined[String(frame.index)] else { continue }
+            let shift = simd_distance(base.center.simd, out.center.simd) * 100
+            if shift.isFinite { shifts.append(shift) }
+        }
+        if !shifts.isEmpty {
+            census.medianPoseShiftCentimeters = PrePassStats.median(shifts)
+            census.maxPoseShiftCentimeters = shifts.max() ?? 0
         }
         return refined
     }

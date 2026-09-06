@@ -64,6 +64,18 @@ final class ScanReviewModel: ObservableObject {
     /// Non-nil when the model could not be shown at all. Plain sentence.
     @Published private(set) var problem: String?
 
+    // MARK: - Where the geometry went
+
+    /// The splat census for this scan: one sentence naming the step that lost
+    /// the most, with the full ladder behind it.
+    ///
+    /// Published twice on purpose. The first version is up as soon as the
+    /// scan's JSON has been read, so the sentence is on screen while the model
+    /// is still loading; the second replaces it once the splat file itself has
+    /// been counted, which is what turns "480,000 points in the file" into
+    /// "480,000 points in the file and 3,000 of them can draw".
+    @Published private(set) var census: ScanCensus = .unread
+
     // MARK: - Mode
 
     @Published var mode: Mode = .walkThrough {
@@ -161,6 +173,7 @@ final class ScanReviewModel: ObservableObject {
             ScanLibraryReader.readDetail(target)
         }.value
         detail = loaded
+        census = ScanCensus.make(loaded.summary.censusInputs)
         displayQuarterTurns = Self.uprightQuarterTurns(of: loaded.bundle)
         displayIntrinsics = loaded.bundle?.intrinsics.rotatedForDisplay(
             quarterTurnsClockwise: displayQuarterTurns
@@ -199,6 +212,33 @@ final class ScanReviewModel: ObservableObject {
             ViewerLog.review.error(
                 "load failed: \(error.localizedDescription, privacy: .public)"
             )
+        }
+
+        // Whether the load succeeded or failed, the renderer will have counted
+        // the file if it got far enough to parse it. A model that failed to
+        // load is exactly when the count matters most, so this is outside the
+        // catch rather than inside the success path.
+        refreshCensusFromLoadedModel(loaded)
+    }
+
+    /// Rebuilds the census with the measurement of the splat file itself, once
+    /// the renderer has one.
+    ///
+    /// Nothing is invented when the renderer has nothing: the census then keeps
+    /// its "the model file has not been opened on this screen" wording, which
+    /// is the truth, rather than a zero.
+    private func refreshCensusFromLoadedModel(_ loaded: ScanDetail) {
+        let measurement = renderer.loadedCloudMeasurement
+        census = ScanCensus.make(loaded.summary.censusInputs, drawable: measurement)
+        if let measurement {
+            // Built as a String first: an os.Logger message is one literal, and
+            // five of them joined with + is not one.
+            let note = "census: \(measurement.total) in file, "
+                + "\(measurement.drawable) can draw, "
+                + "\(measurement.belowAlphaCutoff) too faint, "
+                + "\(measurement.nonFinite) broken, "
+                + "\(measurement.needles) streaks"
+            ViewerLog.review.notice("\(note, privacy: .public)")
         }
     }
 

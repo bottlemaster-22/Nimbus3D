@@ -441,6 +441,20 @@ struct ViewerScanPaths: Sendable {
         url("\(BrandConfig.Folder.model)/model.json")
     }
 
+    /// The pre-pass's optional record of what it threw away and why
+    /// (`ScanCensus.Record`). Absent on every scan built before the census
+    /// existed, which the census screen states rather than papers over.
+    var prePassCensusJSON: URL {
+        url("\(BrandConfig.Folder.prePass)/census.json")
+    }
+
+    /// The trainer's optional record of what its own steps created and deleted
+    /// (`ScanCensus.Record`). Two separate files rather than one shared one, so
+    /// two modules never write the same path.
+    var modelCensusJSON: URL {
+        url("\(BrandConfig.Folder.model)/census.json")
+    }
+
     var modelDirectory: URL {
         root.appendingPathComponent(BrandConfig.Folder.model, isDirectory: true)
     }

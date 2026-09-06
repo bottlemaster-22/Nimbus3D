@@ -140,6 +140,19 @@ enum PrePassInitialSplatBuilder {
         /// Hard ceiling regardless of what the budget asks for: the initial
         /// set is a starting point, and densification exists to grow it.
         var absoluteMaxSplats = 400_000
+        /// The reference sigma the trust weight is built around, metres.
+        ///
+        /// Not used to compute anything: used to REPORT what the trust line
+        /// means in metres. `TwoScaleTrustField.weight` is
+        /// `1 / (1 + (sigma / reference)^2)` times a confidence factor, so a
+        /// cut can be turned back into "the sigma a sample has to beat", which
+        /// is the form a person can compare against a real measurement.
+        ///
+        /// Kept in step with `SmartLossSettings.default.noiseReferenceMeters`,
+        /// which is what the pipeline builds its trust field with. It is a
+        /// number for the census only, so if the two ever drift apart the
+        /// reported sigma is wrong and nothing else is.
+        var trustNoiseReferenceMeters: Float = SmartLossSettings.default.noiseReferenceMeters
 
         init() {}
     }
@@ -157,6 +170,13 @@ enum PrePassInitialSplatBuilder {
     ///   - edgeMapFor: `EdgeClassifier.map(for:)`, or a closure returning an
     ///     empty array when edges were not classified.
     ///   - surfaceAreaSquareMeters: from the survey, used to derive spacing.
+    ///   - census: filled in as the build goes, INCLUDING on the two paths
+    ///     that throw. It is `inout` rather than part of the return value for
+    ///     exactly that reason: the run where a stage produces nothing is the
+    ///     run whose numbers matter most, and a thrown error would take a
+    ///     returned value with it. The caller passes a plain local variable,
+    ///     whose storage is written directly, so everything counted before the
+    ///     throw is still there afterwards.
     static func build(
         bundle: CaptureBundle,
         at ref: CaptureBundleRef,
@@ -167,8 +187,15 @@ enum PrePassInitialSplatBuilder {
         surfaceAreaSquareMeters: Float,
         targetSplatCount: Int,
         noiseModel: SmartDepthNoiseModel = .default,
-        settings: Settings = Settings()
+        settings: Settings = Settings(),
+        census: inout PrePassCensus.Seeding
     ) throws -> PrePassInitialSplatOutput {
+
+        census.attempted = true
+        census.trustedFloor = settings.trustedWeight
+        census.trustedQuantile = settings.trustedQuantile
+        census.targetSplatCount = targetSplatCount
+        census.measuredSurfaceAreaSquareMeters = surfaceAreaSquareMeters
 
         let frames = bundle.frames
             .filter { $0.depthPath != nil && $0.qc.trackingQuality != .notAvailable }
@@ -187,10 +214,15 @@ enum PrePassInitialSplatBuilder {
         // rather than a guard so a tiny object scan still gets the minimum
         // spacing instead of a division by zero.
         let area = Swift.max(surfaceAreaSquareMeters, 0.01)
-        var spacing = (area / Float(target)).squareRoot()
-        spacing = Swift.min(
-            Swift.max(spacing, settings.minSpacingMeters), settings.maxSpacingMeters
+        let requestedSpacing = (area / Float(target)).squareRoot()
+        let spacing = Swift.min(
+            Swift.max(requestedSpacing, settings.minSpacingMeters), settings.maxSpacingMeters
         )
+        census.spacingRequestedMeters = requestedSpacing
+        census.spacingMeters = spacing
+        // A clamp here silently changes the density of the whole scan away
+        // from what the budget asked for, in either direction.
+        census.spacingWasClamped = abs(spacing - requestedSpacing) > 1e-6
 
         let geometry = PrePassDepthGeometry(
             rgbIntrinsics: bundle.intrinsics, settings: bundle.settings
@@ -227,9 +259,31 @@ enum PrePassInitialSplatBuilder {
         var color: [SIMD3<Float>] = []
         var weight: [Float] = []
         var sigma: [Float] = []
+        /// Whether this cell's sigma is a MEASUREMENT or the physics
+        /// prediction. Kept per cell rather than as a single flag because a
+        /// scan can be half and half, and a median taken over a mixture of the
+        /// two would be neither.
+        var sigmaMeasured: [Bool] = []
         var rangeMeters: [Float] = []
         var hasNormal: [Bool] = []
         var onEdge: [Bool] = []
+
+        // The funnel, counted. Plain Ints on the stack: the inner loop runs
+        // about eight million times on a room scan and does one add per
+        // survivor, which is not measurable next to the unprojection it sits
+        // beside.
+        var keyframesDepthLoaded = 0
+        var keyframesDepthMissing = 0
+        var keyframesImageMissing = 0
+        var samplesInspected = 0
+        var samplesWithReturn = 0
+        var samplesInRange = 0
+        var samplesInsideGrid = 0
+        var samplesWithZeroTrust = 0
+        var confidenceLow = 0
+        var confidenceMedium = 0
+        var confidenceHigh = 0
+        census.keyframesSelected = keyframes.count
 
         for frame in keyframes {
             try Task.checkCancellation()
@@ -240,9 +294,17 @@ enum PrePassInitialSplatBuilder {
                     frame: frame, settings: bundle.settings, at: ref
                 )
             } catch {
+                // A corrupt or unreadable sidecar. Skipped in silence before
+                // the census, so a scan that read no depth at all and a scan
+                // whose depth was all out of range produced the same nothing.
+                keyframesDepthMissing += 1
                 continue
             }
-            guard let depthFrame else { continue }
+            guard let depthFrame else {
+                keyframesDepthMissing += 1
+                continue
+            }
+            keyframesDepthLoaded += 1
 
             // Normals come from the same unprojection ICP uses, so the surface
             // orientation a splat gets and the orientation a loop closure was
@@ -257,22 +319,39 @@ enum PrePassInitialSplatBuilder {
                 url: ref.url(forRelativePath: frame.imagePath),
                 width: width, height: height
             )
+            // No picture means every splat from this frame comes out mid grey.
+            // Worth knowing before someone spends a day wondering why the
+            // model is the colour of concrete.
+            if image == nil { keyframesImageMissing += 1 }
             let edges = edgeMapFor(frame.index)
             let pose = poseFor(frame)
             let cameraCentre = pose.center.simd
             let rotationInverse = pose.rotation.simd.inverse
 
             for sampleIndex in 0..<(width * height) {
+                samplesInspected += 1
                 guard depthFrame.hasReturn(at: sampleIndex) else { continue }
+                samplesWithReturn += 1
                 let z = depthFrame.depthMeters(at: sampleIndex)
                 let range = geometry.range(index: sampleIndex, depthMeters: z)
                 guard range > 0.2, range <= maxRange else { continue }
+                samplesInRange += 1
+                // Recorded, not filtered on. A histogram that is entirely
+                // medium means the confidence sidecar was missing, because
+                // that is what a missing file reads back as.
+                switch depthFrame.confidenceLevel(at: sampleIndex) {
+                case 0: confidenceLow += 1
+                case 1: confidenceMedium += 1
+                default: confidenceHigh += 1
+                }
 
                 let direction = rotationInverse.act(geometry.rayDirections[sampleIndex])
                 let world = cameraCentre + direction * range
                 guard let key = voxelFrame.key(world) else { continue }
+                samplesInsideGrid += 1
 
                 let sampleWeight = clamp01(trustWeight(frame.index, sampleIndex))
+                if sampleWeight <= 0 { samplesWithZeroTrust += 1 }
 
                 let slot = hash.indexOrInsert(key)
                 if !slot.inserted, sampleWeight <= weight[slot.index] { continue }
@@ -295,9 +374,11 @@ enum PrePassInitialSplatBuilder {
                 var sampleSigma = noiseModel.sigma(
                     rangeMeters: range, incidenceCosine: incidence
                 )
+                var sampleSigmaMeasured = false
                 if let measured = sigmaFor(frame.index, sampleIndex),
                    measured.isFinite, measured > 0 {
                     sampleSigma = measured
+                    sampleSigmaMeasured = true
                 }
 
                 let rgb = image?.rgb(
@@ -313,6 +394,7 @@ enum PrePassInitialSplatBuilder {
                     color.append(rgb)
                     weight.append(sampleWeight)
                     sigma.append(sampleSigma)
+                    sigmaMeasured.append(sampleSigmaMeasured)
                     rangeMeters.append(range)
                     hasNormal.append(normalValid)
                     onEdge.append(isEdge)
@@ -324,6 +406,7 @@ enum PrePassInitialSplatBuilder {
                     color[s] = rgb
                     weight[s] = sampleWeight
                     sigma[s] = sampleSigma
+                    sigmaMeasured[s] = sampleSigmaMeasured
                     rangeMeters[s] = range
                     hasNormal[s] = normalValid
                     // An edge seen in any frame stays an edge: a curve that is
@@ -334,6 +417,23 @@ enum PrePassInitialSplatBuilder {
         }
 
         let count = position.count
+
+        // Recorded BEFORE the guard below, so the run that produced nothing
+        // still reports exactly how much it started with and where the last
+        // survivor was lost. That run is the whole reason this exists.
+        census.keyframesWithDepthLoaded = keyframesDepthLoaded
+        census.keyframesDepthMissing = keyframesDepthMissing
+        census.keyframesImageMissing = keyframesImageMissing
+        census.samplesInspected = samplesInspected
+        census.samplesWithReturn = samplesWithReturn
+        census.samplesInRange = samplesInRange
+        census.samplesInsideGrid = samplesInsideGrid
+        census.samplesWithZeroTrustWeight = samplesWithZeroTrust
+        census.samplesConfidenceLow = confidenceLow
+        census.samplesConfidenceMedium = confidenceMedium
+        census.samplesConfidenceHigh = confidenceHigh
+        census.gaussiansBuilt = count
+
         guard count > 0 else {
             throw NimbusError.prePassFailed(
                 "no laser measurements survived to build a starting point set from"
@@ -354,6 +454,7 @@ enum PrePassInitialSplatBuilder {
         var trustedCount = 0
         var doubtfulCount = 0
         var edgeCount = 0
+        var normalCount = 0
 
         let trustedLogit = SplatMath.invSigmoid(settings.trustedOpacity)
         let doubtfulLogit = SplatMath.invSigmoid(settings.doubtfulOpacity)
@@ -367,14 +468,73 @@ enum PrePassInitialSplatBuilder {
         // A steady, well lit scan puts the quantile well above the floor and
         // the floor does nothing. A shaky first scan puts it below, and the
         // floor stops the model calling genuinely bad geometry solid.
+        // The same sorted array serves the cut and the census, so recording
+        // the distribution costs one extra read of numbers already in hand.
+        // The cut and the distribution have to be read together: a cut is only
+        // wrong RELATIVE to the data, which is the lesson of the 0.5 gate that
+        // rejected every sample on the first real scan.
+        let sortedWeights: [Float] = weight.prefix(count).filter { $0.isFinite }.sorted()
         let trustCut: Float = {
-            let finite = weight.prefix(count).filter { $0.isFinite }
-            guard !finite.isEmpty else { return settings.trustedWeight }
-            let sorted = finite.sorted()
+            guard !sortedWeights.isEmpty else { return settings.trustedWeight }
             let q = Swift.max(0, Swift.min(1, settings.trustedQuantile))
-            let index = Swift.min(sorted.count - 1, Int(Float(sorted.count - 1) * q))
-            return Swift.max(sorted[index], settings.trustedWeight)
+            let index = Swift.min(
+                sortedWeights.count - 1, Int(Float(sortedWeights.count - 1) * q)
+            )
+            return Swift.max(sortedWeights[index], settings.trustedWeight)
         }()
+        census.trustCut = trustCut
+        if !sortedWeights.isEmpty {
+            func quantile(_ q: Float) -> Float {
+                let index = Swift.min(
+                    sortedWeights.count - 1,
+                    Swift.max(0, Int(Float(sortedWeights.count - 1) * q))
+                )
+                return sortedWeights[index]
+            }
+            census.weightMinimum = sortedWeights[0]
+            census.weightP05 = quantile(0.05)
+            census.weightMedian = quantile(0.5)
+            census.weightP95 = quantile(0.95)
+            census.weightMaximum = sortedWeights[sortedWeights.count - 1]
+        }
+
+        // --- The trust line, expressed in metres.
+        //
+        // The cut is on a WEIGHT, and a weight means nothing to a reader. The
+        // trust field builds it as
+        //
+        //     weight = 1 / (1 + (sigma / reference)^2) * (0.25 + 0.75 * conf)
+        //
+        // so at perfect confidence the cut inverts to
+        //
+        //     sigma = reference * sqrt(1 / cut - 1)
+        //
+        // which is "how tight a measurement has to be to be believed". Sanity
+        // check on the arithmetic: the old cut of 0.5 at the 0.02 m reference
+        // gives 0.02 * sqrt(1) = 2 cm, which is exactly the gate that rejected
+        // every sample on the first real scan. Printed next to the median
+        // sigma below, that fault is one line instead of one day.
+        let reference = Swift.max(settings.trustNoiseReferenceMeters, 1e-4)
+        census.trustNoiseReferenceMeters = reference
+        if trustCut > 0, trustCut < 1 {
+            let equivalent = reference * (1 / trustCut - 1).squareRoot()
+            if equivalent.isFinite { census.trustGateEquivalentSigmaMeters = equivalent }
+        }
+
+        // The median of the MEASURED sigmas only. Mixing in the physics prior
+        // would produce a number that is neither a measurement nor a
+        // prediction, and it is reported to the rest of the app under the name
+        // "measured".
+        var measuredSigmas: [Float] = []
+        measuredSigmas.reserveCapacity(count)
+        for i in 0..<count where sigmaMeasured[i] && sigma[i].isFinite {
+            measuredSigmas.append(sigma[i])
+        }
+        census.gaussiansWithMeasuredSigma = measuredSigmas.count
+        if !measuredSigmas.isEmpty {
+            census.medianSigmaMeters = PrePassStats.median(measuredSigmas)
+            census.sigmaIsMeasured = true
+        }
 
         for i in 0..<count {
             let p = position[i]
@@ -389,6 +549,11 @@ enum PrePassInitialSplatBuilder {
             let sensorSpacing = rangeMeters[i] / nativeFX
             let radius = 0.5 * Swift.max(spacing, sensorSpacing)
 
+            // Two gates, not one. A point can clear the trust cut and still be
+            // doubtful because it never got a surface direction, and if the
+            // normals fail everywhere the trusted count is zero no matter
+            // where the cut sits. Counted separately for exactly that reason.
+            if hasNormal[i] { normalCount += 1 }
             let trusted = weight[i] >= trustCut && hasNormal[i]
             let axis: SIMD3<Float>
             let thirdScale: Float
@@ -427,6 +592,14 @@ enum PrePassInitialSplatBuilder {
             expectedError[i] = sigma[i]
         }
 
+        // Recorded here rather than after the file is written, so a failure in
+        // the PLY writer does not also lose the answer to "how many of them
+        // were trusted", which is the question that matters most.
+        census.gaussiansWithNormal = normalCount
+        census.trustedCount = trustedCount
+        census.doubtfulCount = doubtfulCount
+        census.onEdgeCount = edgeCount
+
         let cloud = try SplatCloud(
             shDegree: .zero,
             positions: positions,
@@ -451,6 +624,8 @@ enum PrePassInitialSplatBuilder {
         try PrePassBinary.write(
             Data(flags), to: ref.url(forRelativePath: PrePassPaths.initialSplatFlags)
         )
+
+        census.splatsWritten = count
 
         return PrePassInitialSplatOutput(
             ref: InitialSplatSetRef(

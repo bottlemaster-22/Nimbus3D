@@ -89,13 +89,26 @@ struct PrePassFramePoints: Sendable {
         // one produces a normal pointing at nothing. Those samples get no
         // normal and drop out of the alignment - which is correct: a depth
         // edge is precisely where the native map is least trustworthy (F3).
+        //
+        // The neighbour test READS `depthValid`, a frozen snapshot of what the
+        // unprojection above decided, and WRITES its answer into a separate
+        // `hasNormal`. Those must not be the same array. In raster order
+        // `valid[i - 1]` and `valid[i - w]` would already have been overwritten
+        // by this very loop, so a single dead sample killed the whole rest of
+        // its row, and that row then killed the same columns in every row
+        // below it. The surviving set collapsed into a left-anchored staircase:
+        // on a 256x192 frame with 20% of samples missing, 2 points survived
+        // instead of ~15,100, which is two orders of magnitude below the 300
+        // `PrePassICP.Settings.minInliers` needs before it will even start.
+        let depthValid = valid
+        var hasNormal = [Bool](repeating: false, count: n)
         var normals = [SIMD3<Float>](repeating: .zero, count: n)
         var validCount = 0
         for y in 1..<Swift.max(h - 1, 1) {
             let row = y * w
             for x in 1..<Swift.max(w - 1, 1) {
                 let i = row + x
-                guard valid[i] else { continue }
+                guard depthValid[i] else { continue }
                 let z = depth[i]
                 // Scale the allowed neighbour jump with range: at 4 m the
                 // sample spacing itself is ~2 cm, so a fixed 2 cm threshold
@@ -104,13 +117,18 @@ struct PrePassFramePoints: Sendable {
 
                 let left = i - 1, right = i + 1
                 let up = i - w, down = i + w
-                guard valid[left], valid[right], valid[up], valid[down],
+                // `depthValid`, not `valid`. This is the whole point of the
+                // snapshot taken above, and reading the live array here was the
+                // bug the comment describes: `valid[left]` and `valid[up]` have
+                // already been rewritten by this same loop, so one dead sample
+                // cascaded along its row and then down every row beneath it.
+                guard depthValid[left], depthValid[right],
+                      depthValid[up], depthValid[down],
                       abs(depth[left] - z) < depthStep,
                       abs(depth[right] - z) < depthStep,
                       abs(depth[up] - z) < depthStep,
                       abs(depth[down] - z) < depthStep
                 else {
-                    valid[i] = false
                     continue
                 }
 
@@ -118,22 +136,26 @@ struct PrePassFramePoints: Sendable {
                 let dy = points[down] - points[up]
                 let cross = simd_cross(dx, dy)
                 let length = simd_length(cross)
-                guard length > 1e-9 else { valid[i] = false; continue }
+                guard length > 1e-9 else { continue }
                 var normal = cross / length
                 // Orient towards the camera: the camera sits at the origin of
                 // this frame, so a surface we can see has n . (-p) > 0.
                 if simd_dot(normal, points[i]) > 0 { normal = -normal }
                 normals[i] = normal
+                hasNormal[i] = true
                 validCount += 1
             }
         }
-        // Border samples never get a normal; make that explicit rather than
-        // leaving them "valid with a zero normal".
-        for y in 0..<h {
-            for x in 0..<w where x == 0 || y == 0 || x == w - 1 || y == h - 1 {
-                valid[y * w + x] = false
-            }
-        }
+
+        // A sample is usable only if it got a normal, so that IS the validity
+        // this function returns. Writing it as a separate array and swapping it
+        // in at the end (rather than mutating `valid` inside the loop) is what
+        // makes the aliasing bug above structurally impossible rather than
+        // merely fixed: there is no longer a live array to read by mistake.
+        //
+        // Border samples fall out for free, because the loops above run
+        // 1..<h-1 and 1..<w-1 and can never set `hasNormal` on an edge.
+        valid = hasNormal
 
         return PrePassFramePoints(
             width: w,

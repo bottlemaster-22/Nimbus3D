@@ -1,0 +1,1032 @@
+//
+//  TrainerCensus.swift
+//  Trainer
+//
+//  THE SPLAT CENSUS. WHERE EVERY GAUSSIAN WENT, WRITTEN DOWN AS IT HAPPENS.
+//
+//  ---------------------------------------------------------------------------
+//  WHY THIS FILE EXISTS
+//  ---------------------------------------------------------------------------
+//  The first real scan this app ever produced "looked like nothing", and
+//  finding out why took a day of reading code and estimating survivor counts
+//  stage by stage, because the trainer recorded NOTHING about its own
+//  behaviour. Four separate faults had each destroyed most of the model:
+//
+//    1. `absGradThreshold` was in the wrong units, so densification created
+//       ZERO Gaussians on every run that has ever happened.
+//    2. `degradeForHeat` cut the splat cap BELOW the live population, which
+//       deleted real Gaussians and then left `headroom = cap - count` at 0,
+//       switching densification off for the rest of the run.
+//    3. `pruneStartFraction` / `pruneEndFraction` were declared, defaulted and
+//       assigned but read nowhere, so pruning ran 29 times instead of ~10.
+//    4. The seeder's trust gate rejected essentially every realistic sample,
+//       so every seed was laid as a stretched blob instead of a solid disc.
+//
+//  NOT ONE of them logged, warned or failed. The app reported success and
+//  produced almost nothing. Every one of the four would have been a single
+//  line in this file's output:
+//
+//    1. "growth was allowed in 18 passes with room for 240,000 more and
+//        created 0"
+//    2. "the splat cap was cut from 300,000 to 137,000 at iteration 100 while
+//        182,000 were alive: 45,000 real points were deleted"
+//    3. "faint-or-oversized pruning ran in 17 passes outside its window"
+//    4. "0 of 182,340 seeds were laid as solid discs; every one was stretched
+//        along the viewing ray"
+//
+//  ---------------------------------------------------------------------------
+//  THE RULES THIS FILE KEEPS
+//  ---------------------------------------------------------------------------
+//  * CHEAP. Everything here is an integer counter held in memory. There is one
+//    disk write, at the very end of the run. There is no per-iteration write
+//    and there is not one GPU synchronisation that the trainer would not have
+//    done anyway: every number recorded is one the loop already had in a Swift
+//    variable.
+//  * IT AGGREGATES, IT DOES NOT RE-MEASURE. `TrainerDensifyOutcome` already
+//    counts splits, clones, relocations, each prune reason and the carve, and
+//    `TrainerBudgetGovernor.changes` already records every reduction. This
+//    file collects those, stamps them with when and where, and adds only the
+//    context they were missing (which window was open, what the cap was, how
+//    much headroom there was).
+//  * IT NEVER GUESSES. A number that was not measured is not in the file. The
+//    one derived figure, `splatCountAfterGrowth`, is exact arithmetic on two
+//    measured counts and says so where it is declared.
+//  * IT WRITES EVEN WHEN THE RUN FAILS. The run that throws is the run you
+//    most want the census for, so `MetalSplatTrainer.run` writes this from a
+//    `defer` rather than from the success path.
+//
+
+import Foundation
+
+// MARK: - Budget
+
+/// A training budget flattened to plain numbers, so "asked for" and "actually
+/// run" can be read side by side without decoding a nested type.
+struct TrainerCensusBudget: Codable {
+    var splatCap: Int
+    var iterations: Int
+    var renderLongEdgePixels: Int
+    var shDegree: Int
+    var keyframeCount: Int
+    var memoryCeilingBytes: UInt64
+    /// Recorded as it is written into the model: the GPU structs in
+    /// TrainerGPULayouts.swift are fp32 by design whatever was asked for, so
+    /// this is false on every real run.
+    var useHalfPrecision: Bool
+
+    init(_ budget: TrainingBudget, halfPrecisionActuallyUsed: Bool = false) {
+        splatCap = budget.splatCap
+        iterations = budget.iterations
+        renderLongEdgePixels = budget.renderLongEdgePixels
+        shDegree = budget.shDegree.rawValue
+        keyframeCount = budget.keyframeCount
+        memoryCeilingBytes = budget.memoryCeilingBytes
+        useHalfPrecision = halfPrecisionActuallyUsed
+    }
+}
+
+/// One budget-lowering event, with WHEN it happened and what the population
+/// was at that moment. The last two fields are the whole point: a cap cut that
+/// lands at or below the live count deletes real geometry and then leaves zero
+/// headroom, and without the live count beside it that is invisible.
+struct TrainerCensusBudgetReduction: Codable {
+    /// "splatCap", "renderLongEdgePixels" or "iterations".
+    var what: String
+    var from: Int
+    var to: Int
+    /// "the phone was warm", "memory share" or "memory ceiling".
+    var reason: String
+    /// Thermal level as a number (0 nominal, 3 critical) when the reason was
+    /// heat; nil otherwise.
+    var thermalLevel: Int?
+    var residentBytes: UInt64?
+    var comparedAgainstBytes: UInt64?
+    /// Slice this happened in, and the iteration counted across the whole run.
+    /// Both are -1 for a reduction taken before any loop started (the sizing
+    /// pass in `initialSplatCap`), which is a real and different moment.
+    var atSliceIndex: Int
+    var atIteration: Int
+    /// How many Gaussians were alive when this was applied.
+    var liveSplatCount: Int
+    /// True when a splat-cap cut landed at or below the live population. That
+    /// is the one-way ratchet: real Gaussians are deleted to fit, and the
+    /// headroom densification needs is then zero for the rest of the run.
+    var landedAtOrBelowLivePopulation: Bool
+    /// The sentence the user was shown for this reduction.
+    var messageShown: String
+
+    /// Straight transcription of what the governor already recorded. Nothing
+    /// is recomputed here, so the file and the governor can never disagree.
+    init(_ change: TrainerBudgetChange) {
+        what = change.changedField
+        from = change.fromValue
+        to = change.toValue
+        reason = change.reason.censusReason
+        thermalLevel = change.reason.thermalLevel?.rawValue
+        residentBytes = change.reason.residentBytes
+        comparedAgainstBytes = change.reason.comparedAgainstBytes
+        atSliceIndex = change.atSliceIndex
+        atIteration = change.atIteration
+        liveSplatCount = change.liveSplatCount
+        landedAtOrBelowLivePopulation = change.landedAtOrBelowLivePopulation
+        messageShown = change.message
+    }
+}
+
+// MARK: - The gates, as the code actually read them
+
+/// Every schedule constant the loop READ, recorded from the point of use.
+///
+/// Bug 3 was a pair of settings that existed in three files and were read by
+/// nothing. A value copied out of a struct at start-up would look identical in
+/// the working and the broken case, so these are captured inside the slice
+/// loop, next to the passes they gate. "The window says 0.15 to 0.80 and
+/// pruning ran in 29 passes" is then a contradiction visible on one page.
+struct TrainerCensusGates: Codable {
+    var densifyStartFraction: Float
+    var densifyEndFraction: Float
+    var densifyIntervalIterations: Int
+    var pruneStartFraction: Float
+    var pruneEndFraction: Float
+    var carveIntervalIterations: Int
+    /// The score a Gaussian must beat to become a densification candidate, as
+    /// the loop ACTUALLY applies it. It is `0`: `TrainerDensifier` selects on
+    /// `score[i] > 0` and lets the ranked truncation to the cap do the cutting,
+    /// which is scale-free and cannot be broken again by a units change.
+    ///
+    /// This field is deliberately NOT `TrainerTuning.absGradThreshold`. That
+    /// constant still exists, at 1e-9, and the densifier no longer reads it.
+    /// Recording it here under a name that implies it is the gate would be the
+    /// same fault as the pruning window that was declared and read by nothing:
+    /// a census whose whole job is to catch a dead setting must not print one
+    /// as though it were live.
+    var densifyScoreFloor: Float
+    var pruneOpacity: Float
+    var pruneMaxWorldScaleFraction: Float
+    var pruneMaxScreenRadiusPx: Float
+    var maxGrowthFractionPerPass: Float
+    var maxRelocationFractionPerPass: Float
+    var pruneMaxFractionPerPass: Float
+    var warmupFraction: Float
+    var binarizeLastFraction: Float
+    var minimumAuthorityForDepth: Float
+}
+
+// MARK: - One densification / prune / carve pass
+
+/// What one call to `TrainerDensifier.run` did, and the context it did it in.
+///
+/// Growth, pruning and carving all happen inside one pass, so one row covers
+/// all three. `splatCountAfterGrowth` is the only derived number here and it
+/// is exact rather than estimated: a split replaces its parent in place and
+/// appends one child, and a clone appends one, so the population after growth
+/// is always `splatCountBefore + addedBySplit + addedByClone`.
+struct TrainerCensusDensifyPass: Codable {
+    var sliceIndex: Int
+    /// Iteration within this slice, which is what the windows are measured
+    /// against.
+    var iteration: Int
+    var progressFraction: Float
+
+    var growthWindowOpen: Bool
+    var pruneWindowOpen: Bool
+    /// True when the carver actually ran this pass (it is due only every
+    /// `carveIntervalIterations`). `carverAvailable` says whether there was an
+    /// occupancy grid to run at all, so "no grid" and "not due" stay distinct.
+    var carveRan: Bool
+    var carverAvailable: Bool
+
+    var capInForce: Int
+    var headroom: Int
+    var growthAllowance: Int
+
+    /// How many Gaussians were scored, how many scored above zero, and how
+    /// many of those survived the "something actually looked at it" filter.
+    /// A large population with zero candidates is the fingerprint of a dead
+    /// gradient signal or a threshold in the wrong units.
+    var splatsScored: Int
+    var splatsWithNonZeroScore: Int
+    var candidatesAfterVisibilityFilter: Int
+    var relocationDonorsAvailable: Int
+
+    var splatCountBefore: Int
+    var addedBySplit: Int
+    var addedByClone: Int
+    var relocated: Int
+    /// Derived, exactly: before + split + clone. See the type comment.
+    var splatCountAfterGrowth: Int
+    var prunedNonFinite: Int
+    var prunedLowOpacity: Int
+    var prunedOversized: Int
+    var carvedFromEmptySpace: Int
+    var trimmedToCap: Int
+    var splatCountAfter: Int
+
+    init(
+        sliceIndex: Int,
+        iteration: Int,
+        progressFraction: Float,
+        carverAvailable: Bool,
+        outcome: TrainerDensifyOutcome
+    ) {
+        self.sliceIndex = sliceIndex
+        self.iteration = iteration
+        self.progressFraction = progressFraction
+        self.growthWindowOpen = outcome.growthAllowed
+        self.pruneWindowOpen = outcome.pruneAllowed
+        self.carveRan = outcome.carveAttempted
+        self.carverAvailable = carverAvailable
+        self.capInForce = outcome.splatCapInForce
+        self.headroom = outcome.headroomAtStart
+        self.growthAllowance = outcome.growthAllowance
+        self.splatsScored = outcome.splatsScored
+        self.splatsWithNonZeroScore = outcome.splatsWithNonZeroScore
+        self.candidatesAfterVisibilityFilter = outcome.candidatesAfterVisibilityFilter
+        self.relocationDonorsAvailable = outcome.relocationDonorsAvailable
+        self.splatCountBefore = outcome.splatCountBefore
+        self.addedBySplit = outcome.split
+        self.addedByClone = outcome.cloned
+        self.relocated = outcome.relocated
+        self.splatCountAfterGrowth = outcome.splatCountBefore + outcome.split + outcome.cloned
+        self.prunedNonFinite = outcome.prunedNonFinite
+        self.prunedLowOpacity = outcome.prunedLowOpacity
+        self.prunedOversized = outcome.prunedOversized
+        self.carvedFromEmptySpace = outcome.carvedFromEmptySpace
+        self.trimmedToCap = outcome.trimmedToCap
+        self.splatCountAfter = outcome.splatCountAfter
+    }
+}
+
+// MARK: - One slice
+
+/// One slice's whole life: what it was seeded with, what it ran, what it
+/// handed to the merge.
+struct TrainerCensusSlice: Codable {
+    var index: Int = 0
+    var label: String = ""
+    var keyframesTrained: Int = 0
+    var keyframesHeldOut: Int = 0
+
+    // --- Seeding ------------------------------------------------------------
+
+    /// Either a sidecar path (the pre-pass's own set) or "native depth maps".
+    /// The two mean different things by "rejected", which is why the alert
+    /// rules below only judge the rejection rate of the second.
+    var seedSource: String = ""
+    var seedFramesUsed: Int = 0
+    var seedSamplesConsidered: Int = 0
+    var seedSamplesRejected: Int = 0
+    /// How many seeds were laid as SOLID DISCS across the surface because the
+    /// depth sample was trusted, and how many were STRETCHED ALONG THE VIEWING
+    /// RAY because it was not. A run where the second number is everything is
+    /// a run whose trust gate is rejecting realistic input.
+    var seedsPinnedAsDiscs: Int = 0
+    var seedsStretchedAlongRay: Int = 0
+    var seedsBuilt: Int = 0
+    /// What actually reached the GPU. Lower than `seedsBuilt` means the buffer
+    /// could not hold them all.
+    var seedsUploaded: Int = 0
+    /// True once `seedsUploaded` above has actually been written by the upload
+    /// step. A slice row is opened BEFORE seeding so that a slice which throws
+    /// still leaves a row behind, which means an untouched `seedsUploaded` is a
+    /// default and not a measurement. Everything downstream that would
+    /// otherwise report that default as "the build started with 0 points"
+    /// checks this first.
+    var seedsUploadedCounted: Bool = false
+    var seedMedianSpacingMillimetres: Int = 0
+
+    // --- The run ------------------------------------------------------------
+
+    var splatCapAsked: Int = 0
+    var splatCapMeasuredAffordable: Int = 0
+    var splatCapEffective: Int = 0
+    var renderWidth: Int = 0
+    var renderHeight: Int = 0
+    var iterationsRequested: Int = 0
+    var iterationsCompleted: Int = 0
+    /// Iterations that took no optimisation step, each for a stated reason.
+    /// These are silent skips in the loop, counted here rather than left to be
+    /// inferred from a gap in the wall clock.
+    var iterationsSkippedNoSupervision: Int = 0
+    var iterationsSkippedGrowingTileBuffer: Int = 0
+    var iterationsSkippedNothingToRender: Int = 0
+    var stopReason: String = TrainerCensus.unfinishedOutcome
+
+    // --- What came out -------------------------------------------------------
+
+    var splatCountAtEndOfTraining: Int = 0
+    /// Non-finite Gaussians dropped by `readCloud` on the way out. Should
+    /// always be zero; if it is not, something is producing NaNs and the prune
+    /// is not catching them.
+    var droppedNonFiniteOnReadback: Int = 0
+    var splatsHandedToMerge: Int = 0
+    var heldOutPSNR: Float?
+}
+
+// MARK: - The merge
+
+struct TrainerCensusMerge: Codable {
+    /// How many Gaussians each slice handed in, in slice order.
+    var splatsInPerSlice: [Int]
+    var splatsIn: Int
+    var kept: Int
+    /// Deleted because another slice owns the region their centre fell in.
+    var droppedToAnotherOwner: Int
+    var trimmedToCap: Int
+    var splatsOut: Int
+}
+
+// MARK: - Alerts
+
+/// One thing worth looking at, stated with the numbers that make it a fact
+/// rather than an opinion.
+struct TrainerCensusAlert: Codable {
+    /// "loud" means a whole stage did nothing or most of the model was
+    /// destroyed. "check" means it is worth a look but may be legitimate.
+    var severity: String
+    /// A stable machine-readable name, so a screen can match on it without
+    /// parsing English.
+    var code: String
+    var detail: String
+}
+
+// MARK: - The census
+
+/// Everything one training run did to its own geometry.
+///
+/// Written once, at the end of the run, to `model/train_census.json`. See
+/// `docs/DATA_FORMAT.md` section 8.
+struct TrainerCensus: Codable {
+
+    /// Bumped only when a field changes MEANING. Adding an optional field does
+    /// not bump it, which is the rule the rest of the format already uses.
+    var formatVersion: Int = 1
+    var scanID: ScanID
+    var startedAt: Date
+    var finishedAt: Date?
+    /// "completed", "cancelled", "stopped early" or "failed: <reason>". The
+    /// default is what a run that vanished mid-flight leaves behind, which is
+    /// more honest than a blank.
+    var outcome: String = TrainerCensus.unfinishedOutcome
+
+    /// What `outcome` and `TrainerCensusSlice.stopReason` say until something
+    /// overwrites them. Named once so a reader cannot mistake a run that died
+    /// silently for one that finished.
+    static let unfinishedOutcome = "did not reach the end"
+
+    var budgetRequested: TrainerCensusBudget
+    var budgetAsRun: TrainerCensusBudget
+    var budgetReductions: [TrainerCensusBudgetReduction] = []
+    var gates: TrainerCensusGates?
+
+    var keyframesSelected: Int = 0
+    var sliceCount: Int = 0
+    var slices: [TrainerCensusSlice] = []
+    var densifyPasses: [TrainerCensusDensifyPass] = []
+    var merge: TrainerCensusMerge?
+
+    var iterationsRequested: Int
+    var iterationsCompleted: Int = 0
+    var finalSplatCount: Int = 0
+
+    /// The five second read: one ordered line per stage, from the seeds to the
+    /// final count, so a reader sees WHERE the geometry went without adding
+    /// anything up. Filled in by `sealed()`.
+    var ledger: [String] = []
+    /// What is worth looking at, worst first. Filled in by `sealed()`.
+    var alerts: [TrainerCensusAlert] = []
+
+    init(scanID: ScanID, requested: TrainingBudget, startedAt: Date = Date()) {
+        self.scanID = scanID
+        self.startedAt = startedAt
+        self.budgetRequested = TrainerCensusBudget(requested)
+        self.budgetAsRun = TrainerCensusBudget(requested)
+        self.iterationsRequested = requested.iterations
+    }
+
+    // MARK: Totals
+
+    /// Plain sums over the recorded passes. Nothing here is stored; it is
+    /// recomputed on demand so it can never disagree with the rows above it.
+    struct Totals {
+        var passes = 0
+        var addedBySplit = 0
+        var addedByClone = 0
+        var relocated = 0
+        var prunedNonFinite = 0
+        var prunedLowOpacity = 0
+        var prunedOversized = 0
+        var carved = 0
+        var trimmedToCap = 0
+        var passesWithGrowthWindowOpen = 0
+        var passesWithGrowthWindowOpenAndHeadroom = 0
+        var passesWithPruneWindowOpen = 0
+        var passesThatPrunedByJudgement = 0
+        var passesThatPrunedByJudgementOutsideWindow = 0
+        var largestHeadroomWhileGrowthWasAllowed = 0
+        /// Passes where pruning of ANY kind removed at least one Gaussian,
+        /// non-finite included. The denominator that belongs with
+        /// `prunedAtAll`: a pass count taken over one definition of pruning and
+        /// a deleted count taken over another is two numbers that look like a
+        /// pair and are not.
+        var passesThatPrunedAnything = 0
+        /// How many Gaussians densification actually looked at as candidates,
+        /// summed over every pass. Zero candidates across many passes is a
+        /// scoring or units fault; many candidates and nothing created is a
+        /// creation fault, and the two need telling apart.
+        var densifyCandidates = 0
+
+        var added: Int { addedBySplit + addedByClone }
+        var prunedByJudgement: Int { prunedLowOpacity + prunedOversized }
+        /// Everything the prune step removed, however it decided. Carving and
+        /// the cap trim are separate steps and are deliberately not in here.
+        var prunedAtAll: Int { prunedNonFinite + prunedByJudgement }
+    }
+
+    var totals: Totals {
+        var t = Totals()
+        for pass in densifyPasses {
+            t.passes += 1
+            t.addedBySplit += pass.addedBySplit
+            t.addedByClone += pass.addedByClone
+            t.relocated += pass.relocated
+            t.prunedNonFinite += pass.prunedNonFinite
+            t.prunedLowOpacity += pass.prunedLowOpacity
+            t.prunedOversized += pass.prunedOversized
+            t.carved += pass.carvedFromEmptySpace
+            t.trimmedToCap += pass.trimmedToCap
+            if pass.growthWindowOpen {
+                t.passesWithGrowthWindowOpen += 1
+                if pass.headroom > 0 {
+                    t.passesWithGrowthWindowOpenAndHeadroom += 1
+                    t.largestHeadroomWhileGrowthWasAllowed = Swift.max(
+                        t.largestHeadroomWhileGrowthWasAllowed, pass.headroom
+                    )
+                }
+            }
+            if pass.pruneWindowOpen { t.passesWithPruneWindowOpen += 1 }
+            if pass.prunedLowOpacity + pass.prunedOversized > 0 {
+                t.passesThatPrunedByJudgement += 1
+                if !pass.pruneWindowOpen { t.passesThatPrunedByJudgementOutsideWindow += 1 }
+            }
+            if pass.prunedNonFinite + pass.prunedLowOpacity + pass.prunedOversized > 0 {
+                t.passesThatPrunedAnything += 1
+            }
+            t.densifyCandidates += pass.candidatesAfterVisibilityFilter
+        }
+        return t
+    }
+
+    /// True once at least one slice has put its seeds on the GPU, which is the
+    /// moment training genuinely began.
+    ///
+    /// Every loop-derived number below is absent until this is true, because a
+    /// run that died during allocation has a `densifyPasses` array that is
+    /// empty for a reason that has nothing to do with densification. Writing
+    /// "0 points created" for that run would be the exact fault this whole
+    /// file exists to stop: a number nobody measured, presented as a fact.
+    var trainingBegan: Bool {
+        slices.contains { $0.seedsUploadedCounted }
+    }
+
+    var seedsBuiltTotal: Int { slices.reduce(0) { $0 + $1.seedsBuilt } }
+    var seedsUploadedTotal: Int { slices.reduce(0) { $0 + $1.seedsUploaded } }
+    var seedsPinnedAsDiscsTotal: Int { slices.reduce(0) { $0 + $1.seedsPinnedAsDiscs } }
+    var seedsStretchedAlongRayTotal: Int { slices.reduce(0) { $0 + $1.seedsStretchedAlongRay } }
+    var droppedNonFiniteOnReadbackTotal: Int {
+        slices.reduce(0) { $0 + $1.droppedNonFiniteOnReadback }
+    }
+    var iterationsSkippedTotal: Int {
+        slices.reduce(0) {
+            $0 + $1.iterationsSkippedNoSupervision
+                + $1.iterationsSkippedGrowingTileBuffer
+                + $1.iterationsSkippedNothingToRender
+        }
+    }
+
+    // MARK: Sealing
+
+    /// Fills in the ledger and the alerts and stamps the finish time. Call it
+    /// once, immediately before writing. Everything it computes is arithmetic
+    /// over numbers already in the struct, so it costs nothing and calling it
+    /// twice changes nothing.
+    func sealed(at when: Date = Date()) -> TrainerCensus {
+        var out = self
+        out.finishedAt = when
+        out.ledger = buildLedger()
+        out.alerts = buildAlerts()
+        return out
+    }
+
+    private func buildLedger() -> [String] {
+        let t = totals
+        let n: (Int) -> String = TrainerCensusFormat.count
+        var lines: [String] = []
+
+        lines.append("seeded \(n(seedsBuiltTotal)) starting points")
+        if seedsUploadedTotal != seedsBuiltTotal {
+            lines.append("uploaded \(n(seedsUploadedTotal)) of them to the GPU")
+        }
+        let discs = seedsPinnedAsDiscsTotal
+        let stretched = seedsStretchedAlongRayTotal
+        if discs + stretched > 0 {
+            lines.append(
+                "of those, \(n(discs)) were laid as solid discs and \(n(stretched)) "
+                    + "were stretched along the viewing ray"
+            )
+        }
+        lines.append(
+            "densification ran \(t.passes) pass(es) and added \(n(t.added)) "
+                + "(\(n(t.addedBySplit)) by split, \(n(t.addedByClone)) by clone)"
+        )
+        if t.relocated > 0 {
+            lines.append("relocated \(n(t.relocated)), which does not change the count")
+        }
+        lines.append(
+            "pruning removed \(n(t.prunedNonFinite + t.prunedByJudgement)) "
+                + "(\(n(t.prunedNonFinite)) non-finite, \(n(t.prunedLowOpacity)) too faint, "
+                + "\(n(t.prunedOversized)) too big)"
+        )
+        // How many passes were allowed to prune by judgement, and how many
+        // actually did. Bug 3 was pruning running in 29 passes when the
+        // configured window covers about 10, so the two counts belong side by
+        // side rather than one being inferred from the other.
+        lines.append(
+            "the prune window was open in \(t.passesWithPruneWindowOpen) of \(t.passes) "
+                + "pass(es), and faint-or-oversized pruning removed something in "
+                + "\(t.passesThatPrunedByJudgement)"
+        )
+        lines.append("free-space carving removed \(n(t.carved))")
+        if t.trimmedToCap > 0 {
+            lines.append("the cap trimmed \(n(t.trimmedToCap))")
+        }
+        if droppedNonFiniteOnReadbackTotal > 0 {
+            lines.append(
+                "dropped \(n(droppedNonFiniteOnReadbackTotal)) non-finite when reading back"
+            )
+        }
+        if let merge = merge, sliceCount > 1 {
+            lines.append(
+                "merging \(sliceCount) parts dropped \(n(merge.droppedToAnotherOwner)) "
+                    + "to another part's region and trimmed \(n(merge.trimmedToCap))"
+            )
+        }
+        lines.append(
+            "ran \(iterationsCompleted) of \(iterationsRequested) requested iterations"
+        )
+        lines.append("final model: \(n(finalSplatCount)) points")
+        return lines
+    }
+
+    // swiftlint:disable:next cyclomatic_complexity function_body_length
+    private func buildAlerts() -> [TrainerCensusAlert] {
+        var loud: [TrainerCensusAlert] = []
+        var check: [TrainerCensusAlert] = []
+        let t = totals
+        let n: (Int) -> String = TrainerCensusFormat.count
+
+        // 1. A WHOLE STAGE DID NOTHING. Bug 1's exact signature: growth was
+        //    permitted, there was room for it, and not one Gaussian appeared.
+        if t.passesWithGrowthWindowOpenAndHeadroom > 0, t.added == 0 {
+            let openPasses = densifyPasses.filter { $0.growthWindowOpen }
+            let scored = openPasses.reduce(0) { $0 + $1.splatsWithNonZeroScore }
+            let examined = openPasses.reduce(0) { $0 + $1.splatsScored }
+            loud.append(
+                TrainerCensusAlert(
+                    severity: "loud",
+                    code: "densification_created_nothing",
+                    detail: "Growth was allowed in \(t.passesWithGrowthWindowOpenAndHeadroom) "
+                        + "pass(es) with room for up to "
+                        + "\(n(t.largestHeadroomWhileGrowthWasAllowed)) more points, and created "
+                        + "0. Across those passes \(n(scored)) of \(n(examined)) points scored "
+                        + "above zero. A densification stage that adds nothing is a no-op, not a "
+                        + "quiet run."
+                )
+            )
+        }
+
+        // 2. GROWTH WAS NEVER EVEN OFFERED. The window never opened, which is
+        //    a schedule problem rather than a signal problem.
+        if t.passes > 0, t.passesWithGrowthWindowOpen == 0 {
+            loud.append(
+                TrainerCensusAlert(
+                    severity: "loud",
+                    code: "growth_window_never_open",
+                    detail: "\(t.passes) densification pass(es) ran and the growth window was "
+                        + "shut for every one. Compare densifyStartFraction and "
+                        + "densifyEndFraction in the gates block against the progressFraction of "
+                        + "each pass."
+                )
+            )
+        }
+
+        // 3. NO ROOM TO GROW, EVER. This is what a splat cap sitting at or
+        //    below the live population leaves behind.
+        if t.passesWithGrowthWindowOpen > 0, t.passesWithGrowthWindowOpenAndHeadroom == 0 {
+            loud.append(
+                TrainerCensusAlert(
+                    severity: "loud",
+                    code: "no_headroom_whenever_growth_was_allowed",
+                    detail: "The growth window was open in \(t.passesWithGrowthWindowOpen) "
+                        + "pass(es) and the headroom (cap minus live count) was 0 in every one, "
+                        + "so nothing could be created."
+                )
+            )
+        }
+
+        // 4. THE ONE-WAY RATCHET. A cap cut that lands at or below the live
+        //    population deletes real geometry AND zeroes the headroom.
+        for reduction in budgetReductions where reduction.landedAtOrBelowLivePopulation {
+            let deleted = Swift.max(reduction.liveSplatCount - reduction.to, 0)
+            if deleted > 0 {
+                // Below the population: real Gaussians were trimmed to fit and
+                // the GPU buffer was rebuilt smaller. Unrecoverable.
+                loud.append(
+                    TrainerCensusAlert(
+                        severity: "loud",
+                        code: "splat_cap_cut_below_live_population",
+                        detail: "At iteration \(reduction.atIteration) the splat cap was cut from "
+                            + "\(n(reduction.from)) to \(n(reduction.to)) because "
+                            + "\(reduction.reason), while \(n(reduction.liveSplatCount)) points "
+                            + "were alive. That deleted \(n(deleted)) real points and left no "
+                            + "headroom for densification afterwards."
+                    )
+                )
+            } else {
+                // Exactly AT the population: nothing was deleted, which is
+                // what the fixed thermal ladder is meant to do, but the
+                // headroom is still zero and growth is over until something
+                // frees space. Worth seeing, not worth shouting about.
+                check.append(
+                    TrainerCensusAlert(
+                        severity: "check",
+                        code: "splat_cap_cut_to_exactly_the_live_population",
+                        detail: "At iteration \(reduction.atIteration) the splat cap was cut from "
+                            + "\(n(reduction.from)) to \(n(reduction.to)) because "
+                            + "\(reduction.reason), which is exactly the live count. Nothing was "
+                            + "deleted, but the headroom for densification is now 0."
+                    )
+                )
+            }
+        }
+
+        // 5. A GATE THAT IS NOT WIRED. Judgement pruning outside the window it
+        //    is supposed to obey means the window is not gating anything.
+        if t.passesThatPrunedByJudgementOutsideWindow > 0, let gates = gates {
+            let start = String(format: "%.2f", gates.pruneStartFraction)
+            let end = String(format: "%.2f", gates.pruneEndFraction)
+            loud.append(
+                TrainerCensusAlert(
+                    severity: "loud",
+                    code: "judgement_pruning_outside_its_window",
+                    detail: "Faint-or-oversized pruning ran in "
+                        + "\(t.passesThatPrunedByJudgementOutsideWindow) pass(es) that fell "
+                        + "outside the configured window of \(start) to \(end) of the run. The "
+                        + "window is declared but is not gating anything."
+                )
+            )
+        }
+
+        // 6. A THRESHOLD THAT REJECTS EVERYTHING. Only the depth-map seeding
+        //    path is judged here: on the pre-pass path "rejected" counts the
+        //    spatial thinning down to the cap, which is meant to be large.
+        for slice in slices where slice.seedSource == TrainerInitializer.depthSeedSourceName {
+            guard slice.seedSamplesConsidered > 0 else { continue }
+            let percent = Float(slice.seedSamplesRejected) * 100
+                / Float(slice.seedSamplesConsidered)
+            guard percent >= 95 else { continue }
+            loud.append(
+                TrainerCensusAlert(
+                    severity: "loud",
+                    code: "seeding_rejected_almost_every_sample",
+                    detail: "Part \(slice.index + 1) rejected \(n(slice.seedSamplesRejected)) of "
+                        + "\(n(slice.seedSamplesConsidered)) depth samples, which is "
+                        + String(format: "%.1f", percent)
+                        + " percent. A gate that rejects nearly everything is a misplaced "
+                        + "threshold, not a high standard."
+                )
+            )
+        }
+
+        // 7. EVERY SEED A BLOB. The seeder's trust gate, made visible.
+        let discs = seedsPinnedAsDiscsTotal
+        let stretched = seedsStretchedAlongRayTotal
+        if discs + stretched > 0, discs == 0 {
+            loud.append(
+                TrainerCensusAlert(
+                    severity: "loud",
+                    code: "no_seed_was_trusted",
+                    detail: "0 of \(n(discs + stretched)) seeds were laid as solid discs across "
+                        + "the surface; every one was stretched along the viewing ray because its "
+                        + "depth sample was not trusted. A handheld scan is normally a mixture."
+                )
+            )
+        } else if discs + stretched > 0, Float(discs) / Float(discs + stretched) < 0.05 {
+            check.append(
+                TrainerCensusAlert(
+                    severity: "check",
+                    code: "almost_no_seed_was_trusted",
+                    detail: "\(n(discs)) of \(n(discs + stretched)) seeds were trusted enough to "
+                        + "be laid as solid discs, which is under 5 percent."
+                )
+            )
+        }
+
+        // 8. WHERE THE POPULATION ACTUALLY WENT. A model that ends far below
+        //    what it started with is worth naming even when no single stage
+        //    looks wrong on its own.
+        let started = seedsUploadedTotal
+        if started > 0, finalSplatCount < started / 2 {
+            loud.append(
+                TrainerCensusAlert(
+                    severity: "loud",
+                    code: "most_of_the_model_disappeared",
+                    detail: "Started with \(n(started)) points and finished with "
+                        + "\(n(finalSplatCount)). Pruning removed "
+                        + "\(n(t.prunedNonFinite + t.prunedByJudgement)), carving removed "
+                        + "\(n(t.carved)), the cap trimmed \(n(t.trimmedToCap)), and "
+                        + "densification added \(n(t.added))."
+                )
+            )
+        }
+        if budgetAsRun.splatCap > 0, finalSplatCount < budgetAsRun.splatCap / 4, t.added == 0 {
+            check.append(
+                TrainerCensusAlert(
+                    severity: "check",
+                    code: "final_count_far_below_the_cap",
+                    detail: "Finished at \(n(finalSplatCount)) points against a cap of "
+                        + "\(n(budgetAsRun.splatCap)), having added none. The budget was never "
+                        + "the limit here."
+                )
+            )
+        }
+
+        // 9. CARVING AS THE MAIN CAUSE OF DEATH.
+        let removedTotal = t.prunedNonFinite + t.prunedByJudgement + t.carved + t.trimmedToCap
+        if t.carved > 0, removedTotal > 0,
+           Float(t.carved) / Float(removedTotal) > 0.5,
+           t.carved > started / 4
+        {
+            check.append(
+                TrainerCensusAlert(
+                    severity: "check",
+                    code: "free_space_carving_removed_the_most",
+                    detail: "Carving deleted \(n(t.carved)) points, more than half of everything "
+                        + "removed and over a quarter of what the run started with. A "
+                        + "mis-registered occupancy grid is how a whole room disappears."
+                )
+            )
+        }
+
+        // 10. NON-FINITE GAUSSIANS SURVIVING TO THE READBACK.
+        if droppedNonFiniteOnReadbackTotal > 0 {
+            check.append(
+                TrainerCensusAlert(
+                    severity: "check",
+                    code: "non_finite_points_reached_the_readback",
+                    detail: "\(n(droppedNonFiniteOnReadbackTotal)) points were non-finite when "
+                        + "the model was read off the GPU and were dropped there. The prune is "
+                        + "meant to catch these in every pass."
+                )
+            )
+        }
+
+        // 11. THE MERGE ATE THE MODEL.
+        if let merge = merge, merge.splatsIn > 0,
+           Float(merge.droppedToAnotherOwner) / Float(merge.splatsIn) > 0.5
+        {
+            loud.append(
+                TrainerCensusAlert(
+                    severity: "loud",
+                    code: "merge_dropped_most_of_the_parts",
+                    detail: "The merge dropped \(n(merge.droppedToAnotherOwner)) of "
+                        + "\(n(merge.splatsIn)) points because another part owned the region they "
+                        + "fell in. Above half means region ownership does not match where the "
+                        + "geometry actually is."
+                )
+            )
+        }
+
+        // 12. THE RUN WAS CUT SHORT.
+        if iterationsRequested > 0, iterationsCompleted < (iterationsRequested * 95) / 100 {
+            check.append(
+                TrainerCensusAlert(
+                    severity: "check",
+                    code: "run_ended_before_its_budget",
+                    detail: "Completed \(iterationsCompleted) of \(iterationsRequested) requested "
+                        + "iterations. Outcome: \(outcome)."
+                )
+            )
+        }
+
+        // 13. ITERATIONS THAT DID NOTHING.
+        let skipped = iterationsSkippedTotal
+        if iterationsCompleted > 0, skipped * 20 > iterationsCompleted {
+            check.append(
+                TrainerCensusAlert(
+                    severity: "check",
+                    code: "many_iterations_did_no_work",
+                    detail: "\(skipped) of \(iterationsCompleted) iterations took no optimisation "
+                        + "step: no supervision could be built, the tile buffer had to grow, or "
+                        + "there was nothing to render. That is over 5 percent."
+                )
+            )
+        }
+
+        return loud + check
+    }
+}
+
+// MARK: - Number formatting
+
+/// Thousands separators, built by hand rather than by `NumberFormatter`.
+///
+/// These strings go into a file and into a log line, not onto a screen, so
+/// they must read the same everywhere. A locale-aware formatter would put a
+/// full stop in the middle of "182.340" on a German phone and turn a
+/// diagnostic into a puzzle.
+enum TrainerCensusFormat {
+    static func count(_ value: Int) -> String {
+        let negative = value < 0
+        var digits = String(value.magnitude)
+        guard digits.count > 3 else { return negative ? "-\(digits)" : digits }
+        var grouped = ""
+        while digits.count > 3 {
+            let cut = digits.index(digits.endIndex, offsetBy: -3)
+            grouped = "," + String(digits[cut...]) + grouped
+            digits = String(digits[..<cut])
+        }
+        grouped = digits + grouped
+        return negative ? "-\(grouped)" : grouped
+    }
+}
+
+// MARK: - The flat record the Viewer reads
+
+/// `model/census.json`: the small, flat slice of this census that the review
+/// screen knows how to read.
+///
+/// TWO FILES, ON PURPOSE, AND THEY ARE NOT THE SAME FILE.
+/// `model/train_census.json` is this module's own diagnostic and is as detailed
+/// as it likes. `model/census.json` is the shape asked for in
+/// INTEGRATION_REQUESTS.md and declared as `ScanCensus.Record` in
+/// `ios/Sources/Viewer/ScanCensus.swift`. That type is NOT re-declared here:
+/// this is one Xcode target and a duplicate top-level name is a link error, so
+/// this is a private local struct with matching key names, which is exactly
+/// what that request asks for.
+///
+/// EVERY FIELD IS OPTIONAL AND THAT IS THE POINT. A key written as `0` is a
+/// measured zero, which is a strong claim; a key left out reads as "not
+/// recorded" on screen. `sharedRecord` below therefore leaves out every number
+/// that would only be a default.
+struct TrainerCensusSharedRecord: Codable {
+    var formatVersion: Int = 1
+    var writtenBy: String = "trainer"
+
+    var splatsAtStart: Int?
+    var splatsCreatedByDensification: Int?
+    var densificationPassCount: Int?
+    var densificationCandidateCount: Int?
+    var splatsDeletedByPruning: Int?
+    var pruningPassCount: Int?
+    var splatsDeletedByHeatCut: Int?
+    var heatCutCount: Int?
+    var splatsAtEnd: Int?
+    var plannedSplatCap: Int?
+    var finalSplatCap: Int?
+}
+
+extension TrainerCensus {
+
+    /// Every splat-cap reduction the governor made because the phone was warm.
+    ///
+    /// Matched on `TrainerBudgetChange.Reason.censusReason`, which is a named
+    /// constant in TrainerBudget.swift rather than a phrase repeated here, so
+    /// a reworded reason cannot silently stop matching.
+    private var heatCapCuts: [TrainerCensusBudgetReduction] {
+        budgetReductions.filter {
+            $0.what == "splatCap" && $0.reason == TrainerCensusBudgetReduction.heatReason
+        }
+    }
+
+    /// The census flattened into the shape the review screen reads.
+    ///
+    /// Derived from the rows above rather than accumulated separately, so the
+    /// two files physically cannot disagree, and gated on `trainingBegan` so a
+    /// run that never got as far as the loop reports "not recorded" rather
+    /// than a row of confident zeroes.
+    var sharedRecord: TrainerCensusSharedRecord {
+        var out = TrainerCensusSharedRecord()
+        let t = totals
+
+        if trainingBegan {
+            out.splatsAtStart = seedsUploadedTotal
+            out.splatsCreatedByDensification = t.added
+            out.densificationPassCount = t.passes
+            out.densificationCandidateCount = t.densifyCandidates
+            out.splatsDeletedByPruning = t.prunedAtAll
+            out.pruningPassCount = t.passesThatPrunedAnything
+        }
+
+        // These two are measured from the moment the run starts, whether or not
+        // it ever reached the loop: the governor records every reduction it
+        // makes, so an empty list is a real "no cap cut happened" rather than
+        // an absence of counting. Writing them always is what lets the review
+        // screen RULE HEAT OUT instead of saying it cannot tell.
+        out.heatCutCount = heatCapCuts.count
+        // What a warm-phone cap cut cost. Counted at the moment of each cut as
+        // the Gaussians that were alive above the new ceiling, which is the
+        // number the trim then had to delete. A cut taken before any loop
+        // existed has a live count of 0 and contributes nothing.
+        out.splatsDeletedByHeatCut = heatCapCuts.reduce(0) {
+            $0 + Swift.max($1.liveSplatCount - $1.to, 0)
+        }
+
+        // The merge is the only place `finalSplatCount` is written, and it is
+        // written in the same breath as `merge`, so this is "the run got to the
+        // end" and not a guess.
+        if merge != nil {
+            out.splatsAtEnd = finalSplatCount
+        }
+        out.plannedSplatCap = budgetRequested.splatCap
+        out.finalSplatCap = budgetAsRun.splatCap
+        return out
+    }
+}
+
+extension TrainerCensusBudgetReduction {
+    /// The exact string `TrainerBudgetChange.Reason.censusReason` produces for
+    /// heat. Named once so the match above and the phrase there cannot drift.
+    static let heatReason = "the phone was warm"
+}
+
+// MARK: - Writing it out
+
+enum TrainerCensusWriter {
+
+    /// Where the census lands, relative to the scan folder. Documented in
+    /// `docs/DATA_FORMAT.md` section 8.
+    static var relativePath: String { "\(BrandConfig.Folder.model)/train_census.json" }
+
+    /// Where the FLAT record lands: the file the review screen actually opens.
+    ///
+    /// This path is not a choice. `ViewerScanPaths.modelCensusJSON` reads
+    /// `model/census.json` and INTEGRATION_REQUESTS.md asks for that name. The
+    /// detailed `train_census.json` beside it is this module's own and nothing
+    /// outside the Trainer reads it.
+    static var sharedRecordRelativePath: String {
+        "\(BrandConfig.Folder.model)/census.json"
+    }
+
+    /// Seals the census, puts the ledger and the alerts in the log, and writes
+    /// the file.
+    ///
+    /// Best effort by design: a run that produced a model must not fail
+    /// because its diagnostic could not be saved. A write that did not happen
+    /// is logged, so "there is no census" is never mistaken for "the census
+    /// was clean".
+    static func write(_ census: TrainerCensus, at ref: CaptureBundleRef) {
+        let sealed = census.sealed()
+
+        // `os.Logger` takes an `OSLogMessage`, not a `String`, so every call
+        // below is ONE interpolated literal with a pre-built string inside it.
+        // A `+` between two pieces here does not compile.
+        for line in sealed.ledger {
+            TrainerLog.densify.notice("census: \(line, privacy: .public)")
+        }
+        for alert in sealed.alerts {
+            let text = "\(alert.code): \(alert.detail)"
+            if alert.severity == "loud" {
+                TrainerLog.densify.error("census alert: \(text, privacy: .public)")
+            } else {
+                TrainerLog.densify.notice("census alert: \(text, privacy: .public)")
+            }
+        }
+
+        do {
+            let data = try ContractsJSON.encoder().encode(sealed)
+            try SmartBinary.write(data, to: ref.url(forRelativePath: relativePath))
+        } catch {
+            let why = error.localizedDescription
+            TrainerLog.densify.error(
+                "The training census could not be written: \(why, privacy: .public)"
+            )
+        }
+
+        // The flat record the review screen reads. Written from the SAME sealed
+        // census as the file above, in its own `do` block: the detailed
+        // diagnostic and the screen's copy must not be able to take each other
+        // down, and the screen's copy is the one a person actually sees.
+        do {
+            let data = try ContractsJSON.encoder().encode(sealed.sharedRecord)
+            try SmartBinary.write(
+                data, to: ref.url(forRelativePath: sharedRecordRelativePath)
+            )
+        } catch {
+            let why = error.localizedDescription
+            TrainerLog.densify.error(
+                "model/census.json could not be written: \(why, privacy: .public)"
+            )
+        }
+    }
+}

@@ -43,6 +43,11 @@ enum PrePassPaths {
     static let directory = BrandConfig.Folder.prePass
 
     static var result: String { "\(directory)/prepass_result.json" }
+    /// The splat census: what every stage of the pre-pass counted about
+    /// itself. A separate file from `prepass_result.json` because the result
+    /// type lives in `Sources/Core`, which this module does not own, and
+    /// because a report about the work must never be able to break the work.
+    static var census: String { "\(directory)/census.json" }
     static var occupancy: String { "\(directory)/occupancy.bin" }
     static var trustBias: String { "\(directory)/trust_bias.bin" }
     static var trustNoise: String { "\(directory)/trust_noise.bin" }

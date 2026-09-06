@@ -45,6 +45,16 @@
 //     convention (`colour = 0.5 + 0.282095 * dc`), so iteration 0 already
 //     looks like the room rather than grey mud.
 //
+//  HOW MANY SEEDS, and why it is NOT the cap:
+//
+//    A seeder that fills the splat cap leaves densification nothing to do.
+//    The densifier's growth allowance is `max(splatCap - splatCount, 0)`, so
+//    starting at the cap makes that zero on every growth pass of the run and
+//    the model can never add a single Gaussian, no matter how well the
+//    densification scores are working. Both sources therefore thin to
+//    `seedTarget(forSplatCap:)`, which is at most three quarters of the cap
+//    and normally half of it. See that function for the arithmetic.
+//
 
 import Foundation
 import simd
@@ -68,6 +78,28 @@ struct TrainerSeedResult {
     var samplesRejected: Int
     var medianSpacingMeters: Float
 
+    /// How many seeds were laid as SOLID DISCS across the surface because the
+    /// depth sample was trusted, and how many were STRETCHED ALONG THE VIEWING
+    /// RAY because it was not.
+    ///
+    /// This split is the seeder's trust gate made countable. The owner's first
+    /// scan had a trust threshold that required a measured sigma under about
+    /// two centimetres, while that sigma also absorbs pose error and two to
+    /// four centimetres is ordinary on a handheld walk, so EVERY sample failed
+    /// and every seed came out a stretched blob. Nothing said so. These two
+    /// numbers say so.
+    ///
+    /// Computed from the flags rather than counted during construction, so
+    /// they are measured AFTER the thinning to the cap and there is only one
+    /// place that can be wrong. One pass over the seeds, once per slice.
+    var seedsPinnedAsDiscs: Int {
+        seeds.reduce(0) { $0 + (($1.flags & TrainerSplatFlag.positionPinned) != 0 ? 1 : 0) }
+    }
+
+    var seedsStretchedAlongRay: Int {
+        seeds.reduce(0) { $0 + (($1.flags & TrainerSplatFlag.elongatedAlongRay) != 0 ? 1 : 0) }
+    }
+
     /// One plain sentence for the log and the progress message.
     var summary: String {
         if seeds.isEmpty {
@@ -79,6 +111,54 @@ struct TrainerSeedResult {
 }
 
 enum TrainerInitializer {
+
+    /// The exact `TrainerSeedResult.source` value the depth-map seeding path
+    /// reports. Named once because the census matches on it: on this path
+    /// `samplesRejected` is a real quality rejection and a rate near 100 per
+    /// cent is a bug, while on the pre-pass path the same field counts the
+    /// spatial thinning down to the cap and is MEANT to be large. Comparing
+    /// against a loose string literal in two files is how that distinction
+    /// silently stops working.
+    static let depthSeedSourceName = "native depth maps"
+
+    /// How many seeds a slice is allowed to START with, given the splat cap
+    /// that slice has to live inside for the whole run.
+    ///
+    /// THIS IS NOT THE CAP, AND THAT IS THE ENTIRE POINT. `SplatDensifier`
+    /// works out what it may add as
+    ///
+    ///     headroom = max(splatCap - splatCount, 0)
+    ///
+    /// so a seed set that already fills the cap makes the headroom zero on
+    /// pass one and keeps it zero for the rest of the run. Densification then
+    /// scores correctly, logs correctly, and adds nothing, which is exactly
+    /// the failure the thermal-cap ratchet produced from the other direction.
+    /// Growth being switched off is not a smaller version of growth: it is no
+    /// growth.
+    ///
+    /// The rule, in order:
+    ///
+    ///  * Never more than THREE QUARTERS of the cap, so there is always real
+    ///    room to grow into even when the cap is tiny (`effectiveCap` has a
+    ///    5,000 floor in `MetalSplatTrainer`, and at 5,000 a "20,000 minimum"
+    ///    would silently mean "no thinning at all").
+    ///  * Otherwise HALF the cap, which is the split the depth-map path was
+    ///    already sizing its voxels for, so densification gets as much room as
+    ///    the seeds took.
+    ///  * With a 20,000 floor underneath, because a very small starting set is
+    ///    a poor start regardless of what the cap says, and that floor is
+    ///    itself clamped by the three-quarter ceiling above.
+    ///
+    /// Worked through for the caps this app actually produces:
+    /// 150,000 (one object, full tier) seeds 75,000 and leaves 75,000;
+    /// 300,000 (a room) seeds 150,000 and leaves 150,000;
+    /// 40,000 (limited tier) seeds 20,000 and leaves 20,000;
+    /// 5,000 (the emergency floor) seeds 3,750 and leaves 1,250.
+    static func seedTarget(forSplatCap cap: Int) -> Int {
+        guard cap > 0 else { return 0 }
+        let ceilingWithHeadroom = (cap * 3) / 4
+        return Swift.max(cap / 2, Swift.min(20_000, ceilingWithHeadroom))
+    }
 
     // MARK: - Entry point
 
@@ -167,7 +247,14 @@ enum TrainerInitializer {
             )
         }
 
-        seeds = thin(seeds, to: budget.splatCap)
+        // `seedTarget`, NOT `budget.splatCap`. Thinning to the cap itself fills
+        // it exactly, which makes `headroom = max(splatCap - splatCount, 0)`
+        // zero on the first growth pass and every pass after it, so
+        // densification scores correctly, logs correctly and adds nothing. This
+        // is the PREFERRED seeding path, so that was the state of every real
+        // run: growth was impossible even after the gradient-threshold fix that
+        // was supposed to switch densification back on.
+        seeds = thin(seeds, to: seedTarget(forSplatCap: budget.splatCap))
         let spacing = medianNearestSpacing(of: seeds)
         return TrainerSeedResult(
             seeds: seeds,
@@ -201,7 +288,7 @@ enum TrainerInitializer {
         let sampleCount = depthWidth * depthHeight
         guard sampleCount > 0, !keyframes.isEmpty else {
             return TrainerSeedResult(
-                seeds: [], source: "depth maps", framesUsed: 0,
+                seeds: [], source: depthSeedSourceName, framesUsed: 0,
                 samplesConsidered: 0, samplesRejected: 0, medianSpacingMeters: 0
             )
         }
@@ -360,7 +447,7 @@ enum TrainerInitializer {
 
         guard !cells.isEmpty else {
             return TrainerSeedResult(
-                seeds: [], source: "depth maps", framesUsed: framesUsed,
+                seeds: [], source: depthSeedSourceName, framesUsed: framesUsed,
                 samplesConsidered: considered, samplesRejected: rejected,
                 medianSpacingMeters: 0
             )
@@ -440,13 +527,15 @@ enum TrainerInitializer {
             seeds.append(seed)
         }
 
-        seeds = thin(seeds, to: budget.splatCap)
+        // Same rule as the pre-pass path above: leave densification real room
+        // to grow into rather than handing it a full cap and zero headroom.
+        seeds = thin(seeds, to: seedTarget(forSplatCap: budget.splatCap))
         spacings.sort()
         let median = spacings.isEmpty ? voxel : spacings[spacings.count / 2]
 
         return TrainerSeedResult(
             seeds: seeds,
-            source: "native depth maps",
+            source: depthSeedSourceName,
             framesUsed: framesUsed,
             samplesConsidered: considered,
             samplesRejected: rejected,

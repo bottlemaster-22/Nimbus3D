@@ -461,6 +461,14 @@ struct TrainerTuning: Sendable {
     ///
     /// Keep this at or near zero. If a real floor is ever wanted, derive it
     /// from the render width so it cannot drift out of units again.
+    ///
+    /// NOTHING READS THIS TODAY. `TrainerDensifier` selects candidates on
+    /// `score[i] > 0` and lets the ranked truncation to the cap do the cutting.
+    /// It is written down here rather than deleted because the units trap
+    /// above is worth keeping where the next person to want a floor will find
+    /// it, and `model/train_census.json` records the floor actually in force
+    /// (`gates.densifyScoreFloor`, which is 0) rather than this number, so the
+    /// census cannot present a dead setting as a live one.
     var absGradThreshold: Float = 1e-9
     /// A Gaussian larger than this fraction of the scene extent is SPLIT;
     /// smaller ones are CLONED.

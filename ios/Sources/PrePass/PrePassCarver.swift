@@ -172,6 +172,15 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
     /// dropped. Surfaces are never dropped.
     public private(set) var hitCellCap = false
 
+    /// What the last carve counted about itself: rays followed, rays that
+    /// proved nothing, and the empty / surface / unknown split of the cells.
+    ///
+    /// Assigned ONCE, at the end of `carve`, from plain local counters that
+    /// the ray loop increments. The loop does integer adds and nothing else,
+    /// so the measurement costs nothing and cannot itself be the reason a
+    /// carve is slow. See `PrePassCensus`.
+    public private(set) var lastCensus = PrePassCensus.Carving()
+
     // Loaded state, for `state(atWorldPoint:)` during training.
     private var loadedKeys: [UInt64] = []
     private var loadedStates: [UInt8] = []
@@ -189,6 +198,13 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
         voxelSizeMeters: Float
     ) async throws -> OccupancyGridRef {
         requestedVoxelSizeMeters = voxelSizeMeters
+        // Reset to a census that says "this ran and found nothing" rather than
+        // leaving the previous run's numbers in place. A stale number is worse
+        // than a zero: a zero is a fact about this scan.
+        var census = PrePassCensus.Carving()
+        census.attempted = true
+        census.requestedVoxelSizeMeters = voxelSizeMeters
+        lastCensus = census
 
         let frames = bundle.frames.sorted { $0.timestampSeconds < $1.timestampSeconds }
         guard !frames.isEmpty else {
@@ -224,6 +240,41 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
         hits.reserveCapacity(1 << 16)
 
         let keyframes = self.keyframes(from: frames)
+        census.keyframesSelected = keyframes.count
+        census.actualVoxelSizeMeters = voxel
+        census.boundsSizeMeters = size
+
+        // Local counters, incremented by the ray loop. Plain Ints on the
+        // stack: no allocation, no retain, nothing to synchronise.
+        var raysCast = 0
+        var raysWithReturnInRange = 0
+        var raysBeyondMaxRange = 0
+        var raysTooClose = 0
+        var raysNoReturn = 0
+        var raysNoReturnBounded = 0
+        var keyframesLoaded = 0
+        var keyframesMissing = 0
+
+        // Copied out on EVERY exit, including a corrupt sidecar throwing
+        // halfway through. A carve that died at keyframe 40 of 300 should say
+        // so; reporting zeros for it would look exactly like a carve that
+        // found nothing, which is a different problem with a different fix.
+        // On the normal path this runs after the block at the end of the
+        // function and simply rewrites the same values.
+        defer {
+            census.keyframesWithDepthLoaded = keyframesLoaded
+            census.keyframesDepthMissing = keyframesMissing
+            census.raysCast = raysCast
+            census.raysWithReturnInRange = raysWithReturnInRange
+            census.raysBeyondMaxRange = raysBeyondMaxRange
+            census.raysTooClose = raysTooClose
+            census.raysNoReturn = raysNoReturn
+            census.raysNoReturnBounded = raysNoReturnBounded
+            census.raysNoReturnUnbounded = raysNoReturn - raysNoReturnBounded
+            census.hitCellCap = hitCellCap
+            lastCensus = census
+        }
+
         let stride = Swift.max(tuning.raySubsampleStride, 1)
         // A ray can only cross so many cells before it has left the scene.
         let maxSteps = Int((maxRange / voxel).rounded(.up)) + 4
@@ -232,7 +283,14 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
             try Task.checkCancellation()
             guard let depthFrame = try PrePassDepthFrame.load(
                 frame: frame, settings: bundle.settings, at: ref
-            ) else { continue }
+            ) else {
+                // Skipped in silence before the census existed. A carve that
+                // read no depth at all used to look exactly like a carve that
+                // found no empty air.
+                keyframesMissing += 1
+                continue
+            }
+            keyframesLoaded += 1
 
             let pose = frame.refinedPose ?? frame.rawPose
             let sensorOrigin = pose.center.simd
@@ -247,11 +305,18 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
                     let directionWorld = PrePassRigid.worldDirection(
                         cameraDirection: geometry.rayDirections[index], pose: pose
                     )
+                    raysCast += 1
 
                     if depthFrame.hasReturn(at: index) {
                         let z = depthFrame.depthMeters(at: index)
                         let range = geometry.range(index: index, depthMeters: z)
+                        if range > maxRange {
+                            raysBeyondMaxRange += 1
+                        } else if range <= 0.05 {
+                            raysTooClose += 1
+                        }
                         if range > 0.05, range <= maxRange {
+                            raysWithReturnInRange += 1
                             // Free space up to just short of the surface, then
                             // the surface cell itself.
                             let free = Swift.max(range - tuning.surfaceMarginMeters, 0)
@@ -275,10 +340,12 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
                         // is that it reached at least as far as its neighbours
                         // did before something stopped them - which for a
                         // window pane in a wall is the wall's own distance.
+                        raysNoReturn += 1
                         if let bound = noReturnFreeBound(
                             depthFrame: depthFrame, geometry: geometry,
                             x: x, y: y, maxRange: maxRange
                         ) {
+                            raysNoReturnBounded += 1
                             carveFree(
                                 origin: sensorOrigin, direction: directionWorld, distance: bound,
                                 voxelFrame: voxelFrame, maxSteps: maxSteps,
@@ -325,6 +392,27 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
         loadedKeys = keys
         loadedStates = sortedStates
         loadedFrame = voxelFrame
+
+        // --- The rest of the census. The ray counters are copied out by the
+        //     `defer` above, which covers the paths that never reach here.
+        census.cellsRecorded = entries.count
+        census.emptyCells = emptyCount
+        census.surfaceCells = surfaceCount
+        census.actualVoxelSizeMeters = voxel
+        // Everything inside the grid's own box that no ray ever reached. Not
+        // stored anywhere (the file is sparse and absence means unknown), so
+        // it has to be counted here or it cannot be known at all. Computed in
+        // Double because a large room at a small voxel overflows Int32 easily.
+        let cellsAcross = Double(Swift.max(size.x, 0)) / Double(voxel)
+        let cellsUp = Double(Swift.max(size.y, 0)) / Double(voxel)
+        let cellsDeep = Double(Swift.max(size.z, 0)) / Double(voxel)
+        let cellsInBounds = cellsAcross * cellsUp * cellsDeep
+        if cellsInBounds.isFinite, cellsInBounds > Double(entries.count) {
+            census.unknownCellsInBounds = Int(
+                Swift.min(cellsInBounds - Double(entries.count), Double(Int.max / 2))
+            )
+        }
+        lastCensus = census
 
         return grid
     }

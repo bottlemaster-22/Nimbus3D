@@ -116,6 +116,14 @@ struct ScanReviewScreen: View {
 
     private var controls: some View {
         List {
+            // FIRST, above everything, including the mode picker. When a scan
+            // comes out looking like nothing, the preview above is a black
+            // rectangle and this sentence is the next thing the eye lands on.
+            // Putting it below the controls would mean the one screen that
+            // explains the black rectangle is the one thing the user has to go
+            // looking for.
+            ScanCensusSummarySection(census: model.census)
+
             Section {
                 Picker("What to show", selection: $model.mode) {
                     ForEach(ScanReviewModel.Mode.allCases) { mode in
