@@ -82,6 +82,7 @@
 
 import Foundation
 import SwiftUI
+import UIKit
 
 // MARK: - Notices
 
@@ -264,6 +265,20 @@ final class ScanProcessingCoordinator: ObservableObject {
 
         observePrePassStages()
 
+        // Hold the screen awake for the whole run.
+        //
+        // Capture already did this (ARCaptureService sets it around the
+        // session) but processing never did, so the display would dim and
+        // lock partway through a twenty minute job. That is not a cosmetic
+        // problem: this is foreground work with a live Metal trainer and a
+        // preview attached to it, and iOS is free to suspend the app once
+        // the screen locks, which loses the run.
+        //
+        // Cleared in `retireRun`, which is the one place that runs after
+        // the task has actually returned, so a cancelled or failed run
+        // releases it exactly like a finished one.
+        UIApplication.shared.isIdleTimerDisabled = true
+
         runGeneration += 1
         let generation = runGeneration
         runTask = Task { [weak self] in
@@ -327,6 +342,10 @@ final class ScanProcessingCoordinator: ObservableObject {
         guard generation == runGeneration else { return }
         runTask = nil
         isStopping = false
+        // Let the screen sleep again. Paired with the disable in `start`,
+        // and here rather than at the end of `run` because this is the
+        // point the run has genuinely returned, cancelled ones included.
+        UIApplication.shared.isIdleTimerDisabled = false
         releasePreview()
     }
 

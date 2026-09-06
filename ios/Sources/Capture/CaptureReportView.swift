@@ -246,9 +246,16 @@ struct CaptureReportPanel: View {
                         "Map slid",
                         CaptureFormat.centimeters(card.driftCentimeters)
                     ),
+                    // CONFIRMED closures, not candidates. The capture-side
+                    // count of places the walk crossed itself lives in
+                    // `summary.revisitCount` and is a different number: one
+                    // scan reported 138 there and 0 here, and the two were
+                    // described in words so similar that the report read as
+                    // self-contradictory. Both labels now say which is
+                    // which.
                     CaptureFact(
-                        "Crossed your own path",
-                        "\(card.loopClosureCount) times"
+                        "Crossings the check-over could confirm",
+                        "\(card.loopClosureCount)"
                     ),
                     CaptureFact(
                         "Angles a surface was seen from",
@@ -377,16 +384,17 @@ struct CaptureReportPanel: View {
         if summary.revisitCount > 0 {
             result.append(
                 CaptureReportNote(
-                    text: "You walked back over the same spot \(summary.revisitCount) "
-                        + "times. That is what lets the app straighten the scan out later.",
+                    text: "Your walk crossed itself \(summary.revisitCount) times. "
+                        + "The check-over tries to line those crossings up, and the "
+                        + "number it managed is in the check-over above.",
                     color: CaptureHUDPalette.satisfied
                 )
             )
         } else {
             result.append(
                 CaptureReportNote(
-                    text: "You never walked back over a spot you had already been. "
-                        + "Finishing where you started makes a noticeable difference.",
+                    text: "Your walk never crossed itself. Finishing where you "
+                        + "started makes a noticeable difference.",
                     color: CaptureHUDPalette.sharpness
                 )
             )

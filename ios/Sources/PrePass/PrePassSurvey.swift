@@ -621,8 +621,8 @@ enum PrePassQCBuilder {
                 QCFinding(
                     code: "loop_closures",
                     severity: .warning,
-                    message: "You did not pass back over anywhere you had already scanned, so "
-                        + "the app had nothing to check its own tracking against.",
+                    message: "The app could not confirm a single place you passed back "
+                        + "over, so it had nothing to check its own tracking against.",
                     fixHint: "Walk a loop rather than a line, and end where you began."
                 )
             )
