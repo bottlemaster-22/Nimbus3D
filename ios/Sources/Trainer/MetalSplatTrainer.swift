@@ -1643,7 +1643,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         )
         encoderA.endEncoding()
         bufferA.commit()
-        bufferA.waitUntilCompleted()
+        try Self.finish(bufferA, "the tile scan")
 
         // The one unavoidable readback: how many (Gaussian, tile) pairs this
         // frame produced. The exclusive scan means the total is the last
@@ -1702,7 +1702,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
         encoderB.endEncoding()
         bufferB.commit()
-        bufferB.waitUntilCompleted()
+        try Self.finish(bufferB, "the tile sort")
 
         // --- Readbacks ------------------------------------------------------------------
         let lossValue = resources.lossAccum.readElement(Float.self, at: 0) ?? 0
@@ -2022,7 +2022,48 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         gpu.resetDensifyStats(encoder, count: splatCount)
         encoder.endEncoding()
         buffer.commit()
+        try Self.finish(buffer, "a reset pass")
+    }
+
+    /// Wait for a batch of GPU work AND ask whether it actually worked.
+    ///
+    /// `waitUntilCompleted()` returns when the GPU is finished, not when
+    /// it has succeeded. A command buffer that faulted comes back from it
+    /// exactly like one that did not, with `status == .error` and a
+    /// populated `error`, and every call site in this file used to ignore
+    /// both and read the output buffers regardless.
+    ///
+    /// That mattered more than a missing check usually does, because a GPU
+    /// fault on iOS can take the whole process down without leaving a
+    /// crash report anywhere a person can find one. The owner hit a repeat
+    /// crash during processing with no app-named report and no JetsamEvent
+    /// at the time, which is what that looks like from the outside.
+    ///
+    /// Throwing here cannot stop the driver killing the process. What it
+    /// does is turn every fault the process SURVIVES into a named stage
+    /// and a message, instead of a wrong model built from whatever was
+    /// left in the buffers.
+    static func finish(_ buffer: MTLCommandBuffer, _ stage: String) throws {
         buffer.waitUntilCompleted()
+        if let error = buffer.error {
+            TrainerLog.gpu.error(
+                """
+                GPU work for \(stage, privacy: .public) failed: \
+                \(error.localizedDescription, privacy: .public)
+                """
+            )
+            throw TrainerError.gpuFailed(
+                stage: stage, detail: error.localizedDescription
+            )
+        }
+        guard buffer.status == .completed else {
+            let detail = "the command buffer ended in state "
+                + "\(buffer.status.rawValue) rather than completed"
+            TrainerLog.gpu.error(
+                "GPU work for \(stage, privacy: .public) \(detail, privacy: .public)"
+            )
+            throw TrainerError.gpuFailed(stage: stage, detail: detail)
+        }
     }
 
     // MARK: - Mip-Splatting 3D filter sweep
@@ -2100,7 +2141,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         )
         encoder.endEncoding()
         buffer.commit()
-        buffer.waitUntilCompleted()
+        try Self.finish(buffer, "a reset pass")
     }
 
     // MARK: - Camera delta
@@ -2262,7 +2303,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             )
             encoderA.endEncoding()
             bufferA.commit()
-            bufferA.waitUntilCompleted()
+            try Self.finish(bufferA, "the filter sweep")
 
             let lastOffset = resources.offsets.readElement(UInt32.self, at: splatCount - 1) ?? 0
             let lastTouched = resources.tilesTouched.readElement(UInt32.self, at: splatCount - 1) ?? 0
@@ -2279,7 +2320,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             gpu.rasterizeForward(encoderB, camera: &camera)
             encoderB.endEncoding()
             bufferB.commit()
-            bufferB.waitUntilCompleted()
+            try Self.finish(bufferB, "the filter finalise")
 
             // Composite and exposure are applied here rather than by a kernel,
             // because the evaluation must not touch the gradient buffers.

@@ -59,9 +59,25 @@ enum TrainerError: LocalizedError {
     /// still unwinding after a stop. There is one trainer and one set of GPU
     /// buffers, so this is refused rather than allowed to share them.
     case alreadyRunning
+    /// The GPU rejected or failed a batch of work.
+    ///
+    /// Nothing in this app asked this question before. Six places
+    /// committed a command buffer and called `waitUntilCompleted()`, and
+    /// not one of them then looked at `buffer.error` or `buffer.status`.
+    /// A GPU fault therefore had two ways to present: carry on with
+    /// whatever was in the buffers and produce a quietly wrong model, or
+    /// have the driver take the process down. The second leaves no crash
+    /// report a person can find in Settings, which matches a crash the
+    /// owner hit repeatedly with no app-named report and no JetsamEvent
+    /// anywhere near it.
+    ///
+    /// This does not prevent a GPU fault. It makes one say so.
+    case gpuFailed(stage: String, detail: String)
 
     var errorDescription: String? {
         switch self {
+        case .gpuFailed(let stage, let detail):
+            return "The graphics work for \(stage) did not finish: \(detail)"
         case .noMetalDevice:
             return "This iPhone did not give the app a graphics device to work with."
         case .noShaderLibrary:
