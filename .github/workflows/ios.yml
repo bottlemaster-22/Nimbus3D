@@ -194,12 +194,23 @@ jobs:
           # got reported against a build three releases behind its fix;
           # identifying it afterwards meant matching Mach-O UUIDs to
           # release artefacts. This makes the running app say so itself.
-          # For a pull_request event the checkout is an ephemeral MERGE
-          # commit that exists in no branch, so stamping HEAD would print
-          # a SHA nobody can look up, which defeats the point. Use the
-          # head commit of the branch being built.
-          REVISION=$(git -C "$GITHUB_WORKSPACE" rev-parse --short 
-            "${{ github.event.pull_request.head.sha || github.sha }}")
+          # NOT `git rev-parse HEAD`, for two separate reasons that both
+          # broke the archive when it was written that way.
+          #
+          # One: for a pull_request event the checkout is an ephemeral
+          # MERGE commit that exists in no branch, so HEAD names a commit
+          # thrown away when the run ends. The whole point of this field is
+          # tracing a build on a phone back to source, and an unresolvable
+          # SHA does not do that.
+          #
+          # Two: actions/checkout fetches depth 1, so on a pull request the
+          # head commit is not even in the local object store and asking
+          # git for it fails with "Needed a single revision".
+          #
+          # GitHub already hands us the SHA, so no git call is needed at
+          # all. Shortening it is a substring.
+          REVISION_FULL="${{ github.event.pull_request.head.sha || github.sha }}"
+          REVISION="${REVISION_FULL:0:7}"
 
           xcodebuild archive \
             -project "$PROJECT" \
