@@ -57,7 +57,14 @@
 //  and fixed a revision that reported success at the hosting step, which would
 //  have made this screen lie.
 //
+//  `lan_ip` is REQUIRED in practice even though the contract calls it
+//  optional. The installer reaches the phone through the relay bridge and has
+//  no address of its own to dial, so a job without it signs successfully and
+//  then fails with no_iphone_target. Sending it is the difference between an
+//  install and a confusing half-success.
+//
 
+import Darwin
 import Foundation
 import os
 
@@ -192,6 +199,14 @@ public final class SelfUpdateService: ObservableObject {
             "installed_build_version": Self.installedBuildVersion
         ]
         if force { body["force"] = true }
+
+        // Checked here rather than left to the broker to reject, because a
+        // phone on cellular has no address the relay could reach and the
+        // useful thing to say is why, not a 400.
+        guard let lan = Self.wifiIPv4Address(), Self.isPrivateIPv4(lan) else {
+            throw SelfUpdateError.noWiFiAddress
+        }
+        body["lan_ip"] = lan
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         return try await send(request)
@@ -235,6 +250,78 @@ public final class SelfUpdateService: ObservableObject {
         return Reply(status: parsed, message: text)
     }
 
+    // MARK: - This phone's address
+
+    /// The IPv4 address of this phone on Wi-Fi, or nil when it has none.
+    ///
+    /// The broker signs the build and then has to CONNECT BACK to the phone
+    /// through the relay bridge, and it has no address of its own to dial.
+    /// Without this the job signs and then fails with no_iphone_target,
+    /// which is a success followed by a confusing failure.
+    ///
+    /// en0 is Wi-Fi on iPhone. Cellular is pdp_ip0 and is deliberately not
+    /// accepted: a carrier address is not reachable from a machine at home,
+    /// so offering it would trade a clear "you are not on Wi-Fi" for an
+    /// install that fails somewhere less legible.
+    static func wifiIPv4Address() -> String? {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return nil }
+        defer { freeifaddrs(head) }
+
+        for interface in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let flags = Int32(interface.pointee.ifa_flags)
+            guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0 else { continue }
+            guard let address = interface.pointee.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_INET),
+                  String(cString: interface.pointee.ifa_name) == "en0"
+            else { continue }
+
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let result = getnameinfo(
+                address, socklen_t(address.pointee.sa_len),
+                &host, socklen_t(host.count),
+                nil, 0, NI_NUMERICHOST
+            )
+            if result == 0 { return String(cString: host) }
+        }
+        return nil
+    }
+
+    /// True for the private ranges the broker accepts: 10/8, 172.16-31 and
+    /// 192.168/16.
+    ///
+    /// PARSED DIGIT BY DIGIT, NOT MATCHED WITH A REGULAR EXPRESSION, and
+    /// that is a deliberate choice rather than a style preference. The
+    /// Bottle agent shipped this same validator as a regex, had its
+    /// backslashes eaten when the file was written, and ended up with a
+    /// checker that rejected every valid address including the phone's own.
+    /// The same escaping hazard has bitten this repository repeatedly today
+    /// in its patch scripts. A validator that can be silently corrupted by
+    /// the act of writing it is worth avoiding when plain arithmetic does
+    /// the same job and cannot be.
+    static func isPrivateIPv4(_ text: String) -> Bool {
+        let parts = text.split(
+            separator: ".", omittingEmptySubsequences: false
+        )
+        guard parts.count == 4 else { return false }
+
+        var octets: [Int] = []
+        for part in parts {
+            guard !part.isEmpty, part.count <= 3,
+                  part.allSatisfy({ $0.isASCII && $0.isNumber }),
+                  let value = Int(part), value <= 255
+            else { return false }
+            octets.append(value)
+        }
+
+        switch (octets[0], octets[1]) {
+        case (10, _): return true
+        case (172, 16...31): return true
+        case (192, 168): return true
+        default: return false
+        }
+    }
+
     // MARK: Words
 
     private static func sentence(for error: Error) -> String {
@@ -249,6 +336,9 @@ public final class SelfUpdateService: ObservableObject {
             return "The update server sent something this app could not read."
         case SelfUpdateError.badEndpoint:
             return "This build's update address is not usable."
+        case SelfUpdateError.noWiFiAddress:
+            return "This iPhone is not on Wi-Fi, so the machine at home has no "
+                + "way to reach it. Join the same network and try again."
         default:
             return "Could not reach the update server: \(error.localizedDescription)"
         }
@@ -259,6 +349,7 @@ public final class SelfUpdateService: ObservableObject {
 
 enum SelfUpdateError: Error {
     case badEndpoint
+    case noWiFiAddress
     case rejected(status: Int, message: String?)
     case unreadableReply(message: String?)
 }
