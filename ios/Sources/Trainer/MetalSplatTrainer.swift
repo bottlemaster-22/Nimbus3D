@@ -52,6 +52,17 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     private let tuning: TrainerTuning
     private let settings: SmartLossSettings
 
+    /// How many densification passes in a row may add nothing, while growth was
+    /// permitted and there was room under the cap, before the trainer says so
+    /// on screen and in the census.
+    ///
+    /// Named once because two places read it: the live progress message inside
+    /// the slice loop, and the run's final outcome string. A threshold written
+    /// twice is a threshold that will disagree with itself. At the default
+    /// 100-iteration densify interval this is a thousand iterations of a stage
+    /// that is meant to be adding geometry adding none.
+    private static let zeroGrowthPassesBeforeSaying = 10
+
     // MARK: - GPU
 
     private var device: MTLDevice?
@@ -431,6 +442,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         var parts: [(slice: TrainerSlice, cloud: SplatCloud)] = []
         var mergedSoFar: [SplatCloud] = []
         var totalIterationsRun = 0
+        // Times round the loop, and times a gradient step actually ran. These
+        // are NOT the same number and the run is only allowed to call itself
+        // completed on the strength of the second one.
+        var totalGradientSteps = 0
+        // The worst run of consecutive densification passes that were allowed
+        // to add geometry and added none.
+        var worstZeroGrowthStreak = 0
         var lastPSNR: Float?
 
         for slice in slices {
@@ -446,6 +464,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 completedParts: mergedSoFar,
                 emit: emit,
                 iterationsRunSoFar: &totalIterationsRun,
+                gradientStepsRunSoFar: &totalGradientSteps,
+                zeroGrowthStreakWorstSoFar: &worstZeroGrowthStreak,
                 heldOutPSNR: &lastPSNR,
                 census: &census
             )
@@ -517,12 +537,44 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
         // Set here rather than in the `defer`: reaching this line is the only
         // thing that makes "completed" true.
+        //
+        // AND REACHING THIS LINE IS NOT ENOUGH ON ITS OWN.
+        //
+        // `totalIterationsRun` counts times round the loop. A run that could
+        // not decode a single photo, or whose buffers were never big enough,
+        // advanced that counter on every one of those iterations and arrived
+        // here with a full count and an empty model, and said "completed". The
+        // work actually done is `totalGradientSteps`, and the outcome is now
+        // judged on it.
+        //
         // The same 95 per cent tolerance the census's own alert uses: slice
         // iteration budgets are integer shares of the whole and round down, so
         // a full run legitimately lands a few iterations short.
-        census.outcome = totalIterationsRun * 100 < governor.current.iterations * 95
-            ? "stopped early"
-            : "completed"
+        let ranItsBudget = totalIterationsRun * 100 >= governor.current.iterations * 95
+        // Half. Below this the run trained on less than it skipped, and no
+        // amount of wall clock makes that a finished scan.
+        let didRealWork = totalGradientSteps * 2 >= totalIterationsRun
+        let skippedIterations = Swift.max(totalIterationsRun - totalGradientSteps, 0)
+
+        if !didRealWork {
+            census.outcome = "ran \(totalIterationsRun) iterations but only "
+                + "\(totalGradientSteps) of them took a real training step"
+        } else if !ranItsBudget {
+            census.outcome = "stopped early"
+        } else if worstZeroGrowthStreak >= Self.zeroGrowthPassesBeforeSaying {
+            census.outcome = "completed, but densification added nothing for "
+                + "\(worstZeroGrowthStreak) consecutive passes that were allowed to add something"
+        } else {
+            census.outcome = "completed"
+        }
+
+        TrainerLog.general.info(
+            """
+            Run finished: \(totalIterationsRun) iterations, \(totalGradientSteps) real gradient \
+            steps, \(skippedIterations) that did nothing. Worst run of densification passes \
+            that were allowed to add geometry and added none: \(worstZeroGrowthStreak).
+            """
+        )
 
         emit(
             progressTick(
@@ -532,7 +584,14 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 splatCount: merged.cloud.count,
                 loss: nil,
                 thermal: governor.thermalLevel,
-                message: doneMessage(cloud: merged.cloud, psnr: lastPSNR, governor: governor),
+                message: doneMessage(
+                    cloud: merged.cloud,
+                    psnr: lastPSNR,
+                    governor: governor,
+                    iterationsRun: totalIterationsRun,
+                    gradientSteps: totalGradientSteps,
+                    worstZeroGrowthStreak: worstZeroGrowthStreak
+                ),
                 previewAvailable: true
             )
         )
@@ -552,6 +611,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         completedParts: [SplatCloud],
         emit: @escaping @Sendable (TrainerProgress) -> Void,
         iterationsRunSoFar: inout Int,
+        /// Times round the loop is not work done. This is the run-level total of
+        /// iterations that actually ran a forward, a backward and an Adam step,
+        /// and it is what decides whether the run may call itself completed.
+        gradientStepsRunSoFar: inout Int,
+        /// The worst run of consecutive densification passes, anywhere in the
+        /// run, that were allowed to add geometry and added none.
+        zeroGrowthStreakWorstSoFar: inout Int,
         heldOutPSNR: inout Float?,
         census: inout TrainerCensus
     ) async throws -> SplatCloud {
@@ -659,8 +725,38 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         census.slices[censusRow].seedsPinnedAsDiscs = seedResult.seedsPinnedAsDiscs
         census.slices[censusRow].seedsStretchedAlongRay = seedResult.seedsStretchedAlongRay
         census.slices[censusRow].seedsBuilt = seedResult.seeds.count
-        census.slices[censusRow].seedMedianSpacingMillimetres =
-            Int((seedResult.medianSpacingMeters * 1000).rounded())
+        // Clamped before the conversion, not trusted to be in range. A
+        // Float-to-Int conversion outside Int's range TRAPS, in release as
+        // well as in debug, and this value arrives from another file. It is
+        // in range today; making it unreachable by construction costs one
+        // clamp and removes a crash on the line that logs how the run started.
+        //
+        // nil, not 0, when it could not be measured. `TrainerSeedResult` uses
+        // 0 for "no nearest neighbour was found", and 0 mm stored in a census
+        // reads as "the starting points were on top of each other", which is
+        // the opposite of what happened.
+        let spacingMetres = seedResult.medianSpacingMeters
+        if spacingMetres.isFinite, spacingMetres > 0 {
+            let millimetres = TrainerMath.clamp(spacingMetres * 1000, 0, 1_000_000)
+            census.slices[censusRow].seedMedianSpacingMillimetres = Int(millimetres.rounded())
+        } else {
+            census.slices[censusRow].seedMedianSpacingMillimetres = nil
+        }
+        // The trust line this slice drew, and the distribution it drew it on.
+        // Copied across rather than re-derived: `TrainerInitializer` is the
+        // only place that knows whether a gate was consulted at all, and
+        // `wasMeasured == false` is what stops the census reporting "the gate
+        // rejected everything" about a scan that had no gate.
+        if let cut = seedResult.trustCut {
+            census.slices[censusRow].seedTrustWasMeasured = cut.wasMeasured
+            census.slices[censusRow].seedTrustCut = cut.cut
+            census.slices[censusRow].seedTrustFloor = cut.floor
+            census.slices[censusRow].seedTrustQuantile = cut.quantile
+            census.slices[censusRow].seedTrustP05 = cut.p05
+            census.slices[censusRow].seedTrustMedian = cut.median
+            census.slices[censusRow].seedTrustP95 = cut.p95
+            census.slices[censusRow].seedTrustCellsConsidered = cut.cellsConsidered
+        }
         census.slices[censusRow].splatCapMeasuredAffordable = measuredCap
         census.slices[censusRow].splatCapEffective = effectiveCap
         census.slices[censusRow].renderWidth = renderSize.width
@@ -727,6 +823,33 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         let sliceFraction = Float(slice.iterationBudget)
             / Float(Swift.max(governor.ceiling.iterations, 1))
         var iteration = 0
+        // TIMES ROUND THE LOOP IS NOT WORK DONE, AND THE TWO WERE THE SAME
+        // NUMBER.
+        //
+        // `iteration` counts revolutions. Three of those revolutions do no
+        // optimisation at all: a keyframe whose photo will not decode, a frame
+        // with no pixels or no Gaussians, and a frame abandoned to grow the
+        // tile buffer. All three still advance `iteration`, so a run that
+        // decoded not one photo burned its whole budget, wrote
+        // `iterationsCompleted == iterationsRequested`, and left through the
+        // normal success path saying "completed".
+        //
+        // This is the number that says otherwise: incremented ONLY on
+        // `.stepped`, which is the only return that has run a forward pass, a
+        // backward pass and an Adam step. Everything below that judges whether
+        // the run did any work judges it on this, not on `iteration`.
+        var gradientSteps = 0
+        // Densification passes that added nothing, in a row, and the worst such
+        // run in this slice. `TrainerDensifyOutcome.summary` is nil when a pass
+        // did nothing at all, and the log line was inside `if let summary`, so
+        // a densification stage that had stopped producing anything was
+        // COMPLETELY SILENT. That is the exact shape of the fault that made the
+        // owner's first scan look like nothing.
+        var zeroGrowthStreak = 0
+        var longestZeroGrowthStreak = 0
+        var densifyPassesRun = 0
+        var densifyPassesThatAddedNothing = 0
+        let zeroGrowthStreakToReport = Self.zeroGrowthPassesBeforeSaying
         var lastEmit = Date.distantPast
         // How many polls in a row the phone has been too hot to work. A phone
         // that never cools has to end the run rather than sit in a loop
@@ -968,7 +1091,20 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 exposure: exposure,
                 splatCount: splatCount,
                 iteration: iteration,
-                totalIterations: totalIterations,
+                // EVERY schedule inside `runIteration` keys off this one
+                // number: the spherical-harmonic degree ramp and the
+                // frequency-blur decay in `cameraUniforms`, the depth-loss
+                // decay, the late opacity binarization in
+                // `regularizerUniforms`, the position learning-rate decay in
+                // `adamUniforms`, and the warm-up end that unfreezes the
+                // cameras and freezes the background. Handing it the PLANNED
+                // slice length while the loop exits at `effectiveTotal` is the
+                // same fault `progressFraction` had: a run cut from 3,000 to
+                // 1,500 would stop at fraction 0.5 and the entire back half of
+                // every one of those schedules would never execute. This is
+                // the fix applied to all of them at once, because they all
+                // read the same argument.
+                totalIterations: effectiveTotal,
                 sceneExtent: sceneExtent,
                 shCoefficientCount: shCoefficientCount,
                 trust: smart.trust,
@@ -980,7 +1116,18 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             )
             switch step {
             case .stepped:
-                break
+                // The ONLY place this is incremented, and the only return that
+                // ran a gradient step.
+                gradientSteps += 1
+                // Recorded on `.stepped` alone, because that is the only
+                // return that actually handed these samples to the loss.
+                // Counting them on a skipped iteration would inflate the
+                // supervised fraction with frames the laser never voted on.
+                census.slices[censusRow].depthSamplesPerFrameTotal +=
+                    frameSupervision.depthSamples.count
+                census.slices[censusRow].depthSamplesSupervisedTotal +=
+                    frameSupervision.supervisedSampleCount
+                census.slices[censusRow].depthSupervisionFramesMeasured += 1
             case .skippedNothingToRender:
                 census.slices[censusRow].iterationsSkippedNothingToRender += 1
             case .grewTileBufferAndRetried:
@@ -1065,16 +1212,109 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     )
                 )
 
-                if outcome.changedTopology || outcome.relocated > 0 {
-                    try resetDensifyStats(
-                        gpu: gpu, resources: resources, queue: queue, splatCount: splatCount
-                    )
+                // UNCONDITIONAL, and this used to be
+                // `if outcome.changedTopology || outcome.relocated > 0`.
+                //
+                // The kernel's own comment says it runs after every pass, and
+                // the accumulators are meant to average over ONE interval. A
+                // pass that changed nothing was skipping the reset, so
+                // `absGrad2D`, `denom`, `visAccum` and `unknownAccum` kept
+                // running into the next interval. `absGrad2D / denom` is a
+                // mean and largely survives that; `visAccum` does not. It is
+                // only ever compared against zero, so never resetting it makes
+                // the "something actually looked at this" filter steadily more
+                // permissive the longer densification goes without changing
+                // anything. A stage that is producing nothing must not also be
+                // quietly loosening the gate that decides whether it has
+                // candidates to work with.
+                try resetDensifyStats(
+                    gpu: gpu, resources: resources, queue: queue, splatCount: splatCount
+                )
+
+                // --- Did this pass add anything, and how long has that been
+                //     true --------------------------------------------------
+                //
+                // The streak is counted ONLY over passes where growth was
+                // permitted AND there was room under the cap, which is the
+                // same pair of conditions `TrainerCensus`'s
+                // `passesWithGrowthWindowOpenAndHeadroom` uses. Adding nothing
+                // outside the densify window, or with a full budget, is
+                // correct behaviour; counting those would put a false alarm in
+                // front of a user who cannot check it.
+                densifyPassesRun += 1
+                // `created` is `TrainerDensifyOutcome`'s own name for
+                // `cloned + split`, and relocation is deliberately not in it:
+                // moving a Gaussian is not adding one and the total does not
+                // change, which is exactly the disguise a stalled
+                // densification stage wears.
+                let addedThisPass = outcome.created
+                let couldHaveAdded = outcome.growthAllowed && outcome.headroomAtStart > 0
+                if couldHaveAdded {
+                    if addedThisPass > 0 {
+                        zeroGrowthStreak = 0
+                    } else {
+                        zeroGrowthStreak += 1
+                        densifyPassesThatAddedNothing += 1
+                        longestZeroGrowthStreak = Swift.max(
+                            longestZeroGrowthStreak, zeroGrowthStreak
+                        )
+                    }
                 }
+
+                // EVERY PASS LOGS. NO EXCEPTIONS.
+                //
+                // This was `if let summary = outcome.summary`, and `summary` is
+                // nil precisely when a pass changed nothing, so the passes most
+                // worth knowing about were the only ones that never printed.
                 if let summary = outcome.summary {
                     TrainerLog.densify.info(
                         "Iteration \(iteration): \(summary, privacy: .public)"
                     )
+                } else {
+                    TrainerLog.densify.info(
+                        """
+                        Iteration \(iteration): densification changed nothing. Growth \
+                        allowed: \(outcome.growthAllowed), room under the cap: \
+                        \(outcome.headroomAtStart).
+                        """
+                    )
                 }
+
+                // AND THE STREAK GETS ITS OWN LINE, at error level, separate
+                // from the summary above.
+                //
+                // Deliberately not folded into the `else` branch. A pass that
+                // pruned twelve Gaussians and created none has a perfectly
+                // cheerful non-nil summary ("removed 12") and would take the
+                // quiet path, and a run of those is exactly a stalled
+                // densification stage looking like a working one. The test is
+                // on what was CREATED and on how long that has been true,
+                // nothing else. Every number here is one
+                // `TrainerDensifyOutcome` already carries; none of them costs
+                // a pass over a buffer or touches the GPU.
+                if couldHaveAdded, addedThisPass == 0,
+                   zeroGrowthStreak >= zeroGrowthStreakToReport
+                {
+                    TrainerLog.densify.error(
+                        """
+                        Iteration \(iteration): densification has added NOTHING for \
+                        \(zeroGrowthStreak) passes in a row while it was allowed to and had \
+                        room. Verdict: \(outcome.growthVerdict.rawValue). Room for \
+                        \(outcome.headroomAtStart), allowance \
+                        \(outcome.growthAllowance), scored \(outcome.splatsScored), \
+                        \(outcome.splatsWithNonZeroScore) above zero, \
+                        \(outcome.candidatesAfterVisibilityFilter) candidates after the \
+                        visibility filter.
+                        """
+                    )
+                }
+
+                // The SCREEN is told by the progress tick below, which runs at
+                // most twice a second and rebuilds its sentence from
+                // `zeroGrowthStreak` every time. That is deliberately not a
+                // one-shot announcement: the warning stays up for as long as
+                // the streak lasts and disappears by itself the moment a pass
+                // adds something, because `zeroGrowthStreak` goes back to zero.
             }
 
             if iteration % Swift.max(tuning.snapshotIntervalIterations, 1) == 0 {
@@ -1090,18 +1330,45 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             let now = Date()
             if now.timeIntervalSince(lastEmit) > 0.5 || iteration == effectiveTotal - 1 {
                 lastEmit = now
+                // `effectiveTotal`, not `totalIterations`. The stage label and
+                // the sentence under it are the user's only view of where the
+                // run is, and keying them to the planned length on a run that
+                // was shortened means the screen sits on "Adding detail where
+                // it is missing" and never reaches "Deciding what is solid",
+                // while the loop underneath has already binarized and stopped.
+                // The stage shown and the stage running have to be the same
+                // stage.
+                //
+                // The sentence itself is normally the stage label; but once
+                // densification has gone `zeroGrowthStreakToReport` passes in a
+                // row without adding a single point, that is the more important
+                // thing to say, and it is said WHILE THE RUN IS STILL GOING
+                // rather than discovered afterwards in a file. That silence is
+                // the exact failure that produced a scan looking like nothing.
+                var tickMessage = stageMessage(
+                    for: iteration, of: effectiveTotal, sliceLabel: sliceLabel
+                )
+                if zeroGrowthStreak >= zeroGrowthStreakToReport {
+                    let suffix: String = sliceLabel.isEmpty ? "" : " (" + sliceLabel + ")"
+                    tickMessage = "Still working, but no new detail has been added for "
+                        + String(zeroGrowthStreak) + " passes in a row" + suffix + "."
+                }
                 emit(
                     progressTick(
-                        stage: stage(for: iteration, of: totalIterations),
+                        stage: stage(for: iteration, of: effectiveTotal),
                         iteration: iterationsRunSoFar + iteration,
                         total: governor.current.iterations,
                         splatCount: splatCount,
                         loss: lossEMA,
                         thermal: governor.thermalLevel,
-                        message: stageMessage(
-                            for: iteration, of: totalIterations, sliceLabel: sliceLabel
-                        ),
-                        previewAvailable: iteration >= tuning.snapshotIntervalIterations
+                        message: tickMessage,
+                        previewAvailable: iteration >= tuning.snapshotIntervalIterations,
+                        // Both measured, both whole-run to match `iteration`
+                        // above. `tickMessage` already says the second of
+                        // these in prose; a number lets the screen show it as
+                        // a state rather than only print it.
+                        gradientStepsCompleted: gradientStepsRunSoFar + gradientSteps,
+                        consecutiveZeroGrowthPasses: zeroGrowthStreak
                     )
                 )
             }
@@ -1113,6 +1380,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
         census.iterationsCompleted += iteration
         census.slices[censusRow].iterationsCompleted = iteration
+        // Measured, not derived. It should equal `iterationsCompleted` minus
+        // the three skip counters; storing both sides is what makes a skip
+        // path that stops being counted visible instead of invisible.
+        census.slices[censusRow].iterationsWithGradientStep = gradientSteps
         census.slices[censusRow].splatCountAtEndOfTraining = splatCount
         // The size the buffers were actually at when the slice ended, which is
         // not the size it started at if the governor stepped the resolution
@@ -1122,6 +1393,53 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         if census.slices[censusRow].stopReason == TrainerCensus.unfinishedOutcome {
             census.slices[censusRow].stopReason = "ran out its iterations"
         }
+
+        // --- What this slice ACTUALLY did, said out loud -------------------------
+        //
+        // Three numbers, all measured, none inferred:
+        //   `iteration`      times round the loop
+        //   `gradientSteps`  times an optimisation step actually ran
+        //   the difference   iterations that burned budget and did nothing
+        //
+        // The census records the three skip reasons separately
+        // (`iterationsSkippedNoSupervision`, `...NothingToRender`,
+        // `...GrowingTileBuffer`) and sums them in `iterationsSkippedTotal`, so
+        // `gradientSteps` is `iterationsCompleted` minus that sum and the two
+        // sides cannot disagree. This line is what puts it in the log while the
+        // run is fresh rather than leaving it to be worked out from a file.
+        let skippedInSlice = iteration - gradientSteps
+        TrainerLog.general.info(
+            """
+            Slice finished: \(iteration) iterations, \(gradientSteps) of them took a real \
+            gradient step, \(skippedInSlice) did nothing. Densification ran \
+            \(densifyPassesRun) pass(es); \(densifyPassesThatAddedNothing) of the passes that \
+            were allowed to add something added nothing, worst run \
+            \(longestZeroGrowthStreak) in a row.
+            """
+        )
+
+        // The slice's own outcome sentence, and this is the point of the whole
+        // change: a slice that went round its loop the full number of times but
+        // optimised on almost none of them used to say "ran out its iterations",
+        // which reads as a finished slice.
+        //
+        // APPENDED, NOT OVERWRITTEN. A slice stopped by heat already wrote why
+        // it stopped, and that reason is the more important one; this is added
+        // to it rather than in place of it, so neither fact is lost.
+        if iteration > 0, gradientSteps * 2 < iteration {
+            census.slices[censusRow].stopReason +=
+                " (only \(gradientSteps) of \(iteration) iterations took a real training step; "
+                + "the other \(skippedInSlice) did nothing)"
+        } else if longestZeroGrowthStreak >= zeroGrowthStreakToReport {
+            census.slices[censusRow].stopReason +=
+                " (densification added nothing for \(longestZeroGrowthStreak) consecutive "
+                + "passes that were allowed to add something)"
+        }
+
+        gradientStepsRunSoFar += gradientSteps
+        zeroGrowthStreakWorstSoFar = Swift.max(
+            zeroGrowthStreakWorstSoFar, longestZeroGrowthStreak
+        )
 
         // The learned per-frame exposures belong to the whole run, not to this
         // slice: `model/exposure.bin` is keyed by frame index and a frame in
@@ -1259,6 +1577,24 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 iteration: iteration, of: totalIterations, floor: settings.depthScheduleFloor
             )
         loss.depthSampleCount = UInt32(sampleCount)
+        // The divisor that turns the five geometry terms in `trainer_loss_depth`
+        // into per-sample MEANS, so they sit on the same scale as the two
+        // photometric terms instead of ~10^4 above them.
+        //
+        // `supervisedSampleCount` counts the WHOLE sample array. `sampleCount`
+        // above is the prefix that fitted in the GPU buffer, and the two are
+        // the same number on every normal frame. When capacity truncates, the
+        // count is retaken over exactly the prefix that was uploaded: dividing
+        // by samples the GPU never saw would quietly weaken the geometry terms
+        // on precisely the densest frames.
+        let supervisedCount: Int
+        if sampleCount == supervision.depthSamples.count {
+            supervisedCount = supervision.supervisedSampleCount
+        } else {
+            supervisedCount = supervision.depthSamples.prefix(sampleCount)
+                .reduce(into: 0) { $0 += ($1.weight > 0 ? 1 : 0) }
+        }
+        loss.depthSupervisedCount = UInt32(supervisedCount)
         loss.bimodalWeight = settings.bimodalWeight
         loss.transitionWidthWeight = settings.transitionWidthWeight
         loss.freeSpaceWeight = settings.freeSpaceLowerBoundWeight
@@ -1389,7 +1725,15 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             if iteration % 20 == 0 {
                 background.applyAccumulatedGradient(learningRate: 0.25)
             }
-        } else if let background, iteration == warmupEnd + 1 {
+        } else if let background, iteration > warmupEnd, !background.isFrozen {
+            // Was `iteration == warmupEnd + 1`. `warmupEnd` is now derived from
+            // `effectiveTotal`, which MOVES when the governor shortens the run,
+            // so an exact equality can be stepped straight over: one budget cut
+            // that pushes `warmupEnd` below the current iteration and the
+            // background would train for the whole run, absorbing foreground
+            // error forever, with nothing logged. A range test plus the model's
+            // own flag cannot be missed, and `freeze()` still logs exactly once
+            // because it checks that flag itself.
             background.freeze()
             TrainerLog.general.info("Background field frozen at iteration \(iteration)")
         }
@@ -1954,13 +2298,44 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         let sh = resources.sh.readArray(Float.self, count: count * shPerSplat)
         let restCount = shDegree.restCoefficientCount
 
+        // THE 3D LOW-PASS FILTER HAS TO LEAVE WITH THE MODEL, AND IT CAN ONLY
+        // LEAVE FOLDED IN.
+        //
+        // `trainer_preprocess` never renders the Gaussians stored in `splats`.
+        // It renders each one widened to `Sigma + filter3D^2 * I` and dimmed by
+        // `sqrt(det(Sigma) / det(Sigma + filter3D^2 * I))`. Every opacity the
+        // optimiser fitted was fitted against that dimming and every scale
+        // against that widening, so a cloud read off the GPU without them is a
+        // DIFFERENT MODEL from the one that was trained: sharper and more
+        // solid, which is the direction that makes a good run look like noise.
+        //
+        // `filter3D` exists in exactly one place, `TrainerSplatStats.filter3D`,
+        // and no splat file format has a field for it, so it is folded into the
+        // stored log-scale and opacity here, once, by the single
+        // implementation in Export (`SplatCloud.fuse3DFilter`). Do not
+        // re-derive the formula: one copy is the whole point of it living
+        // there.
+        let stats = resources.stats.readArray(TrainerSplatStats.self, count: count)
+        // `readArray` returns an EMPTY array when the buffer is shorter than
+        // asked for, so this is a real test and not a formality. Indexing a
+        // short array with `i` below would be a crash, and pairing a filter
+        // with the wrong Gaussian would be worse: it would look like a
+        // slightly wrong model rather than like a bug.
+        let haveFilters = stats.count == splats.count
+
         var positions: [SIMD3<Float>] = []
         var rotations: [SIMD4<Float>] = []
         var logScales: [SIMD3<Float>] = []
         var opacities: [Float] = []
         var colorDC: [SIMD3<Float>] = []
         var shRest: [[SIMD3<Float>]] = []
+        // Appended inside the same loop and after the same `continue`, so it
+        // stays index-for-index with `logScales` and `opacities`. A filter
+        // list built by indexing the ORIGINAL array with `i` afterwards would
+        // drift by one for every dropped Gaussian.
+        var filters: [Float] = []
         positions.reserveCapacity(splats.count)
+        filters.reserveCapacity(splats.count)
 
         for (i, splat) in splats.enumerated() {
             let mean = splat.mean
@@ -1977,6 +2352,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             rotations.append(splat.rotation)
             logScales.append(logScale)
             opacities.append(splat.opacityLogit)
+            if haveFilters { filters.append(stats[i].filter3D) }
 
             let base = i * shPerSplat
             if base + 3 <= sh.count {
@@ -2000,8 +2376,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             }
         }
 
+        var cloud: SplatCloud
         do {
-            return try SplatCloud(
+            cloud = try SplatCloud(
                 shDegree: shDegree,
                 positions: positions,
                 rotations: rotations,
@@ -2016,6 +2393,37 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             )
             return SplatCloud.empty(shDegree: shDegree)
         }
+
+        // The fuse is deliberately NOT inside the `do` above. A cloud that was
+        // assembled and could not be fused is still a cloud, and throwing it
+        // away would turn a cosmetic loss into an empty model. It is also not
+        // allowed to pass in silence, so both failure paths set the flag to
+        // `false`: the value that means "the producer KNEW there was a filter
+        // and did not apply it", which the viewer already warns on.
+        guard haveFilters, filters.count == cloud.count else {
+            cloud.filter3DFused = false
+            let complaint = "Read \(cloud.count) points back but \(filters.count) filter "
+                + "widths, so the 3D low-pass filter could NOT be folded in. Every point "
+                + "will draw sharper and more solid than it was trained."
+            TrainerLog.general.error("\(complaint, privacy: .public)")
+            return cloud
+        }
+        do {
+            let changed = try cloud.fuse3DFilter(filters)
+            TrainerLog.general.notice(
+                "Folded the 3D low-pass filter into \(changed) of \(cloud.count) points."
+            )
+        } catch {
+            cloud.filter3DFused = false
+            // `String(describing:)`, not `localizedDescription`: `ExportError`
+            // is `CustomStringConvertible` and not `LocalizedError`, so
+            // `localizedDescription` would print Foundation's generic
+            // "operation could not be completed" instead of the reason.
+            let complaint = "The 3D low-pass filter could not be folded in: "
+                + String(describing: error)
+            TrainerLog.general.error("\(complaint, privacy: .public)")
+        }
+        return cloud
     }
 
     /// The preview during a multi-slice run shows the parts already finished
@@ -2039,7 +2447,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             if current.shDegree != .zero { shRest.append(contentsOf: part.shRest) }
         }
 
-        return (try? SplatCloud(
+        guard var merged = try? SplatCloud(
             shDegree: current.shDegree,
             positions: positions,
             rotations: rotations,
@@ -2047,7 +2455,16 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             opacityLogits: opacities,
             colorDC: colorDC,
             shRest: current.shDegree == .zero ? [] : shRest
-        )) ?? current
+        ) else { return current }
+        // A fresh cloud starts at `nil`, so without this the merged preview
+        // would report "cannot say" about a fact every one of its parts knew.
+        // Only the parts whose splats were actually taken above: a part at a
+        // different SH degree contributed nothing and must not vote.
+        let contributing = completedParts.filter { $0.shDegree == current.shDegree }
+        merged.filter3DFused = SplatCloud.mergedFilter3DFused(
+            [current.filter3DFused] + contributing.map { $0.filter3DFused }
+        )
+        return merged
     }
 
     // MARK: - Writing the result
@@ -2345,13 +2762,33 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         }
     }
 
+    /// The one sentence the user reads at the end.
+    ///
+    /// `iterationsRun` and `gradientSteps` are separate arguments on purpose.
+    /// This used to be handed only the finished cloud, so a run that went round
+    /// its loop three thousand times and optimised on none of them produced the
+    /// identical cheerful sentence as a run that worked. If the second number
+    /// is far below the first, the sentence says so, in plain words, on the
+    /// screen the owner actually looks at.
     private func doneMessage(
         cloud: SplatCloud,
         psnr: Float?,
-        governor: TrainerBudgetGovernor
+        governor: TrainerBudgetGovernor,
+        iterationsRun: Int,
+        gradientSteps: Int,
+        worstZeroGrowthStreak: Int
     ) -> String {
         var sentence = "Your scan is ready, built from "
             + "\(TrainerBudgetGovernor.round(cloud.count)) points of detail."
+        if iterationsRun > 0, gradientSteps * 2 < iterationsRun {
+            sentence += " Be warned: only " + String(gradientSteps) + " of "
+                + String(iterationsRun) + " training rounds actually did any work, so this "
+                + "model has had much less training than it looks like."
+        } else if worstZeroGrowthStreak >= Self.zeroGrowthPassesBeforeSaying {
+            sentence += " Be warned: it stopped adding new detail for "
+                + String(worstZeroGrowthStreak) + " rounds in a row part way through, so it "
+                + "may be thinner than it should be."
+        }
         if !governor.changes.isEmpty {
             sentence += " It was made a little smaller along the way because "
                 + (governor.changes.last?.reason.plainCause ?? "the phone needed the room") + "."
@@ -2359,6 +2796,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         if let psnr {
             sentence += " On the photos it was not trained with, it scores "
                 + String(format: "%.1f", psnr) + " decibels."
+            // Said in full, every time, and deliberately not shortened to
+            // "measured on held-out frames". That phrase is exactly the one
+            // that lets a wrong reading survive: it sounds like a score for
+            // the preview, and it is not measured on the preview.
+            sentence += " That score compares the model against photos it never trained on, "
+                + "at the size it was trained at. It is not a score for how the preview looks "
+                + "on screen."
         }
         return sentence
     }
@@ -2371,7 +2815,14 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         loss: Float?,
         thermal: ThermalLevel,
         message: String,
-        previewAvailable: Bool
+        previewAvailable: Bool,
+        // Defaulted to nil, which means NOBODY COUNTED, not zero. Only the
+        // in-loop tick can honestly supply these; the stage-change ticks
+        // around it fire before, between and after the loop, and passing a
+        // stale count from one of those would be a measurement presented at
+        // the wrong moment.
+        gradientStepsCompleted: Int? = nil,
+        consecutiveZeroGrowthPasses: Int? = nil
     ) -> TrainerProgress {
         // `fractionComplete` is nil, not zero, whenever there is no honest
         // number to give: Contracts.swift says the UI draws an indeterminate
@@ -2396,7 +2847,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             thermalLevel: thermal,
             residentBytes: resources?.residentBytes ?? 0,
             message: message,
-            previewAvailable: previewAvailable
+            previewAvailable: previewAvailable,
+            gradientStepsCompleted: gradientStepsCompleted,
+            consecutiveZeroGrowthPasses: consecutiveZeroGrowthPasses
         )
     }
 }

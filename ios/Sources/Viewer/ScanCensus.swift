@@ -435,6 +435,22 @@ extension ScanCensus {
         /// investigation to the wrong place.
         var sourceFile: String?
 
+        /// Whether the model being drawn had the trainer's Mip-Splatting 3D
+        /// low-pass filter folded into its scales and opacities before it left
+        /// the trainer.
+        ///
+        ///  * `true`  - it did, so this is the model that was actually fitted.
+        ///  * `false` - it did not, and the producer KNEW. Every splat draws
+        ///              sharper and more solid than it was trained, and the
+        ///              held-out score was not measured on what is on screen.
+        ///  * `nil`   - the file could not say. `.ply`, `.spz` and `.glb` carry
+        ///              no marker, so an imported model gets no claim made
+        ///              about it either way.
+        ///
+        /// Stamped by `MetalSplatRenderer.load(_:)` next to `sourceFile`, for
+        /// the same reason: `measure` is handed a cloud and cannot know.
+        var filter3DFused: Bool?
+
         /// Walks a cloud once and counts. O(n) in time and O(1) in extra
         /// memory: the middle axis ratio comes from a fixed histogram rather
         /// than from sorting half a million floats.
@@ -1286,11 +1302,28 @@ extension ScanCensus {
     }
 
     private static func drawableAlert(_ drawable: Drawable?) -> String? {
-        guard let drawable, drawable.total > 0 else { return nil }
-        let lost = drawable.total - drawable.drawable
-        guard Double(lost) >= Double(drawable.total) * lossFraction else { return nil }
-        return "\(percentText(lost, of: drawable.total)) of the points in this file cannot put "
-            + "anything on screen from any angle."
+        guard let drawable else { return nil }
+        // Two independent things can be wrong with the same rung, so they are
+        // joined rather than one hiding the other.
+        var faint: String?
+        if drawable.total > 0 {
+            let lost = drawable.total - drawable.drawable
+            if Double(lost) >= Double(drawable.total) * lossFraction {
+                faint = "\(percentText(lost, of: drawable.total)) of the points in this file "
+                    + "cannot put anything on screen from any angle."
+            }
+        }
+        return joined(faint, unfusedFilterAlert(drawable))
+    }
+
+    /// Only `false` says anything. `nil` is a model read back from a file,
+    /// which genuinely cannot know, and an alert that fired on every import
+    /// would be noise rather than information.
+    private static func unfusedFilterAlert(_ drawable: Drawable) -> String? {
+        guard drawable.filter3DFused == false else { return nil }
+        return "This model is being drawn sharper and more solid than it was actually built. "
+            + "The softening the build fitted every point against was not saved into the file, "
+            + "so what is on screen is not quite the model that was scored."
     }
 
     private static func needleAlert(_ drawable: Drawable) -> String? {

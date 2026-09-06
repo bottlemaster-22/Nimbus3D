@@ -147,7 +147,18 @@ struct ViewerUniforms {
     /// This is NOT the 0.3 px dilation the spec says to remove: the dilation
     /// grows every splat unconditionally, whereas this is a proper screen-space
     /// band limit whose effect on brightness is compensated for on the alpha.
-    var filterVariancePx: Float = 0.3                         // offset 136
+    ///
+    /// 0.25 because that is the number the trainer fits through:
+    /// `MetalSplatTrainer.cameraUniforms` sets `camera.filter2DVariance = 0.25`
+    /// unconditionally, and the coarse-to-fine `frequencyBlurVariance` that is
+    /// added to it has decayed to 0 long before the model is saved (it ends at
+    /// `frequencyBlurEndFraction`, 0.2 of the run). This field and that one are
+    /// the same quantity added to the same two diagonal entries, so any
+    /// difference between them is the viewer drawing a model nobody fitted.
+    /// It used to read 0.3, which dimmed a 1 px^2 splat to 0.769 where the
+    /// trainer had it at 0.800: about 4 percent too dark on the smallest
+    /// splats, and 0 percent on the large ones, i.e. a size-dependent tint.
+    var filterVariancePx: Float = 0.25                        // offset 136
     var pad0: Float = 0                                       // offset 140
 }                                                             // size 144
 

@@ -222,17 +222,42 @@ enum PrePassSurveyor {
         for (keyframeIndex, frame) in keyframes.enumerated() {
             try Task.checkCancellation()
 
-            let depthFrame: PrePassDepthFrame?
+            // `loadOutcome`, not `load`. THIS COUNTER COULD NOT REACH 1 FOR
+            // ITS OWN NAMED CAUSE.
+            //
+            // `load` returns NIL, not a throw, when a frame HAS a depthPath
+            // and the file will not open, so the `catch` below never ran for
+            // it and `guard let ... else { continue }` swallowed it. The only
+            // things that ever reached the catch were a wrong-LENGTH file and
+            // an impossible recorded map size. A scan whose depth sidecars had
+            // all been lost produced `unreadableDepthFrames == 0` and no
+            // `unreadable_depth` finding: total failure wearing the face of a
+            // scan with no laser data. `loadOutcome` names the three cases
+            // apart; `load` is a wrapper over it, so the two cannot drift.
+            let outcome: PrePassDepthLoad
             do {
-                depthFrame = try PrePassDepthFrame.load(
+                outcome = try PrePassDepthFrame.loadOutcome(
                     frame: frame, settings: bundle.settings, at: ref
                 )
             } catch {
-                // Corrupt sidecar. Counted and reported, never guessed at.
+                // A file that opened and is the wrong length, or an impossible
+                // recorded map size. Counted and reported, never guessed at.
                 result.unreadableDepthFrames += 1
                 continue
             }
-            guard let depthFrame else { continue }
+            let depthFrame: PrePassDepthFrame
+            switch outcome {
+            case .loaded(let loadedFrame):
+                depthFrame = loadedFrame
+            case .unreadable:
+                // A path WAS recorded and the file would not open. This is the
+                // case the counter is named for.
+                result.unreadableDepthFrames += 1
+                continue
+            case .noDepthRecorded:
+                // No laser on this frame at all. Normal, and not a fault.
+                continue
+            }
 
             let pose = poseFor(frame)
             let origin = pose.center.simd

@@ -600,7 +600,7 @@ enum PrePassInitialSplatBuilder {
         census.doubtfulCount = doubtfulCount
         census.onEdgeCount = edgeCount
 
-        let cloud = try SplatCloud(
+        var cloud = try SplatCloud(
             shDegree: .zero,
             positions: positions,
             rotations: rotations,
@@ -609,6 +609,19 @@ enum PrePassInitialSplatBuilder {
             colorDC: colorDC,
             shRest: []
         )
+        // `false`, not `nil`. This set has never been trained, so there is no
+        // Mip-Splatting 3D filter to fold in and this producer KNOWS it. `nil`
+        // is the value for a cloud read back from a file that cannot say,
+        // which is a different fact, and the viewer warns on one and not the
+        // other.
+        //
+        // SAID PLAINLY: nothing reads this today. The cloud is local, it
+        // leaves this function only as a `.ply`, and no splat file format has
+        // anywhere to put the marker. It is set because the value is a fact
+        // about the object and the next person to hand this cloud to a
+        // renderer should not have to work it out again, not because a
+        // mechanism depends on it.
+        cloud.filter3DFused = false
 
         let plyURL = ref.url(forRelativePath: PrePassPaths.initialSplats)
         try FileManager.default.createDirectory(

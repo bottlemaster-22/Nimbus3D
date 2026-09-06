@@ -399,7 +399,7 @@ enum TrainerSliceMerger {
             report.kept = positions.count
         }
 
-        let cloud = try SplatCloud(
+        var cloud = try SplatCloud(
             shDegree: degree,
             positions: positions,
             rotations: rotations,
@@ -407,6 +407,15 @@ enum TrainerSliceMerger {
             opacityLogits: opacities,
             colorDC: colorDC,
             shRest: degree == .zero ? [] : shRest
+        )
+        // A fresh cloud starts at `nil`. Every part above was read off the GPU
+        // by `MetalSplatTrainer.readCloud`, which folds the trainer's 3D
+        // low-pass filter in and says so, and that fact must survive the join
+        // or the finished model reports "cannot say" about its own geometry.
+        // One unfused part makes the whole model unfaithful, so the rule is
+        // the cautious one in `SplatCloud.mergedFilter3DFused`.
+        cloud.filter3DFused = SplatCloud.mergedFilter3DFused(
+            parts.map { $0.cloud.filter3DFused }
         )
         return (cloud, report)
     }

@@ -222,7 +222,8 @@ struct TrainerLossUniforms {
     uint  hasBackground;           // 52
     float ssimC1;                  // 56
     float ssimC2;                  // 60
-};                                 // 64 bytes
+    uint  depthSupervisedCount;    // 64
+};                                 // 68 bytes
 
 struct TrainerAdamUniforms {
     uint  count;                  //  0
@@ -273,6 +274,30 @@ struct TrainerBlurUniforms {
     uint planeCount;  //  8
     uint pad0;        // 12
 };
+
+// ----------------------------------------------------------------------------
+// THE SIZES, CHECKED BY THE METAL COMPILER RATHER THAN BY THE PHONE.
+//
+// `TrainerGPULayouts.verify()` already checks every one of these from the
+// Swift side, but it runs at start-up on the device: a struct that grew here
+// and not there fails as a refusal to train, on the owner's phone, after the
+// build shipped. These fail in CI instead, on the line that is wrong. The
+// numbers must match the `// stride N` comments in TrainerGPULayouts.swift
+// exactly. The viewer's shader has carried the same guard from the start.
+// ----------------------------------------------------------------------------
+static_assert(sizeof(TrainerSplat) == 48, "TrainerSplat must be 48 bytes");
+static_assert(sizeof(TrainerSplatGrad) == 48, "TrainerSplatGrad must be 48 bytes");
+static_assert(sizeof(TrainerSplatStats) == 32, "TrainerSplatStats must be 32 bytes");
+static_assert(sizeof(TrainerSplatDraw) == 64, "TrainerSplatDraw must be 64 bytes");
+static_assert(sizeof(TrainerSamplingTopK) == 16, "TrainerSamplingTopK must be 16 bytes");
+static_assert(sizeof(TrainerDepthSample) == 32, "TrainerDepthSample must be 32 bytes");
+static_assert(sizeof(TrainerCameraUniforms) == 144, "TrainerCameraUniforms must be 144 bytes");
+static_assert(sizeof(TrainerLossUniforms) == 68, "TrainerLossUniforms must be 68 bytes");
+static_assert(sizeof(TrainerAdamUniforms) == 64, "TrainerAdamUniforms must be 64 bytes");
+static_assert(sizeof(TrainerRegUniforms) == 32, "TrainerRegUniforms must be 32 bytes");
+static_assert(sizeof(TrainerScanUniforms) == 16, "TrainerScanUniforms must be 16 bytes");
+static_assert(sizeof(TrainerRadixUniforms) == 16, "TrainerRadixUniforms must be 16 bytes");
+static_assert(sizeof(TrainerBlurUniforms) == 16, "TrainerBlurUniforms must be 16 bytes");
 
 // ============================================================================
 // MARK: - Small helpers
@@ -389,9 +414,15 @@ kernel void trainer_reset_visibility(
     stats[gid].visibleFlag = 0;
 }
 
-/// Zeroes the densification accumulators. Called after every densification
-/// pass, never between iterations: the statistic is meant to average over the
-/// whole interval.
+/// Zeroes the densification accumulators. Called after EVERY densification
+/// pass, including one that changed nothing, and never between iterations: the
+/// statistic is meant to average over exactly one interval.
+///
+/// The "including one that changed nothing" is load-bearing. `visAccum` is
+/// only ever compared against zero, so a pass that skipped this reset would
+/// carry its visibility accumulation into the next interval and make the
+/// candidate filter more permissive the longer the stage went without doing
+/// anything. See the call in `MetalSplatTrainer.trainSlice`.
 kernel void trainer_reset_densify_stats(
     device TrainerSplatStats* stats [[buffer(0)]],
     constant uint&            count [[buffer(1)]],
@@ -1124,6 +1155,77 @@ kernel void trainer_ssim_backward(
 
 // ============================================================================
 // MARK: - Loss: depth, free space, alpha (F2, F3, F4, F6)
+//
+// ----------------------------------------------------------------------------
+// WHY EVERY TERM IN HERE IS DIVIDED BY A SAMPLE COUNT. READ THIS BEFORE
+// TOUCHING ANY WEIGHT IN `SmartLossSettings` OR `TrainerTuning`.
+// ----------------------------------------------------------------------------
+//
+// The two photometric terms are per-pixel MEANS. `trainer_loss_photometric`
+// multiplies by `invN = 1 / pixelCount` and `trainer_ssim_stats` divides by
+// the same `n`. So the photograph contributes a number of order 0.01 to 0.1
+// per frame, whatever the render resolution is.
+//
+// Every term in THIS kernel used to be an unnormalised per-sample SUM over the
+// whole native depth grid: 256 x 192 = 49,152 samples per frame on an iPhone
+// LiDAR. A per-sample Huber of order 0.01 summed over ~30,000 contributing
+// samples is a loss of order 300, against a photometric loss of order 0.04.
+// Roughly four orders of magnitude. Two things followed, neither of which
+// logged anything:
+//
+//   * The photographs were inert. Every geometry parameter (mean, log-scale,
+//     rotation, opacity) was fitted to the laser and effectively not to the
+//     picture, which for a splat renderer throws away the half of the input
+//     that carries appearance and fine detail.
+//
+//   * The AbsGS densification statistic in `trainer_rasterize_backward` is
+//     `length(dLdMean2D)`, and `dLdMean2D` is fed by BOTH the colour channel
+//     (`dLdC`) and the depth channel (`dLdD`, `dLdTTotal`). With the depth
+//     channel ~10^5 times larger, the statistic that decides WHERE to add
+//     detail was measuring where the laser disagrees, not where the picture is
+//     wrong. Densification put its splats in the wrong places.
+//
+// Dividing by the sample count makes each term a per-sample MEAN, so
+// `depthLossScale = 1.0`, `bimodalWeight = 1.0`, `freeSpaceLowerBoundWeight =
+// 0.5` and `alphaSupervisionWeight = 0.05` finally read the way anyone would
+// assume: a multiple of, and a fraction of, the photometric loss.
+//
+// ONE denominator for all five terms, not one per term. That is deliberate.
+// The bimodal and transition-width terms only fire on geometric-edge samples,
+// a few per cent of the frame. Dividing THOSE by the count of edge samples
+// would make `bimodalWeight = 1.0` mean "the edge term totals as much as the
+// whole Huber term", which is not what it says. One denominator makes the
+// weights comparable PER SAMPLE, which is what they read as.
+//
+// FORWARD AND BACKWARD ARE THE SAME ARITHMETIC HERE. Every term's loss value
+// and its gradient are both built from `w` (the four supervised terms) or from
+// `fw` (the free-space hinge), inside this one kernel. Scaling `w` and `fw`
+// therefore scales the value and the gradient by exactly the same factor, by
+// construction rather than by two edits that have to be kept in step. Nothing
+// downstream rescales the depth channel again: `trainer_rasterize_backward`
+// reads `gradDepth` and `gradTFinal` verbatim into `dLdD` and `dLdTExtra`, and
+// `trainer_preprocess_backward` never touches either. The factor appears once,
+// on both sides, in one place.
+//
+// THE DENOMINATOR IS THE NUMBER OF SUPERVISED SAMPLES, NOT THE NUMBER
+// DISPATCHED. `u.depthSampleCount` is the whole native grid, including every
+// sample that carries no weight: a no-return, a dilation-band pixel, an
+// UNKNOWN pixel, anything under `minimumAuthorityForDepth`. Dividing by that
+// would run the geometry terms at the supervised FRACTION of their nominal
+// strength, which on a scan where the laser gets a vote on 8 per cent of the
+// frame is a factor of twelve, and a different factor on every frame.
+// `u.depthSupervisedCount` is the count of samples with `weight > 0`, measured
+// on the CPU over the exact prefix that was uploaded
+// (`TrainerFrameSupervision.supervisedSampleCount`), so it costs no readback
+// and cannot disagree with what the GPU was handed.
+//
+// It falls back to `u.depthSampleCount` when it is zero, and that fallback is
+// load-bearing rather than defensive. The four weighted terms all vanish when
+// nothing is supervised, but the F2 free-space hinge does NOT carry
+// `s.weight`: a frame whose photo QC weight is zero has no supervised samples
+// and can still have thousands of live hinge terms. Dividing those by one
+// would put an unnormalised sum straight back into the loss, which is the
+// exact fault this whole block exists to remove.
 // ============================================================================
 
 kernel void trainer_loss_depth(
@@ -1160,7 +1262,16 @@ kernel void trainer_loss_depth(
     const float safeAlpha = max(alpha, 1e-4f);
     const float expected = accumulated / safeAlpha;
 
-    const float w = u.depthScale * s.weight;
+    // The per-sample mean factor. See the block comment above this kernel: it
+    // is what puts the geometry terms on the same scale as the photometric
+    // mean, and it multiplies the loss VALUE and the GRADIENT together because
+    // both are built from `w` and `fw` below.
+    const uint supervised = (u.depthSupervisedCount > 0u)
+        ? u.depthSupervisedCount
+        : u.depthSampleCount;
+    const float invSamples = 1.0f / float(max(supervised, 1u));
+
+    const float w = u.depthScale * s.weight * invSamples;
     float dL_dExpected = 0.0f;
 
     if (w > 0.0f && s.depth > 0.0f) {
@@ -1217,7 +1328,11 @@ kernel void trainer_loss_depth(
     // wrong, regardless of what the photometry would prefer.
     if (s.freeSpaceBound > 0.0f && expected < s.freeSpaceBound) {
         const float violation = s.freeSpaceBound - expected;
-        const float fw = u.freeSpaceWeight * u.depthScale;
+        // Same per-sample mean factor as `w`. This term does NOT carry
+        // `s.weight` (a beam that passed through a volume is evidence at full
+        // strength whatever the trust in its RANGE reading), so the factor has
+        // to be applied here rather than inherited.
+        const float fw = u.freeSpaceWeight * u.depthScale * invSamples;
         trainer_atomicAdd(lossAccum, fw * 0.5f * violation * violation);
         dL_dExpected += -fw * violation;
     }

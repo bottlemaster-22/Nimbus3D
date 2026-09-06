@@ -486,10 +486,25 @@ struct TrainerTuning: Sendable {
     /// World scale above which a Gaussian is pruned, as a fraction of extent.
     var pruneMaxWorldScaleFraction: Float = 0.1
     /// Fraction of the cap that may be added in one densification pass.
+    ///
+    /// THESE TWO NUMBERS ALSO SET WHAT DENSIFICATION COSTS IN CPU TIME.
+    /// `TrainerDensifier` no longer sorts its candidate list; it selects the
+    /// best `max(growthAllowance, relocationLimit)` of it and leaves the rest
+    /// unordered, because nothing below the truncation point is ever read.
+    /// The size of that selection is exactly these two fractions, so raising
+    /// either one raises the per-pass ranking work with it, and setting
+    /// `maxGrowthFractionPerPass` to 1.0 restores the full-population sort
+    /// this deliberately removed. Counted at a 300,000 point population:
+    /// a full sort is 4,242,295 comparisons against 1,104,232 for a bounded
+    /// selection of the top 15 percent, and the pass runs every
+    /// `densifyIntervalIterations` for the whole run on a phone that is
+    /// already thermally limited.
     var maxGrowthFractionPerPass: Float = 0.15
     /// Once the cap is reached, this fraction of the population may be
     /// RELOCATED per pass (MCMC style: a dead Gaussian is moved onto a
-    /// high-gradient one, so the count never changes).
+    /// high-gradient one, so the count never changes). See the cost note on
+    /// `maxGrowthFractionPerPass`: this is the other half of the bound on how
+    /// much of the population one pass ranks.
     var maxRelocationFractionPerPass: Float = 0.05
     /// Opacity below which a Gaussian is a relocation donor.
     var relocationDonorOpacity: Float = 0.02

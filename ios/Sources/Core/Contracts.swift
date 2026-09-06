@@ -1687,6 +1687,18 @@ public struct SplatModel: Codable, Sendable, Identifiable {
     public var splatCount: Int
     public var shDegree: SHDegree
     public var bounds: BoundingBox
+    /// TIMES ROUND THE TRAINING LOOP, which is NOT the same as the number of
+    /// optimisation steps taken.
+    ///
+    /// `MetalSplatTrainer` fills this from its loop counter. Three returns
+    /// from the loop body do no optimisation at all: a keyframe whose photo
+    /// will not decode, a frame with no pixels or no Gaussians, and a frame
+    /// abandoned to grow the tile buffer. All three still advance this number,
+    /// so a run that decoded not one photo writes
+    /// `iterationsCompleted == iterationsRequested` and leaves by the normal
+    /// success path. Read `TrainerProgress.gradientStepsCompleted`, or
+    /// `TrainerCensusSlice.iterationsWithGradientStep` in
+    /// `model/train_census.json`, for the count of steps that actually ran.
     public var iterationsCompleted: Int
     /// The budget this run actually ran under, after any live degradation.
     public var budgetUsed: TrainingBudget?
@@ -1704,6 +1716,15 @@ public struct SplatModel: Codable, Sendable, Identifiable {
 
     /// PSNR on the ~5% held-out frames, when held-out evaluation ran. This is
     /// the honest quality number; it is reported even when it is bad.
+    ///
+    /// IT IS NOT A SCORE FOR HOW THE PREVIEW LOOKS, and it is not measured on
+    /// the preview. `MetalSplatTrainer.evaluateHeldOut` renders through the
+    /// trainer's own rasteriser at the training resolution (long edge 720, and
+    /// as low as 384 once the thermal governor steps in), applies the learned
+    /// per-frame exposure, and composites the supervision background behind
+    /// the render. The viewer does none of those three and renders at the
+    /// drawable's own size. The number says how well the model predicts a
+    /// photograph it never trained on. Nothing more.
     public var heldOutPSNR: Float?
 
     public init(
@@ -1793,6 +1814,23 @@ public struct TrainerProgress: Codable, Sendable {
     /// True once a preview render of the current state is worth showing.
     public var previewAvailable: Bool
 
+    /// Iterations so far that ran a real forward pass, backward pass and Adam
+    /// step, as opposed to times round the loop. `iteration` above counts
+    /// revolutions and includes the ones that did nothing.
+    ///
+    /// nil means nobody counted, which is a different fact from zero and has
+    /// to stay a different fact: a UI that renders a missing count as "0 real
+    /// steps" would raise a false alarm on any producer that does not measure
+    /// this.
+    public var gradientStepsCompleted: Int?
+    /// Densification passes in a row that were ALLOWED to add geometry, had
+    /// room under the splat cap, and added none. nil when nobody counted.
+    ///
+    /// The trainer already says this in `message` as prose. A number lets the
+    /// screen show it as a state it can style and act on rather than a
+    /// sentence it can only print.
+    public var consecutiveZeroGrowthPasses: Int?
+
     public init(
         stage: TrainerStage,
         iteration: Int,
@@ -1803,7 +1841,11 @@ public struct TrainerProgress: Codable, Sendable {
         thermalLevel: ThermalLevel,
         residentBytes: UInt64,
         message: String,
-        previewAvailable: Bool
+        previewAvailable: Bool,
+        // Appended LAST, with defaults, so every existing positional and
+        // labelled call site keeps compiling untouched.
+        gradientStepsCompleted: Int? = nil,
+        consecutiveZeroGrowthPasses: Int? = nil
     ) {
         self.stage = stage
         self.iteration = iteration
@@ -1815,6 +1857,8 @@ public struct TrainerProgress: Codable, Sendable {
         self.residentBytes = residentBytes
         self.message = message
         self.previewAvailable = previewAvailable
+        self.gradientStepsCompleted = gradientStepsCompleted
+        self.consecutiveZeroGrowthPasses = consecutiveZeroGrowthPasses
     }
 }
 

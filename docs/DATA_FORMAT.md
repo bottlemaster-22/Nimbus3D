@@ -580,6 +580,28 @@ through the same reader as everything else.
   recommended fallback `COLOR_0` so a plain glTF viewer shows a coloured point
   cloud instead of black dots.
 
+**Scale and opacity are draw-ready, not raw optimiser parameters.** The trainer
+fits each Gaussian through a Mip-Splatting 3D low-pass filter of a per-Gaussian
+width in metres: it renders the covariance widened to `Sigma + f^2 * I` and the
+opacity multiplied by `sqrt(det(Sigma) / det(Sigma + f^2 * I))`. That width is
+a training-time quantity with nowhere to live in `.ply`, `.spz` or `.glb`, so it
+is folded into the stored scale and opacity once, on the way out of the trainer,
+by `SplatCloud.fuse3DFilter` (called from `MetalSplatTrainer.readCloud`). A
+reader therefore draws the model that was actually fitted, with no extra field
+and no extra code, which is what makes `blender_addon/` and any third-party
+viewer correct by default.
+
+The fold is exact for geometry: `R S^2 R^T + f^2 I == R (S^2 + f^2 I) R^T`, so
+the widened Gaussian is the same Gaussian with the same quaternion and per-axis
+sigma `sqrt(s^2 + f^2)`. The cost is that the pre-filter parameters cannot be
+recovered from a file, so a file written by this app is a finished model and not
+a training checkpoint. Nothing in the app resumes optimisation from one: the
+trainer seeds from `prepass/init_splats.ply`, never from `model/model.ply`.
+
+Files written before this change carry unfused values. They still read
+correctly; they simply draw a little sharper and more solid than they should.
+No field was added or removed and no byte layout moved.
+
 `model/background.bin` + `background.json` hold the frozen direction-only far
 field (F5). `model/exposure.bin` holds `(UInt32 frameIndex, Float32 gain,
 Float32 bias)` per frame.

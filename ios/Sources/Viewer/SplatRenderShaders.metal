@@ -303,7 +303,10 @@ kernel void viewer_splat_preprocess(
         u.focal.y * pCam.y * invZ + u.principal.y
     );
 
-    // 3D covariance from rotation and log-scale.
+    // 3D covariance from rotation and log-scale. `b.logScale` already has the
+    // Mip-Splatting 3D low-pass filter folded into it (see the note on the 2D
+    // filter below), so this is the trainer's post-filter sigma, not its raw
+    // optimiser parameter, and nothing is added to the diagonal here.
     float3 scale = exp(float3(b.logScale)) * u.scaleBoost;
     float3x3 R = viewer_quat_to_matrix(float4(b.rotation));
     float3x3 M = float3x3(R[0] * scale.x, R[1] * scale.y, R[2] * scale.z);
@@ -332,9 +335,25 @@ kernel void viewer_splat_preprocess(
     float cyy = dot(j1, s1);
 
     // Mip-Splatting 2D screen-space filter (F4), with the opacity compensation
-    // that keeps total energy right. This replaces - it is NOT - the 0.3 px
-    // unconditional dilation the reference rasteriser applies and the spec
-    // says to remove.
+    // that keeps total energy right. This replaces - it is NOT - the
+    // unconditional 0.3 px dilation the INRIA reference rasteriser applies and
+    // the spec says to remove. The 0.25 below is a variance and a band limit,
+    // not that dilation, and the two numbers being close is a coincidence.
+    //
+    // This is the VIEW-DEPENDENT half of Mip-Splatting and the only half that
+    // belongs here. `u.filterVariancePx` is 0.25, the same number the trainer
+    // puts in `camera.filter2DVariance`, so from a given camera this kernel
+    // computes the same `compensation` the trainer's `comp2D` had.
+    //
+    // The other half - the 3D filter, a per-Gaussian world-space width the
+    // trainer widens the covariance by and then divides the opacity for - is
+    // NOT applied here and must not be. It is view-INDEPENDENT and fixed per
+    // splat, it lives only in the trainer's stats buffer, and no splat file
+    // format has a field for it, so it is folded into the stored log-scale and
+    // opacity logit before the cloud ever reaches this kernel
+    // (`SplatCloud.fuse3DFilter`). `b.logScale` and `b.opacityLogit` are
+    // therefore already the widened, compensated values. Applying the 3D
+    // compensation again here would dim and blur every splat twice.
     float detBefore = max(cxx * cyy - cxy * cxy, 1e-12f);
     cxx += u.filterVariancePx;
     cyy += u.filterVariancePx;

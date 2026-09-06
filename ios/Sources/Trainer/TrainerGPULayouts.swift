@@ -39,7 +39,7 @@
 //      TrainerSamplingTopK     16 bytes, align 4
 //      TrainerDepthSample      32 bytes, align 4
 //      TrainerCameraUniforms  144 bytes, align 16
-//      TrainerLossUniforms     64 bytes, align 4
+//      TrainerLossUniforms     68 bytes, align 4
 //      TrainerAdamUniforms     64 bytes, align 4
 //      TrainerRegUniforms      32 bytes, align 4
 //      TrainerScanUniforms     16 bytes, align 4
@@ -384,7 +384,24 @@ struct TrainerLossUniforms {
     /// SSIM stabilisers, squared, on the 0...1 intensity scale.
     var ssimC1: Float = 0.0001        // offset 56   (0.01^2)
     var ssimC2: Float = 0.0009        // offset 60   (0.03^2)
-    // stride 64
+    /// How many of the `depthSampleCount` samples dispatched this frame
+    /// actually carry weight, from
+    /// `TrainerFrameSupervision.supervisedSampleCount`.
+    ///
+    /// This is the divisor `trainer_loss_depth` turns its five geometry terms
+    /// into per-sample MEANS with. It is measured, not assumed: the count is
+    /// taken over the exact prefix of samples that was uploaded, so a run that
+    /// truncated the sample array to the buffer capacity cannot divide by more
+    /// samples than the GPU was given.
+    ///
+    /// 0 means "nothing in this frame was supervised", and the kernel falls
+    /// back to `depthSampleCount` for it rather than dividing by one. That is
+    /// not a nicety. The free-space hinge does not carry `weight`, so a frame
+    /// whose photo QC weight is zero has no supervised samples and thousands
+    /// of live hinge terms, and a divisor of one there would put an
+    /// unnormalised population SUM straight back into the loss.
+    var depthSupervisedCount: UInt32 = 0  // offset 64
+    // stride 68
 }
 
 /// Adam hyper-parameters and the per-group learning rates for one step.
@@ -584,7 +601,7 @@ enum TrainerGPULayouts {
         check("TrainerSamplingTopK", MemoryLayout<TrainerSamplingTopK>.stride, 16)
         check("TrainerDepthSample", MemoryLayout<TrainerDepthSample>.stride, 32)
         check("TrainerCameraUniforms", MemoryLayout<TrainerCameraUniforms>.stride, 144)
-        check("TrainerLossUniforms", MemoryLayout<TrainerLossUniforms>.stride, 64)
+        check("TrainerLossUniforms", MemoryLayout<TrainerLossUniforms>.stride, 68)
         check("TrainerAdamUniforms", MemoryLayout<TrainerAdamUniforms>.stride, 64)
         check("TrainerRegUniforms", MemoryLayout<TrainerRegUniforms>.stride, 32)
         check("TrainerScanUniforms", MemoryLayout<TrainerScanUniforms>.stride, 16)

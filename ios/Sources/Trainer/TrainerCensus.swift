@@ -221,6 +221,16 @@ struct TrainerCensusDensifyPass: Codable {
     var carvedFromEmptySpace: Int
     var trimmedToCap: Int
     var splatCountAfter: Int
+    /// `TrainerDensifyOutcome.growthVerdict.rawValue`: the one-value answer to
+    /// "why did this pass create what it created", decided inside the
+    /// densifier from counters that pass actually measured.
+    ///
+    /// It is copied, not re-derived. The census reconstructing the same
+    /// question from seven counters is how `nothingScored` (a dead gradient
+    /// signal) and `nothingVisible` (a dead visibility accumulator) came to
+    /// read identically, and those are two different faults with two
+    /// different fixes.
+    var growthVerdict: String
 
     init(
         sliceIndex: Int,
@@ -254,6 +264,7 @@ struct TrainerCensusDensifyPass: Codable {
         self.carvedFromEmptySpace = outcome.carvedFromEmptySpace
         self.trimmedToCap = outcome.trimmedToCap
         self.splatCountAfter = outcome.splatCountAfter
+        self.growthVerdict = outcome.growthVerdict.rawValue
     }
 }
 
@@ -293,7 +304,34 @@ struct TrainerCensusSlice: Codable {
     /// otherwise report that default as "the build started with 0 points"
     /// checks this first.
     var seedsUploadedCounted: Bool = false
-    var seedMedianSpacingMillimetres: Int = 0
+    /// Optional because 0 mm is not a spacing, it is the absence of one.
+    /// `TrainerInitializer` returns 0 when it could not measure a nearest
+    /// neighbour at all, and a stored 0 here read back into a sentence would
+    /// say the starting points were on top of each other. nil reads as "not
+    /// measured", which is what happened.
+    var seedMedianSpacingMillimetres: Int?
+
+    // --- The trust line the seeder drew, and the data it drew it on ---------
+
+    /// Copied from `TrainerSeedResult.trustCut`, which the depth-map seeding
+    /// path fills in and the pre-pass path leaves nil (that path takes no cut
+    /// of its own; `PrePassCensus.seeding` already records the one it did
+    /// take). nil here therefore means "this slice took no cut", never "the
+    /// cut was zero".
+    ///
+    /// `seedTrustWasMeasured == false` is a THIRD state and the reason these
+    /// exist: it means the scan had no trust field, so no gate was consulted
+    /// at all. Without it, "the gate rejected every seed" and "there was no
+    /// gate" look identical on screen, and the first sends someone hunting a
+    /// threshold that was never read.
+    var seedTrustWasMeasured: Bool?
+    var seedTrustCut: Float?
+    var seedTrustFloor: Float?
+    var seedTrustQuantile: Float?
+    var seedTrustP05: Float?
+    var seedTrustMedian: Float?
+    var seedTrustP95: Float?
+    var seedTrustCellsConsidered: Int?
 
     // --- The run ------------------------------------------------------------
 
@@ -310,6 +348,30 @@ struct TrainerCensusSlice: Codable {
     var iterationsSkippedNoSupervision: Int = 0
     var iterationsSkippedGrowingTileBuffer: Int = 0
     var iterationsSkippedNothingToRender: Int = 0
+    /// Iterations that ran a real forward, backward and Adam step, as opposed
+    /// to times round the loop. Measured directly by the loop rather than
+    /// inferred, so it can be checked against `iterationsCompleted` minus the
+    /// three skip counters above: if the two ever disagree, a skip path
+    /// stopped being counted.
+    var iterationsWithGradientStep: Int = 0
+
+    // --- How much of each frame the laser actually got a vote on -------------
+
+    /// Summed over the frames below, NOT over every iteration: a frame whose
+    /// photo would not decode never reached the loss and is not in either
+    /// total. `depthSupervisionFramesMeasured` is the divisor, and it is
+    /// stored rather than assumed so that a mean is only ever printed when
+    /// there was something to take a mean of.
+    ///
+    /// This pair is the denominator the depth loss now rests on:
+    /// `trainer_loss_depth` divides its five geometry terms by the supervised
+    /// count to make them per-sample means. A supervised fraction near zero
+    /// means the laser had almost no say in a scan that was meant to be
+    /// LiDAR-led, and nothing else on this page would show it.
+    var depthSamplesPerFrameTotal: Int = 0
+    var depthSamplesSupervisedTotal: Int = 0
+    var depthSupervisionFramesMeasured: Int = 0
+
     var stopReason: String = TrainerCensus.unfinishedOutcome
 
     // --- What came out -------------------------------------------------------
@@ -435,6 +497,16 @@ struct TrainerCensus: Codable {
         /// scoring or units fault; many candidates and nothing created is a
         /// creation fault, and the two need telling apart.
         var densifyCandidates = 0
+        /// The longest run of CONSECUTIVE passes that were allowed to add, had
+        /// room under the cap, and added nothing. Counted within a slice: two
+        /// slices are two separate populations and a streak must not be
+        /// stitched across the join.
+        ///
+        /// Alert 1 only fires when NOTHING was ever created anywhere in the
+        /// run, so a run that densified normally and then stopped for two
+        /// thousand iterations passes it cleanly. This is the number that
+        /// catches that.
+        var longestZeroGrowthStreak = 0
 
         var added: Int { addedBySplit + addedByClone }
         var prunedByJudgement: Int { prunedLowOpacity + prunedOversized }
@@ -445,7 +517,23 @@ struct TrainerCensus: Codable {
 
     var totals: Totals {
         var t = Totals()
+        var streak = 0
+        var streakSlice: Int?
         for pass in densifyPasses {
+            // The streak is per slice. `densifyPasses` is one flat array in
+            // append order, so the slice index changing is the join.
+            if streakSlice != pass.sliceIndex {
+                streak = 0
+                streakSlice = pass.sliceIndex
+            }
+            if pass.growthWindowOpen, pass.headroom > 0 {
+                if pass.addedBySplit + pass.addedByClone > 0 {
+                    streak = 0
+                } else {
+                    streak += 1
+                    t.longestZeroGrowthStreak = Swift.max(t.longestZeroGrowthStreak, streak)
+                }
+            }
             t.passes += 1
             t.addedBySplit += pass.addedBySplit
             t.addedByClone += pass.addedByClone
@@ -556,7 +644,25 @@ struct TrainerCensus: Codable {
                 + "pass(es), and faint-or-oversized pruning removed something in "
                 + "\(t.passesThatPrunedByJudgement)"
         )
-        lines.append("free-space carving removed \(n(t.carved))")
+        // "No occupancy grid" and "a grid that licensed no deletions" are two
+        // different runs and both come out as `carved == 0`. `carverAvailable`
+        // is already recorded per pass, so this is naming a number that
+        // exists rather than measuring a new one.
+        if t.carved == 0, t.passes > 0 {
+            let withGrid = densifyPasses.filter { $0.carverAvailable }.count
+            if withGrid == 0 {
+                lines.append(
+                    "free-space carving removed 0: there was no map of empty air to carve from"
+                )
+            } else {
+                lines.append(
+                    "free-space carving removed 0, from a map of empty air that was loaded for "
+                        + "\(withGrid) of \(t.passes) pass(es)"
+                )
+            }
+        } else {
+            lines.append("free-space carving removed \(n(t.carved))")
+        }
         if t.trimmedToCap > 0 {
             lines.append("the cap trimmed \(n(t.trimmedToCap))")
         }
@@ -578,6 +684,26 @@ struct TrainerCensus: Codable {
         return lines
     }
 
+    /// How many consecutive empty densification passes count as a stall
+    /// rather than a quiet stretch.
+    ///
+    /// The training loop has its own copy of this number
+    /// (`MetalSplatTrainer.zeroGrowthPassesBeforeSaying`, also 10) because
+    /// that one decides when to shout DURING a run and this one decides what
+    /// the finished census says. They are the same value on purpose and the
+    /// two are checked against each other by nothing, so if one moves, move
+    /// the other.
+    static let zeroGrowthStreakThatIsAStall = 10
+
+    /// The verdict that appears most often across a set of passes, or nil when
+    /// there is nothing to report. It never invents one: every value here was
+    /// written by the densifier from counters that pass actually measured.
+    private static func dominantVerdict(_ passes: [TrainerCensusDensifyPass]) -> String? {
+        var tally: [String: Int] = [:]
+        for pass in passes { tally[pass.growthVerdict, default: 0] += 1 }
+        return tally.max(by: { $0.value < $1.value })?.key
+    }
+
     // swiftlint:disable:next cyclomatic_complexity function_body_length
     private func buildAlerts() -> [TrainerCensusAlert] {
         var loud: [TrainerCensusAlert] = []
@@ -591,6 +717,15 @@ struct TrainerCensus: Codable {
             let openPasses = densifyPasses.filter { $0.growthWindowOpen }
             let scored = openPasses.reduce(0) { $0 + $1.splatsWithNonZeroScore }
             let examined = openPasses.reduce(0) { $0 + $1.splatsScored }
+            // The densifier's own verdict, not the census guessing at it from
+            // the counters. "Not one point had a gradient above zero" and
+            // "255,035 scored and none of them was visible in any frame" send
+            // someone to two completely different places, and the two counts
+            // above cannot tell them apart.
+            var verdict = ""
+            if let dominant = Self.dominantVerdict(openPasses) {
+                verdict = " Verdict on most of those passes: " + dominant + "."
+            }
             loud.append(
                 TrainerCensusAlert(
                     severity: "loud",
@@ -600,7 +735,33 @@ struct TrainerCensus: Codable {
                         + "\(n(t.largestHeadroomWhileGrowthWasAllowed)) more points, and created "
                         + "0. Across those passes \(n(scored)) of \(n(examined)) points scored "
                         + "above zero. A densification stage that adds nothing is a no-op, not a "
-                        + "quiet run."
+                        + "quiet run." + verdict
+                )
+            )
+        }
+
+        // 1b. DENSIFICATION STOPPED PART WAY THROUGH. Alert 1 only fires when
+        //     nothing was created ANYWHERE in the run, so a stage that worked
+        //     for a while and then went dead for two thousand iterations
+        //     passes it cleanly. This is that case.
+        if t.longestZeroGrowthStreak >= Self.zeroGrowthStreakThatIsAStall, t.added > 0 {
+            var detail = "Densification went "
+            detail += String(t.longestZeroGrowthStreak)
+            detail += " consecutive pass(es) adding nothing while it was allowed to add and had "
+            detail += "room under the cap. It created "
+            detail += n(t.added)
+            detail += " points in total, so the stage was working and then stopped."
+            let stalled = densifyPasses.filter {
+                $0.growthWindowOpen && $0.headroom > 0 && $0.addedBySplit + $0.addedByClone == 0
+            }
+            if let dominant = Self.dominantVerdict(stalled) {
+                detail += " Verdict on most of the empty passes: "
+                detail += dominant
+                detail += "."
+            }
+            loud.append(
+                TrainerCensusAlert(
+                    severity: "loud", code: "densification_stalled", detail: detail
                 )
             )
         }
@@ -711,14 +872,47 @@ struct TrainerCensus: Codable {
         // 7. EVERY SEED A BLOB. The seeder's trust gate, made visible.
         let discs = seedsPinnedAsDiscsTotal
         let stretched = seedsStretchedAlongRayTotal
-        if discs + stretched > 0, discs == 0 {
+        // "The gate rejected everything" and "there was no gate" produce the
+        // same zero. Only the first is a threshold to go and look at, and
+        // sending someone to look at a threshold that was never consulted is
+        // the exact waste this file exists to prevent.
+        // Written as three plain lines rather than one expression with two
+        // trailing closures and a negation in it. That shape is the one the
+        // Swift type checker gives up on, and CI is this project's only
+        // compiler.
+        let someSliceConsultedAGate = slices.contains(where: { $0.seedTrustWasMeasured == true })
+        let someSliceHadNoTrustField = slices.contains(where: { $0.seedTrustWasMeasured == false })
+        let noTrustFieldAnywhere = someSliceHadNoTrustField && !someSliceConsultedAGate
+        if discs + stretched > 0, discs == 0, noTrustFieldAnywhere {
             loud.append(
                 TrainerCensusAlert(
                     severity: "loud",
-                    code: "no_seed_was_trusted",
+                    code: "no_depth_reliability_to_trust",
                     detail: "0 of \(n(discs + stretched)) seeds were laid as solid discs across "
-                        + "the surface; every one was stretched along the viewing ray because its "
-                        + "depth sample was not trusted. A handheld scan is normally a mixture."
+                        + "the surface. No gate rejected them: this scan carried no "
+                        + "depth-reliability measurements at all, so every starting point was "
+                        + "laid the cautious way. Look at the pre-pass trust stage, not at a "
+                        + "threshold."
+                )
+            )
+        } else if discs + stretched > 0, discs == 0 {
+            var detail = "0 of \(n(discs + stretched)) seeds were laid as solid discs across "
+            detail += "the surface; every one was stretched along the viewing ray because its "
+            detail += "depth sample was not trusted. A handheld scan is normally a mixture."
+            // The cut held up against the distribution it was applied to. A
+            // cut at its floor with a 95th percentile below it is the exact
+            // fingerprint of a gate nothing could ever clear.
+            for slice in slices {
+                guard let cut = slice.seedTrustCut, let p95 = slice.seedTrustP95 else { continue }
+                detail += " Part \(slice.index + 1) drew the line at "
+                detail += String(format: "%.3f", cut)
+                detail += " and the most reliable reading in the whole scan was "
+                detail += String(format: "%.3f", p95)
+                detail += "."
+            }
+            loud.append(
+                TrainerCensusAlert(
+                    severity: "loud", code: "no_seed_was_trusted", detail: detail
                 )
             )
         } else if discs + stretched > 0, Float(discs) / Float(discs + stretched) < 0.05 {
@@ -820,8 +1014,24 @@ struct TrainerCensus: Codable {
         }
 
         // 13. ITERATIONS THAT DID NOTHING.
+        //
+        // Two rungs, because these are two different events. Over 5 per cent
+        // is worth a look. MOST of them is not something to check: it is a
+        // failed run wearing a finished run's clothes, which is precisely what
+        // the first real scan was.
         let skipped = iterationsSkippedTotal
-        if iterationsCompleted > 0, skipped * 20 > iterationsCompleted {
+        if iterationsCompleted > 0, skipped * 2 > iterationsCompleted {
+            loud.append(
+                TrainerCensusAlert(
+                    severity: "loud",
+                    code: "most_iterations_did_no_work",
+                    detail: "\(skipped) of \(iterationsCompleted) iterations took no optimisation "
+                        + "step at all: no supervision could be built, the tile buffer had to "
+                        + "grow, or there was nothing to render. More than half a run doing "
+                        + "nothing is a failed run that finished on time, not a slow one."
+                )
+            )
+        } else if iterationsCompleted > 0, skipped * 20 > iterationsCompleted {
             check.append(
                 TrainerCensusAlert(
                     severity: "check",
@@ -829,6 +1039,54 @@ struct TrainerCensus: Codable {
                     detail: "\(skipped) of \(iterationsCompleted) iterations took no optimisation "
                         + "step: no supervision could be built, the tile buffer had to grow, or "
                         + "there was nothing to render. That is over 5 percent."
+                )
+            )
+        }
+
+        // 14. THE TWO SIDES OF "WORK DONE" DISAGREE. `iterationsWithGradientStep`
+        //     is counted by the loop; the subtraction is counted by the three
+        //     skip paths. They are the same number by construction, so a
+        //     mismatch means an iteration is leaving the loop by a route
+        //     nothing counts, and every judgement above that rests on the skip
+        //     counters is wrong by that much.
+        for slice in slices where slice.iterationsCompleted > 0 {
+            let derived = slice.iterationsCompleted
+                - slice.iterationsSkippedNoSupervision
+                - slice.iterationsSkippedGrowingTileBuffer
+                - slice.iterationsSkippedNothingToRender
+            guard derived != slice.iterationsWithGradientStep else { continue }
+            check.append(
+                TrainerCensusAlert(
+                    severity: "check",
+                    code: "gradient_step_count_does_not_reconcile",
+                    detail: "Part \(slice.index + 1) counted "
+                        + "\(slice.iterationsWithGradientStep) iterations with a real gradient "
+                        + "step, but its iteration and skip counters imply \(derived). An "
+                        + "iteration is leaving the loop by a path nothing counts."
+                )
+            )
+        }
+
+        // 15. THE LASER BARELY GOT A VOTE. Every geometry term in the depth
+        //     loss is divided by the supervised sample count, so this fraction
+        //     is what says how much of each frame the depth supervision
+        //     actually covered. Only judged for slices that measured it: no
+        //     divisor is not a fraction of zero.
+        for slice in slices where slice.depthSupervisionFramesMeasured > 0 {
+            guard slice.depthSamplesPerFrameTotal > 0 else { continue }
+            let percent = Double(slice.depthSamplesSupervisedTotal) * 100
+                / Double(slice.depthSamplesPerFrameTotal)
+            guard percent < 5 else { continue }
+            check.append(
+                TrainerCensusAlert(
+                    severity: "check",
+                    code: "almost_nothing_was_supervised_by_depth",
+                    detail: "Part \(slice.index + 1) had depth supervision on "
+                        + String(format: "%.1f", percent)
+                        + " percent of the samples it read, over "
+                        + "\(slice.depthSupervisionFramesMeasured) frame(s). This is a "
+                        + "LiDAR-led build, so a figure this low means the trust, authority or "
+                        + "photo-quality gates rejected nearly every reading."
                 )
             )
         }

@@ -375,9 +375,21 @@ public struct PrePassCensus: Codable, Sendable {
         public var attempted = false
         public var keyframesSelected = 0
         public var keyframesWithDepthLoaded = 0
-        /// Keyframes whose depth sidecar would not load. Skipped silently in
-        /// the carve loop, so this is the only place it shows.
+        /// Keyframes the carve could not read depth from, for either reason.
+        /// Skipped silently in the carve loop, so this is the only place it
+        /// shows.
         public var keyframesDepthMissing = 0
+        /// The half of `keyframesDepthMissing` that is DATA LOSS: a depth path
+        /// was recorded and the file would not open. The other half is a frame
+        /// that never recorded depth at all, which is a different problem with
+        /// a different fix, and the two used to be rendered under one label
+        /// reading "had no depth to read".
+        ///
+        /// Optional, and nil is not zero. A census written before the carver
+        /// counted the two apart cannot say which half its total was, and a
+        /// zero here would be a claim that every miss was a frame with no
+        /// laser. Nil reads as "not recorded" on screen, which is the truth.
+        public var keyframesDepthUnreadable: Int?
         /// Rays actually walked, after the subsample stride.
         public var raysCast = 0
         public var raysWithReturnInRange = 0
@@ -414,7 +426,8 @@ public struct PrePassCensus: Codable, Sendable {
 
         private enum CodingKeys: String, CodingKey {
             case attempted, keyframesSelected, keyframesWithDepthLoaded
-            case keyframesDepthMissing, raysCast, raysWithReturnInRange
+            case keyframesDepthMissing, keyframesDepthUnreadable
+            case raysCast, raysWithReturnInRange
             case raysBeyondMaxRange, raysTooClose, raysNoReturn
             case raysNoReturnBounded, raysNoReturnUnbounded
             case cellsRecorded, emptyCells, surfaceCells, unknownCellsInBounds
@@ -428,6 +441,11 @@ public struct PrePassCensus: Codable, Sendable {
             keyframesSelected = try c.decode(Int.self, forKey: .keyframesSelected)
             keyframesWithDepthLoaded = try c.decode(Int.self, forKey: .keyframesWithDepthLoaded)
             keyframesDepthMissing = try c.decode(Int.self, forKey: .keyframesDepthMissing)
+            // `decodeIfPresent`: a file written before the split existed has
+            // no key here, and that has to come back as nil rather than 0.
+            keyframesDepthUnreadable = try c.decodeIfPresent(
+                Int.self, forKey: .keyframesDepthUnreadable
+            )
             raysCast = try c.decode(Int.self, forKey: .raysCast)
             raysWithReturnInRange = try c.decode(Int.self, forKey: .raysWithReturnInRange)
             raysBeyondMaxRange = try c.decode(Int.self, forKey: .raysBeyondMaxRange)
@@ -456,6 +474,7 @@ public struct PrePassCensus: Codable, Sendable {
             try c.encode(keyframesSelected, forKey: .keyframesSelected)
             try c.encode(keyframesWithDepthLoaded, forKey: .keyframesWithDepthLoaded)
             try c.encode(keyframesDepthMissing, forKey: .keyframesDepthMissing)
+            try c.encodeIfPresent(keyframesDepthUnreadable, forKey: .keyframesDepthUnreadable)
             try c.encode(raysCast, forKey: .raysCast)
             try c.encode(raysWithReturnInRange, forKey: .raysWithReturnInRange)
             try c.encode(raysBeyondMaxRange, forKey: .raysBeyondMaxRange)
@@ -848,6 +867,20 @@ extension PrePassCensus {
         ]
     }
 
+    /// The second line under "Frames carved from". Built here rather than
+    /// inline so the "not recorded" case is a branch and not a printed zero.
+    private var carvingKeyframeDetail: String {
+        var detail = PrePassCensusFormat.count(carving.keyframesSelected) + " chosen, "
+        detail += PrePassCensusFormat.count(carving.keyframesDepthMissing)
+        detail += " could not be read"
+        if let unreadable = carving.keyframesDepthUnreadable {
+            detail += " ("
+            detail += PrePassCensusFormat.count(unreadable)
+            detail += " of them a depth file that would not open)"
+        }
+        return detail
+    }
+
     private var carvingLines: [PrePassCensusLine] {
         let stage = "Which air the laser flew through"
         return [
@@ -855,8 +888,13 @@ extension PrePassCensus {
                 key: "carving.keyframes", stage: stage,
                 label: "Frames carved from",
                 value: PrePassCensusFormat.count(carving.keyframesWithDepthLoaded),
-                detail: "\(PrePassCensusFormat.count(carving.keyframesSelected)) chosen, "
-                    + "\(PrePassCensusFormat.count(carving.keyframesDepthMissing)) had no depth to read",
+                // "could not be read", not "had no depth to read". Every frame
+                // the carve tries to open already has a depth path recorded
+                // (`keyframes(from:)` filters on it), so the old wording said
+                // "this phone had no laser here" about a fact that is "this
+                // scan's laser data was lost". The split is appended only when
+                // the writer actually measured it.
+                detail: carvingKeyframeDetail,
                 isAlarm: carving.attempted && carving.keyframesWithDepthLoaded == 0
             ),
             PrePassCensusLine(

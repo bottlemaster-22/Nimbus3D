@@ -410,6 +410,26 @@ public final class MetalSplatRenderer: SplatRenderer {
             (ViewerCloudUpload.prepare(cloud), ScanCensus.Drawable.measure(cloud))
         }.value
         loadedCloudMeasurement = outcome.measurement
+        // Stamped, not measured: `Drawable.measure` is handed a cloud and has
+        // no way to know. Same reason `sourceFile` is stamped here.
+        loadedCloudMeasurement?.filter3DFused = cloud.filter3DFused
+
+        // The trainer fits every Gaussian through a Mip-Splatting 3D low-pass
+        // filter and through the opacity compensation that goes with it. That
+        // per-Gaussian filter width exists nowhere but the trainer's own GPU
+        // stats buffer, so it has to be folded into the stored scale and
+        // opacity before the cloud leaves (`SplatCloud.fuse3DFilter`). A cloud
+        // that says outright it was NOT fused is a different model from the one
+        // that was trained, and the difference goes the way that makes a good
+        // run look like noise. Say so. `nil` is a cloud read back from a file,
+        // which carries no marker either way and gets no claim made about it.
+        if cloud.filter3DFused == false {
+            let complaint: String = "This model arrived without the 3D low-pass filter fused into "
+                + "its sizes and opacities. Every splat will draw sharper and more solid "
+                + "than the trainer fitted it, and the held-out PSNR was not measured on "
+                + "what is about to be drawn."
+            ViewerLog.renderer.warning("\(complaint, privacy: .public)")
+        }
 
         guard cloud.count > 0 else {
             throw ViewerError.emptyModel
@@ -717,7 +737,9 @@ public final class MetalSplatRenderer: SplatRenderer {
         u.shRestCount = UInt32(shRestCount)
         u.alphaCutoff = 1.0 / 255.0
         u.scaleBoost = 1
-        u.filterVariancePx = 0.3
+        // Matches the trainer's `camera.filter2DVariance` exactly. See
+        // `ViewerUniforms.filterVariancePx` for why the two must not drift.
+        u.filterVariancePx = 0.25
         return u
     }
 

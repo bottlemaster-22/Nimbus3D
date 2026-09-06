@@ -216,17 +216,55 @@ struct PrePassDepthFrame {
         confidence.isEmpty ? 1 : confidence[index]
     }
 
-    /// Reads the two sidecars for one frame. Returns nil when the frame has no
-    /// depth path at all (a legitimate state - `CaptureFrame.depthPath` is
-    /// optional); throws when a file exists but is the wrong size, because
-    /// that is corruption and guessing at it would poison everything
-    /// downstream.
+    /// Reads the two sidecars for one frame, collapsing two very different
+    /// facts into one `nil`.
+    ///
+    /// NIL MEANS EITHER OF TWO THINGS AND THIS SIGNATURE CANNOT TELL THEM
+    /// APART:
+    ///
+    ///   * the frame never recorded depth at all (`CaptureFrame.depthPath` is
+    ///     optional, and a frame captured without the laser legitimately has
+    ///     none) - normal, and not a fault;
+    ///   * the frame DID record depth and the file would not open - missing,
+    ///     unreadable, or deleted after capture, which is lost measurement.
+    ///
+    /// A scan whose depth sidecars had all been lost therefore reads back
+    /// through this function exactly like a scan taken on a phone with no
+    /// laser in it. Any caller that counts, reports or alarms MUST use
+    /// `loadOutcome(frame:settings:at:)` instead, which names all three
+    /// outcomes; this wrapper is for callers that genuinely only want the
+    /// frame or nothing.
+    ///
+    /// Throws only when a file DID open and is the wrong size, or when the
+    /// capture recorded an impossible depth map size, because that is
+    /// corruption and guessing at it would poison everything downstream.
     static func load(
         frame: CaptureFrame,
         settings: CaptureSettings,
         at ref: CaptureBundleRef
     ) throws -> PrePassDepthFrame? {
-        guard let depthPath = frame.depthPath else { return nil }
+        switch try loadOutcome(frame: frame, settings: settings, at: ref) {
+        case .loaded(let depthFrame):
+            return depthFrame
+        case .noDepthRecorded, .unreadable:
+            return nil
+        }
+    }
+
+    /// The same read, with the two `nil` cases kept apart. One implementation
+    /// backs both, so the two views of a read cannot drift.
+    ///
+    /// - Throws: `NimbusError.malformedData` when the depth map size the
+    ///   capture recorded is impossible, or when a file opened and is the
+    ///   wrong length. A file that will not open is NOT a throw: it is
+    ///   `.unreadable`, so a caller can count it and carry on rather than
+    ///   losing every later frame to one bad sidecar.
+    static func loadOutcome(
+        frame: CaptureFrame,
+        settings: CaptureSettings,
+        at ref: CaptureBundleRef
+    ) throws -> PrePassDepthLoad {
+        guard let depthPath = frame.depthPath else { return .noDepthRecorded }
         let width = settings.depthWidth
         let height = settings.depthHeight
         guard width > 0, height > 0 else {
@@ -238,7 +276,10 @@ struct PrePassDepthFrame {
 
         let depthURL = ref.url(forRelativePath: depthPath)
         guard let depthData = try? Data(contentsOf: depthURL, options: .mappedIfSafe) else {
-            return nil
+            // A path WAS recorded and the file will not open. Named rather
+            // than returned as a bare nil: this is the case the honesty
+            // counters exist for.
+            return .unreadable(path: depthPath)
         }
         guard depthData.count == sampleCount * 2 else {
             throw NimbusError.malformedData(
@@ -266,13 +307,34 @@ struct PrePassDepthFrame {
             }
         }
 
-        return PrePassDepthFrame(
-            width: width,
-            height: height,
-            depthMillimeters: depth,
-            confidence: confidence
+        return .loaded(
+            PrePassDepthFrame(
+                width: width,
+                height: height,
+                depthMillimeters: depth,
+                confidence: confidence
+            )
         )
     }
+}
+
+/// What a depth-sidecar read actually found.
+///
+/// Three outcomes, because two of them used to be the same `nil` and the
+/// difference between them is the difference between "this scan never had
+/// laser data" and "this scan's laser data was lost". The first needs no
+/// action; the second is the thing the QC card's `unreadable_depth` finding
+/// and the census's depth-missing counts exist to say out loud.
+enum PrePassDepthLoad {
+    /// The sidecar opened and is the length the recorded map size implies.
+    case loaded(PrePassDepthFrame)
+    /// `CaptureFrame.depthPath` is nil: no depth was ever recorded for this
+    /// frame. Normal.
+    case noDepthRecorded
+    /// A depth path WAS recorded and the file would not open. Lost
+    /// measurement. The relative path travels with it so a caller can name
+    /// the first casualty instead of only counting them.
+    case unreadable(path: String)
 }
 
 /// Intrinsics resampled to the native depth resolution, plus the per-pixel

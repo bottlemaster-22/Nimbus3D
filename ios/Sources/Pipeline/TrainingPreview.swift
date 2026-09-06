@@ -324,7 +324,7 @@ enum TrainingPreviewCloud {
             index += step
         }
 
-        return try SplatCloud(
+        var thinned = try SplatCloud(
             shDegree: .zero,
             positions: positions,
             rotations: rotations,
@@ -333,5 +333,11 @@ enum TrainingPreviewCloud {
             colorDC: colorDC,
             shRest: []
         )
+        // A subset of the same splats, so it inherits the same fact. A fresh
+        // cloud starts at `nil`, and `nil` here would mean the preview stopped
+        // being able to say whether the trainer's 3D low-pass filter had been
+        // folded in, purely because it was thinned.
+        thinned.filter3DFused = cloud.filter3DFused
+        return thinned
     }
 }

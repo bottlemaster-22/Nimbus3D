@@ -34,6 +34,30 @@
 //     slide along. Opacity starts low so it can be deleted cheaply if the
 //     photometry never finds a use for it.
 //
+//  WHERE THE TRUSTED / DOUBTFUL LINE IS DRAWN, and why it is not a constant:
+//
+//    RELATIVE TO THIS SCAN, exactly as `PrePassInitialSplatBuilder` draws it:
+//    the better half of the trust scores this scan actually produced, with a
+//    low absolute floor underneath so a scan that measured nothing cannot have
+//    half of nothing called solid. Both seeders now mean the same thing by
+//    "trusted", which matters because the answer decides the SHAPE of the seed
+//    (a thin pinned disc against a stretched translucent blob) and the two
+//    shapes train completely differently.
+//
+//    The gate that used to be here was absolute and it passed nothing:
+//
+//        trusted = bestTrust >= minimumAuthorityForDepth * 4 && bestTrust >= 0.35
+//
+//    `bestTrust` is not a trust weight. It is `trustWeight * authority`, and
+//    authority is itself `0.25 + 0.75 * trustWeight` times the range, glass,
+//    saturation and parallax ramps, so that product is a trust weight
+//    multiplied by a function of itself. Clearing 0.35 on the product needs a
+//    trust weight of 0.537 even when every other ramp is perfect, which is a
+//    HARDER bar than the flat 0.5 that had already been measured rejecting one
+//    hundred per cent of a real handheld scan. The first clause was dead:
+//    `minimumAuthorityForDepth` is 0.05, so it read 0.20, and 0.20 can never
+//    bind under 0.35. It only made the gate look softer than it was.
+//
 //   * SCALE COMES FROM MEASURED LOCAL SPACING, never a constant. A constant
 //     scale is the single most common way an on-device 3DGS run wastes its
 //     budget: too big and every surface is a blur that densification then has
@@ -69,6 +93,35 @@ struct TrainerSeed {
     var flags: UInt32
 }
 
+/// The trusted / doubtful line the depth-map seeder drew, and the distribution
+/// it drew it from.
+///
+/// Recorded rather than recomputed, because a cut is only ever wrong RELATIVE
+/// to the data it was applied to: "the cut was 0.35" says nothing, and "the cut
+/// was 0.35 and the whole scan topped out at 0.21" says everything. That pair
+/// of numbers is what the previous absolute gate never wrote down, which is why
+/// it survived a review and a real scan.
+struct TrainerSeedTrustCut {
+    /// False when this scan had no trust field at all. The seeder then calls
+    /// nothing trusted, which is the same choice `PrePassInitialSplatBuilder`
+    /// makes when its trust weights are missing (its weights read as zero and
+    /// nothing clears the floor). It is a DIFFERENT state from "the gate
+    /// rejected everything", and a census that cannot tell them apart sends
+    /// someone hunting for a bug in a threshold that was never consulted.
+    var wasMeasured: Bool
+    /// The score a cell had to reach to be laid as a solid disc.
+    var cut: Float
+    /// The absolute floor under the quantile, and the quantile itself.
+    var floor: Float
+    var quantile: Float
+    /// The distribution the cut came out of.
+    var p05: Float
+    var median: Float
+    var p95: Float
+    /// How many occupied voxels the distribution was taken over.
+    var cellsConsidered: Int
+}
+
 /// What a seeding run produced, plus the honest count of what it skipped.
 struct TrainerSeedResult {
     var seeds: [TrainerSeed]
@@ -77,6 +130,11 @@ struct TrainerSeedResult {
     var samplesConsidered: Int
     var samplesRejected: Int
     var medianSpacingMeters: Float
+    /// Set only by the depth-map path, which is the only path that draws this
+    /// line here. `nil` on the pre-pass path, which drew its own and already
+    /// recorded it in `PrePassCensus.seeding`. Optional rather than zeroed so
+    /// that nothing downstream can print a cut for a run that never took one.
+    var trustCut: TrainerSeedTrustCut?
 
     /// How many seeds were laid as SOLID DISCS across the surface because the
     /// depth sample was trusted, and how many were STRETCHED ALONG THE VIEWING
@@ -105,8 +163,16 @@ struct TrainerSeedResult {
         if seeds.isEmpty {
             return "No starting points could be built from this scan."
         }
+        // A spacing of zero means it could not be measured, not that the points
+        // are on top of each other, so the sentence simply stops rather than
+        // telling the owner something that was never true. The upper guard is
+        // belt and braces on a Float-to-Int conversion that traps out of range.
+        guard medianSpacingMeters > 0, medianSpacingMeters < 1_000 else {
+            return "Started from \(seeds.count) points taken from \(framesUsed) photos."
+        }
+        let millimetres = Int((medianSpacingMeters * 1000).rounded())
         return "Started from \(seeds.count) points taken from \(framesUsed) photos, "
-            + "spaced about \(Int((medianSpacingMeters * 1000).rounded())) mm apart."
+            + "spaced about \(millimetres) mm apart."
     }
 }
 
@@ -120,6 +186,43 @@ enum TrainerInitializer {
     /// against a loose string literal in two files is how that distinction
     /// silently stops working.
     static let depthSeedSourceName = "native depth maps"
+
+    /// The fraction of THIS scan's occupied voxels that the depth-map seeder is
+    /// willing to call trusted, before the floor below is applied.
+    ///
+    /// The same 0.5 `PrePassInitialSplatBuilder.Settings.trustedQuantile` uses,
+    /// and the same reasoning: the useful part of a trust field is the ORDERING
+    /// it measured, not its absolute level, because the level is dominated by
+    /// how steady the hands were. The better half of a shaky scan is still
+    /// meaningfully better than the worse half of it.
+    static let trustedQuantile: Float = 0.5
+
+    /// The absolute floor under that quantile, on the COMBINED score
+    /// (`trustWeight * authority`) this seeder ranks cells by.
+    ///
+    /// 0.08 is not a taste. It is the pre-pass's own trust-weight floor of 0.20
+    /// carried onto this scale exactly. Authority contains
+    /// `0.25 + 0.75 * trustWeight`, so a sample at weight 0.20 whose range,
+    /// glass, saturation and parallax ramps are all perfect scores
+    ///
+    ///     0.20 * (0.25 + 0.75 * 0.20) = 0.20 * 0.40 = 0.08
+    ///
+    /// and the inverse holds: 0.08 on the product maps back to exactly 0.20 on
+    /// the weight. So the two seeders now insist on the same evidence.
+    ///
+    /// One asymmetry, said out loud rather than left to be discovered: when the
+    /// authority map is missing but the trust field is not, `authority` falls
+    /// back to a flat 0.5, so this floor maps to a trust weight of 0.16 rather
+    /// than 0.20. The quantile dominates in that case anyway, which is the
+    /// point of making the decision relative.
+    ///
+    /// The floor is load-bearing here, not decoration. `rangeAuthority` is
+    /// `smoothdrop(4.5, 5.5, z)` while the far regime does not start until
+    /// 30 m, so every surface past 5.5 m is kept by this seeder and scores
+    /// exactly zero. In a big room that can be most of the cells, and without a
+    /// floor the median of mostly-zeros would happily call zero "the better
+    /// half" and pin a wall of blind guesses.
+    static let trustedCombinedFloor: Float = 0.08
 
     /// How many seeds a slice is allowed to START with, given the splat cap
     /// that slice has to live inside for the whole run.
@@ -187,6 +290,12 @@ enum TrainerInitializer {
             return loaded
         }
 
+        // `settings` is not forwarded. The depth-map seeder used to read
+        // `settings.minimumAuthorityForDepth` in its trust gate, where it was
+        // both the wrong quantity and a clause that could never bind; the gate
+        // now draws its line from this scan's own trust distribution. The
+        // parameter stays on this entry point because it is the trainer's
+        // contract with the seeder and the pre-pass path may want it back.
         let seeded = seedFromDepth(
             bundle: bundle,
             prePass: prePass,
@@ -195,8 +304,7 @@ enum TrainerInitializer {
             budget: budget,
             trust: trust,
             authority: authority,
-            edges: edges,
-            settings: settings
+            edges: edges
         )
         guard !seeded.seeds.isEmpty else {
             throw TrainerError.nothingToTrain(
@@ -214,7 +322,17 @@ enum TrainerInitializer {
         budget: TrainingBudget
     ) -> TrainerSeedResult? {
         let url = ref.url(forRelativePath: refs.path)
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        // Said out loud. The pre-pass result can be REUSED from an earlier
+        // session (`ScanProcessingCoordinator` takes the saved one when the
+        // intent allows), so a reference can outlive the file it points at, and
+        // a silent `nil` here is the difference between "the fallback seeder
+        // ran" and nobody ever knowing why.
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            TrainerLog.general.error(
+                "The pre-pass recorded starting points at \(refs.path, privacy: .public) but the file is not there; seeding from the depth maps instead"
+            )
+            return nil
+        }
         guard let cloud = try? PLYCodec.read(from: url), cloud.count > 0 else {
             TrainerLog.general.error(
                 "The pre-pass starting points at \(refs.path, privacy: .public) could not be read; seeding from the depth maps instead"
@@ -262,7 +380,12 @@ enum TrainerInitializer {
             framesUsed: 0,
             samplesConsidered: cloud.count,
             samplesRejected: cloud.count - seeds.count,
-            medianSpacingMeters: spacing
+            medianSpacingMeters: spacing,
+            // The pre-pass drew its own trusted/doubtful line and recorded it
+            // in `PrePassCensus.seeding`; these flags came out of that decision
+            // already made. Nothing here re-decides it, so there is no cut to
+            // report and this must not pretend otherwise.
+            trustCut: nil
         )
     }
 
@@ -279,8 +402,7 @@ enum TrainerInitializer {
         budget: TrainingBudget,
         trust: TwoScaleTrustField?,
         authority: SmartAuthorityMap?,
-        edges: NativeDepthEdgeClassifier?,
-        settings: SmartLossSettings
+        edges: NativeDepthEdgeClassifier?
     ) -> TrainerSeedResult {
 
         let depthWidth = bundle.settings.depthWidth
@@ -289,7 +411,8 @@ enum TrainerInitializer {
         guard sampleCount > 0, !keyframes.isEmpty else {
             return TrainerSeedResult(
                 seeds: [], source: depthSeedSourceName, framesUsed: 0,
-                samplesConsidered: 0, samplesRejected: 0, medianSpacingMeters: 0
+                samplesConsidered: 0, samplesRejected: 0, medianSpacingMeters: 0,
+                trustCut: nil
             )
         }
 
@@ -298,8 +421,9 @@ enum TrainerInitializer {
         )
         let lidarMaxRange = bundle.settings.lidarMaxRangeMeters
 
-        // Voxel size: aim to fill roughly half the budget with one seed per
-        // voxel, from the scene's measured extent. Never a fixed 1 cm.
+        // Voxel size: aim for one seed per voxel and as many voxels as the
+        // thinning below will actually keep, from the scene's measured extent.
+        // Never a fixed 1 cm.
         // The measured extent when the capture recorded one, otherwise the
         // median camera-to-surface distance from the QC card, which is a
         // measurement too. Never a constant.
@@ -308,7 +432,17 @@ enum TrainerInitializer {
                 ?? (prePass.qcCard.medianCameraToSurfaceMeters * 3),
             0.5
         )
-        let targetSeeds = Swift.max(budget.splatCap / 2, 20_000)
+        // `seedTarget`, the SAME number the thinning below reduces to. It used
+        // to be `max(splatCap / 2, 20_000)`, which has no three-quarter ceiling
+        // and so disagrees with `seedTarget` for every cap under about 26,600.
+        // At the 5,000 emergency floor that is 20,000 against 3,750: the voxel
+        // was sized to produce 5.3 times more cells than would survive, the
+        // thinning threw away 81 per cent of them, and `medianSpacingMeters`
+        // (measured BEFORE the thinning) came out about 2.3 times smaller than
+        // the spacing the seeds actually ended up at. Every disc radius is cut
+        // from that spacing, so the whole set was seeded 2.3x too small and the
+        // holes between them were densification's problem to find.
+        let targetSeeds = seedTarget(forSplatCap: budget.splatCap)
         // A room is a shell, not a solid, so the seeds live on a surface:
         // count grows with the SQUARE of extent over voxel size, not the cube.
         let voxel = Swift.max(
@@ -449,7 +583,7 @@ enum TrainerInitializer {
             return TrainerSeedResult(
                 seeds: [], source: depthSeedSourceName, framesUsed: framesUsed,
                 samplesConsidered: considered, samplesRejected: rejected,
-                medianSpacingMeters: 0
+                medianSpacingMeters: 0, trustCut: nil
             )
         }
 
@@ -460,6 +594,59 @@ enum TrainerInitializer {
         seeds.reserveCapacity(cells.count)
         var spacings: [Float] = []
         spacings.reserveCapacity(cells.count)
+
+        // --- Where the trusted / doubtful line falls FOR THIS SCAN -------------
+        //
+        // Computed once over every occupied voxel, before a single seed is
+        // shaped, so it is a property of the scan rather than of the order the
+        // dictionary happens to enumerate in. Same rule as the pre-pass
+        // seeder's `trustCut`: a quantile of the distribution actually
+        // observed, held up by a low absolute floor.
+        //
+        // The same guard as the shaping loop below, so the count here and the
+        // number of seeds are taken over the same population.
+        var trustScores: [Float] = []
+        trustScores.reserveCapacity(cells.count)
+        for cell in cells.values where cell.weightSum > 1e-6 {
+            if cell.bestTrust.isFinite { trustScores.append(cell.bestTrust) }
+        }
+        trustScores.sort()
+
+        func trustQuantile(_ q: Float) -> Float {
+            guard !trustScores.isEmpty else { return 0 }
+            let clamped = Swift.max(0, Swift.min(1, q))
+            let index = Swift.min(
+                trustScores.count - 1,
+                Swift.max(0, Int(Float(trustScores.count - 1) * clamped))
+            )
+            return trustScores[index]
+        }
+
+        // No trust field means no evidence about which samples are better, and
+        // the honest shape for evidence-free geometry is the cheap one: a
+        // translucent blob the optimiser can delete, not a pinned disc it can
+        // barely move. `PrePassInitialSplatBuilder` lands in the same place
+        // when its trust field is missing, because it feeds zero weights in and
+        // nothing then clears its floor.
+        //
+        // This case matters here specifically. Without the flag, a missing
+        // trust field would send every `trustWeight` and every `authority` to
+        // their 0.5 fallbacks, so EVERY cell would score exactly 0.25, the
+        // median would be 0.25, and `>= 0.25` would be true for all of them:
+        // a quantile alone would pin the entire scan as solid on the strength
+        // of no measurement whatsoever. That is the old fault inverted, and it
+        // would be just as quiet.
+        //
+        // The two failures are independent, before anyone reads a link into
+        // this: a pre-pass with no trust field still writes an initial-splat
+        // set (its builder keeps zero-weight samples, it only refuses to call
+        // them trusted), so a missing trust field does not by itself send the
+        // trainer down this path.
+        let trustWasMeasured = trust != nil
+        let trustCut = Swift.max(
+            trustQuantile(TrainerInitializer.trustedQuantile),
+            TrainerInitializer.trustedCombinedFloor
+        )
 
         for (key, cell) in cells {
             guard cell.weightSum > 1e-6 else { continue }
@@ -486,8 +673,14 @@ enum TrainerInitializer {
             let spacing = nearest.isFinite ? Swift.min(nearest, voxel * 2) : voxel
             spacings.append(spacing)
 
-            let trusted = cell.bestTrust >= settings.minimumAuthorityForDepth * 4
-                && cell.bestTrust >= 0.35
+            // One gate, on one quantity, against a line drawn from that same
+            // quantity's own distribution. `settings.minimumAuthorityForDepth`
+            // is deliberately NOT in here any more: it is a floor on AUTHORITY,
+            // `bestTrust` is trust times authority, and since trust is at most
+            // 1 the product can never exceed the authority. Any clause pairing
+            // the two is therefore either wrong or dead, and the one that was
+            // here was dead.
+            let trusted = trustWasMeasured && cell.bestTrust >= trustCut
             var seed: TrainerSeed
 
             if trusted {
@@ -533,13 +726,48 @@ enum TrainerInitializer {
         spacings.sort()
         let median = spacings.isEmpty ? voxel : spacings[spacings.count / 2]
 
+        let cutRecord = TrainerSeedTrustCut(
+            wasMeasured: trustWasMeasured,
+            cut: trustCut,
+            floor: TrainerInitializer.trustedCombinedFloor,
+            quantile: TrainerInitializer.trustedQuantile,
+            p05: trustQuantile(0.05),
+            median: trustQuantile(0.5),
+            p95: trustQuantile(0.95),
+            cellsConsidered: trustScores.count
+        )
+        // Written whether or not anything cleared the line, because "the cut
+        // was 0.08 and the scan's 95th percentile was 0.02" is the sentence
+        // that would have ended the old gate's career on the first run.
+        //
+        // Built as a plain String, a piece at a time: an `os.Logger` message is
+        // a literal with its own interpolation type and two of them cannot be
+        // joined, and a long `+` chain of interpolated literals is one of the
+        // shapes this project's type checker has given up on before. A log line
+        // is not worth a build failure.
+        var cutLine = "Seed trust line: "
+        if trustWasMeasured {
+            cutLine += "cut \(cutRecord.cut)"
+            cutLine += " (floor \(cutRecord.floor), quantile \(cutRecord.quantile))"
+            cutLine += " over \(cutRecord.cellsConsidered) cells;"
+            cutLine += " p05 \(cutRecord.p05)"
+            cutLine += ", median \(cutRecord.median)"
+            cutLine += ", p95 \(cutRecord.p95)"
+        } else {
+            cutLine += "this scan had no trust field, so all "
+            cutLine += "\(cutRecord.cellsConsidered) starting points were laid "
+            cutLine += "as stretched blobs rather than pinned discs"
+        }
+        TrainerLog.general.info("\(cutLine, privacy: .public)")
+
         return TrainerSeedResult(
             seeds: seeds,
             source: depthSeedSourceName,
             framesUsed: framesUsed,
             samplesConsidered: considered,
             samplesRejected: rejected,
-            medianSpacingMeters: median
+            medianSpacingMeters: median,
+            trustCut: cutRecord
         )
     }
 
@@ -579,9 +807,35 @@ enum TrainerInitializer {
     /// Used only for the plain-language summary, never for a scale.
     private static func medianNearestSpacing(of seeds: [TrainerSeed]) -> Float {
         guard seeds.count > 8 else { return 0 }
-        // A coarse hash makes "nearest neighbour" a local question.
+
+        // A coarse hash makes "nearest neighbour" a local question, and the
+        // cell has to be MEASURED rather than fixed, for the same reason every
+        // other scale in this file is.
+        //
+        // The search only looks at the 26 neighbouring cells, so a cell narrower
+        // than the spacing throws the answer away: at the 0.05 m constant that
+        // used to be here, a set spaced 0.12 m apart (exactly what the pre-pass
+        // clamps to, before the thinning above widens it further) has its
+        // nearest neighbour three cells away, outside the ring, and every
+        // sample is dropped. The median is then taken over the closest pairs
+        // only, or over nothing at all, and "spaced about 0 mm apart" reaches
+        // the owner's screen and the census as though it had been measured.
+        //
+        // Seeds sit on surfaces, so the count grows with the SQUARE of extent
+        // over spacing, the same relation the depth seeder sizes its voxels by.
+        // Two estimated spacings per cell, clamped either side.
+        var lo = seeds[0].position
+        var hi = seeds[0].position
+        for seed in seeds {
+            lo = simd_min(lo, seed.position)
+            hi = simd_max(hi, seed.position)
+        }
+        let span = hi - lo
+        let longestEdge = Swift.max(span.x, Swift.max(span.y, span.z))
+        let estimatedSpacing = longestEdge / Swift.max(sqrtf(Float(seeds.count)), 1)
+        let cell = Swift.max(0.02, Swift.min(1.0, estimatedSpacing * 2))
+
         var grid: [SIMD3<Int32>: [Int]] = [:]
-        let cell: Float = 0.05
         for (i, seed) in seeds.enumerated() {
             let key = SIMD3<Int32>(
                 Int32((seed.position.x / cell).rounded(.down)),
@@ -614,9 +868,24 @@ enum TrainerInitializer {
                     }
                 }
             }
-            if best.isFinite { distances.append(best) }
+            // `best < greatestFiniteMagnitude`, NOT `best.isFinite`. The
+            // sentinel this starts at IS finite, so the old test appended
+            // 3.4e38 metres as a measured distance every time a seed had no
+            // neighbour inside the ring. More than half the samples like that
+            // and the median came back as 3.4e38, which
+            // `Int((median * 1000).rounded())` in `summary` and in
+            // `MetalSplatTrainer` then converts, and a Float-to-Int conversion
+            // out of range TRAPS in release as well as debug. A sparse pre-pass
+            // set in a large room was one crash away, on the preferred seeding
+            // path, and the only symptom would have been the trainer dying at
+            // the line that logs how it started. An infinity from a corrupt
+            // position is dropped by the same test.
+            if best < Float.greatestFiniteMagnitude { distances.append(best) }
             i += sampleStride
         }
+        // Empty means the answer is UNKNOWN, not that the seeds are on top of
+        // each other. `summary` says nothing about spacing when it reads zero,
+        // rather than telling the owner they are "about 0 mm apart".
         guard !distances.isEmpty else { return 0 }
         distances.sort()
         return distances[distances.count / 2]

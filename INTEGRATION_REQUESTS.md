@@ -1002,3 +1002,901 @@ physics prior is a prediction and is never reported under a name that says
 `model/census.json` as one shared format with one key table, and states in
 writing that an absent key means "not counted" while a written `0` is a
 measured zero. Both files are in the folder tree at the top of that document.
+
+---
+
+## From Trainer / TrainerShaders.metal (loss normalisation, 2026-09-06)
+
+Context, so the three bullets below read as one thing rather than three.
+`trainer_loss_photometric` and `trainer_ssim_stats` are per-pixel MEANS: both
+divide by `pixelCount`. Every geometry term in `trainer_loss_depth` (depth
+Huber, F4 bimodal, F4 transition width, F6 alpha supervision, F2 free-space
+hinge) was an unnormalised per-sample SUM over the whole native depth grid,
+256 x 192 = 49,152 samples. The geometry side was therefore larger than the
+photometric side by roughly the number of contributing samples, order 10^4.
+Two consequences: the photographs were effectively inert for every geometry
+parameter, and the AbsGS densification statistic (which is
+`length(dLdMean2D)`, and `dLdMean2D` is fed by the depth channel as well as
+the colour channel) was ranking Gaussians by where the LASER disagreed rather
+than by where the PICTURE was wrong.
+
+`trainer_loss_depth` now divides every one of those five terms, loss value and
+gradient together, by `u.depthSampleCount`. That is the right SHAPE but the
+wrong COUNT: `depthSampleCount` is the number of samples DISPATCHED, which is
+the full native grid including every sample that carries no weight. The
+divisor should be the number that actually contributed.
+
+- **`ios/Sources/Trainer/TrainerGPULayouts.swift`, `TrainerLossUniforms`:**
+  append one field after `ssimC2`, at offset 64:
+  `var depthSupervisedCount: UInt32 = 0  // offset 64`.
+  The struct goes from 64 bytes to 68, align 4. It is uploaded with
+  `setBytes`, not from an `MTLBuffer`, so no allocation changes and no other
+  binding moves. The `check("TrainerLossUniforms", ..., 64)` line in the same
+  file's layout verification needs its expected stride changed to 68, and the
+  header comment at the top of the file (`TrainerLossUniforms 64 bytes,
+  align 4`) needs the same edit. Nothing else in the file is affected: the
+  field is appended, so every existing offset is unchanged.
+
+- **`ios/Sources/Trainer/MetalSplatTrainer.swift`, `runIteration`, next to
+  `loss.depthSampleCount = UInt32(sampleCount)` (about line 1261):** add
+  `loss.depthSupervisedCount = UInt32(supervision.supervisedSampleCount)`.
+  NO NEW WORK AND NO NEW SYNC: `TrainerFrameSupervision.supervisedSampleCount`
+  is already computed, once per frame, on the CPU, at
+  `TrainerSupervision.swift` line 281
+  (`samples.reduce(into: 0) { $0 += ($1.weight > 0 ? 1 : 0) }`), and today it
+  is assigned and read by NOTHING. It is exactly the count the kernel needs:
+  the kernel's gate is `w > 0` where `w = depthScale * s.weight`, and
+  `depthScale` has a floor of 0.05, so `w > 0` is `s.weight > 0`, which is the
+  predicate that reduce already counts. It is also already clamped correctly
+  by construction: `TrainerSupervision` sets `weight = 0` for every BAND
+  sample, every UNKNOWN sample, every no-return, and everything below
+  `minimumAuthorityForDepth`.
+  One caution: `sampleCount` in `runIteration` is
+  `min(supervision.depthSamples.count, resources.depthSampleCapacity)`, so if
+  the capacity ever truncates the array, the supervised count must be
+  recounted over the prefix that was actually uploaded rather than taken from
+  the full array.
+
+- **`ios/Sources/Trainer/TrainerShaders.metal` (Trainer's own file, listed here
+  only so the three land together):** once the field exists, change the one
+  line
+  `const float invSamples = 1.0f / float(max(u.depthSampleCount, 1u));`
+  in `trainer_loss_depth` to use `u.depthSupervisedCount`, and delete the
+  paragraph of the block comment above that kernel headed "THE DENOMINATOR IS
+  NOT YET THE ONE IT SHOULD BE". The comment states the interim in full so it
+  cannot become a silent approximation.
+
+- **`ios/Sources/Trainer/TrainerCensus.swift` (wanted, not blocking):** the
+  supervised sample count is the number that says how much of each frame the
+  laser actually got a vote on, and it is the denominator the loss balance now
+  rests on. A per-slice mean of `supervision.supervisedSampleCount` alongside
+  the 49,152 that were dispatched would make "the LiDAR supervised 8 per cent
+  of this frame" visible on the census page instead of inferable. Trainer's
+  shader measures nothing new here, so this is a request rather than a
+  parallel mechanism: the number exists on the CPU already, and per rule 5 it
+  should reach the eye through `TrainerCensus` or not at all.
+
+### Two things found next door while doing this, NOT changed, evidence attached
+
+- **`ios/Sources/Trainer/TrainerSupervision.swift`, `depthSamples(...)`: the
+  borrowed free-space bound is computed and then thrown away.** For a sample
+  with no return the function calls `borrowedFreeSpaceBound(...)` and stores it
+  in `sample.freeSpaceBound`, with a comment saying that is RULE 5. For a BAND
+  sample it stores `max(z - freeSpaceMargin, 0)`. Both of those samples are
+  then classified UNKNOWN or BAND, and `trainer_loss_depth` returns on exactly
+  those two classes BEFORE it reaches the F2 free-space hinge. So neither bound
+  has ever been used, in the whole history of this app: the free-space term
+  only ever fires on samples that already have a valid depth and a Huber term
+  pulling them to the same place. `borrowedFreeSpaceBound` is the
+  "documented with worked examples and called from nowhere" pattern, one step
+  removed.
+  NOT fixed on purpose, and this is the reason: an UNKNOWN sample is typically
+  a pixel with nothing rendered in it, so `alpha` is near zero, `expected =
+  accumulated / max(alpha, 1e-4)` is near zero, the hinge sees a violation
+  equal to the entire borrowed bound, and the chain rule then multiplies the
+  gradient by `1 / safeAlpha` and `accumulated / safeAlpha^2`, that is by up to
+  1e4 and 1e8. Enabling the branch as it stands would put an amplifier of that
+  size on the emptiest pixels in the frame. It needs an alpha floor or an
+  alpha-weighted hinge designed with it, not an unblocked early return, and
+  that is a change to what the loss MEANS rather than to its scale, which is
+  not what this pass was for.
+
+- **`ios/Sources/Trainer/TrainerShaders.metal`, `trainer_loss_depth`, the same
+  `1 / safeAlpha` and `accumulated / safeAlpha^2` factors, on the samples that
+  DO fire today.** Early in a run, or anywhere the splats have not yet covered
+  a surface the laser can see, `alpha` is small and legitimately so, and the
+  depth gradient is multiplied by up to 1e4. That is real Jacobian, not a bug,
+  but it is an unbounded one, and it is now the largest remaining term-scale
+  hazard in the depth path. Worth measuring (the distribution of `alpha` at
+  supervised pixels over the first few hundred iterations) before anyone
+  chooses a floor by feel.
+
+### Addendum: the reported loss number is not mostly the photograph either
+
+`lossEMA` is display and census only (nothing gates on it, checked:
+`MetalSplatTrainer.swift` lines 1580 to 1582 write it, and every other
+reference passes it to a progress callback), so this is a reporting fault
+rather than a training fault, and it is left alone for now. But it is worth
+knowing while reading a run: `lossAccum[0]` is one scalar carrying four
+different scales at once. The photometric and SSIM terms are per-pixel means
+of order 0.01 to 0.1. The five depth terms are now per-sample means of the
+same order. The three regulariser terms in `trainer_regularizer` are still
+unnormalised sums over the whole population, up to 300,000 Gaussians: the disc
+prior alone at `discWeight = 0.01` contributes of order 100, roughly three
+orders of magnitude above the photometric term. So the number on the screen is
+essentially the regulariser's population sum, and photometric progress is
+invisible in it.
+
+The regulariser sums are NOT wrong and should not be divided by the splat
+count. Each thread there writes the prior's gradient into that Gaussian's OWN
+slot, so the prior's strength per Gaussian is correctly independent of how many
+Gaussians exist; dividing by the population would make every prior weaken as
+the model grows, which is worse than the reporting problem. Only the reported
+total mixes scales.
+
+The cheap fix, if anyone wants it, is four scalars instead of one.
+`resources.lossAccum` is already 16 bytes and `TrainerResources` already
+allocates all four; `TrainerPipelines.clearPerIteration` zeroes only the first
+(`fillFloat(encoder, buffer: resources.lossAccum, count: 1, value: 0)`) and
+`MetalSplatTrainer` reads only element 0. Change the fill to `count: 4` and
+read all four, and `TrainerShaders.metal` will write photometric into 1,
+geometry into 2 and regulariser into 3 alongside the existing total in 0. Not
+done yet on purpose: writing slots that nothing zeroes and nothing reads would
+be a measurement with no reader, which is the fault this whole pass exists to
+remove.
+
+---
+
+## From `ios/Sources/Trainer/MetalSplatTrainer.swift`: the loop can no longer claim work it did not do
+
+Three things were fixed inside `MetalSplatTrainer.swift` itself and need
+nothing from anyone. They are listed first only so the requests below have
+their context.
+
+1. `runIteration` was still being handed `totalIterations` (the PLANNED slice
+   budget) while the loop exits at `effectiveTotal`. That one argument drives
+   the SH degree ramp, the frequency-blur decay, the depth-loss decay, the late
+   opacity binarization, the position learning-rate decay and the warm-up end.
+   The `effectiveTotal` fix had been applied to `progressFraction`, to
+   `supervision.build` and to the loop exit, and to nothing else, so on any
+   shortened run the entire back half of every one of those schedules still
+   never executed. Now `effectiveTotal`.
+2. The stage label and the stage sentence in the progress tick were still keyed
+   to `totalIterations`, so the screen showed a stage the loop was no longer in.
+   Now `effectiveTotal`.
+3. `iteration` (times round the loop) and gradient steps actually taken are now
+   two separate numbers, and the run's outcome is judged on the second.
+
+### Requests
+
+- **`ios/Sources/Core/Contracts.swift`, `TrainerProgress`: two optional fields,
+  both with defaults so no existing call site breaks.**
+  ```swift
+  /// Iterations so far that ran a real forward, backward and Adam step, as
+  /// opposed to times round the loop. nil when nobody counted.
+  public var gradientStepsCompleted: Int? = nil
+  /// Densification passes in a row that were allowed to add geometry and
+  /// added none. nil when nobody counted.
+  public var consecutiveZeroGrowthPasses: Int? = nil
+  ```
+  and the same two as defaulted parameters on the public `init`, appended
+  LAST so the existing positional and labelled calls keep compiling.
+  Why: today the trainer can only reach the screen through
+  `TrainerProgress.message`, so it says "Still working, but no new detail has
+  been added for 12 passes in a row" as prose. That is better than silence, but
+  it is a sentence the review screen cannot style, count or act on. Two numbers
+  would let the UI show it as a state rather than as a sentence.
+
+- **`ios/Sources/Trainer/TrainerCensus.swift`, `TrainerCensusSlice`: one field.**
+  ```swift
+  /// Iterations that ran a real gradient step, as opposed to times round the
+  /// loop. `iterationsCompleted` minus the three skip counters.
+  var iterationsWithGradientStep: Int = 0
+  ```
+  The number is already derivable (`iterationsCompleted` minus
+  `iterationsSkippedNoSupervision + iterationsSkippedGrowingTileBuffer +
+  iterationsSkippedNothingToRender`) and the trainer now measures it directly,
+  so this is naming a number that exists, not inventing one. Storing it also
+  makes the two sides checkable against each other: if the stored count and the
+  subtraction ever disagree, a skip path stopped being counted.
+
+- **`ios/Sources/Trainer/TrainerCensus.swift`, alert 13
+  (`many_iterations_did_no_work`) should escalate.** It currently fires at
+  `severity: "check"` for anything over 5 per cent. A run where MOST iterations
+  took no optimisation step is not a thing to check, it is a failed run wearing
+  a finished run's clothes, and it is the exact case where the app reported
+  success and produced almost nothing. Suggested: keep "check" from 5 per cent,
+  and add a `"loud"` alert, code `most_iterations_did_no_work`, when
+  `skipped * 2 > iterationsCompleted`.
+
+- **`ios/Sources/Trainer/TrainerCensus.swift`: a longest-zero-growth-streak
+  total and a loud alert for it.** Everything needed is already in
+  `densifyPasses`: each row carries `growthWindowOpen`, `headroom` and the added
+  counts. The aggregate wanted is the longest run of CONSECUTIVE passes for
+  which `growthWindowOpen && headroom > 0 && addedBySplit + addedByClone == 0`,
+  and a `"loud"` alert (suggested code `densification_stalled`) when that run
+  reaches 10. Alert 1 (`densification_created_nothing`) only fires when growth
+  was allowed and NOTHING was ever created anywhere in the run, so a run that
+  densified normally for a while and then stalled for two thousand iterations
+  passes it cleanly today. The trainer already tracks and logs this streak
+  live; this is the same measurement surfaced through the census rather than a
+  second mechanism.
+
+- **`ios/Sources/Core/Contracts.swift`, `SplatModel.iterationsCompleted`:
+  needs either a doc comment or a companion.** `MetalSplatTrainer` fills it
+  from `totalIterationsRun`, which is times round the loop, and it is written
+  into the finished model as a claim about how much training the model had. It
+  has no doc comment, so a reader has no way to know it is not the count of
+  optimisation steps. Either document it as "loop iterations, not necessarily
+  optimisation steps" or add `gradientStepsCompleted: Int? = nil` next to it.
+  NOT changed unilaterally: it is a public field in another module's contract
+  and the review screen may already be showing it.
+
+### One thing found next door, NOT changed, evidence attached
+
+- **`ios/Sources/Trainer/MetalSplatTrainer.swift` passes `census: inout
+  TrainerCensus` into `trainSlice`, which is `async throws`.** Every census
+  write a slice makes goes through that `inout`. Swift's in-out parameters are
+  specified as copy-in copy-out, with pass-by-address only as an
+  OPTIMISATION when the argument is a value at a physical address. On the
+  copy-in copy-out path, a callee that throws does not write back. The whole
+  reason the census write sits in a `defer` in `train` is so that a run which
+  THREW still leaves a census behind, and a run that threw inside `trainSlice`
+  is precisely the run whose slice row would be empty if the writeback did not
+  happen.
+  In practice the argument is a local `var` in `train`, so the address
+  optimisation applies and the writes survive today. It is not guaranteed by
+  the language, and it is exactly the class of fault this project has been
+  digging out: correct by accident, invisible when it stops being correct.
+  NOT changed here because the robust fix is to hold the census in a small
+  reference box and pass that, which is about thirty mechanical edits across a
+  file no one can compile locally, and CI is the only compiler. Worth doing
+  deliberately, by whoever owns `TrainerCensus.swift`, as a
+  `final class TrainerCensusRecorder` wrapping the struct.
+
+---
+
+## From the owner of `PrePassCarver.swift` + `PrePassSensorIO.swift` (free-space carving and depth sidecar reads)
+
+Two "total failure looks exactly like a normal empty result" faults were fixed
+inside those two files. Three things they touch live in files owned by other
+agents, so they are asked for here instead.
+
+### 1. `PrePassSurvey.swift`: the `unreadable_depth` finding has never been able to fire
+
+`PrePassSurvey.swift` line 232 does `result.unreadableDepthFrames += 1`, and it
+sits in the `catch` around `PrePassDepthFrame.load`. Line 782 turns any
+non-zero value into the `unreadable_depth` QC finding.
+
+That counter could not reach 1 for its own named cause. `load` returned NIL,
+not a throw, when a frame HAS a `depthPath` and the file will not open, so the
+`catch` never ran for it and `guard let depthFrame else { continue }` swallowed
+it. The only things that ever reached that `catch` were a wrong-LENGTH file and
+an impossible recorded map size. A scan whose depth sidecars had all been lost
+produced `unreadableDepthFrames == 0` and no finding.
+
+`PrePassDepthFrame.load` keeps its exact signature and its exact nil/throw
+behaviour, so nothing breaks. Alongside it there is now:
+
+```swift
+enum PrePassDepthLoad {
+    case loaded(PrePassDepthFrame)
+    case noDepthRecorded          // frame.depthPath == nil. Normal.
+    case unreadable(path: String) // a path WAS recorded, the file will not open.
+}
+
+static func loadOutcome(frame:settings:at:) throws -> PrePassDepthLoad
+```
+
+`load` is now a four-line wrapper over `loadOutcome`, so the two cannot drift.
+
+ASK: in `PrePassSurvey.swift`, replace the `load` call with `loadOutcome` and
+increment `unreadableDepthFrames` on the `.unreadable` case. That is a five-line
+change and it is the only thing standing between that finding and the screen.
+
+The same swap is worth making, but is less urgent, in:
+
+* `PrePassInitialSplats.swift` line 293. It already counts BOTH nil branches
+  into `keyframesDepthMissing`, so its total is right today; the swap would only
+  let it separate "no laser on this frame" from "this frame's laser data was
+  lost", which are different problems with different fixes.
+* `PrePassBundleAdjuster.swift` line 247 and `PrePassGlassDetector.swift` line
+  169. Both `continue` on either branch and count nothing at all.
+* `PrePassPoseRefiner.swift` lines 439 and 779. Both use a bare `try ... else
+  { continue }` / `else { return nil }`, so an unreadable sidecar is skipped
+  and never counted.
+
+DELIBERATELY NOT DONE: making `load` itself throw on an unreadable file. It
+would have fixed the Survey counter with no edit to any other file, but the two
+`PrePassPoseRefiner` sites propagate rather than catch, so ONE bad sidecar would
+have gone from "skip this pair" to "abandon the whole pose-refinement stage".
+Turning a partial degradation into a total one is the wrong trade, and it is not
+a change to make in a file I do not own and cannot fix if it lands badly.
+
+### 2. `PrePassCensus.swift`: `carving.keyframesDepthMissing` is mislabelled, and the split now exists
+
+Line 859 renders that count as `"... had no depth to read"`. In the carve loop
+that label is wrong. `VoxelFreeSpaceCarver.keyframes(from:)` selects with
+`for frame in frames where frame.depthPath != nil`, so EVERY keyframe the carve
+tries to open has a depth path recorded, and every one of those misses is an
+unreadable file, never a frame that had no depth. The label reads as "this phone
+had no laser here" and the fact is "this scan's laser data was lost".
+
+The carver now counts the two apart (`keyframesDepthUnreadable`,
+`keyframesNoDepthRecorded`, plus the path of the first casualty) and logs the
+split at `.error` on every carve where either is non-zero. It still reports the
+SUM into `keyframesDepthMissing`, because that is the only field there is.
+
+ASK, in whichever order suits: (a) change that detail string to "could not be
+read", which is true either way; and/or (b) add
+`public var keyframesDepthUnreadable = 0` to `PrePassCensus.Carving` (plus its
+CodingKey, decode and encode lines) and I will fill it on the next pass. Until
+(b) exists the number is measured and logged but has no census slot, and per the
+rule that a census must never report a number the code did not measure, nothing
+is being written under a borrowed name.
+
+### 3. `Contracts.swift` / `MetalSplatTrainer.swift`: the occupancy grid now refuses to load empty
+
+`OccupancyGridRef.cellCount`, `.emptyCellCount` and `.surfaceCellCount` were
+written at exactly one place (`PrePassCarver.carve`) and read at ZERO places in
+all of `ios/Sources`. Grepped. They are now read, in
+`VoxelFreeSpaceCarver.load`, which throws `NimbusError.malformedData` when the
+file's record count disagrees with `cellCount`, and when `emptyCellCount` is 0.
+
+Consequence for `MetalSplatTrainer.loadSmartLayer` (line 2241): a scan whose
+occupancy grid proves no air empty now leaves `layer.carver` nil and logs the
+sentence that is already there, "The free-space map could not be read (...);
+nothing is deleted on free-space grounds this run". That sentence is now true
+instead of unreachable. Behaviour is otherwise identical: an all-unknown grid
+and a nil carver both delete exactly nothing, the difference is that one of them
+says so.
+
+NOTE for whoever owns the trainer census: `TrainerCensus` cannot currently tell
+"F2 had no grid" from "F2 had a grid and it licensed no deletes" - both are
+`carvedFromEmptySpace == 0`. A `freeSpaceGridLoaded` flag would close that.
+
+---
+
+## From Viewer + Export (ios/Sources/Viewer, ios/Sources/Export)
+
+### The trainer's 3D low-pass filter has to be fused into the cloud before it leaves the trainer
+
+**What is wrong today.** `trainer_preprocess` renders every Gaussian with the
+Mip-Splatting 3D filter applied: it widens the covariance to
+`Sigma + filter3D^2 * I` (TrainerShaders.metal lines 620-625) and multiplies the
+alpha by `comp3D = sqrt(det(Sigma) / det(Sigma + filter3D^2 * I))` (line 632,
+used at line 713 as `comp = comp2D * comp3D`). Every opacity the optimiser ever
+fitted was fitted against that dimming, and every scale against that widening.
+
+`filter3D` exists in exactly one place: `TrainerSplatStats.filter3D`
+(TrainerGPULayouts.swift:220), written by `trainer_filter3d_finalize`.
+`MetalSplatTrainer.readCloud` (MetalSplatTrainer.swift, around line 1945) does
+not read the stats buffer at all. So the value is dropped there, and the
+`SplatCloud` that goes to the viewer, to `.ply`, to `.spz` and to `.glb` is a
+DIFFERENT MODEL from the one that was trained: narrower, and too opaque, in the
+direction that makes a good run look like noise.
+
+**The decision, and why it is a bake and not a new field.** Carrying `filter3D`
+through would need a non-standard `.ply` property, a break in the `.spz` binary
+layout and a vendor glTF extension, and even then only this app's own viewer
+would benefit: the Blender add-on in this repo, SuperSplat and every other
+reader would still draw the wrong model. Baking is also what upstream
+Mip-Splatting itself does for released models. The one thing baking costs is the
+raw optimiser parameters, and nothing in this app resumes optimisation from a
+`SplatCloud`: `TrainerInitializer` seeds from `PrePassResult.initialSplats`
+(`TrainerSeed`), never from one of these. So the cost is zero here and the
+benefit is every reader on earth.
+
+**The exact change.** In `ios/Sources/Trainer/MetalSplatTrainer.swift`,
+`readCloud(resources:count:shDegree:)`:
+
+1. Read the stats alongside the splats:
+   `let stats = resources.stats.readArray(TrainerSplatStats.self, count: count)`
+2. Build a `filters: [Float]` in the SAME order as the arrays the loop appends
+   to. Append `stats[i].filter3D` inside the existing
+   `for (i, splat) in splats.enumerated()` loop, in the same place the other
+   `append` calls happen, AFTER the non-finite `guard ... else { continue }`.
+   Indexing a post-filter array with `i` is the one way this can silently
+   mis-pair filters with splats, and it would look like a slightly wrong model
+   rather than like a bug.
+3. After the `SplatCloud` is built, fuse and record:
+
+```swift
+var cloud = try SplatCloud(...)          // exactly as today
+let changed = try cloud.fuse3DFilter(filters)
+TrainerLog.general.notice(
+    "Fused the 3D low-pass filter into \(changed, privacy: .public) of \(cloud.count, privacy: .public) splats."
+)
+return cloud
+```
+
+`SplatCloud.fuse3DFilter(_:)` is already written and lives in Export
+(`ios/Sources/Export/SplatCloud.swift`), together with the two pieces of maths
+it uses, `SplatMath.filter3DCompensation` and `SplatMath.fusing3DFilter`. Do
+NOT re-derive the formula in the trainer: one implementation is the whole point
+of putting it there. It sets `cloud.filter3DFused = true`; it throws
+`ExportError.alreadyFused` if it is ever called twice on the same cloud; it
+throws `ExportError.inconsistentAttributeCounts` if the array length does not
+match `cloud.count`; and it leaves any splat whose filter is zero, negative or
+non-finite exactly as it was, so "no filter" always means "no compensation" and
+never a crash or a NaN.
+
+The fuse is EXACT for geometry, not an approximation:
+`R S^2 R^T + f^2 I == R (S^2 + f^2 I) R^T`, so the widened Gaussian is the same
+Gaussian with the same quaternion and per-axis sigma `sqrt(s^2 + f^2)`. Nothing
+about the shape is lost. Only the pre-filter parameters are unrecoverable.
+
+**Also set the flag honestly on the paths that do not fuse.** Three other places
+build a `SplatCloud`, and they must not all silently read as `nil`:
+
+- `MetalSplatTrainer.mergePreview(completedParts:current:)` builds a fresh cloud
+  from merged arrays, which throws the flag away. Carry it across, or a fused
+  preview will report itself unknown.
+- The slice merge at `TrainerSlices.swift:402` has the same problem across
+  slices. If every part is `true` the merged cloud is `true`; if any part is
+  `false` it is `false`; otherwise `nil`.
+- `PrePassInitialSplats.swift:603` builds the seed cloud. It has never been
+  trained and has no filter, so `filter3DFused = false` is the honest value:
+  it is a cloud whose producer KNOWS there is no filter to apply. Not `true`,
+  and not `nil`.
+
+**Until this lands, the viewer says so out loud.** `MetalSplatRenderer.load(_:)`
+now logs a warning on `viewer.renderer` whenever a cloud arrives with
+`filter3DFused == false`. It deliberately does not warn on `nil`: a cloud read
+back from a file genuinely cannot know, and a warning that fired on every
+import would be noise rather than information.
+
+### `ios/Sources/Viewer/ScanCensus.swift`, `ScanCensus.Drawable`: one field wanted
+
+Per rule 5 this belongs in the census rather than in a parallel mechanism, and
+`Drawable` already has the precedent: `sourceFile` is a `var` that
+`MetalSplatRenderer` stamps after `measure` has run. Add alongside it:
+
+```swift
+/// Whether the model being drawn had the trainer's 3D low-pass filter fused
+/// into its scales and opacities. `nil` means the file could not say.
+var filter3DFused: Bool?
+```
+
+and the renderer will stamp it in `load(_:)` exactly as it stamps `sourceFile`,
+next to the line that already reads `cloud.filter3DFused`. On the review page
+`false` should read as something like "this model is drawn more solid than it
+was trained" rather than as a technical term. `Drawable` has no explicit
+initialiser, so a field with a `nil` default added at the end does not disturb
+`measure`.
+
+### `docs/DATA_FORMAT.md`: the meaning of two stored fields has changed
+
+No field is added or removed and no byte layout moves, so every existing file
+still parses and every existing reader still works. What changes is what
+`opacity` and `scale_0..2` MEAN. The doc currently describes them as raw
+trainer parameters (the round-trip note near line 556 and the `.spz` note near
+line 575). Please add, in the storage-conventions section:
+
+> **Scale and opacity are draw-ready, not raw optimiser parameters.** The
+> trainer fits each Gaussian through a Mip-Splatting 3D low-pass filter of a
+> per-Gaussian width in metres: it renders the covariance widened to
+> `Sigma + f^2 * I` and the opacity multiplied by
+> `sqrt(det(Sigma) / det(Sigma + f^2 * I))`. That width is a training-time
+> quantity with nowhere to live in `.ply`, `.spz` or `.glb`, so it is folded
+> into the stored scale and opacity once, on the way out of the trainer, by
+> `SplatCloud.fuse3DFilter`. A reader therefore draws the model that was
+> actually fitted, with no extra field and no extra code, which is what makes
+> the Blender add-on and any third-party viewer correct by default. The cost is
+> that the pre-filter parameters cannot be recovered from a file, so a file
+> written by this app is a finished model and not a training checkpoint.
+> Files written before this change carry unfused values. They still read
+> correctly; they simply draw a little sharper and more solid than they should.
+
+### Optional, for a future re-import guard
+
+`SplatCloud.filter3DFused` is `nil` for anything parsed out of a file, so
+re-fusing an already-fused `.ply` cannot be detected. If that ever becomes a
+real risk, `PLYCodec` could write one line, `comment nimbus filter3d fused`, and
+set the flag when it reads it back. Not requested now: nothing in the app
+re-fuses, and an unused marker is exactly the "written and never wired" pattern
+this project keeps finding.
+
+### What `MetalSplatTrainer.swift` now depends on in `TrainerDensifier.swift`
+
+Coded against the file as it stands right now. Whoever owns that file: if any
+of these three are renamed, the trainer stops compiling.
+
+- `TrainerDensifyOutcome.created` (the computed `cloned + split`). Used as the
+  test for "did this pass add anything", because relocation is correctly not in
+  it. If `created` is ever redefined to include relocations, the stall detector
+  goes blind, which is the fault it was built to catch.
+- `TrainerDensifyOutcome.growthAllowed` and `.headroomAtStart`. Together they
+  are the gate on the streak: only passes that were ALLOWED to add and had ROOM
+  to add can count towards it. A pass that adds nothing outside the densify
+  window is behaving correctly and must never raise the alarm.
+- `.growthAllowance`, `.splatsScored`, `.splatsWithNonZeroScore` and
+  `.candidatesAfterVisibilityFilter`, printed on the stall line.
+
+Once `TrainerDensifyGrowthVerdict` / `growthVerdict` settles, the stall line in
+`MetalSplatTrainer.trainSlice` should print the verdict instead of the four raw
+counters. It was not used yet because that type is being written as this was
+written and CI is the only compiler. Say when it is stable and the swap is one
+line.
+
+### The held-out PSNR is not measured on the picture the user sees, and the app should say so
+
+Read this next to the fuse request above, because the two are connected.
+
+**Before the fuse lands, the number is not about his model at all.** Held-out
+evaluation runs `gpu.preprocess`, which is `trainer_preprocess`, which applies
+the 3D low-pass filter and `comp3D`. The viewer applies neither. So today the
+PSNR grades a model the user has never once looked at.
+
+**After the fuse lands, it is about his model, but still not about his picture.**
+`evaluateHeldOut` (MetalSplatTrainer.swift, the pixel loop around line 2179)
+differs from the viewer in three ways that no fuse can close, and all three are
+correct for what a held-out PSNR is supposed to mean:
+
+1. It renders at `renderSize`, whose long edge is 720 and can be dropped to
+   600, 480 or 384 by the thermal governor. The viewer renders at the
+   drawable's own size.
+2. It applies the learned per-frame exposure, `exposure.x * value + exposure.y`.
+   The viewer has no exposure term at all.
+3. It composites `transmittance[i] * background[i]` behind the render when the
+   frame has a supervision background. The viewer composites against its own
+   clear colour.
+
+It also uses the capture's real intrinsics, where `renderIntrinsics` in the
+viewer recentres the principal point on the drawable by design.
+
+So the honest sentence is: **the PSNR says how well this model predicts a photo
+it was never trained on. It does not say how good the preview looks, and it is
+not measured on the preview.** That is the right number to report and the wrong
+number to read as "how pretty is my scan".
+
+**Where to put it, since the Viewer/Export agent owns none of these strings:**
+
+- `ios/Sources/Trainer/MetalSplatTrainer.swift`, `doneMessage(cloud:psnr:governor:)`
+  around line 2359, which currently renders as ". . . decibels." Add one plain
+  sentence after it, something like: "That score compares the model against
+  photos it never trained on, at the size it was trained at. It is not a score
+  for how the preview looks on screen."
+- `ios/Sources/Viewer/ScanReviewScreen.swift` / `ScanLibraryStore.swift`
+  wherever `heldOutPSNR` is shown, the same sentence as a caption under the
+  number.
+
+Do not shorten it to "measured on held-out frames". The owner is not a graphics
+engineer, and "held-out frames" is exactly the phrase that lets a wrong reading
+survive.
+
+### The seeder now records the trust line it drew; the census should print it
+
+From the TrainerInitializer.swift agent. Nothing here is urgent and nothing here
+blocks: the fix is complete and self-contained inside that file. These are the
+two places where a number it now measures stops at the file boundary.
+
+**1. `TrainerSeedResult.trustCut` is measured and logged, and the census cannot
+see it.**
+
+`TrainerInitializer` gained `TrainerSeedTrustCut`, carried on
+`TrainerSeedResult.trustCut` (optional, nil on the pre-pass path because that
+path takes no cut of its own; `PrePassCensus.seeding` already records its one).
+It holds `wasMeasured`, `cut`, `floor`, `quantile`, `p05`, `median`, `p95`,
+`cellsConsidered`. It is written, read and logged inside TrainerInitializer, so
+it is not a dead field, but the trainer census cannot report it.
+
+Two things would follow, when whoever owns those files is free:
+
+- `MetalSplatTrainer.trainSlice`, in the block around line 655 that already
+  copies `seedResult` into `census.slices[censusRow]`, could copy these across.
+- `TrainerCensus.TrainerCensusSlice` would need the fields, and the alarms at
+  the bottom of TrainerCensus.swift could then separate two states that read
+  identically today. Alarm 7, `no_seed_was_trusted`, currently fires on
+  `seedsPinnedAsDiscsTotal == 0` and says the trust gate rejected everything.
+  With `wasMeasured == false` that sentence is wrong: no gate was consulted,
+  the scan simply had no trust field, and the honest line is "this scan had no
+  depth-reliability measurements, so every starting point was laid cautiously".
+  Sending the owner to look for a broken threshold that was never read is the
+  same waste the census exists to prevent. Only worth doing WITH the fields
+  above; the census must not guess it.
+- The pair worth printing together is `cut` against `p95`. A cut at the floor
+  with a 95th percentile below it is the exact fingerprint of the fault that was
+  just removed, and one line catches it returning.
+
+**2. `MetalSplatTrainer.swift` line 729 converts a Float to an Int unguarded.**
+
+    Int((seedResult.medianSpacingMeters * 1000).rounded())
+
+A Float-to-Int conversion out of Int's range traps, in release as well as debug.
+Until today `medianNearestSpacing` could return `Float.greatestFiniteMagnitude`
+(its "no neighbour found" sentinel was tested with `.isFinite`, and that
+sentinel is finite), so a sparse pre-pass seed set in a large room would have
+killed the trainer on the line that logs how it started. The sentinel is fixed
+in TrainerInitializer.swift and the value reaching that line is now always a
+real distance or zero, so this is no longer reachable. It is still an unguarded
+conversion on a Float that arrives from another file, and it costs one `min` to
+make it unreachable by construction rather than by argument.
+
+Also: `seedMedianSpacingMillimetres` in the census has no "not measured" state,
+so an unmeasurable spacing lands there as 0 mm. `TrainerSeedResult.summary` now
+drops the spacing clause rather than claiming "about 0 mm apart"; the census row
+still says 0. Worth an optional or a sentinel if that field is ever read into a
+sentence.
+
+### The densifier now names WHY a pass grew nothing; the census can record it
+
+From the TrainerDensifier.swift agent. Nothing here blocks: both changes are
+complete and self-contained inside TrainerDensifier.swift and TrainerSupport.swift,
+and everything new is already read from inside those files, so none of it is a
+declared-and-never-wired setting. These are the places where a value it now
+derives stops at the file boundary.
+
+**1. `TrainerDensifyOutcome.growthVerdict` should be one more column in the
+census row.**
+
+`TrainerDensifier` gained `TrainerDensifyGrowthVerdict`, a `String`-raw-value
+`Codable` enum, exposed as the computed property `TrainerDensifyOutcome
+.growthVerdict`. It has nine cases: `populationEmpty`, `buffersReadShort`,
+`grew`, `nothingScored`, `nothingVisible`, `growthWindowClosed`,
+`atTheCapRelocated`, `atTheCapNoDonors`, `unexplained`. Nothing is stored: every
+case is decided by a counter the pass actually measured, so it cannot report a
+cause the code did not observe, and `unexplained` exists specifically so it
+never has to invent one.
+
+The reason it is worth a column: the census today reconstructs the same question
+from seven separate counters at two different call sites (`couldHaveAdded` in
+`MetalSplatTrainer.trainSlice`, and `passesWithGrowthWindowOpenAndHeadroom`
+against `t.added` in `TrainerCensus.buildAlerts`), and neither of them can
+distinguish `nothingScored` from `nothingVisible`, which are a dead gradient
+signal and a dead visibility accumulator: two different faults with two
+different fixes. The order the tests run in also matters and is easy to get
+wrong. `growthVerdict` checks the scoring faults BEFORE the window and the cap,
+because "the window was shut" and "the budget was full" are both perfectly
+reasonable-looking explanations that will stand in front of a dead signal and
+hide it. That ordering is now written down in exactly one place.
+
+Two things would follow, when whoever owns those files is free:
+
+- `TrainerCensusDensifyPass` (TrainerCensus.swift, around line 184) could take
+  `var growthVerdict: String` and set it in its `init` from
+  `outcome.growthVerdict.rawValue`. It is a pure add: no existing field changes
+  and no existing number moves.
+- `TrainerCensus.buildAlerts` alarm 1, `densification_created_nothing`, could
+  then name the dominant verdict across the open passes instead of only quoting
+  the scored counts. "Not one of 300,000 points had a gradient above zero" and
+  "255,035 scored and none of them was visible in any frame" send the owner to
+  two completely different places.
+
+Also worth knowing: `TrainerDensifyOutcome.summary` MUST stay optional and MUST
+stay nil for a pass that changed nothing. `MetalSplatTrainer.trainSlice` around
+line 1213 branches on exactly that: nil is what routes a zero-growth pass to the
+loud branch that prints the counters and the streak length. A non-nil string
+there would quietly send the most important passes in the run back to `.info`.
+This is now documented on the property itself.
+
+**2. `trainer_reset_densify_stats` is documented as running after every pass and
+does not.**
+
+The shader's own comment (TrainerShaders.metal, above the kernel at line 395)
+says "Called after every densification pass, never between iterations".
+`MetalSplatTrainer.trainSlice` calls it under
+`if outcome.changedTopology || outcome.relocated > 0`. So a pass that changed
+nothing does NOT reset the accumulators, and `absGrad2D`, `denom`, `visAccum`
+and `unknownAccum` keep accumulating into the next interval.
+
+`absGrad2D / denom` is a mean, so it is largely self-correcting. `visAccum` is
+not: it is only ever compared against zero, and it never resets on a quiet pass,
+so the "something actually looked at it" filter gets steadily more permissive
+the longer densification goes without changing anything. That is the wrong
+direction. A stage that is producing nothing should not also be quietly
+loosening the gate that decides whether it has candidates.
+
+Not fixed here because the call is in MetalSplatTrainer.swift and the comment is
+in TrainerShaders.metal, and neither is this agent's file. Either the call
+should be unconditional, or the shader comment should say what actually happens.
+It should not be left saying one thing while the code does another: that is the
+same class of thing as the settings that were declared and never read.
+
+**3. What this cost, for whoever is tracking the thermal budget.**
+
+The candidate ranking in `TrainerDensifier.run` was a full sort of an index
+array covering very nearly the whole population, run every
+`densifyIntervalIterations` for the whole run (29 passes on a 3,000 iteration
+slice, not only the 19 inside the growth window). The donor ranking on the
+relocation path was worse: a full sort whose comparator called `sigmoid`, and so
+`expf`, twice per comparison rather than once per element.
+
+Both are now bounded selections of only the part that is ever read. Counted
+exactly at a 300,000 point population: 4,242,295 comparisons against 1,104,232.
+Measured on a desktop transcription of exactly the new code, as a ratio and not
+as a device timing: candidate ranking 101.0 ms against 18.5, donor ranking 335.9
+ms against 17.7 in its worst case, and with the growth window shut the pass now
+does no ranking at all, 101.0 ms against 0.9. The score floor is unchanged and
+is still `score[i] > 0`, so nothing here reintroduces a magnitude threshold.
+
+`TrainerTuning.maxGrowthFractionPerPass` and `maxRelocationFractionPerPass` now
+also set the size of that selection, which is documented on both. Setting
+`maxGrowthFractionPerPass` to 1.0 restores the full-population sort.
+
+---
+
+## Resolved by the compile gate, 2026-09-06 (the six-agent pass)
+
+Every request filed above by the six agents that ran in parallel today is
+answered here: made, or refused with a reason. Nothing is left open without a
+line saying so. Verified against the source, not against the notes.
+
+### ACTIONED: the fuse was written and wired to nothing
+
+**This was the largest hole in the set.** `SplatCloud.fuse3DFilter(_:)`,
+`SplatMath.filter3DCompensation` and `SplatMath.fusing3DFilter` were complete
+and correct, and `grep` found **zero callers**. `SplatCloud.filter3DFused` was
+read in exactly one place (`MetalSplatRenderer.load(_:)`, the warning) and set
+to `true` in exactly one place (inside `fuse3DFilter` itself), so the warning
+branch was unreachable and every exported model was still the wrong model. The
+viewer's `filterVariancePx` was correctly changed to 0.25 to match the trainer,
+which closed the 2D half of the mismatch and left the 3D half entirely open.
+
+Made, exactly as the request specified:
+
+* `MetalSplatTrainer.readCloud(resources:count:shDegree:)` now reads
+  `resources.stats` alongside `resources.splats`, builds `filters: [Float]`
+  **inside the existing loop and after the same non-finite `continue`** so it
+  stays index-for-index with `logScales`, and calls `cloud.fuse3DFilter(filters)`.
+  `readArray` returns an EMPTY array when the buffer is short, so
+  `haveFilters = stats.count == splats.count` is a real test; both failure
+  paths set `filter3DFused = false` and log at `.error`, and neither throws the
+  cloud away.
+* The fuse is deliberately outside the `do` that builds the cloud. A cloud that
+  cannot be fused is still a cloud; discarding it would turn a cosmetic loss
+  into an empty model.
+* Flag carried across every other construction site, using one shared rule,
+  `SplatCloud.mergedFilter3DFused(_:)` (false if any part is false, true only
+  if every part is true, nil otherwise, nil for an empty list):
+  `MetalSplatTrainer.mergePreview`, `TrainerSlices.merge`, and
+  `TrainingPreview`'s downsample (a subset of the same splats inherits the same
+  fact). `PrePassInitialSplats` sets `false`, with a comment saying plainly that
+  nothing reads it today and why it is still set.
+* `ScanCensus.Drawable.filter3DFused` added and stamped by
+  `MetalSplatRenderer.load(_:)` next to `sourceFile`, and surfaced on the
+  review page through `drawableAlert` on the "Points that can actually draw"
+  rung. `nil` says nothing, as asked.
+* `docs/DATA_FORMAT.md` section 8 now states that scale and opacity are
+  draw-ready rather than raw optimiser parameters.
+
+### ACTIONED: the depth-loss denominator is now the supervised count
+
+All three bullets of the loss-normalisation request, together:
+
+* `TrainerLossUniforms` gained `depthSupervisedCount: UInt32` at offset 64.
+  Stride 64 -> 68, align 4. Header comment, the `check(...)` line in
+  `TrainerGPULayouts.verify()`, and the Metal struct all updated.
+* `MetalSplatTrainer.runIteration` sets it from
+  `supervision.supervisedSampleCount`, and **recounts over the uploaded prefix**
+  when `sampleCount` truncated the array, exactly as the caution asked.
+* `trainer_loss_depth` divides by it.
+
+**One deviation, and it is a correction rather than a preference.** The request
+said to use `u.depthSupervisedCount` outright. The kernel falls back to
+`u.depthSampleCount` when it is zero, because the F2 free-space hinge does NOT
+carry `s.weight`: a frame whose photo QC weight is zero has no supervised
+samples and can still have thousands of live hinge terms, and a divisor of one
+there would put an unnormalised population sum straight back into the loss.
+That is the fault the whole change exists to remove, so the fallback is
+load-bearing, not defensive. It is written down in the kernel comment.
+
+### ACTIONED: `trainer_reset_densify_stats` now runs after every pass
+
+The call in `MetalSplatTrainer.trainSlice` was under
+`if outcome.changedTopology || outcome.relocated > 0`, and the shader's comment
+said "after every densification pass". The call is now unconditional and the
+shader comment says why that matters. `visAccum` is only ever compared against
+zero, so a pass that skipped the reset made the candidate filter steadily more
+permissive the longer densification went without doing anything, which is the
+wrong direction. Cost: one extra command buffer per empty pass, roughly 29 per
+slice, one kernel over the population.
+
+### ACTIONED: the census
+
+* `TrainerCensusDensifyPass.growthVerdict: String`, copied from
+  `outcome.growthVerdict.rawValue`. Not re-derived.
+* `TrainerCensus.buildAlerts` alarm 1 now names the dominant verdict across the
+  open passes.
+* New loud alarm `densification_stalled`, on
+  `Totals.longestZeroGrowthStreak >= 10` with something created earlier in the
+  run. The streak is counted per slice (two slices are two populations and a
+  streak must not be stitched across the join).
+* Alarm 13 split: `most_iterations_did_no_work` at "loud" when more than half a
+  run took no optimisation step, `many_iterations_did_no_work` at "check" from
+  5 per cent, as suggested.
+* `TrainerCensusSlice.iterationsWithGradientStep`, measured by the loop, plus a
+  new "check" alarm `gradient_step_count_does_not_reconcile` that fires when
+  the stored count and the skip-counter subtraction disagree. Storing both
+  sides is what makes a skip path that stops being counted visible.
+* `depthSamplesPerFrameTotal`, `depthSamplesSupervisedTotal` and
+  `depthSupervisionFramesMeasured` per slice, accumulated ONLY on `.stepped`,
+  plus a "check" alarm when the supervised fraction is under 5 per cent. The
+  divisor is stored so a mean is only ever printed when there was one to take.
+* `TrainerSeedTrustCut` copied into the slice row as eight optional fields.
+  Alarm 7 now splits: `no_depth_reliability_to_trust` when
+  `wasMeasured == false` (no gate was consulted, so do not send anyone hunting
+  a threshold), and `no_seed_was_trusted` otherwise, now printing the cut
+  against the 95th percentile it was applied to.
+* `seedMedianSpacingMillimetres` is now `Int?`. 0 mm is not a spacing.
+* `PrePassCensus.Carving.keyframesDepthUnreadable: Int?` added, with its
+  CodingKey, `decodeIfPresent` and `encodeIfPresent`, filled by the carver's
+  `defer`. The detail string reads "could not be read" instead of "had no depth
+  to read", and appends the split only when the writer measured it.
+* The carving ledger line now distinguishes "there was no map of empty air" from
+  "a map was loaded and licensed no deletions", using the `carverAvailable`
+  flag that was already recorded per pass. **The requested
+  `freeSpaceGridLoaded` flag was not added: it already exists** as
+  `TrainerCensusDensifyPass.carverAvailable` and was simply not being rendered.
+
+### ACTIONED: the small ones
+
+* `PrePassSurvey` now calls `PrePassDepthFrame.loadOutcome` and increments
+  `unreadableDepthFrames` on `.unreadable`. The `unreadable_depth` QC finding
+  can fire for its own named cause for the first time.
+* `TrainerProgress.gradientStepsCompleted` and `.consecutiveZeroGrowthPasses`,
+  appended last with `nil` defaults, and **wired**: the in-loop progress tick
+  fills both. The stage-change ticks around the loop leave them nil, because
+  nil means nobody counted and a stale count presented at the wrong moment
+  would be worse than silence.
+* `SplatModel.iterationsCompleted` now carries the doc comment saying it is
+  times round the loop, not optimisation steps, and names where the real count
+  lives.
+* `SplatModel.heldOutPSNR` documents the three ways held-out evaluation differs
+  from the viewer, and `doneMessage` now says the plain sentence in full. The
+  requested caption in `ScanReviewScreen` / `ScanLibraryStore` was NOT added,
+  because neither of those displays `heldOutPSNR` at all: `ScanSummary` stores
+  it and nothing reads it. There is no string to caption.
+* `MetalSplatTrainer.swift`'s unguarded `Int((medianSpacingMeters * 1000).rounded())`
+  is now clamped and finiteness-checked before the conversion.
+* The stall line in `trainSlice` prints `outcome.growthVerdict.rawValue`
+  alongside the counters, as asked once the type settled. It is stable.
+* `TrainerShaders.metal` gained `static_assert(sizeof(X) == N)` for all
+  thirteen GPU structs. `TrainerGPULayouts.verify()` already checked these, but
+  at start-up on the owner's phone; these fail in CI instead, on the wrong line.
+  The viewer's shader has carried the same guard from the start.
+
+### REFUSED, with reasons
+
+* **Carrying `filter3D` through the file formats instead of baking it.** Agreed
+  with the filter3d agent's reasoning and it is now moot: the bake has landed.
+  A `.ply` `comment nimbus filter3d fused` marker is also refused for now.
+  Nothing in the app re-fuses, `fuse3DFilter` already throws
+  `ExportError.alreadyFused` on the one cloud that could, and an unused marker
+  is the written-and-never-wired pattern this pass exists to remove.
+* **Unblocking the F2 free-space hinge on UNKNOWN and BAND samples.** The
+  agent's own evidence stands: `expected = accumulated / max(alpha, 1e-4)` on
+  an empty pixel puts a factor of up to 1e4 and 1e8 on the chain rule, so
+  enabling the branch as it stands is an amplifier on the emptiest pixels in
+  the frame. `borrowedFreeSpaceBound` stays computed and unused, and that is
+  the lesser fault. It needs an alpha floor designed with it.
+* **Splitting `lossAccum` into four scalars.** Correct diagnosis: the reported
+  loss is mostly the regulariser's population sum and photometric progress is
+  invisible in it. Not done, because `lossEMA` is display and census only,
+  nothing gates on it, and this pass was not the moment to change four kernels
+  and a readback for a reporting improvement.
+* **Holding the census in a reference box instead of `inout`.** The hazard is
+  real and correctly described. It is roughly thirty mechanical edits across
+  the largest file in the project, on a day when six agents had already
+  rewritten parts of it and CI is the only compiler. Deliberately deferred, not
+  forgotten.
+* **Swapping `load` for `loadOutcome` in `PrePassInitialSplats`,
+  `PrePassBundleAdjuster`, `PrePassGlassDetector` and `PrePassPoseRefiner`.**
+  The Survey one was the urgent case and it is done. These four change no total
+  that is wrong today; they would only split a count that is currently correct.
+  Worth doing on a quiet day, not on this one.
+* **`ScanReviewScreen` PSNR caption.** See above: there is nothing on that
+  screen to caption yet.
+
+### One thing found by the gate, NOT changed, evidence attached
+
+`trainer_loss_depth` writes `gradDepth[s.pixelIndex] +=` and
+`gradTFinal[s.pixelIndex] +=` non-atomically, and several depth samples sharing
+one render pixel would lose updates. It cannot happen today and the reason is
+arithmetic, not luck: `TrainerSupervision` maps a 256 x 192 native sample to
+`px = floor((u + 0.5) * W / 256)`, and every rung of
+`TrainerBudgetGovernor.resolutionLadder` (720, 600, 480, 384 long edge at 4:3)
+gives a render grid of at least 384 x 288, so the map is injective in both axes
+in portrait and in landscape. If anyone ever adds a rung below 256 columns or
+192 rows, this becomes a silent race in the depth gradient. Worth a comment at
+the ladder if that is ever considered.

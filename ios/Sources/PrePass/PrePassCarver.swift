@@ -36,6 +36,7 @@
 //
 
 import Foundation
+import os
 import simd
 
 // MARK: - Ray traversal
@@ -181,6 +182,13 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
     /// carve is slow. See `PrePassCensus`.
     public private(set) var lastCensus = PrePassCensus.Carving()
 
+    /// The carve says out loud, here, what it could not say through a return
+    /// value: a stage that produced nothing has to reach the log even when the
+    /// census file itself fails to write.
+    private let log = Logger(
+        subsystem: BrandConfig.loggingSubsystem, category: "PrePassCarver"
+    )
+
     // Loaded state, for `state(atWorldPoint:)` during training.
     private var loadedKeys: [UInt64] = []
     private var loadedStates: [UInt8] = []
@@ -205,6 +213,13 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
         census.attempted = true
         census.requestedVoxelSizeMeters = voxelSizeMeters
         lastCensus = census
+        // Drop any grid a previous carve left loaded. Without this, a carve
+        // that is refused below would leave `state(atWorldPoint:)` answering
+        // from the LAST scan's geometry, which is the worst kind of stale: a
+        // confident answer about the wrong room.
+        loadedKeys = []
+        loadedStates = []
+        loadedFrame = nil
 
         let frames = bundle.frames.sorted { $0.timestampSeconds < $1.timestampSeconds }
         guard !frames.isEmpty else {
@@ -254,6 +269,24 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
         var raysNoReturnBounded = 0
         var keyframesLoaded = 0
         var keyframesMissing = 0
+        // The two halves of `keyframesMissing`, kept apart. Before this split
+        // a depth sidecar that would not open and a frame that never recorded
+        // depth were the same nil, so a scan whose laser files had all been
+        // lost was indistinguishable from a scan with no laser.
+        var keyframesDepthUnreadable = 0
+        var keyframesNoDepthRecorded = 0
+        var firstUnreadableDepthPath: String?
+
+        // The cell counts, declared out here rather than at the bottom of the
+        // function so the `defer` below can copy them out on EVERY exit. When
+        // they lived only on the success path, a carve that filled millions of
+        // cells and then failed to WRITE them reported "0 cells" - a number
+        // the code never measured, and exactly the sort of false zero this
+        // census exists to prevent.
+        var cellsRecorded = 0
+        var emptyCells = 0
+        var surfaceCells = 0
+        var unknownCells = 0
 
         // Copied out on EVERY exit, including a corrupt sidecar throwing
         // halfway through. A carve that died at keyframe 40 of 300 should say
@@ -264,6 +297,10 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
         defer {
             census.keyframesWithDepthLoaded = keyframesLoaded
             census.keyframesDepthMissing = keyframesMissing
+            // The data-loss half of that total, in its own slot. Written here
+            // in the `defer` with everything else, so a carve that threw part
+            // way still reports the split it had reached rather than nothing.
+            census.keyframesDepthUnreadable = keyframesDepthUnreadable
             census.raysCast = raysCast
             census.raysWithReturnInRange = raysWithReturnInRange
             census.raysBeyondMaxRange = raysBeyondMaxRange
@@ -271,6 +308,10 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
             census.raysNoReturn = raysNoReturn
             census.raysNoReturnBounded = raysNoReturnBounded
             census.raysNoReturnUnbounded = raysNoReturn - raysNoReturnBounded
+            census.cellsRecorded = cellsRecorded
+            census.emptyCells = emptyCells
+            census.surfaceCells = surfaceCells
+            census.unknownCellsInBounds = unknownCells
             census.hitCellCap = hitCellCap
             lastCensus = census
         }
@@ -281,12 +322,29 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
 
         for frame in keyframes {
             try Task.checkCancellation()
-            guard let depthFrame = try PrePassDepthFrame.load(
+            // `loadOutcome` rather than `load`: `load` answers nil for both
+            // "this frame never recorded depth" and "this frame's depth file
+            // will not open", and only the second is data loss. Skipped in
+            // silence before the census existed, and indistinguishable from
+            // each other before this split.
+            let depthFrame: PrePassDepthFrame
+            switch try PrePassDepthFrame.loadOutcome(
                 frame: frame, settings: bundle.settings, at: ref
-            ) else {
-                // Skipped in silence before the census existed. A carve that
-                // read no depth at all used to look exactly like a carve that
-                // found no empty air.
+            ) {
+            case .loaded(let opened):
+                depthFrame = opened
+            case .unreadable(let path):
+                keyframesDepthUnreadable += 1
+                keyframesMissing += 1
+                if firstUnreadableDepthPath == nil { firstUnreadableDepthPath = path }
+                continue
+            case .noDepthRecorded:
+                // `keyframes(from:)` only ever selects frames whose
+                // `depthPath` is non-nil, so this should be unreachable.
+                // Counted anyway, and reported below, so that if that filter
+                // ever changes the fact shows up as a number instead of
+                // quietly inflating the unreadable count.
+                keyframesNoDepthRecorded += 1
                 keyframesMissing += 1
                 continue
             }
@@ -375,8 +433,77 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
             if sortedStates[i] == OccupancyState.surface.rawValue { surfaceCount += 1 }
         }
 
+        // --- The census numbers, written into the locals the `defer` copies
+        //     out. Set BEFORE anything below can throw, so a failed write or a
+        //     refused carve still reports what this run actually measured.
+        cellsRecorded = entries.count
+        emptyCells = emptyCount
+        surfaceCells = surfaceCount
+        // Everything inside the grid's own box that no ray ever reached. Not
+        // stored anywhere (the file is sparse and absence means unknown), so
+        // it has to be counted here or it cannot be known at all. Computed in
+        // Double because a large room at a small voxel overflows Int32 easily.
+        let cellsAcross = Double(Swift.max(size.x, 0)) / Double(voxel)
+        let cellsUp = Double(Swift.max(size.y, 0)) / Double(voxel)
+        let cellsDeep = Double(Swift.max(size.z, 0)) / Double(voxel)
+        let cellsInBounds = cellsAcross * cellsUp * cellsDeep
+        if cellsInBounds.isFinite, cellsInBounds > Double(entries.count) {
+            unknownCells = Int(
+                Swift.min(cellsInBounds - Double(entries.count), Double(Int.max / 2))
+            )
+        }
+
+        // The depth-read split, said out loud whether or not anything else
+        // went wrong. `keyframesDepthMissing` in the census is the sum of
+        // these two, and the two mean completely different things.
+        if keyframesDepthUnreadable > 0 || keyframesNoDepthRecorded > 0 {
+            let lost = "\(keyframesDepthUnreadable) depth files would not open"
+            let never = "\(keyframesNoDepthRecorded) frames recorded no depth"
+            let read = "\(keyframesLoaded) of \(keyframes.count) keyframes read"
+            let example = firstUnreadableDepthPath ?? "none"
+            // Assembled by interpolation rather than a chain of `+`: a long
+            // concatenation is the classic way to make the Swift type checker
+            // give up on a file.
+            let line = "Carving depth reads: \(read), \(lost), \(never), first unreadable: \(example)"
+            log.error("\(line, privacy: .public)")
+        }
+
         let data = PrePassOccupancyFile.encode(keys: keys, states: sortedStates, hits: sortedHits)
+        // Written before the refusal below on purpose: whatever this run
+        // carved is what should be on disk, so a stale grid from an earlier
+        // run can never be mistaken for this one's work.
         try PrePassBinary.write(data, to: ref.url(forRelativePath: PrePassPaths.occupancy))
+
+        // --- A CARVE THAT PROVED NO AIR EMPTY IS NOT A RESULT.
+        //
+        // `emptyCellCount` is the entire product of this stage. The only thing
+        // in the app that consumes an occupancy grid is
+        // `certifiedEmptyIndices`, and with no empty cells that returns an
+        // empty list to every question for the rest of the run. Returning a
+        // structurally valid `OccupancyGridRef` here would have the pipeline
+        // store it as a successful occupancy result and the trainer install a
+        // carver that deletes nothing, for ever, in silence - which is what
+        // used to happen, right down to a zero-byte file when nothing at all
+        // was recorded.
+        //
+        // Throwing instead means the pipeline's own error boundary catches it,
+        // adds the `carving_failed` finding to the QC card, and leaves
+        // `result.occupancy` nil. Nothing crashes, nothing is stored, and the
+        // numbers are already in the census by way of the `defer` above, where
+        // `census_no_empty_cells` and `census_no_surface_cells` turn them into
+        // alarms on the screen the owner already looks at.
+        if emptyCount == 0 {
+            let cells = "\(entries.count) cells recorded"
+            let split = "\(emptyCount) empty, \(surfaceCount) surface"
+            let rays = "\(raysCast) rays cast, \(raysWithReturnInRange) hit something in range"
+            // Named `framesText` because `frames` is the whole sorted frame
+            // list in this scope and shadowing it here would read as a bug.
+            let framesText = "\(keyframesLoaded) of \(keyframes.count) keyframes read"
+            let reason = "the free-space carve proved no air empty: "
+                + "\(cells) (\(split)), \(rays), \(framesText)"
+            log.error("\(reason, privacy: .public)")
+            throw NimbusError.prePassFailed(reason)
+        }
 
         let grid = OccupancyGridRef(
             path: PrePassPaths.occupancy,
@@ -393,27 +520,9 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
         loadedStates = sortedStates
         loadedFrame = voxelFrame
 
-        // --- The rest of the census. The ray counters are copied out by the
-        //     `defer` above, which covers the paths that never reach here.
-        census.cellsRecorded = entries.count
-        census.emptyCells = emptyCount
-        census.surfaceCells = surfaceCount
-        census.actualVoxelSizeMeters = voxel
-        // Everything inside the grid's own box that no ray ever reached. Not
-        // stored anywhere (the file is sparse and absence means unknown), so
-        // it has to be counted here or it cannot be known at all. Computed in
-        // Double because a large room at a small voxel overflows Int32 easily.
-        let cellsAcross = Double(Swift.max(size.x, 0)) / Double(voxel)
-        let cellsUp = Double(Swift.max(size.y, 0)) / Double(voxel)
-        let cellsDeep = Double(Swift.max(size.z, 0)) / Double(voxel)
-        let cellsInBounds = cellsAcross * cellsUp * cellsDeep
-        if cellsInBounds.isFinite, cellsInBounds > Double(entries.count) {
-            census.unknownCellsInBounds = Int(
-                Swift.min(cellsInBounds - Double(entries.count), Double(Int.max / 2))
-            )
-        }
-        lastCensus = census
-
+        // Every census number is now set on the locals the `defer` copies out,
+        // so there is nothing left to fill in here. `lastCensus` is written
+        // once, by that `defer`, on this exit and on every other one.
         return grid
     }
 
@@ -428,6 +537,28 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
             throw NimbusError.malformedData(
                 "the occupancy grid \(grid.path) is \(data.count) bytes, which is not a whole "
                     + "number of \(PrePassOccupancyFile.recordSize)-byte records"
+            )
+        }
+        // --- THE REFERENCE IS CHECKED AGAINST THE FILE.
+        //
+        // `cellCount`, `emptyCellCount` and `surfaceCellCount` were written by
+        // `carve` and read by nothing in the entire app, which is why a grid
+        // truncated to nothing used to load "successfully" as a grid that
+        // answers UNKNOWN to every question - and `certifiedEmptyIndices` then
+        // returned an empty list for the whole training run without one line
+        // of evidence that anything was wrong. Both halves are checked here,
+        // which is also what finally makes those three fields load-bearing.
+        guard decoded.keys.count == grid.cellCount else {
+            throw NimbusError.malformedData(
+                "the occupancy grid \(grid.path) holds \(decoded.keys.count) cells "
+                    + "but the scan recorded \(grid.cellCount)"
+            )
+        }
+        guard grid.emptyCellCount > 0, !decoded.keys.isEmpty else {
+            throw NimbusError.malformedData(
+                "the occupancy grid \(grid.path) proves no air empty "
+                    + "(\(decoded.keys.count) cells, \(grid.emptyCellCount) of them empty), "
+                    + "so nothing could be cleaned up from it"
             )
         }
         loadedKeys = decoded.keys
