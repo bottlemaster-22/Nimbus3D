@@ -94,7 +94,8 @@ struct TrainerCensusBudgetReduction: Codable {
     var what: String
     var from: Int
     var to: Int
-    /// "the phone was warm", "memory share" or "memory ceiling".
+    /// "the phone was warm", "memory share", "memory ceiling" or "memory
+    /// headroom".
     var reason: String
     /// Thermal level as a number (0 nominal, 3 critical) when the reason was
     /// heat; nil otherwise.

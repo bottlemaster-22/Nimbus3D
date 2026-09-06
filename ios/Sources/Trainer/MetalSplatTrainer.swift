@@ -1629,21 +1629,45 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         loss.hasBackground = supervision.hasBackground ? 1 : 0
 
         // --- Command buffer A: preprocess and size the sort -------------------------
-        guard let bufferA = queue.makeCommandBuffer(),
-              let encoderA = bufferA.makeComputeCommandEncoder()
-        else { throw TrainerError.noMetalDevice }
-        encoderA.label = "trainer.preprocess"
-        gpu.clearPerIteration(encoderA, splatCount: splatCount)
-        gpu.preprocess(encoderA, camera: &camera, splatCount: splatCount)
-        gpu.exclusiveScan(
-            encoderA,
-            input: resources.tilesTouched,
-            output: resources.offsets,
-            count: splatCount
-        )
-        encoderA.endEncoding()
-        bufferA.commit()
-        try Self.finish(bufferA, "the tile scan")
+        //
+        // POOLED, and this is the biggest single accumulator left in the app.
+        // `makeCommandBuffer()` and `makeComputeCommandEncoder()` are
+        // Objective-C methods that hand back AUTORELEASED objects, and a
+        // command buffer keeps a reference to every resource it was encoded
+        // against until it is deallocated. This function runs once per training
+        // iteration, and `TrainingBudget` sets 2,000 or 3,000 of those for the
+        // WHOLE run: `governor.ceiling.iterations` is that number and each slice
+        // takes `sliceFraction` of it, so the slices divide the budget rather
+        // than each spending it. The loop that calls this never suspends, so
+        // with no pool of its own every command buffer and encoder of the
+        // entire run stays alive until the run ends, each one pinning the
+        // trainer's Metal buffers. Two per iteration here and two in buffer B
+        // below is eight to twelve thousand live objects on a full run.
+        //
+        // The pool closes after `Self.finish`, which is where the wait lives, so
+        // the GPU work has finished and its results are already in `resources`;
+        // nothing below reads `bufferA` or `encoderA` again. A fault makes
+        // `finish` throw, and the pool drains on the way out just as it does on
+        // the normal path. `camera` is a local of this function captured by a
+        // non-escaping closure, so passing it inout in here is the same store it
+        // was before.
+        try autoreleasepool { () throws -> Void in
+            guard let bufferA = queue.makeCommandBuffer(),
+                  let encoderA = bufferA.makeComputeCommandEncoder()
+            else { throw TrainerError.noMetalDevice }
+            encoderA.label = "trainer.preprocess"
+            gpu.clearPerIteration(encoderA, splatCount: splatCount)
+            gpu.preprocess(encoderA, camera: &camera, splatCount: splatCount)
+            gpu.exclusiveScan(
+                encoderA,
+                input: resources.tilesTouched,
+                output: resources.offsets,
+                count: splatCount
+            )
+            encoderA.endEncoding()
+            bufferA.commit()
+            try Self.finish(bufferA, "the tile scan")
+        }
 
         // The one unavoidable readback: how many (Gaussian, tile) pairs this
         // frame produced. The exclusive scan means the total is the last
@@ -1667,42 +1691,56 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         instanceCount = Swift.max(instanceCount, 0)
 
         // --- Command buffer B: everything else ---------------------------------------
-        guard let bufferB = queue.makeCommandBuffer(),
-              let encoderB = bufferB.makeComputeCommandEncoder()
-        else { throw TrainerError.noMetalDevice }
-        encoderB.label = "trainer.step"
+        //
+        // Pooled for the same reason as buffer A above, and this is the
+        // expensive half: the encoder it drains carries the whole forward and
+        // backward pass and both Adam steps, so it references nearly every
+        // buffer in `TrainerResources`. `reg` and `adam` are declared inside
+        // the pool because nothing outside it reads them; `camera`, `loss`,
+        // `instanceCount` and `sampleCount` are locals of this function
+        // captured by a non-escaping closure.
+        //
+        // The pool closes after `Self.finish`, so every readback below is
+        // reading finished results out of `resources` rather than anything the
+        // pool owned.
+        try autoreleasepool { () throws -> Void in
+            guard let bufferB = queue.makeCommandBuffer(),
+                  let encoderB = bufferB.makeComputeCommandEncoder()
+            else { throw TrainerError.noMetalDevice }
+            encoderB.label = "trainer.step"
 
-        gpu.duplicateKeys(encoderB, camera: &camera, splatCount: splatCount)
-        gpu.radixSort(encoderB, count: instanceCount)
-        gpu.tileRanges(encoderB, instanceCount: instanceCount)
-        gpu.rasterizeForward(encoderB, camera: &camera)
+            gpu.duplicateKeys(encoderB, camera: &camera, splatCount: splatCount)
+            gpu.radixSort(encoderB, count: instanceCount)
+            gpu.tileRanges(encoderB, instanceCount: instanceCount)
+            gpu.rasterizeForward(encoderB, camera: &camera)
 
-        gpu.lossPhotometric(encoderB, loss: &loss)
-        gpu.ssim(encoderB, loss: &loss)
-        gpu.lossFinalize(encoderB, loss: &loss)
-        gpu.lossDepth(encoderB, loss: &loss, sampleCount: sampleCount)
+            gpu.lossPhotometric(encoderB, loss: &loss)
+            gpu.ssim(encoderB, loss: &loss)
+            gpu.lossFinalize(encoderB, loss: &loss)
+            gpu.lossDepth(encoderB, loss: &loss, sampleCount: sampleCount)
 
-        gpu.rasterizeBackward(encoderB, camera: &camera, loss: &loss)
-        gpu.preprocessBackward(encoderB, camera: &camera, splatCount: splatCount)
+            gpu.rasterizeBackward(encoderB, camera: &camera, loss: &loss)
+            gpu.preprocessBackward(encoderB, camera: &camera, splatCount: splatCount)
 
-        var reg = regularizerUniforms(
-            splatCount: splatCount, iteration: iteration, totalIterations: totalIterations
-        )
-        gpu.regularizer(encoderB, reg: &reg)
+            var reg = regularizerUniforms(
+                splatCount: splatCount, iteration: iteration, totalIterations: totalIterations
+            )
+            gpu.regularizer(encoderB, reg: &reg)
 
-        var adam = adamUniforms(
-            splatCount: splatCount,
-            shCoefficientCount: shCoefficientCount,
-            iteration: iteration,
-            totalIterations: totalIterations,
-            sceneExtent: sceneExtent
-        )
-        gpu.adamSplat(encoderB, adam: &adam)
-        gpu.adamSH(encoderB, adam: &adam)
+            var adam = adamUniforms(
+                splatCount: splatCount,
+                shCoefficientCount: shCoefficientCount,
+                iteration: iteration,
+                totalIterations: totalIterations,
+                sceneExtent: sceneExtent
+            )
+            gpu.adamSplat(encoderB, adam: &adam)
+            gpu.adamSH(encoderB, adam: &adam)
 
-        encoderB.endEncoding()
-        bufferB.commit()
-        try Self.finish(bufferB, "the tile sort")
+            encoderB.endEncoding()
+            bufferB.commit()
+            try Self.finish(bufferB, "the tile sort")
+        }
 
         // --- Readbacks ------------------------------------------------------------------
         let lossValue = resources.lossAccum.readElement(Float.self, at: 0) ?? 0

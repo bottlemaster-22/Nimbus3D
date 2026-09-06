@@ -309,204 +309,229 @@ public final class TwoScaleTrustField: TrustField {
                 throw NimbusError.cancelled
             }
 
-            guard
-                let frame = framesByIndex[slot],
-                let pose = poses[frame.index],
-                let depth = depthCache.depth(for: frame, at: ref)
-            else {
-                try noiseWriter.appendFloats(
-                    [Float](repeating: Self.hopelessSigma, count: perFrame)
-                )
-                continue
-            }
-
-            let confidence = depthCache.confidence(for: frame, at: ref)
-
-            // --- 1. The prior, for every sample. --------------------------
-            // A few flops, so it is computed for the whole grid; only the
-            // cross-frame verification below is strided.
-            var sigma = [Float](repeating: Self.hopelessSigma, count: perFrame)
-            for v in 0..<height {
-                for u in 0..<width {
-                    let i = v * width + u
-                    let z = depth[i]
-                    guard z > 0, SmartMath.isUsableDepth(z) else { continue }
-                    let cosIncidence = Self.incidenceCosine(
-                        depth: depth, u: u, v: v, width: width, height: height, k: nativeK
+            // One pool per frame slot, for the reason spelled out in
+            // SmartImageLoader.load: a Swift concurrency job drains its
+            // autorelease pool when the job ENDS, not between iterations, and
+            // this is the longest-running loop in the pre-pass. It walks EVERY
+            // slot from 0 to the highest frame index, not just the keyframes,
+            // so on the 900-frame scan this file's own comments describe it is
+            // 900 passes, and each pass opens this frame's depth and
+            // confidence sidecars, hands a 196,608-byte chunk to the noise
+            // writer, and can reach into the image cache for the plane sweep.
+            // None of that is meant to outlive the slot it was read for, so
+            // draining per slot keeps one frame resident instead of the scan.
+            //
+            // The skip path RETURNS rather than using `continue`, which cannot
+            // cross a closure boundary. It means exactly what the `continue`
+            // meant: the maximally distrusted frame HAS been written and this
+            // iteration is over. That ordering is load bearing. trust_noise.bin
+            // is frame-major with no header, so a return placed above the
+            // append would leave the file one frame short and shear every later
+            // lookup into another frame's samples.
+            //
+            // The cancellation check stays outside the pool because its throw
+            // has to leave the loop rather than the closure, and the writer has
+            // to be closed before it does.
+            try autoreleasepool { () throws -> Void in
+                guard
+                    let frame = framesByIndex[slot],
+                    let pose = poses[frame.index],
+                    let depth = depthCache.depth(for: frame, at: ref)
+                else {
+                    try noiseWriter.appendFloats(
+                        [Float](repeating: Self.hopelessSigma, count: perFrame)
                     )
-                    sigma[i] = noiseModel.sigma(rangeMeters: z, incidenceCosine: cosIncidence)
+                    return
                 }
-            }
 
-            // --- 2. Cross-frame verification, strided. --------------------
-            let sampleStride = Swift.max(1, cost.trustSampleStride)
-            var partnerFrames: [CaptureFrame] = []
-            for id in partners[frame.index] ?? [] {
-                if let partner = framesByIndex[Int(id)] { partnerFrames.append(partner) }
-            }
+                let confidence = depthCache.confidence(for: frame, at: ref)
 
-            var measuredRatios: [Float] = []
-            var affineSensor: [Float] = []
-            var affineTarget: [Float] = []
-
-            if !partnerFrames.isEmpty {
-                var v = 0
-                while v < height {
-                    var u = 0
-                    while u < width {
-                        defer { u += sampleStride }
-                        let i = v * width + u
-                        let z = depth[i]
-                        guard z > 0, SmartMath.isUsableDepth(z),
-                              sigma[i] < Self.hopelessSigma
-                        else { continue }
-
-                        let pixel = SIMD2<Float>(Float(u) + 0.5, Float(v) + 0.5)
-                        let cameraPoint = SmartCamera.unproject(pixel, depthZ: z, nativeK)
-                        let world = SmartCamera.cameraToWorld(pose, cameraPoint)
-
-                        var residuals: [Float] = []
-                        residuals.reserveCapacity(partnerFrames.count)
-                        for partner in partnerFrames {
-                            guard
-                                let partnerPose = poses[partner.index],
-                                let partnerDepth = depthCache.depth(for: partner, at: ref)
-                            else { continue }
-                            let pc = SmartCamera.worldToCamera(partnerPose, world)
-                            guard let pp = SmartCamera.project(pc, nativeK) else { continue }
-                            // Trapping conversion: guard before, not after.
-                            // `project` only rules out points behind the
-                            // camera, so a partner pose with a huge or
-                            // non-finite translation still lands here.
-                            guard
-                                let partnerPixel = SmartMath.pixelIndex(
-                                    pp, width: width, height: height
-                                )
-                            else { continue }
-                            let pz = partnerDepth[partnerPixel.y * width + partnerPixel.x]
-                            guard pz > 0, SmartMath.isUsableDepth(pz) else { continue }
-                            // Positive residual: this frame's sample sits
-                            // BEYOND where the partner sees the surface.
-                            residuals.append(pc.z - pz)
-                        }
-                        guard residuals.count >= 2 else { continue }
-
-                        let medianResidual = SmartMath.median(residuals)
-                        // Robust spread, not a standard deviation: one partner
-                        // looking through a doorway must not get to decide
-                        // this sample's noise. 1.4826 makes the median
-                        // absolute deviation comparable to a sigma.
-                        let spread = SmartMath.median(residuals.map { abs($0 - medianResidual) })
-                            * 1.4826
-
-                        var measured = sqrt(
-                            sigma[i] * sigma[i]
-                                + spread * spread
-                                + medianResidual * medianResidual
-                        )
-
-                        // Optional photometric second opinion, budgeted.
-                        if planeSweepBudget > 0,
-                           let sweep = planeSweep(
-                               frame: frame,
-                               pose: pose,
-                               partners: partnerFrames,
-                               poses: poses,
-                               u: u,
-                               v: v,
-                               depth: z,
-                               nativeK: nativeK,
-                               imageCache: imageCache,
-                               ref: ref
-                           )
-                        {
-                            planeSweepBudget -= 1
-                            // A sharp, high-NCC peak that agrees with the
-                            // sensor is real evidence the sample is good; a
-                            // flat peak is a textureless patch and its
-                            // location means nothing.
-                            let agreement = SmartMath.smoothdrop(
-                                0.02, settings.planeSweepRangeMeters, abs(sweep.offsetMeters)
-                            )
-                            let quality = SmartMath.clamp(sweep.peakNCC, 0, 1) * sweep.sharpness
-                            let trustBoost = 0.5 + 0.5 * agreement * quality
-                            measured /= Swift.max(trustBoost, 0.25)
-                            accumulator.add(
-                                world: world,
-                                residual: sweep.offsetMeters,
-                                timeSeconds: frame.timestampSeconds
-                            )
-                        }
-
-                        sigma[i] = measured
-                        let headOnPrior = Swift.max(
-                            noiseModel.sigma(rangeMeters: z, incidenceCosine: 1), 1e-4
-                        )
-                        measuredRatios.append(measured / headOnPrior)
-
-                        accumulator.add(
-                            world: world,
-                            residual: medianResidual,
-                            timeSeconds: frame.timestampSeconds
-                        )
-
-                        let level = Int(i < confidence.count ? confidence[i] : 1)
-                        if level >= 0, level < 3 {
-                            residualsByLevel[level].append(abs(medianResidual))
-                        }
-
-                        affineSensor.append(z)
-                        affineTarget.append(z - medianResidual)
-                    }
-                    v += sampleStride
-                }
-            }
-
-            // --- 3. Frame-level inflation for unverified samples. ----------
-            // NOT spatial averaging: one scalar per frame, applied uniformly,
-            // which cannot move an outlier into its neighbours. It says "on
-            // this frame the sensor turned out to be 1.6x worse than the
-            // physics prior expected", which is a frame property (motion blur,
-            // a warm sensor, a dark room), not a place property.
-            let inflation = measuredRatios.isEmpty
-                ? 1
-                : Swift.max(1, SmartMath.percentile(measuredRatios, 0.5))
-            if inflation > 1 {
+                // --- 1. The prior, for every sample. --------------------------
+                // A few flops, so it is computed for the whole grid; only the
+                // cross-frame verification below is strided.
+                var sigma = [Float](repeating: Self.hopelessSigma, count: perFrame)
                 for v in 0..<height {
                     for u in 0..<width {
                         let i = v * width + u
-                        guard sigma[i] < Self.hopelessSigma else { continue }
-                        let verified = (v % sampleStride == 0) && (u % sampleStride == 0)
-                        if !verified { sigma[i] *= inflation }
+                        let z = depth[i]
+                        guard z > 0, SmartMath.isUsableDepth(z) else { continue }
+                        let cosIncidence = Self.incidenceCosine(
+                            depth: depth, u: u, v: v, width: width, height: height, k: nativeK
+                        )
+                        sigma[i] = noiseModel.sigma(rangeMeters: z, incidenceCosine: cosIncidence)
                     }
                 }
-            }
 
-            // --- 4. Per-frame sensor affine. -------------------------------
-            let affine = Self.fitAffine(
-                sensor: affineSensor,
-                target: affineTarget,
-                maxScaleDeviation: settings.maxDepthScaleDeviation,
-                maxShiftMeters: settings.maxDepthShiftMeters
-            )
-            if !affine.isIdentity {
-                affines.append((frame.index, affine))
-                let scaleClamped =
-                    abs(affine.scale - 1) >= settings.maxDepthScaleDeviation * 0.999
-                let shiftClamped =
-                    abs(affine.shiftMeters) >= settings.maxDepthShiftMeters * 0.999
-                if scaleClamped || shiftClamped {
-                    SmartLog.trust.notice(
-                        """
-                        Frame \(frame.index) depth affine hit its clamp \
-                        (scale \(affine.scale), shift \(affine.shiftMeters) m). \
-                        A correction this large usually means the POSE is wrong, not the depth.
-                        """
-                    )
+                // --- 2. Cross-frame verification, strided. --------------------
+                let sampleStride = Swift.max(1, cost.trustSampleStride)
+                var partnerFrames: [CaptureFrame] = []
+                for id in partners[frame.index] ?? [] {
+                    if let partner = framesByIndex[Int(id)] { partnerFrames.append(partner) }
                 }
-            }
 
-            try noiseWriter.appendFloats(sigma)
+                var measuredRatios: [Float] = []
+                var affineSensor: [Float] = []
+                var affineTarget: [Float] = []
+
+                if !partnerFrames.isEmpty {
+                    var v = 0
+                    while v < height {
+                        var u = 0
+                        while u < width {
+                            defer { u += sampleStride }
+                            let i = v * width + u
+                            let z = depth[i]
+                            guard z > 0, SmartMath.isUsableDepth(z),
+                                  sigma[i] < Self.hopelessSigma
+                            else { continue }
+
+                            let pixel = SIMD2<Float>(Float(u) + 0.5, Float(v) + 0.5)
+                            let cameraPoint = SmartCamera.unproject(pixel, depthZ: z, nativeK)
+                            let world = SmartCamera.cameraToWorld(pose, cameraPoint)
+
+                            var residuals: [Float] = []
+                            residuals.reserveCapacity(partnerFrames.count)
+                            for partner in partnerFrames {
+                                guard
+                                    let partnerPose = poses[partner.index],
+                                    let partnerDepth = depthCache.depth(for: partner, at: ref)
+                                else { continue }
+                                let pc = SmartCamera.worldToCamera(partnerPose, world)
+                                guard let pp = SmartCamera.project(pc, nativeK) else { continue }
+                                // Trapping conversion: guard before, not after.
+                                // `project` only rules out points behind the
+                                // camera, so a partner pose with a huge or
+                                // non-finite translation still lands here.
+                                guard
+                                    let partnerPixel = SmartMath.pixelIndex(
+                                        pp, width: width, height: height
+                                    )
+                                else { continue }
+                                let pz = partnerDepth[partnerPixel.y * width + partnerPixel.x]
+                                guard pz > 0, SmartMath.isUsableDepth(pz) else { continue }
+                                // Positive residual: this frame's sample sits
+                                // BEYOND where the partner sees the surface.
+                                residuals.append(pc.z - pz)
+                            }
+                            guard residuals.count >= 2 else { continue }
+
+                            let medianResidual = SmartMath.median(residuals)
+                            // Robust spread, not a standard deviation: one partner
+                            // looking through a doorway must not get to decide
+                            // this sample's noise. 1.4826 makes the median
+                            // absolute deviation comparable to a sigma.
+                            let spread = SmartMath.median(residuals.map { abs($0 - medianResidual) })
+                                * 1.4826
+
+                            var measured = sqrt(
+                                sigma[i] * sigma[i]
+                                    + spread * spread
+                                    + medianResidual * medianResidual
+                            )
+
+                            // Optional photometric second opinion, budgeted.
+                            if planeSweepBudget > 0,
+                               let sweep = planeSweep(
+                                   frame: frame,
+                                   pose: pose,
+                                   partners: partnerFrames,
+                                   poses: poses,
+                                   u: u,
+                                   v: v,
+                                   depth: z,
+                                   nativeK: nativeK,
+                                   imageCache: imageCache,
+                                   ref: ref
+                               )
+                            {
+                                planeSweepBudget -= 1
+                                // A sharp, high-NCC peak that agrees with the
+                                // sensor is real evidence the sample is good; a
+                                // flat peak is a textureless patch and its
+                                // location means nothing.
+                                let agreement = SmartMath.smoothdrop(
+                                    0.02, settings.planeSweepRangeMeters, abs(sweep.offsetMeters)
+                                )
+                                let quality = SmartMath.clamp(sweep.peakNCC, 0, 1) * sweep.sharpness
+                                let trustBoost = 0.5 + 0.5 * agreement * quality
+                                measured /= Swift.max(trustBoost, 0.25)
+                                accumulator.add(
+                                    world: world,
+                                    residual: sweep.offsetMeters,
+                                    timeSeconds: frame.timestampSeconds
+                                )
+                            }
+
+                            sigma[i] = measured
+                            let headOnPrior = Swift.max(
+                                noiseModel.sigma(rangeMeters: z, incidenceCosine: 1), 1e-4
+                            )
+                            measuredRatios.append(measured / headOnPrior)
+
+                            accumulator.add(
+                                world: world,
+                                residual: medianResidual,
+                                timeSeconds: frame.timestampSeconds
+                            )
+
+                            let level = Int(i < confidence.count ? confidence[i] : 1)
+                            if level >= 0, level < 3 {
+                                residualsByLevel[level].append(abs(medianResidual))
+                            }
+
+                            affineSensor.append(z)
+                            affineTarget.append(z - medianResidual)
+                        }
+                        v += sampleStride
+                    }
+                }
+
+                // --- 3. Frame-level inflation for unverified samples. ----------
+                // NOT spatial averaging: one scalar per frame, applied uniformly,
+                // which cannot move an outlier into its neighbours. It says "on
+                // this frame the sensor turned out to be 1.6x worse than the
+                // physics prior expected", which is a frame property (motion blur,
+                // a warm sensor, a dark room), not a place property.
+                let inflation = measuredRatios.isEmpty
+                    ? 1
+                    : Swift.max(1, SmartMath.percentile(measuredRatios, 0.5))
+                if inflation > 1 {
+                    for v in 0..<height {
+                        for u in 0..<width {
+                            let i = v * width + u
+                            guard sigma[i] < Self.hopelessSigma else { continue }
+                            let verified = (v % sampleStride == 0) && (u % sampleStride == 0)
+                            if !verified { sigma[i] *= inflation }
+                        }
+                    }
+                }
+
+                // --- 4. Per-frame sensor affine. -------------------------------
+                let affine = Self.fitAffine(
+                    sensor: affineSensor,
+                    target: affineTarget,
+                    maxScaleDeviation: settings.maxDepthScaleDeviation,
+                    maxShiftMeters: settings.maxDepthShiftMeters
+                )
+                if !affine.isIdentity {
+                    affines.append((frame.index, affine))
+                    let scaleClamped =
+                        abs(affine.scale - 1) >= settings.maxDepthScaleDeviation * 0.999
+                    let shiftClamped =
+                        abs(affine.shiftMeters) >= settings.maxDepthShiftMeters * 0.999
+                    if scaleClamped || shiftClamped {
+                        SmartLog.trust.notice(
+                            """
+                            Frame \(frame.index) depth affine hit its clamp \
+                            (scale \(affine.scale), shift \(affine.shiftMeters) m). \
+                            A correction this large usually means the POSE is wrong, not the depth.
+                            """
+                        )
+                    }
+                }
+
+                try noiseWriter.appendFloats(sigma)
+            }
         }
 
         try noiseWriter.close()
@@ -847,23 +872,35 @@ public final class TwoScaleTrustField: TrustField {
         levelProbabilities: [Float]
     ) throws {
         let writer = try SmartChunkedWriter(url: url)
+        // The SECOND full walk over every slot in this build, and it costs the
+        // same as the first: the depth cache holds only a handful of frames, so
+        // nearly every slot here is a miss that opens this frame's depth and
+        // confidence sidecars again, and every slot writes another
+        // `samplesPerFrame` floats. Same pool, same reason as the loop in
+        // `build`, and the same reshaping: `continue` cannot cross a closure
+        // boundary, so the skip path writes its all-zero frame and RETURNS.
+        // confidence_recal.bin is frame-major like the noise field, so that
+        // write has to happen before the return or every later frame's
+        // confidence reads back off by one frame.
         for slot in 0..<slotCount {
-            guard
-                let frame = framesByIndex[slot],
-                let depth = depthCache.depth(for: frame, at: bundleRef)
-            else {
-                try writer.appendFloats([Float](repeating: 0, count: samplesPerFrame))
-                continue
+            try autoreleasepool { () throws -> Void in
+                guard
+                    let frame = framesByIndex[slot],
+                    let depth = depthCache.depth(for: frame, at: bundleRef)
+                else {
+                    try writer.appendFloats([Float](repeating: 0, count: samplesPerFrame))
+                    return
+                }
+                let confidence = depthCache.confidence(for: frame, at: bundleRef)
+                var out = [Float](repeating: 0, count: samplesPerFrame)
+                for i in 0..<samplesPerFrame {
+                    guard i < depth.count, depth[i] > 0, SmartMath.isUsableDepth(depth[i])
+                    else { continue }
+                    let level = Swift.max(0, Swift.min(2, Int(i < confidence.count ? confidence[i] : 1)))
+                    out[i] = levelProbabilities[level]
+                }
+                try writer.appendFloats(out)
             }
-            let confidence = depthCache.confidence(for: frame, at: bundleRef)
-            var out = [Float](repeating: 0, count: samplesPerFrame)
-            for i in 0..<samplesPerFrame {
-                guard i < depth.count, depth[i] > 0, SmartMath.isUsableDepth(depth[i])
-                else { continue }
-                let level = Swift.max(0, Swift.min(2, Int(i < confidence.count ? confidence[i] : 1)))
-                out[i] = levelProbabilities[level]
-            }
-            try writer.appendFloats(out)
         }
         try writer.close()
     }

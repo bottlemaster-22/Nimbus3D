@@ -32,8 +32,14 @@
 //       more than a scan that does not finish.
 //
 //  NOTHING HERE ASSUMES A SCENE FITS. Every decision is taken against a
-//  measurement: `os_proc_available_memory()` through `DeviceMemoryFacts`, and
-//  `TrainerResources.residentBytes`, which is what Metal actually reserved.
+//  measurement, and the measurement is of the PROCESS: two readings of
+//  `os_proc_available_memory()` through `DeviceMemoryFacts`, one taken before
+//  this run had allocated anything and one taken now, with the fall between
+//  them as what the run has consumed. `TrainerResources.residentBytes` is
+//  still read, but only to size the headroom a cut needs in order to be able
+//  to perform itself. It is the trainer's own Metal buffers and nothing else:
+//  on the desk scan that was about 37 MB inside a 3.26 GB app footprint, so
+//  no threshold is compared against it any more.
 //
 
 import Foundation
@@ -83,12 +89,21 @@ struct TrainerBudgetChange {
         case thermal(ThermalLevel)
         case memory(residentBytes: UInt64, availableBytes: UInt64)
         case memoryCeiling(residentBytes: UInt64, ceilingBytes: UInt64)
+        /// The process is close enough to its allocation limit that the next
+        /// large allocation is the one that gets it killed. Kept separate from
+        /// `.memory` because it is a different question with a different
+        /// answer: `.memory` asks whether this run is holding too big a share
+        /// of what is left, and this asks whether there is still enough left
+        /// to survive one buffer rebuild. The second is the one that decides
+        /// whether the scan finishes at all, so the census has to be able to
+        /// tell them apart afterwards.
+        case memoryHeadroom(residentBytes: UInt64, remainingBytes: UInt64)
 
         var plainCause: String {
             switch self {
             case .thermal:
                 return "your phone is getting warm"
-            case .memory, .memoryCeiling:
+            case .memory, .memoryCeiling, .memoryHeadroom:
                 return "this phone has less spare memory than this scan wanted"
             }
         }
@@ -108,6 +123,7 @@ struct TrainerBudgetChange {
             case .thermal: return TrainerCensusBudgetReduction.heatReason
             case .memory: return "memory share"
             case .memoryCeiling: return "memory ceiling"
+            case .memoryHeadroom: return "memory headroom"
             }
         }
 
@@ -116,22 +132,32 @@ struct TrainerBudgetChange {
             return nil
         }
 
+        /// For the three memory reasons, what the RUN had consumed
+        /// process-wide at the moment the reduction was taken, not the
+        /// trainer's own Metal buffers. The name is kept as it is because it
+        /// is a field name in `model/train_census.json`; the meaning changed
+        /// when `TrainerBudgetGovernor.MemoryReading` started measuring the
+        /// process instead of the buffer list. Zero for the sizing pass in
+        /// `initialSplatCap`, which runs before there is a footprint to
+        /// report.
         var residentBytes: UInt64? {
             switch self {
             case .thermal: return nil
             case .memory(let resident, _): return resident
             case .memoryCeiling(let resident, _): return resident
+            case .memoryHeadroom(let resident, _): return resident
             }
         }
 
         /// What `residentBytes` was measured against: the process's remaining
         /// allocation for `.memory`, the budget's own ceiling for
-        /// `.memoryCeiling`.
+        /// `.memoryCeiling`, the headroom floor for `.memoryHeadroom`.
         var comparedAgainstBytes: UInt64? {
             switch self {
             case .thermal: return nil
             case .memory(_, let available): return available
             case .memoryCeiling(_, let ceiling): return ceiling
+            case .memoryHeadroom(_, let remaining): return remaining
             }
         }
     }
@@ -233,15 +259,86 @@ final class TrainerBudgetGovernor {
         currentSplatCount = splatCount
     }
 
-    /// How much of what the process may still allocate the trainer is willing
-    /// to be holding. Above this, the budget comes down. Deliberately well
-    /// under 1: the rasteriser's tile lists, the decoded frames and the OS's
-    /// own headroom all live in the same pot.
+    /// How much of what the process may still allocate this run is willing to
+    /// take: `degradeForMemory` steps the budget down above this share, and
+    /// `initialSplatCap` sizes the very first allocation from the same
+    /// fraction. Deliberately well under 1: the rasteriser's tile lists, the
+    /// decoded frames and the OS's own headroom all live in the same pot.
     private let memoryUseFraction: Float = 0.6
+
+    /// The least unallocated headroom this governor will let the process run
+    /// on before it starts shedding work, whatever else is true.
+    ///
+    /// iOS gives no warning before jetsam. `os_proc_available_memory()` counts
+    /// down towards zero and the process is killed at zero, so the only safe
+    /// way to use it is to keep a margin large enough to survive the biggest
+    /// thing the run can still do in one go, and that includes the cut itself.
+    /// A cut is not free: `applyBudgetChange` trims the live population first,
+    /// and `MetalSplatTrainer.trimSplats` reads the splats, statistics and SH
+    /// coefficients out into Swift arrays and builds a second set of them
+    /// before writing them back, after which
+    /// `TrainerResources.resizeSplatCapacity` rebuilds every per-Gaussian
+    /// buffer. A quarter of a gigabyte is the floor under that, and
+    /// `headroomFloor(trainerBufferBytes:)` raises it whenever the trainer is
+    /// holding more than that.
+    ///
+    /// It is a judgement, not a measurement. The first device run writes the
+    /// footprint and what it was compared against into
+    /// `model/train_census.json` for every reduction, which is what a real
+    /// number would have to be tuned from.
+    static let minimumHeadroomBytes: UInt64 = 256 * 1024 * 1024
+
+    /// The headroom this run has to keep free, sized from what the trainer is
+    /// holding right now: a cut that cannot afford to perform itself kills the
+    /// app instead of saving it.
+    ///
+    /// Deliberately conservative rather than exact, and it is worth writing
+    /// down which way. `resizeSplatCapacity` used to construct a complete
+    /// second `TrainerResources` and push eight buffers out through host
+    /// arrays on top of that, so the peak really was about two of everything;
+    /// it now replaces one buffer at a time and releases the ten transient
+    /// buffers before it allocates anything, so its peak over the steady state
+    /// is close to a single replacement buffer. What did NOT change is
+    /// `trimSplats`, whose host arrays still scale with the live population.
+    /// The trainer's own allocation is the only figure available at this
+    /// moment that scales with either of those, so the floor is tied to it.
+    /// Erring high costs a slightly earlier cut; erring low costs the scan.
+    static func headroomFloor(trainerBufferBytes: UInt64) -> UInt64 {
+        Swift.max(minimumHeadroomBytes, trainerBufferBytes)
+    }
+
+    /// What `os_proc_available_memory()` said before this run had allocated
+    /// anything of its own.
+    ///
+    /// This is what lets the governor see memory it could not see before. The
+    /// governor is constructed at the top of `MetalSplatTrainer.run(...)`,
+    /// before `prepare()` makes a Metal device, before the SMART sidecars are
+    /// read, before a keyframe is decoded and before the first slice cloud
+    /// exists. So the gap between this number and a fresh reading is what the
+    /// TRAINING has added to the process since: the SMART sidecars, decoded
+    /// image caches, seed arrays, the retained slice clouds (`parts` and
+    /// `mergedSoFar` in MetalSplatTrainer), the merge temporaries, and the
+    /// trainer's own buffers. Only the last of those appears in
+    /// `TrainerResources.residentBytes`.
+    ///
+    /// What it does NOT include, and the comment says so because getting this
+    /// wrong would make the number look like an absolute footprint: anything
+    /// allocated before `run(...)` was entered. The pre-pass has already
+    /// finished by then (its result arrives as a parameter), so whatever it
+    /// kept is inside the baseline rather than counted against this run.
+    ///
+    /// A difference of two readings from the same source, rather than an
+    /// absolute footprint, on purpose. `os_proc_available_memory()` is the one
+    /// number iOS gives that already accounts for this process's real limit,
+    /// which may or may not include the increased-memory-limit entitlement,
+    /// and an absolute footprint would have to be compared against a limit
+    /// nothing here knows.
+    let baselineAvailableBytes: UInt64
 
     init(budget: TrainingBudget) {
         self.ceiling = budget
         self.current = budget
+        self.baselineAvailableBytes = DeviceMemoryFacts.probe().availableBytes
     }
 
     // MARK: - The one-way valve
@@ -422,36 +519,140 @@ final class TrainerBudgetGovernor {
 
     // MARK: - Memory
 
-    /// What the trainer is actually holding, and what the process may still
-    /// allocate. Both measured; neither derived from `physicalMemory`.
+    /// What this run has consumed, what the process may still allocate, and
+    /// what the trainer's own allocation accounts for. All measured; none of
+    /// it derived from `physicalMemory`.
+    ///
+    /// WHY THIS READING HAS THIS SHAPE. It used to carry one number called
+    /// `residentBytes`, and that number was `TrainerResources.residentBytes`:
+    /// the sum of `allocatedSize` over the trainer's own Metal buffers, and
+    /// nothing else. It was compared against
+    /// `TrainingBudget.memoryCeilingBytes`, which `TrainingBudget.recommended`
+    /// sets to `availableMemoryBytes / 2` and `ProcessingBudgetPlanner.plan`
+    /// re-clamps to the same thing, so something over a gigabyte on a phone
+    /// with a normal allowance.
+    ///
+    /// TWO DEVICE RUNS SAY HOW FAR OUT THAT WAS. A room scan reported "766 MB
+    /// of memory in use" while iOS put the app at 2.04 GB, an undercount of
+    /// about 2.7x. A 94-shot scan of a single desk reached 3.02 GB of Metal
+    /// inside a 3.26 GB app footprint with 279 MB of headroom left, and
+    /// finished with 55,041 Gaussians, whose buffers come to about 37 MB. So
+    /// the number the governor was watching was roughly a hundredth of the
+    /// number that was about to get the process killed, and the ceiling it was
+    /// being compared against was half of what the phone had to give.
+    /// `overCeiling` was unreachable by arithmetic, and `overShare(0.6)`
+    /// needed the trainer's buffers ALONE to pass 0.6 of what remained, which
+    /// meant the process was already past saving before the governor noticed
+    /// anything. A governor that can only fire once the app is about to be
+    /// killed is not a governor.
+    ///
+    /// It was watching the one pool that did not need watching. The trainer's
+    /// buffers are allocated once per capacity change and are exactly the size
+    /// the splat cap says they are. Everything that actually varies was
+    /// invisible to it: the SMART sidecars, decoded image caches, seed arrays,
+    /// the retained slice clouds and the merge temporaries.
     struct MemoryReading {
-        var residentBytes: UInt64
+        /// `TrainerResources.residentBytes`: every Metal buffer the trainer
+        /// holds for the slice being trained. Still measured, because it sets
+        /// the headroom floor below, but no longer what any threshold is
+        /// compared against.
+        ///
+        /// It is NOT `splatCap * bytesPerSplat + pixelCount * bytesPerPixel`,
+        /// and nothing may treat it as though it were. `keysA`, `keysB`,
+        /// `valuesA` and `valuesB` are sized from `instanceCapacity`, which
+        /// `MetalSplatTrainer` sets to `capacity * 8`, so they add 128 bytes
+        /// per unit of splat capacity on top of the per-Gaussian cost, the
+        /// radix histograms add more, and `growInstanceCapacity` can raise all
+        /// of it mid-run. Bytes in and Gaussians out do not round-trip, which
+        /// is why the reduction below is sized in Gaussians rather than by
+        /// dividing this number by anything.
+        var trainerBufferBytes: UInt64
+        /// How many Gaussians the trainer has actually allocated room for
+        /// right now.
+        ///
+        /// This is NOT `current.splatCap`. `TrainerSlices` gives each slice
+        /// `splatCap * (that slice's share of the frames)`, and
+        /// `MetalSplatTrainer` allocates the slice's share, so on a
+        /// four-slice scan this is about a quarter of the cap. The reduction
+        /// below needs it because a cap cut ABOVE what is allocated makes
+        /// `applyBudgetChange` call `resizeSplatCapacity` upwards, which
+        /// allocates in answer to memory pressure. Zero when there are no
+        /// resources yet, which the caller treats as "no clamp available".
+        var allocatedSplatCapacity: Int
+        /// `os_proc_available_memory()`, read fresh for this reading.
         var availableBytes: UInt64
+        /// True when `availableBytes` is `physicalMemory / 4` because
+        /// `os_proc_available_memory()` returned 0, which it does outside a
+        /// normal app process. That fallback is a CONSTANT, so baseline and
+        /// current are then equal, `footprintBytes` is 0, and the two
+        /// footprint gates below are off. That is the right way round: a
+        /// governor with no measurement degrades nothing rather than degrading
+        /// on a guess. The headroom gate still reads it, which is harmless: a
+        /// quarter of physical RAM is comfortably above the floor on every
+        /// device that meets this app's memory requirement.
         var availableIsEstimated: Bool
         var ceilingBytes: UInt64
+        /// `TrainerBudgetGovernor.baselineAvailableBytes`, carried in so the
+        /// reading is a self-contained fact rather than something that has to
+        /// be read against governor state to mean anything.
+        var baselineAvailableBytes: UInt64
+        /// The headroom this run has to keep free. See
+        /// `TrainerBudgetGovernor.headroomFloor(trainerBufferBytes:)`.
+        var headroomFloorBytes: UInt64
 
-        var overCeiling: Bool { residentBytes > ceilingBytes && ceilingBytes > 0 }
-        /// True when what is held is a large share of what is left to give.
+        /// How many bytes this training run has added to the process since the
+        /// governor was built, taken from the fall in what the process may
+        /// still allocate. THIS is the footprint figure, and it counts the
+        /// pools the old `residentBytes` could not see.
+        ///
+        /// Saturating rather than wrapping: a later reading can come back
+        /// higher than the baseline when something else in the process lets
+        /// go, and UInt64 subtraction below zero is a trap, not a negative
+        /// number.
+        var footprintBytes: UInt64 {
+            baselineAvailableBytes > availableBytes
+                ? baselineAvailableBytes - availableBytes
+                : 0
+        }
+
+        var overCeiling: Bool { footprintBytes > ceilingBytes && ceilingBytes > 0 }
+
+        /// True when what this run has consumed is a large share of what is
+        /// left to give.
         func overShare(_ fraction: Float) -> Bool {
             guard availableBytes > 0 else { return false }
-            return Float(residentBytes) > Float(availableBytes) * fraction
+            return Float(footprintBytes) > Float(availableBytes) * fraction
         }
+
+        /// True when there is no longer enough unallocated headroom to survive
+        /// the largest allocation the run can still make. This is the gate the
+        /// old reading could not even ask, and it is deliberately indifferent
+        /// to who consumed the memory: another part of the app holding half a
+        /// gigabyte kills the process just as dead as the trainer holding it.
+        var belowHeadroomFloor: Bool { availableBytes < headroomFloorBytes }
     }
 
     func measureMemory(resources: TrainerResources?) -> MemoryReading {
         let facts = DeviceMemoryFacts.probe()
+        let trainerBuffers = resources?.residentBytes ?? 0
         return MemoryReading(
-            residentBytes: resources?.residentBytes ?? 0,
+            trainerBufferBytes: trainerBuffers,
+            allocatedSplatCapacity: resources?.splatCapacity ?? 0,
             availableBytes: facts.availableBytes,
             availableIsEstimated: facts.availableIsEstimated,
-            ceilingBytes: current.memoryCeilingBytes
+            ceilingBytes: current.memoryCeilingBytes,
+            baselineAvailableBytes: baselineAvailableBytes,
+            headroomFloorBytes: Self.headroomFloor(trainerBufferBytes: trainerBuffers)
         )
     }
 
     /// Decides whether memory pressure requires a step down, and takes one
     /// step if it does. The step is sized from the measurement rather than
-    /// being a fixed fraction: if the run is holding 1.4x what it should, the
-    /// cap comes down by roughly that factor, so one step is usually enough.
+    /// being a fixed fraction: the overage that tripped the gate is converted
+    /// into a number of Gaussians and that many come off the cap, so a small
+    /// crossing costs a small cut and a large one costs a large cut. That
+    /// matters because the loop polls this every 50 iterations, which usually
+    /// catches a crossing while the overage is still small.
     func degradeForMemory(
         reading: MemoryReading,
         currentSplatCount: Int,
@@ -459,30 +660,138 @@ final class TrainerBudgetGovernor {
         pixelCount: Int
     ) -> TrainerBudgetChange? {
 
+        // THREE GATES, and the third is the one that matters most.
+        //
+        // `overCeiling` and `overShare` now read `reading.footprintBytes`,
+        // which is what this run has actually consumed process-wide, so they
+        // are reachable at last; `MemoryReading` above carries the arithmetic
+        // that made them unreachable before. `belowHeadroomFloor` is new and
+        // is independent of both: it fires on how little is LEFT, regardless
+        // of who is holding it, because what kills the app is the next
+        // allocation failing, not this run's share of the blame for it.
+        let belowFloor = reading.belowHeadroomFloor
         let overCeiling = reading.overCeiling
         let overShare = reading.overShare(memoryUseFraction)
-        guard overCeiling || overShare else { return nil }
+        guard belowFloor || overCeiling || overShare else { return nil }
 
-        let reason: TrainerBudgetChange.Reason = overCeiling
-            ? .memoryCeiling(residentBytes: reading.residentBytes, ceilingBytes: reading.ceilingBytes)
-            : .memory(residentBytes: reading.residentBytes, availableBytes: reading.availableBytes)
+        let footprint = reading.footprintBytes
 
-        // What is a safe number of bytes to be holding?
-        let safeBytes: UInt64
-        if overCeiling {
-            safeBytes = reading.ceilingBytes
+        // Which fact gets recorded, most urgent first. The census keeps these
+        // apart ("memory headroom" against "memory ceiling") because they mean
+        // different things for the next run: a headroom cut says this phone
+        // cannot hold this scan at all, a ceiling cut says the budget asked
+        // for more than it planned for.
+        let reason: TrainerBudgetChange.Reason
+        if belowFloor {
+            reason = .memoryHeadroom(
+                residentBytes: footprint, remainingBytes: reading.availableBytes
+            )
+        } else if overCeiling {
+            reason = .memoryCeiling(
+                residentBytes: footprint, ceilingBytes: reading.ceilingBytes
+            )
         } else {
-            safeBytes = UInt64(Float(reading.availableBytes) * memoryUseFraction * 0.9)
+            reason = .memory(
+                residentBytes: footprint, availableBytes: reading.availableBytes
+            )
         }
 
-        // Per-Gaussian and per-pixel costs, measured from the layouts.
-        let perSplat = UInt64(TrainerResources.bytesPerSplat(shCoefficientCount: shCoefficientCount))
-        let perPixel = UInt64(TrainerResources.bytesPerPixel())
-        let pixelBytes = perPixel * UInt64(Swift.max(pixelCount, 1))
+        // HOW MANY BYTES HAVE TO GO BACK, taken as the worst of whichever
+        // gates tripped. An overage is the only quantity here that converts
+        // into a number of Gaussians without having to assume that the
+        // trainer's buffers are made of nothing but Gaussians and pixels,
+        // which `MemoryReading.trainerBufferBytes` explains they are not.
+        var deficitBytes: UInt64 = 0
+        if overCeiling, footprint > reading.ceilingBytes {
+            deficitBytes = Swift.max(deficitBytes, footprint - reading.ceilingBytes)
+        }
+        if overShare {
+            let share = UInt64(Float(reading.availableBytes) * memoryUseFraction * 0.9)
+            if footprint > share {
+                deficitBytes = Swift.max(deficitBytes, footprint - share)
+            }
+        }
+        if belowFloor {
+            deficitBytes = Swift.max(
+                deficitBytes, reading.headroomFloorBytes - reading.availableBytes
+            )
+        }
 
-        // 1. Splat cap, sized to fit what is left after the pixel buffers.
-        if safeBytes > pixelBytes, perSplat > 0 {
-            let affordable = Int((safeBytes - pixelBytes) / perSplat)
+        // The per-Gaussian cost, measured from the layouts. The per-PIXEL
+        // cost is deliberately not consulted here any more: rung 1 now cuts a
+        // number of Gaussians rather than sizing a byte budget that the pixel
+        // buffers would have to be subtracted from, and the pixel buffers are
+        // rung 2's business. `pixelCount` is still a parameter because
+        // `initialSplatCap` and the caller both speak in those terms.
+        let perSplat = UInt64(TrainerResources.bytesPerSplat(shCoefficientCount: shCoefficientCount))
+
+        // 1. Splat cap, cut by the overage expressed in Gaussians.
+        //
+        // TWO THINGS THIS MUST NOT DO, both of which fall out of trying to
+        // express the cut as a byte target for the trainer's buffers and then
+        // dividing that target by `bytesPerSplat`.
+        //
+        // It must not read the target off `reading.trainerBufferBytes`. That
+        // is what THIS SLICE allocated, and `TrainerSlices` hands each slice
+        // `splatCap * (its share of the frames)`, so on a four-slice scan it
+        // is about a quarter of the cap. `lower(...)` is global and one-way,
+        // so a cap read off a quarter-sized allocation would pin the cap at a
+        // quarter for every remaining slice on the first trip of any gate,
+        // whatever the overage actually was.
+        //
+        // And it must not divide that number by `bytesPerSplat`, because the
+        // two do not describe the same buffers: the tile sort keys alone are
+        // `instanceCapacity * 16` bytes, `instanceCapacity` is `capacity * 8`,
+        // and none of that is in `bytesPerSplat`. Dividing anyway reports the
+        // trainer as affording about a quarter MORE Gaussians than it has room
+        // for, so a small overage produced no cap cut at all and the ladder
+        // fell through to the resolution rung, which is the wrong order: this
+        // file's header puts the splat cap first precisely because it costs
+        // the least visible quality per byte saved.
+        //
+        // So: shed a number of Gaussians sized from the overage, taken off
+        // whichever is smaller of the cap and what is actually allocated. The
+        // second half of that is not tidiness. `applyBudgetChange` answers a
+        // cap change with `resizeSplatCapacity(to:keeping:)`, which rebuilds
+        // the per-Gaussian buffers at whatever capacity it is handed in EITHER
+        // direction, so a "cut" to a number above the slice's allocation would
+        // allocate more memory in answer to memory pressure.
+        if perSplat > 0 {
+            let cutFrom = reading.allocatedSplatCapacity > 0
+                ? Swift.min(current.splatCap, reading.allocatedSplatCapacity)
+                : current.splatCap
+            let splatsWanted = Int(deficitBytes / perSplat)
+
+            // HOW DEEP ONE STEP MAY GO, and why the overage alone cannot say.
+            //
+            // Cutting Gaussians hands back the trainer's buffers and nothing
+            // else, and those are a small part of the footprint the gates now
+            // measure: 37 MB of the desk scan's 3.26 GB. A deficit taken
+            // across the whole process therefore converts into more Gaussians
+            // than the trainer has, routinely. Left unbounded that is the same
+            // one-way ratchet this file already carries two scars from,
+            // arrived at from the other side: at the moment `overShare`
+            // crosses, the deficit is the 10% band between the gate and its
+            // target, which is 6% of what the process may still allocate, and
+            // on a 2.5 GB allowance that is 100 MB, or about 180,000
+            // Gaussians at SH degree 1. `affordable` would be 0, `capTarget`
+            // would land on its 20,000 floor on the first memory check of the
+            // run, and `lower(...)` is global and one-way, so every remaining
+            // slice would be built at 20,000 too.
+            //
+            // So a share or ceiling crossing sheds at most a quarter of what
+            // is allocated in one step. It is the same fraction the thermal
+            // rung uses, and the loop re-measures every 50 iterations, so a
+            // pressure that is really there takes another quarter shortly
+            // afterwards while a single crossing costs a step rather than the
+            // scan. `belowFloor` is deliberately exempt: that gate says the
+            // next allocation may be the one that gets the process killed, and
+            // there is no time to converge on an answer.
+            let stepLimit = Swift.max(cutFrom / 4, 1)
+            let splatsToShed = belowFloor
+                ? splatsWanted
+                : Swift.min(splatsWanted, stepLimit)
+            let affordable = cutFrom > splatsToShed ? cutFrom - splatsToShed : 0
 
             // MEMORY IS NOT HEAT, and this rung is deliberately not the same
             // as `degradeForHeat`'s.
@@ -522,8 +831,10 @@ final class TrainerBudgetGovernor {
                 return change
             }
         } else {
-            // The pixel buffers alone do not fit. That is a resolution problem
-            // and no amount of splat cutting fixes it.
+            // `bytesPerSplat` came back zero, which can only mean the GPU
+            // layouts changed underneath this. Nothing can be sized from a
+            // zero divisor, so go straight to the rung that needs no
+            // per-Gaussian cost at all.
             if let next = Self.nextResolutionDown(from: current.renderLongEdgePixels),
                let change = lower(
                    .resolution(from: current.renderLongEdgePixels, to: next), reason: reason
