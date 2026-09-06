@@ -169,7 +169,11 @@ enum PreviewCameraPathBuilder {
 
         // 3. Cap the count by uniform decimation in time.
         if keptSamples.count > options.maxKeyframes {
-            let stride = Int(ceil(Double(keptSamples.count) / Double(options.maxKeyframes)))
+            // `Double(0)` in the denominator would make this infinite, and
+            // `Int(infinity)` is a trapping conversion.
+            let stride = Int(
+                ceil(Double(keptSamples.count) / Double(Swift.max(options.maxKeyframes, 1)))
+            )
             var decimated: [Sample] = []
             var index = 0
             while index < keptSamples.count {

@@ -2261,3 +2261,137 @@ fails the check.
 It deliberately does not block the IPA. The archive job has no `needs:` on it,
 because the phone build is how the owner gets a working app and a lint finding
 must never be the reason he cannot install one.
+
+### `framesSkippedNoTracking` is counted but never reported (Capture to Core)
+
+`ARCaptureService.framesSkippedNoTracking` (declared line 272, reset line 400,
+incremented line 615) is written and never read. The comment above the tracking
+gate says the frame is counted "so the census can say how many were dropped and
+why", and nothing surfaces it. Its sibling `framesSkippedBadPose` at least
+reaches the log.
+
+It does not fail `deadwire.py`, because the name does appear more than once, so
+this is a quiet gap rather than a red build. Surfacing it means a field on the
+session summary or the census, which is a Core contract and not mine to change.
+Whoever adds the first reader should take it. Until then the number exists and
+nobody can see it, which is the entire reason the tracking drop was invisible in
+the first place.
+
+### `tools/trapconv_allowlist.txt` does not exist yet (Core/Export/Booster/Pipeline to whoever owns `tools/`)
+
+`tools/trapconv.py` exits non-zero on every candidate that is not listed in
+`tools/trapconv_allowlist.txt`, and that file has not been created. It is under
+`tools/`, five agents are triaging in parallel, and every one of us would be
+appending to the same file at the same time, so I am not creating it from here.
+
+These four are the candidates in my file set. I read every one of them in the
+source and all four are provably safe, so they want an allowlist line each
+rather than a code change. Line numbers are as of my edits:
+
+    Booster/BoosterUploadManager.swift:213   # attempts is a private parameter
+      defaulting to 3 with exactly one call site that does not override it, so
+      the exponent is 0 or 1 and the delay is 0.5s or 1s. Not reachable at 35.
+    Core/Contracts.swift:1648                # UInt64 integer division. The
+      divisor is Swift.max(1, ...) so it cannot be zero, and the dividend is
+      availableMemoryBytes / 2, which cannot exceed Int.max.
+    Export/SPZCodec.swift:361                # packSmallestThree rejects a
+      non-finite or near-zero-length quaternion and substitutes identity before
+      normalising, so each non-largest component is in [0, sqrt(1/2)] and the
+      result is at most 512.
+    Pipeline/TrainingPreview.swift:239       # settleSeconds is a private let
+      constant of 0.7.
+
+If the allowlist ends up keyed by line number, note that it will drift on the
+next edit to any of these files. Keying it by the matched text, or requiring a
+`// trapconv: ok` marker comment on the line, would survive.
+
+---
+
+## ACTIONED by the gate, 2026-09-06 (the trapping-conversion pass)
+
+Both requests standing at the end of this file when the gate ran are answered
+below. One made, one made in part and refused in part, with the reasoning for
+the refusal written out rather than left implied.
+
+### MADE: `tools/trapconv_allowlist.txt` now exists, with 65 entries
+
+Created, one `File.swift:line  # reason` per line, every one read in the source
+first. `python tools/trapconv.py` exits 0 on the current tree and `python
+tools/deadwire.py` exits 0 beside it.
+
+The four lines the Core/Export/Booster/Pipeline agent asked for are all in it,
+with that agent's own reasoning kept and the line numbers refreshed to the
+current tree:
+
+    Booster/BoosterUploadManager.swift:213
+    Core/Contracts.swift:1648
+    Export/SPZCodec.swift:361
+    Pipeline/TrainingPreview.swift:239
+
+The gate is now wired: `.github/workflows/ios.yml`, the job that used to be
+called `Dead-wire check (code nothing calls)` is now
+`Static gates (dead code, trapping conversions)` and carries a second Python
+step, `Look for trapping float-to-integer conversions`. Same job, same runner,
+same ten-minute timeout, and the same deliberate absence of a `needs:` from the
+archive job: a lint finding must never be the reason the owner cannot install
+an app. Renaming the job's display name is the one thing to know about, because
+a branch-protection rule naming the old string would need updating.
+
+### FIXED while doing it: the detector was reporting the wrong line numbers
+
+Worth recording, because it made every line-keyed entry a lie before a single
+one was written. `strip_comments_and_strings` blanked a backslash and the
+character after it as two spaces. Inside a Swift multi-line string a backslash
+at the END OF A LINE is a continuation, so that deleted a newline. Fifteen of
+those in `MetalSplatTrainer.swift` put every candidate below them fifteen lines
+too high, and ten files in the tree were affected. `trapconv.py` now preserves
+the newline, and the reported line numbers match the source exactly. There is a
+newline-parity assertion easy enough to re-run: strip a file and compare
+`count('\n')` before and after.
+
+### REFUSED: re-keying the allowlist by matched text or a `// trapconv: ok` marker
+
+The request suggested that keying by line number will drift on the next edit,
+and it will. Refused anyway, for two reasons.
+
+It fails LOUD, not silent. An edit above an allowlisted line shifts that line,
+the shifted key is not in the file, and CI goes red naming the new line. That
+is a fifteen-second fix (re-run `--list`, paste the number) and it forces
+somebody to look at the entry again, which is not the worst property for a
+triage record to have. The failure mode people should fear is the opposite one,
+and line keying does not have it: for a NEW trap to inherit an old entry's
+number silently, every other allowlisted line in that same file would have to
+shift onto a new trapping conversion at the same time, and any one of them
+missing turns the build red first.
+
+A `// trapconv: ok` marker in the source moves the triage next to the code,
+which sounds better and is worse here: the whole reason this bug reached five
+files is that the three lines were COPIED, and a marker comment gets copied
+with them. A reason that lives in `tools/` has to be written again for the
+copy. That is the property worth keeping.
+
+### MADE IN PART: `framesSkippedNoTracking` is now readable
+
+`ARCaptureService.finish()` now logs both drop counters at the end of every
+scan, next to the frame count that was kept:
+
+    Scan finished with N frames kept. Dropped while tracking was unusable: X.
+    Dropped for a camera transform that did not invert: Y.
+
+That is the half that needed no contract change, and it puts the number where
+its sibling `framesSkippedBadPose` already goes.
+
+### REFUSED for now: a `framesSkippedNoTracking` field on the capture bundle
+
+The other half of that request wants the count on a Core contract so the census
+can print it. Refused in this pass, deliberately.
+
+`CaptureBundle` and its census types are `Codable` and are read back by four
+modules. Adding a stored property to a Codable struct whose memberwise
+initialiser is written by hand is one of the two shapes that has actually
+broken this CI before (a stored property with no default that an initialiser
+never assigns), and CI is the only compiler this project has. Doing it in the
+same pass as a crash fix means that if the build goes red, nobody can tell
+which change did it. It is a five-line change and it should be its own change,
+made by whoever adds the first reader on the census side, with a default value
+on the property so old bundles still decode.

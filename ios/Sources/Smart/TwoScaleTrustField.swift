@@ -355,10 +355,16 @@ public final class TwoScaleTrustField: TrustField {
                             else { continue }
                             let pc = SmartCamera.worldToCamera(partnerPose, world)
                             guard let pp = SmartCamera.project(pc, nativeK) else { continue }
-                            let pu = Int(pp.x.rounded(.down))
-                            let pv = Int(pp.y.rounded(.down))
-                            guard pu >= 0, pu < width, pv >= 0, pv < height else { continue }
-                            let pz = partnerDepth[pv * width + pu]
+                            // Trapping conversion: guard before, not after.
+                            // `project` only rules out points behind the
+                            // camera, so a partner pose with a huge or
+                            // non-finite translation still lands here.
+                            guard
+                                let partnerPixel = SmartMath.pixelIndex(
+                                    pp, width: width, height: height
+                                )
+                            else { continue }
+                            let pz = partnerDepth[partnerPixel.y * width + partnerPixel.x]
                             guard pz > 0, SmartMath.isUsableDepth(pz) else { continue }
                             // Positive residual: this frame's sample sits
                             // BEYOND where the partner sees the surface.
@@ -1168,9 +1174,14 @@ struct SmartBiasAccumulator {
         cell.mean += delta / Float(cell.count)
         cell.sumSquaredDelta += delta * (residual - cell.mean)
         if cell.times.count < 4096, timeSeconds.isFinite {
-            cell.times.insert(Int32(truncatingIfNeeded: Int(
-                (timeSeconds / timeBucketSeconds).rounded(.down)
-            )))
+            // `Int(someDouble)` traps on anything outside Int's range, and
+            // this timestamp is read out of capture_bundle.json. Finite is
+            // not enough on its own. At two seconds per bucket the window
+            // below is longer than any scan will ever be.
+            let bucket = (timeSeconds / timeBucketSeconds).rounded(.down)
+            if bucket > -1e15, bucket < 1e15 {
+                cell.times.insert(Int32(truncatingIfNeeded: Int(bucket)))
+            }
         }
         cells[key] = cell
     }

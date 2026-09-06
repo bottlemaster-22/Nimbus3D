@@ -407,9 +407,9 @@ enum PrePassColmapWriter {
             let p = positions[i]
             let c = i < colors.count ? colors[i] : SIMD3<Float>(repeating: 0.5)
             let e = i < expectedErrorMeters.count ? expectedErrorMeters[i] : 0
-            let r = UInt8(Swift.min(Swift.max(c.x * 255, 0), 255))
-            let g = UInt8(Swift.min(Swift.max(c.y * 255, 0), 255))
-            let b = UInt8(Swift.min(Swift.max(c.z * 255, 0), 255))
+            let r = colorByte(c.x)
+            let g = colorByte(c.y)
+            let b = colorByte(c.z)
             out += String(
                 format: "%d %.6f %.6f %.6f %d %d %d %.6f\n",
                 i + 1,
@@ -419,6 +419,29 @@ enum PrePassColmapWriter {
             )
         }
         return out
+    }
+
+    /// One colour channel, 0...1, as the byte `points3D.txt` wants.
+    ///
+    /// The clamp this replaced was written the wrong way round and was a
+    /// trapping conversion waiting for a bad colour:
+    ///
+    ///     UInt8(Swift.min(Swift.max(c.x * 255, 0), 255))
+    ///
+    /// Swift's `min` and `max` are `y < x ? y : x` and `y >= x ? y : x`, so
+    /// when the comparison is false they hand back their FIRST argument. NaN
+    /// makes every comparison false, so with the value written first the NaN
+    /// is what survives the clamp and lands on `UInt8(...)`, which kills the
+    /// process. With the literal written first the clamp absorbs it instead.
+    ///
+    /// A channel we cannot trust becomes mid grey, the same neutral the splat
+    /// seeder already substitutes when there is no image to sample. Dropping
+    /// the point is not an option here: `points3D.txt` has to stay in the same
+    /// order, and with the same count, as the PLY it was written beside.
+    @inline(__always)
+    private static func colorByte(_ value: Float) -> UInt8 {
+        guard value.isFinite else { return 128 }
+        return UInt8(Swift.max(0, Swift.min(255, value * 255)))
     }
 
     private static func fileExtension(of path: String) -> String {

@@ -161,11 +161,19 @@ enum PrePassSurveyor {
         // --- Camera height spread and motion outliers: poses only, every frame.
         var heights: [Float] = []
         heights.reserveCapacity(frames.count)
-        for frame in frames { heights.append(poseFor(frame).center.y) }
-        result.cameraHeightSpreadMeters = Swift.max(
-            PrePassStats.percentile(heights, 0.95) - PrePassStats.percentile(heights, 0.05),
-            0
-        )
+        // Non-finite heights are dropped rather than measured. A scan recorded
+        // before the capture pose fix can carry a NaN pose on disk, and a NaN
+        // height would poison the sort inside `percentile` and then survive
+        // `Swift.max(spread, 0)`, because `max` hands back its FIRST argument
+        // when the comparison is false and NaN makes every comparison false.
+        // The spread would then be NaN all the way into the QC card.
+        for frame in frames {
+            let y = poseFor(frame).center.y
+            if y.isFinite { heights.append(y) }
+        }
+        let heightSpread =
+            PrePassStats.percentile(heights, 0.95) - PrePassStats.percentile(heights, 0.05)
+        result.cameraHeightSpreadMeters = heightSpread.isFinite ? Swift.max(0, heightSpread) : 0
         result.outlierFrameCount = outlierFrames(frames: frames, poseFor: poseFor).count
 
         // --- Keyframes: evenly spread over the walk, not the first N.
@@ -364,7 +372,15 @@ enum PrePassSurveyor {
         }
 
         result.surfaceCellCount = hash.count
-        result.coverageFraction = Float(result.coveredCellCount) / Float(hash.count)
+        // The ceiling line directly below already guards its divisor, and this
+        // one did not. `Float(0) / Float(0)` is NaN, not zero, and a scan whose
+        // depth frames all failed to record a single cell reaches here with
+        // `hadNoDepth` false and `hash.count` zero. The NaN then landed on
+        // `Int((coverageFraction * 100).rounded())` while the QC card was being
+        // written, and `Int(someFloat)` traps on NaN.
+        result.coverageFraction = hash.count > 0
+            ? Float(result.coveredCellCount) / Float(hash.count)
+            : 0
         result.ceilingCoverageFraction = result.ceilingCellCount > 0
             ? Float(result.ceilingCoveredCellCount) / Float(result.ceilingCellCount)
             : 0
@@ -834,7 +850,15 @@ enum PrePassQCBuilder {
     /// One decimal place, and no trailing ".0" on a whole number, because
     /// "3 cm" reads better than "3.0 cm" to somebody who is not a programmer.
     private static func format(_ value: Float) -> String {
-        guard value.isFinite else { return "0" }
+        // `isFinite` alone is NOT enough in front of `Int(_: Float)`. That
+        // conversion traps on any value outside `Int`'s range as well as on
+        // NaN, and 1e30 is perfectly finite. Every number that reaches here is
+        // a drift in centimetres, a distance in metres or a timing in
+        // thousandths of a second, all derived from poses read back off disk,
+        // so a corrupt bundle really can hand over a finite absurdity. Same
+        // mistake, same shape, as the guard that was too narrow in
+        // `ProcessingFormat.meters`.
+        guard value.isFinite, value.magnitude < 1_000_000 else { return "0" }
         if value == value.rounded() { return String(Int(value.rounded())) }
         return String(format: "%.1f", Double(value))
     }

@@ -208,7 +208,21 @@ final class CaptureCoverageField: @unchecked Sendable {
         let azimuthCount = CaptureCoverageField.azimuthBins
         let elevationCount = CaptureCoverageField.elevationBins
         let azimuth = atan2(direction.z, direction.x)  // -pi ... pi
-        let azimuthTurn: Float = (azimuth + .pi) / (2 * .pi)
+        let rawTurn: Float = (azimuth + .pi) / (2 * .pi)
+        // Clamped as a FLOAT before the conversion, the way the elevation line
+        // below already is. `Int(someFloat)` traps on NaN, and clamping the
+        // Int afterwards is one step too late: `atan2` returns NaN the moment
+        // either component is NaN. `Swift.min(1, x)` is the safe ordering,
+        // because NaN compares false against everything and so the FIRST
+        // argument survives, giving 1 rather than NaN.
+        //
+        // The one caller guards `direction` already (a NaN world position
+        // makes `simd_length` NaN, which fails `distance > 0.05` in `observe`),
+        // so this was not the live crash. It is written this way so the
+        // function is safe on its own terms instead of by agreement with a
+        // guard one stack frame away, which is precisely the arrangement that
+        // let the original crash through.
+        let azimuthTurn: Float = Swift.max(0, Swift.min(1, rawTurn))
         let azimuthBin = Int((azimuthTurn * Float(azimuthCount)).rounded(.down))
             .clampedToRange(0...(azimuthCount - 1))
         let elevation = Swift.max(-1, Swift.min(1, direction.y))  // -1 ... 1

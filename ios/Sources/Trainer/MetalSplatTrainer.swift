@@ -998,11 +998,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         )
                     )
                 }
-                try await Task.sleep(
-                    nanoseconds: UInt64(
-                        Swift.max(governor.current.thermalPolicy.sampleIntervalSeconds, 1) * 1_000_000_000
-                    )
-                )
+                // Literal FIRST in both clamps. `Swift.max(x, 1)` is
+                // `1 >= x ? 1 : x`, so a NaN interval came straight back out
+                // and `UInt64(NaN * 1e9)` is a trapping conversion. Same
+                // result for every sane interval; the upper bound keeps a
+                // corrupt policy from parking a paused run for a century.
+                let pollSeconds = Swift.min(60, Swift.max(1, governor.current.thermalPolicy.sampleIntervalSeconds))
+                try await Task.sleep(nanoseconds: UInt64(pollSeconds * 1_000_000_000))
                 continue
 
             case .degrade:

@@ -131,7 +131,13 @@ actor BoosterUploadManager {
         startingAt: Int64,
         onFileProgress: @escaping @Sendable (Int64) -> Void
     ) async throws -> Int64 {
-        guard startingAt < file.byteCount else {
+        // `startingAt`, and every offset the server acknowledges below, come
+        // from the Booster over the network, and `UInt64(_: Int64)` traps on a
+        // negative number just as hard as a float conversion traps on NaN. One
+        // bad number in one JSON response would kill the app mid-upload, so
+        // force what the server says into this file's real range first.
+        let resumeOffset = Self.clampedOffset(startingAt, fileByteCount: file.byteCount)
+        guard resumeOffset < file.byteCount else {
             onFileProgress(file.byteCount)
             return file.byteCount
         }
@@ -144,7 +150,7 @@ actor BoosterUploadManager {
         }
         defer { try? handle.close() }
 
-        var offset = startingAt
+        var offset = resumeOffset
         try handle.seek(toOffset: UInt64(offset))
         let path = BoosterAPI.jobFile(jobID, relativePath: file.relativePath)
 
@@ -175,8 +181,12 @@ actor BoosterUploadManager {
             if response.receivedByteOffset != offset + Int64(chunk.count) {
                 // The server disagrees with our bookkeeping (a dropped
                 // response, a partial write on its side, etc). Trust it and
-                // re-seek rather than silently drifting out of sync.
-                offset = response.receivedByteOffset
+                // re-seek rather than silently drifting out of sync, but only
+                // as far as an offset that actually exists in this file.
+                offset = Self.clampedOffset(
+                    response.receivedByteOffset,
+                    fileByteCount: file.byteCount
+                )
                 try handle.seek(toOffset: UInt64(offset))
             } else {
                 offset += Int64(chunk.count)
@@ -206,6 +216,14 @@ actor BoosterUploadManager {
             }
         }
         throw lastError ?? BoosterError.connectionFailed("Upload failed after several tries.")
+    }
+
+    /// A byte offset the Booster reported, forced into this file's real
+    /// range. Negative traps the `UInt64(_:)` conversion the seeks need; past
+    /// the end would seek off the back of the file. Both are the server's
+    /// word against a length we measured ourselves, so ours wins.
+    private static func clampedOffset(_ offset: Int64, fileByteCount: Int64) -> Int64 {
+        Swift.min(Swift.max(0, offset), Swift.max(0, fileByteCount))
     }
 
     private static func sha256Hex(_ data: Data) -> String {

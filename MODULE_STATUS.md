@@ -2,8 +2,8 @@
 
 One row per module, one current status, one line of specifics. No history: that
 belongs in `SESSION_JOURNAL.md`. Rewritten from the source on 2026-09-06 by the
-integration gate that reviewed the five parallel dead-wire agents, reading every
-claim below against the file it describes.
+integration gate that reviewed the five parallel trapping-conversion agents,
+reading every claim below against the file it describes.
 
 ---
 
@@ -15,16 +15,15 @@ exactly ONE real scan. Almost nothing below is proven working.**
 Those four facts, precisely:
 
 * **It compiled once.** Commit `4bebe6e` is the last thing CI saw. Everything
-  described below as "this round" is on top of it.
-* **Nothing since then has been compiled by anything.** The working tree carries
-  30 modified files against `4bebe6e`: 26 Swift, 1 Metal, 2 Markdown and the CI
-  workflow, 1,604 lines added and 58 removed. There is no Swift toolchain on the
-  machine this gate ran on. Every claim here about this round is a claim about
-  SOURCE, not about a build.
+  described below as "earlier today" or "this round" is on top of it.
+* **Nothing since then has been compiled by anything.** There is no Swift
+  toolchain on the machine these gates ran on. Every claim here about the last
+  two rounds is a claim about SOURCE, not about a build.
 * **It is installed.** On the owner's iPhone 17 Pro Max, signed through Bottle
   with a free Apple ID.
 * **It has run once.** One three minute scan of a room, on 2026-09-05. It came
-  out looking like nothing. Everything done since has been tracing why, and
+  out looking like nothing, and since then the app has been **crashing during
+  use, with memory free**. Everything done since has been tracing why, and
   **not one of those fixes has been tested on hardware.** No scan has been made
   since.
 
@@ -46,119 +45,163 @@ work" is that nobody knows, because it has been executed either once or never.
 reachable by nothing, and that is the single most common fault this project has
 found in itself.
 
-**Two rounds happened on 2026-09-06.** Rows say which. "Committed earlier today"
-means it is in `4bebe6e` and CI has seen it. "This round" means it is in the
-working tree and nothing has compiled it.
+**Three rounds happened on 2026-09-06.** Rows say which. "Committed earlier
+today" means it is in `4bebe6e` and CI has seen it. "The dead-wire round" means
+the morning pass that hunted code nothing calls. "This round" means the
+trapping-conversion pass, which is the one chasing the crash, and nothing has
+compiled it.
+
+---
+
+## The crash this round was chasing, in four lines
+
+1. `ARCaptureService` read ARKit's tracking state and used it for one bracket
+   check. There was no tracking gate.
+2. `Pose.fromARKitCameraTransform` inverted the camera transform with no
+   determinant check, and `simd_inverse` of a singular matrix is silently NaN
+   in every element.
+3. Every world position from that frame was NaN.
+4. Each one landed on `Int64((position.x / size).rounded(.down))`, and
+   **`Int64(someFloat)` is a TRAPPING conversion**: it kills the process, in
+   release as well as debug, on NaN, on infinity, and on any finite value
+   outside the destination range. Memory is never involved, which is exactly
+   why "it crashes with RAM free" was the clue that cracked it.
+
+Those three lines were found in five separate files. Steps 1 and 2 were fixed
+earlier today. This round finished the rest and put a gate in front of it.
 
 ---
 
 ## What this gate checked mechanically, and what it did not
 
-Checked, over all 122 Swift and Metal files in `ios/Sources`:
+Seventeen Swift files changed in this round: eleven by the five parallel agents
+and six more by this gate. No `.metal` file changed (the newest is timestamped
+before the round started), and `Contracts.swift` was appended to and reverted
+byte for byte during a negative control, so it carries a modified timestamp and
+no change.
 
-* Top-level type and typealias names, for collisions across the one Xcode
-  target. 0 duplicates.
-* Braces, parentheses and brackets balanced in every file changed this round,
-  with line comments, block comments and string literals stripped first. Also
-  `#if` against `#endif`, and triple-quote counts. 0 imbalances in 26 files.
+Checked, over all 119 Swift files in `ios/Sources`:
+
+* **Braces, parentheses and brackets**, with line comments, block comments and
+  string literals stripped first. 0 imbalances, and no depth going negative
+  anywhere.
+* **Top-level type, protocol and typealias names**, for collisions across the
+  one Xcode target: 415 names, **0 duplicates**.
 * Every cross-file symbol the new code names, resolved against its declaration:
-  `BrandConfig.loggingSubsystem` / `.versionString` / `.Folder.exports` /
-  `.Folder.sparseModel`, `NimbusServices.installedModules`,
-  `StoredDeviceReport.isStale`, `DeviceReportStore.load()`,
-  `OnboardingFormat.yesNo`, `OnboardingFactRow(symbol:label:value:note:)`,
-  `QCFinding(code:severity:message:fixHint:)`,
-  `CaptureBundleRef.url(forRelativePath:)`,
-  `ARCaptureService.setBracketingEnabled` / `.unlockExposureAndWhiteBalance`,
-  `ThermalLevel(ProcessInfo.ThermalState)` and its `Comparable`,
-  `TrainerBudgetGovernor.resolutionLadder`, `TrainerRenderSize.tileCount`,
-  `ExportedAsset.init(...)`, `ScanSummary.rootURL` / `.scanID`,
-  `ScanLibraryStore.nextUpScan`, `ScanSummary.primaryActionTitle`,
-  `ScanProcessingScreen(summary:)`. All resolve.
-* `DeviceCompatibilityProbe.findingsForDisplay()` changed its return type this
-  round. It is NOT a `DeviceCompatibilityService` protocol requirement
-  (`Contracts.swift:2060` requires only `evaluate()`), and its one caller was
-  updated. No conformance broke.
-* Actor isolation on everything new: `NimbusServices` and `NimbusBootstrap` are
-  `@MainActor`, so is `ScreenUnavailableView` now, and all three of its call
-  sites are `@ViewBuilder` members of MainActor views. `ARCaptureService` and
-  `CaptureScreenModel` are both `@MainActor`. Everything crossing a
-  `Task.detached` boundary is `Sendable`: `URL`, `ScanID` (a `String`),
-  `[ExportedAsset]` (`Codable, Hashable, Sendable`), `DeviceFindingsForDisplay`.
-* `SmartAuthorityMap.map(for:)` takes a non-recursive `NSLock`. The new
-  glass-counting block sits AFTER the `lock.unlock()` at line 778 and takes the
-  lock again for three statements. No re-entrant acquisition, no deadlock.
-* The 13 `static_assert(sizeof(...))` lines in `TrainerShaders.metal` against
-  the 13 stride checks in `TrainerGPULayouts.verify()`. They match one for one.
-  No GPU struct changed this round, so none of the asserts moved.
-* **The new SSIM window, in float32 arithmetic, because it now gates the trainer
-  starting at all.** `verify()` re-derives the eleven taps from `ssimSigma` and
-  fails the run if the shipped table is off by more than `1e-6` on any tap or
-  `1e-5` on the sum. Recomputed here: worst tap error `2.98e-8`, sum exactly
-  `1.0`. It passes with about 30x margin. The table it replaced summed to
-  `0.99752`.
-* The 16-bit tile ceiling the same function now enforces: the ladder tops out at
-  720 px, which is 45x45 = 2,025 tiles against a 65,535 limit. Passes.
-* 40 Metal entry points across the three `.metal` files (4 capture, 28 trainer,
-  8 viewer). Unchanged this round.
+  `PrePassVoxelFrame.cellIndex(_:)` (internal `static func` on an internal
+  struct, in the same single target, called six times from
+  `TrainerInitializer.swift`), `CaptureCoverageField.voxelIndex(_:_:)` (called
+  from `CapturePointCloudAccumulator` and twice from `CaptureRevisitDetector`
+  rather than copied), `SmartMath.pixelIndex(_:width:height:)` (new, called
+  from `SmartCore.rgbNearest` and `TwoScaleTrustField.swift:363`),
+  `PrePassColmapWriter.colorByte(_:)` (new, private, called three times inside
+  its own enum, whose closing brace is at `PrePassBinaryIO.swift:459` so the
+  helper really is inside it), `SmartCamera.nativePixelInImage(u:v:...)`
+  against its `SIMD2<Float>` return and `SmartImage.rgbNearest(_:)`,
+  `Pose.isFinite` (`Contracts.swift:251`), `ViewerMath.clamp` in both
+  overloads. All resolve, all in-target, none needing a cross-module change.
+* **No new top-level declaration and no new stored property** in any of the
+  seventeen files. The only two new declarations are the private/internal
+  static funcs above, and both are wired: `tools/deadwire.py` still reports
+  exactly 112 candidates, the same number as before this round.
+* **No `@available` and no `#available` added**, so nothing new can be an
+  unguarded iOS 18 API on an iOS 17 deployment target.
+* **Concurrency**: nothing new crosses an isolation boundary. The two new
+  functions are pure and take value types; the new log line in
+  `ARCaptureService.finish()` reads two private `Int` counters from inside a
+  method of the same type, the same way the sibling log line at line 624
+  already does.
 * By name, the exact things that have broken this project's CI before: bare
-  `abs` binding to C's integer `abs` (16 uses, every argument a `Float` or
-  `Double`, all pre-existing; the one new comparison uses `Swift.abs`
-  explicitly), Swift 6 only syntax under language mode 5.0 (none), iOS 18 API
-  without a guard (none), a stored property no initialiser assigns (none in the
-  four structs that gained fields; all four are optional or defaulted),
-  `Data.append` and `withUnsafeBytes` (untouched), a public init exposing an
-  internal type (`DeviceFindingsForDisplay` and
-  `SmartLossSettings.trustBuildCost` both take and return public types only).
+  `abs` binding to C's integer `abs` (19 uses in the changed files, every
+  argument a `Float` or a `Double` except one pre-existing `Int` at
+  `ARCaptureService.swift:1308`, which is Swift's own `abs`), Swift 6 only
+  syntax under language mode 5.0 (none), a stored property no initialiser
+  assigns (no stored property was added), `Data.append` and `withUnsafeBytes`
+  (untouched), a public init exposing an internal type (no new init).
+* The 13 `static_assert(sizeof(...))` lines in `TrainerShaders.metal` against
+  the 13 stride checks in `TrainerGPULayouts.verify()`. They match one for one,
+  and no GPU struct changed this round, so none of the asserts moved.
 * `.github/workflows/ios.yml` parsed as YAML. Three jobs, the two `if:`
-  expressions are well-formed, and `build` has no `needs:` on the new check.
+  expressions well-formed, and `build` still has no `needs:` on the checks.
 
 NOT checked exhaustively, and named so nobody reads more into this than is
 there: protocol requirements against every conformer, and non-defaulted stored
-properties against every initialiser, across all 122 files. Both were checked
+properties against every initialiser, across all 119 files. Both were checked
 for what changed this round, not repo-wide. Type-checker time on the longer
-string concatenations is a guess, not a measurement.
-
-There is no SwiftLint step in CI, so `swiftlint:disable` comments and line
-lengths cannot fail the build.
+expressions is a judgement, not a measurement.
 
 That is a static sweep, not a compiler. **CI is still the only compiler.**
 
 ---
 
-## The dead-wire gate, new this round
+## The two gates, and what they cost
 
-`tools/deadwire.py` reports every declaration whose name appears nowhere else in
-the module. It found 135 candidates; five agents triaged their own file sets and
-wired up the real ones, and this gate triaged Booster, which nobody had been
-given. 112 remain and every one of them is listed in
-`tools/deadwire_allowlist.txt` with a reason.
+### `tools/deadwire.py` (dead-wire, from the morning round)
 
-The script now reads that allowlist, excludes it, and **exits non-zero on
-anything else**, so the build goes red for exactly one reason: somebody wrote
-new code that nothing calls. A `deadwire` job in `.github/workflows/ios.yml`
-runs it on every push, on a cheap Ubuntu runner. It does not block the IPA.
+Reports every declaration whose name appears nowhere else in the module. 112
+candidates remain and every one is listed with a reason in
+`tools/deadwire_allowlist.txt`. Exits non-zero on anything else, so the build
+goes red for exactly one reason: somebody wrote new code that nothing calls.
 
-Verified both ways before it was committed: exit 0 on the current tree, and exit
-1 with the offending lines named when a decoy declaration was added.
+**Exit code on the current tree: 0.**
+
+### `tools/trapconv.py` (trapping conversions, new this round)
+
+Reports every float-to-integer conversion in the tree. It is deliberately
+over-eager: it flags anything converting a float-shaped expression, and it
+knows one thing that is easy for a person to miss. Swift's `min(x, y)` is
+`y < x ? y : x` and `max(x, y)` is `y >= x ? y : x`, so NaN compares false, the
+SECOND argument is absorbed and the FIRST propagates:
+
+    UInt8(max(0, min(255, x)))          -> 255 when x is NaN.  SAFE.
+    UInt8(min(max(x * 255, 0), 255))    -> NaN when x is NaN.  TRAPS.
+
+Those two lines look identical. `PrePassBinaryIO.swift:410` was the second
+form. `ViewerMath.clamp` was the second form. `PrePassMath.percentile` was the
+second form.
+
+76 candidates on the current tree, every one read in the source and listed with
+a written reason in `tools/trapconv_allowlist.txt`, so it goes red for exactly
+one reason: somebody added a NEW untriaged conversion.
+
+**Exit code on the current tree: 0.** Verified both ways: a decoy
+`Int((v / 2).rounded()` added to `Contracts.swift` produced exit 1 naming the
+file and line, and was then removed.
+
+**A bug in the detector was fixed while curating the list, and it mattered.**
+Its comment/string stripper blanked a backslash and the character after it, and
+inside a Swift multi-line string a backslash at the end of a line is a
+continuation, so that deleted a newline. Ten files were affected and
+`MetalSplatTrainer.swift` was reported fifteen lines out. Every line-keyed
+allowlist entry written from the old output would have pointed at innocent
+code. Newline parity now holds in all 119 files.
+
+Both gates run as two Python steps in one job, `Static gates (dead code,
+trapping conversions)`, on a cheap Ubuntu runner, on every push to every
+branch. **Neither blocks the IPA**: the archive job has no `needs:` on them,
+because the phone build is how the owner gets a working app and a lint finding
+must never be the reason he cannot install one. The job's display name changed
+this round, which matters only if a branch-protection rule names the old
+string.
 
 ---
 
 | Module | Status | Reached from | What is real, and what is not |
 |---|---|---|---|
-| **core** (`ios/Sources/Core/`) | COMPLETE | Every other module | The shared vocabulary: cross-module types and the twelve service protocols, `BrandConfig` reading the product name out of the Info.plist so no Swift file hardcodes it, the one ARKit to COLMAP pose conversion, `TrainingBudget.recommended`. Nothing here is a placeholder. Committed earlier today: `TrainerProgress` gained `gradientStepsCompleted` and `consecutiveZeroGrowthPasses`, both optional and appended last so no call site changed. Untouched this round. Two known contract gaps remain, both worked around at the call site and both filed in `INTEGRATION_REQUESTS.md`: `SplatTrainer` has `cancel()` and no way to ask whether a run has ended, so Pipeline downcasts to `MetalSplatTrainer` for `isTraining` and `waitUntilIdle()`; and `TrainerProgress` still has no field for "I lowered the budget", so Pipeline recognises one by matching the wording of a sentence. |
-| **app-shell** (`ios/Sources/App/`) | COMPLETE | `@main` | The first-run compatibility gate, the three tabs, and one integration block that registers Capture, PrePass, Trainer, Viewer, Export and Booster with no line commented out. `AppNavigation.shared.showSavedScan(scanID)` is called from `CaptureScreen.swift` and cleared in `ScanLibraryScreen.swift`, so finishing a capture lands on the new scan. THIS ROUND: the app can finally say what is in the build. `NimbusServices.installedModules` existed and nothing read it, so the registration list was only checkable by opening this file; `NimbusBootstrap.install` now logs it at launch and logs an `error` naming any of the seven expected modules that did NOT register, and `ScreenUnavailableView` prints what did load underneath the name of what did not. Read out over a phone call that is the difference between "it is broken" and one named missing module. |
-| **onboarding** (`ios/Sources/Onboarding/`) | COMPLETE | The app shell, on first launch | Probes ARKit, Metal, memory and the device model, decides full / limited / incompatible, and explains the verdict in sentences about this specific phone. THIS ROUND, two honesty fixes. `findingsForDisplay()` used to return a bare `DeviceCompatibilityFindings`, so a report read back off disk and one measured a moment ago produced the same struct and the same screen; it now returns `DeviceFindingsForDisplay` carrying `StoredDeviceReport.isStale`, and the "Checked" row says outright when the numbers came from an older build, an older iOS, or over a month ago. And the technical details table never stated whether the phone HAS the laser scanner, the one measurement the whole verdict turns on; it is now a row, with a note when running in the Simulator where the answer is a stub. Labelled uncertainty, unchanged: the iPhone 17 rows in the chip table are inferred from the naming pattern rather than confirmed against shipped hardware, and `AppleSiliconCatalog.swift` says so in a `TODO(nimbus)`. The owner's phone got past this gate, so the "not incompatible" branch has been exercised once. |
-| **capture** (`ios/Sources/Capture/`) | COMPLETE | The Scan tab | The ARKit session and everything it writes: native 256x192 depth and confidence sidecars from `sceneDepth` and never the smoothed variant, the crash-safe `frames.jsonl` log, the COLMAP text model, mesh chunks with per-face classification, anchors logged twice for a free drift measurement. Live: three-channel coverage painted on the room, a gyro-driven blur meter, spoken and haptic guidance, window mode, exposure bracketing, thermal and storage guards. **The one part of this app with real hardware evidence.** THIS ROUND, three fixes, and the first is a correction to the app's own definition of "done". (1) The sharpness channel returned `bestSharpness` RAW while the other two channels were normalised against their targets, and `CaptureTuning.coverageSharpnessTarget = 0.55` was referenced nowhere. Since `CaptureSharpnessMeter` normalises against the SESSION RUNNING MAXIMUM, the coverage bar was not asking "was this patch seen sharply enough" but "was it seen by a frame within 70 per cent of the sharpest frame in the whole scan", a moving reference and a bar 1.8x too high. The error made the percentage pessimistic, not optimistic: it never said "done" early, it stalled short and gave no way to clear the patches it held back, and it drove the spoken hint to the wrong channel. (2) `coverageDirectionBuckets = 32` appeared only in a doc comment while the bucket maths hardcoded 8 azimuth by 4 elevation; azimuth bins are now derived from the constant, with a hard 32-bit ceiling, so the mask and the tuning cannot disagree. Same 31 maximum as before, so behaviour is unchanged today. (3) "Hold the brightness" was a one-way door: lock the exposure at a window, walk into a dark hallway, and every remaining frame was exposed for the window with no control anywhere to give it back. There is now a release on the window card and a second one in the settings panel that stays on screen after the card has gone, plus a user switch for the darker window shots that reads its initial state from the service instead of assuming. One dead spare deleted: `CaptureHUDPalette.panel`, confirmed unreferenced. Unchanged and untested: the owner's complaint that the blur warning fires too readily for shaky hands. |
-| **prepass** (`ios/Sources/PrePass/`) | COMPLETE | `ScanProcessingCoordinator`, and the capture report for the quick card | The no-training pass, orchestrated by `PrePassPipeline`: submaps, revisit detection, pose-graph optimisation, camera-to-IMU offset calibration, free-space carving where unknown is never treated as empty, glass detection, the initial Gaussian set, the quality card, and a second COLMAP model under `prepass/sparse_refined/`. Per-stage error boundaries, so a failed carve cannot cost you the poses. **The refined poses were checked end to end this round and they are fine**: computed at `PrePassPipeline.swift:477`, improved by the LiDAR-anchored bundle adjustment, written onto `CaptureFrame.refinedPose`, carried in `PrePassResult.refinedPoses`, and written to `prepass/sparse_refined/` before the four optional later stages so a crash in carving cannot cost them. THIS ROUND: `PrePassPaths` declares five sidecar paths that `Sources/Smart` writes by building the identical strings itself, and nothing enforced that the two spellings keep agreeing. A silent disagreement would look exactly like a stage that ran and produced nothing. `PrePassPaths.missing(_:at:)` is new and the pipeline now calls it right after the F6 and F3 stages report success, raising `trust_files_missing` or `edge_maps_missing` at `.problem` severity on the QC card. That detects drift; it does not prevent it, and the refactor that would is rejected in writing in `INTEGRATION_REQUESTS.md`. Unchanged weakness: `run(bundle:at:)` has no re-entrancy guard and no "have I finished unwinding?" hook. |
-| **smart** (`ios/Sources/Smart/`) | PARTIAL | PrePass and Trainer, which construct these directly | Real: the two-scale trust field (bias averaged, noise never averaged), the direction-only frozen background model, the native-resolution depth edge classifier, the per-pixel authority map, and the disparity-space anchoring that would turn a relative monocular depth map into a metric one. STUB, and still the only one in the iOS app: `SmartMonocularDepthStub`, the mid-range depth estimator, the default `midRegimeProvider` in `DirectionalBackgroundModel`. THIS ROUND, three things that were measured and thrown away. (1) `SmartLossSettings.economy` was declared, documented for "a phone that is already warm, or a house-sized scan", and selected by NOTHING, so every trust build ran at full cost regardless. `trustBuildCost(requested:frameCount:thermalLevel:)` now makes that choice from two measurements, `TwoScaleTrustField.build` calls it at the top of every build, and it logs which preset ran and why, because a cheaper build is a real difference in what was verified. Only the three build-cost knobs are taken from the preset; the calibration fields are kept, so two runs stay comparable. (2) `midRegimeProvenance` and `isMidRegimeReal` existed so a stubbed run could never be mistaken for a real one, and nothing read them, so no scan on disk recorded which it got; they now go into `model/background.json` as two new optional fields, into the summary sentence, and into the log once per run. (3) `SmartGlassMask.confirmedFraction` was measured per frame and read by nothing, so a scan of a conservatory could lose most of its geometry with nothing saying why. `SmartAuthorityMap` now warns once and keeps a running `glassDominatedFrameCount`, **and this gate added the `builtFrameCount` denominator it needs**, because a count without one cannot say whether it is a catastrophe or a footnote. |
-| **trainer** (`ios/Sources/Trainer/`) | COMPLETE | `ScanProcessingCoordinator` | The owner's own 3D Gaussian splatting trainer on Metal: full forward and backward rasterisation, SSIM, depth and regularisation losses, budget-first densification that relocates rather than exceeding the cap, slice-train-merge, and a governor that lowers the budget as the phone heats up. Committed earlier today, and the largest single correction this trainer has had: every geometry term in `trainer_loss_depth` was an unnormalised sum over 49,152 native depth samples while both photometric terms were per-pixel means, so the laser outweighed the photograph by roughly four orders of magnitude; plus six schedules that never ran their back half on a shortened run, gradient steps split from times round the loop, and the Mip-Splatting 3D filter folded into the export. THIS ROUND: **the SSIM blur window on the GPU had drifted from the sigma written down in Swift.** The eleven literal taps in `trainer_blur_h` and `trainer_blur_v` summed to `0.99752` with a centre tap of `0.26361500` where the normalised sigma-1.5 Gaussian wants `0.26601172`, so every separable blur lost about half a per cent of its energy and the SSIM half of the loss ran on slightly wrong local means. Nothing compared the two, because nothing could. `TrainerGPULayouts.verify()` now re-derives the window from `ssimSigma` and `ssimWindowRadius` and refuses to start if the three disagree, and it also enforces the 16-bit tile ceiling that was written down and never checked. Census additions this round: `authorityFramesBuilt`, `glassDominatedFrames`, `midRegimeIsReal` and `midRegimeProvenance`, a ledger line for each, and a `glass_dominated_frames` alert at a third of frames. Honest limits: every GPU struct is fp32, so `useHalfPrecision` is recorded as false whatever was asked for; `TrainerTuning.absGradThreshold`, `splitChildCount` and `lossReadbackIntervalIterations` are read by nothing and each says so at its declaration, so the census cannot present a dead setting as a live one. **Executed exactly once, and that run produced almost nothing.** |
-| **pipeline** (`ios/Sources/Pipeline/`) | PARTIAL | The scan library, and the review screen's "Next step" link | `ScanProcessingCoordinator` drives `PrePassService.run` then `SplatTrainer.train` for one scan, offers an existing `prepass/` for reuse rather than silently redoing twenty minutes of work, sizes a `TrainingBudget` from the device tier plus the scan's measured extent plus `os_proc_available_memory()`, keeps every budget reduction where the user can read it, and refuses to file a finished model under a scan it does not belong to. `ScanProcessingScreen` shows a live preview of the model as it is built. Untouched this round. PARTIAL for one reason only, and the file's own header states it: stopping is cooperative and genuinely waited for on the training half (`waitUntilIdle`), and the same guarantee does not hold for the check-over, because `PrePassService` has nothing to ask. |
-| **viewer** (`ios/Sources/Viewer/`) | PARTIAL | The Scans tab | Real: the Metal splat renderer, the honesty mask that hatches directions the scan never saw, the artefact heatmap, the fly-through pinned to where you actually walked, the photo-versus-scan slider, and the library, review and export screens. The splat census puts one sentence at the top of the review screen naming the step that lost the most geometry, every number carrying the file it was counted in, and a missing number rendered as "not recorded" rather than as zero. Committed earlier today: the renderer's 2D filter variance was 0.3 against the trainer's 0.25 and both are now 0.25. THIS ROUND, three things that were written and never reached. (1) `ScanLibraryStore.nextUpScan` and `ScanSummary.primaryActionTitle` were both written for a "Next up" card that no screen drew, so coming back from the Capture tab a freshly recorded scan was one more identical row; the card now exists at the top of the library with the words of the button that starts the next step. That chain, through `isWaitingOnYou`, is now live. (2) `produced` only ever held files exported in the CURRENT session, so a file exported yesterday sat in the scan's export folder with no row and no share button anywhere in the app; the export screen now lists what is on disk, off the main actor, merged so a file made this session keeps its splat count. (3) `ExportSelfTest.runAll()` now has a caller. Still not real: `ScanSummary.heldOutPSNR` is assigned at `ScanLibraryStore.swift:332` and displayed by nothing. Still flat grey: nothing in this module reads `model/background.bin`, so the trained far field appears in no preview. That is the largest thing left open and it is rejected in writing, with reasons, in `INTEGRATION_REQUESTS.md`. |
-| **export** (`ios/Sources/Export/`) | PARTIAL | The export screen, the Booster, the trainer | Real: `.ply` write and read, `.spz` versions 1 to 3 write and read, `.glb` with the `KHR_gaussian_splatting` extension plus a fallback colour attribute so a plain glTF viewer still shows something, ZIP packaging of a capture bundle, and the share sheet. Committed earlier today: `SplatCloud.fuse3DFilter(_:)` folds the Mip-Splatting 3D low-pass filter into the stored log-scale and opacity, exactly, so `blender_addon/`, SuperSplat and every other reader draws the model that was actually fitted; it is called from `MetalSplatTrainer.readCloud`, which is worth saying because for most of that day it was written and called from nowhere. `SplatCloud.filter3DFused` is `true` / `false` / `nil`, and `nil` means "a file that cannot say", never a guess. A labelled refusal rather than a guess: `.spz` version 4 read throws `unsupportedVersion`, because nobody has published a sample. THIS ROUND: no file in this module changed, but `ExportSelfTest.runAll()` finally runs. Its 368 lines of round-trip and known-answer checks, including "PLY round trip is bit-exact", "SPZ round trip within quantization tolerance" and "empty cloud is rejected, not silently written", had **zero callers anywhere in the app** and had therefore never executed once. A DEBUG-only section of the export screen now runs them on open and shows each line, failures in orange. Release builds compile none of it. The `TODO(nimbus)` asking for a real test target still stands. |
-| **booster-client** (`ios/Sources/Booster/`) | COMPLETE | The Booster tab, and the "send it to a computer" section of the processing screen | Bonjour discovery, code-confirmed pairing with the token in the Keychain, chunked resumable upload, live progress over a WebSocket with a polling fallback, and resumable download of the result. Pure Swift, no third-party dependencies. The routes and payload field names agree with `docs/BOOSTER_PROTOCOL.md` and the Python server. Untouched this round, but **no agent was assigned this module and this gate triaged its six dead-wire candidates rather than leave them unlooked-at.** All six are safe and now carry reasons: `BoosterAPI.pathPrefix` is used eight times and only inside string interpolations the scanner strips, so every Booster URL really is built from it; `pollStatus` is a spare confirmed against `booster/server/pairing.py:137`, which resolves a confirm synchronously so the poll path is never needed; `gpuName` and `queueDepth` are wire-contract fields the Python server really sends and no screen shows yet; `allPairings` and `removeJob` are spare store reads. **Never run against a real Booster.** |
-| **booster-pc** (`booster/`) | PARTIAL | Run by hand on a PC | Real: the aiohttp server, pairing, resumable chunked transfer, job queue, the PySide6 window, and a pipeline that turns an uploaded scan into real geometry (depth unprojected on its native grid, normal-aligned Gaussian discs, free-space carving) and writes `model.ply`, `model.spz`, `model.json` and a preview image the phone can download. Not written, and it says so rather than pretending: there is no `trainer/train.py`, so there is no photometric optimisation loop. `trainer/pipeline.py` line 26 states this in the file, `optimiser_available()` returns false, and the result carries `optimised: bool = False` so nothing downstream can mistake a raw initialisation for a trained model. That step will need an NVIDIA GPU with CUDA PyTorch and gsplat. Untouched this round. |
+| **core** (`ios/Sources/Core/`) | COMPLETE | Every other module | The shared vocabulary: cross-module types and the twelve service protocols, `BrandConfig` reading the product name out of the Info.plist so no Swift file hardcodes it, the one ARKit to COLMAP pose conversion, `TrainingBudget.recommended`. Committed earlier today, and it is step 2 of the crash: `Pose.fromARKitCameraTransform` now takes `simd_determinant` of the camera-to-world matrix and returns identity, not NaN, when it is non-finite or under `1e-6`. Verified in place at `Contracts.swift:273`, with `Pose.isFinite` at line 251 as the second half of the answer. **Unchanged this round**: the file was appended to and reverted byte for byte during the gate's negative control, so its timestamp moved and its contents did not. `Contracts.swift:1648` is on the trapconv allowlist as UInt64 integer division with a guarded divisor. Two known contract gaps remain, both worked around at the call site and both filed in `INTEGRATION_REQUESTS.md`: `SplatTrainer` has `cancel()` and no way to ask whether a run has ended, so Pipeline downcasts to `MetalSplatTrainer`; and `TrainerProgress` still has no field for "I lowered the budget", so Pipeline recognises one by matching the wording of a sentence. A third is newly refused in writing: a `framesSkippedNoTracking` field on the capture bundle, refused for this pass because adding a stored property to a hand-initialised `Codable` struct is one of the two shapes that has actually broken this CI, and it must not land in the same change as a crash fix. |
+| **app-shell** (`ios/Sources/App/`) | COMPLETE | `@main` | The first-run compatibility gate, the three tabs, and one integration block that registers Capture, PrePass, Trainer, Viewer, Export and Booster with no line commented out. `NimbusBootstrap.install` logs the registered module list at launch and logs an `error` naming any of the seven expected modules that did NOT register; `ScreenUnavailableView` prints what did load underneath the name of what did not. Untouched this round. |
+| **onboarding** (`ios/Sources/Onboarding/`) | COMPLETE | The app shell, on first launch | Probes ARKit, Metal, memory and the device model, decides full / limited / incompatible, and explains the verdict in sentences about this specific phone. `findingsForDisplay()` returns `DeviceFindingsForDisplay` carrying `StoredDeviceReport.isStale`, so the "Checked" row says outright when the numbers came from an older build, an older iOS, or over a month ago, and the details table has a row for whether the phone has the laser scanner at all. Untouched this round. Labelled uncertainty, unchanged: the iPhone 17 rows in the chip table are inferred from the naming pattern rather than confirmed against shipped hardware, and `AppleSiliconCatalog.swift` says so in a `TODO(nimbus)`. The owner's phone got past this gate, so the "not incompatible" branch has been exercised once. |
+| **capture** (`ios/Sources/Capture/`) | COMPLETE | The Scan tab | The ARKit session and everything it writes: native 256x192 depth and confidence sidecars from `sceneDepth` and never the smoothed variant, the crash-safe `frames.jsonl` log, the COLMAP text model, mesh chunks with per-face classification, anchors logged twice for a free drift measurement. Live: three-channel coverage painted on the room, a gyro-driven blur meter, spoken and haptic guidance, window mode, exposure bracketing, thermal and storage guards. **The one part of this app with real hardware evidence, and the origin of the crash.** Steps 1 and 2 of the crash are fixed and verified in place: `ARCaptureService.swift:614` now gates on `quality != .notAvailable, quality != .limitedInitializing` and then on `pose.isFinite`, counting each rejection separately. `CaptureCoverageField.voxelIndex` guards `isFinite` and clamps to the 21-bit key range BEFORE `Int64(...)`, in the absorbing argument order, and `CapturePointCloudAccumulator` and `CaptureRevisitDetector` both CALL it rather than carrying a fourth and fifth copy, which is the duplication that spread this bug in the first place. THIS ROUND: `CaptureCoverageField.directionBucket` clamped its azimuth as an `Int` after the conversion, one step too late, and now clamps the `Float` before it, matching the elevation line beside it; and the tracking-drop counter that the gate's own comment promised to the census is finally readable, because `finish()` now logs both drop counts next to the frames kept. Verified SAFE and allowlisted rather than changed: `CaptureCOLMAPWriter.swift:167-169` is `SIMD3<UInt8>`, not a float at all. Unchanged and untested: the owner's complaint that the blur warning fires too readily for shaky hands. |
+| **prepass** (`ios/Sources/PrePass/`) | COMPLETE | `ScanProcessingCoordinator`, and the capture report for the quick card | The no-training pass, orchestrated by `PrePassPipeline`: submaps, revisit detection, pose-graph optimisation, camera-to-IMU offset calibration, free-space carving where unknown is never treated as empty, glass detection, the initial Gaussian set, the quality card, and a second COLMAP model under `prepass/sparse_refined/`. Per-stage error boundaries, so a failed carve cannot cost you the poses. **The module with the most real traps, and every one of them turned on a number read back off disk.** `PrePassVoxelFrame.cellIndex` is the shared non-trapping floor-and-clamp and is now the only place in the module that converts a voxel coordinate. `PrePassColmapWriter.pointsText` wrote colour bytes as `UInt8(min(max(c.x * 255, 0), 255))`, the propagating order, and now goes through one `colorByte` helper with the literals first. THIS ROUND the gate found four more that the module's own agent did not: `PrePassCarver.swift:321` was the one reader of `lidarMaxRangeMeters` that did not clamp it, so a corrupt bundle's range killed the carve; `PrePassPoseRefiner` built `duration` as `Swift.max(end - start, 0)` over two timestamps decoded from the frame sidecar with no validation, and that order propagates NaN into a trapping `Int(...)` sixteen lines later; `PrePassSurvey` divided the covered-cell count by a cell count that can be zero, and `0/0` is NaN, not zero, which then reached the QC card; and `PrePassSurvey.format` guarded `isFinite` only, which lets through every finite value up to 3.4e38 while the conversion traps above 9.2e18. All four are fixed. `PrePassMath.percentile` had the same wrong-order clamp as `ViewerMath.clamp` and is now written literal-first. Unchanged weakness: `run(bundle:at:)` has no re-entrancy guard and no "have I finished unwinding?" hook. |
+| **smart** (`ios/Sources/Smart/`) | PARTIAL | PrePass and Trainer, which construct these directly | Real: the two-scale trust field (bias averaged, noise never averaged), the direction-only frozen background model, the native-resolution depth edge classifier, the per-pixel authority map, and the disparity-space anchoring that would turn a relative monocular depth map into a metric one. STUB, and still the only one in the iOS app: `SmartMonocularDepthStub`, the mid-range depth estimator, the default `midRegimeProvider` in `DirectionalBackgroundModel`. THIS ROUND: every projected pixel in the module now goes through one new `SmartMath.pixelIndex(_:width:height:)`, which guards `isFinite` and the image bounds and returns an Optional, so a partner pose with a huge or non-finite translation drops one sample instead of the app. It is called from `SmartImage.rgbNearest` and from the plane sweep at `TwoScaleTrustField.swift:363`; both call sites were verified, which is what keeps it off the dead-wire list. Verified SAFE and allowlisted rather than changed: `SmartMath.clamp` and `TrainerMath.clamp` are both `simd_clamp`, which is the `fmin`/`fmax` family and absorbs NaN from either side, so the four percentile and gate conversions built on them cannot trap. Carried over from the dead-wire round and still true: `SmartLossSettings.economy` now selects itself from two measurements and logs which preset ran; `midRegimeProvenance` reaches `model/background.json`; `SmartGlassMask.confirmedFraction` warns once with a denominator behind it. |
+| **trainer** (`ios/Sources/Trainer/`) | COMPLETE | `ScanProcessingCoordinator` | The owner's own 3D Gaussian splatting trainer on Metal: full forward and backward rasterisation, SSIM, depth and regularisation losses, budget-first densification that relocates rather than exceeding the cap, slice-train-merge, and a governor that lowers the budget as the phone heats up. **THIS ROUND holds the fix most likely to be what the owner was actually hitting.** `TrainerInitializer.loadPrePassSet` reads `prepass/init_splats.ply` and copied `cloud.positions[i]` into a seed with no finite check, then handed those positions to `medianNearestSpacing`, which converted them with six bare `Int32((position.x / cell).rounded(.down))` calls. Any scan recorded before the capture tracking gate landed has a NaN position on disk, and this is the PREFERRED seeding path, so it was the ordinary case, not the exotic one: the trainer died at slice start on the line that measures spacing for a log message, with memory free. Both loops now drop non-finite positions and both call `PrePassVoxelFrame.cellIndex`. The depth fallback seeder additionally requires each axis under 1e6 metres, because `voxel` floors at 0.005 m and multiplies the position by up to 200 before the conversion, so a finite-but-absurd depth affine read off disk traps just as hard as a NaN. One hardening by the gate: the thermal pause slept for `UInt64(Swift.max(interval, 1) * 1e9)` in the propagating order and is now literal-first and capped at 60 seconds. Committed earlier today and unchanged: the depth-loss normalisation (the laser had outweighed the photograph by roughly four orders of magnitude), the SSIM window re-derived from `ssimSigma` at startup, the 16-bit tile ceiling. Honest limits: every GPU struct is fp32, so `useHalfPrecision` is recorded as false whatever was asked for; three `TrainerTuning` fields are read by nothing and each says so at its declaration. **Executed exactly once, and that run produced almost nothing.** |
+| **pipeline** (`ios/Sources/Pipeline/`) | PARTIAL | The scan library, and the review screen's "Next step" link | `ScanProcessingCoordinator` drives `PrePassService.run` then `SplatTrainer.train` for one scan, offers an existing `prepass/` for reuse rather than silently redoing twenty minutes of work, sizes a `TrainingBudget` from the device tier plus the scan's measured extent plus `os_proc_available_memory()`, keeps every budget reduction where the user can read it, and refuses to file a finished model under a scan it does not belong to. THIS ROUND: `ProcessingFormat.meters` guarded `value.isFinite` and nothing else, so a finite-but-absurd scene extent from a half-written pose file killed the app on the check-over screen, in the sentence that explains the plan before training starts. It now refuses above 100 km and says "an unknown distance" rather than inventing a number. PARTIAL for one reason only, and the file's own header states it: stopping is cooperative and genuinely waited for on the training half (`waitUntilIdle`), and the same guarantee does not hold for the check-over, because `PrePassService` has nothing to ask. |
+| **viewer** (`ios/Sources/Viewer/`) | PARTIAL | The Scans tab | Real: the Metal splat renderer, the honesty mask that hatches directions the scan never saw, the artefact heatmap, the fly-through pinned to where you actually walked, the photo-versus-scan slider, and the library, review and export screens. THIS ROUND: `ViewerMath.clamp` was `Swift.min(Swift.max(v, lo), hi)`, the NaN-propagating order, in both the `Float` and the `Double` overload. It is the module's shared clamp, so it was feeding two separate crashes downstream, including the census histogram bin at `ScanCensus.swift:521`, where a splat whose log-scales are all above about 88.8 passes the `isFinite` check and then overflows `exp()`. Both overloads are now literal-first, identical for every finite input. `PreviewCameraPathBuilder` gained finite checks on the camera centres it samples and a guarded `ceil` on the decimation stride, because a zero denominator there makes `Int(infinity)`. Verified SAFE and allowlisted rather than changed: both `ObservedDirectionField` cell conversions, where `rel >= 0` rejects NaN and negatives and `rel < maxCoordinate` rejects infinity, and the quarter-turn count in `ViewerSupport`. Still not real: `ScanSummary.heldOutPSNR` is assigned at `ScanLibraryStore.swift:332` and displayed by nothing. Still flat grey: nothing in this module reads `model/background.bin`, so the trained far field appears in no preview. That is the largest thing left open and it is rejected in writing, with reasons, in `INTEGRATION_REQUESTS.md`. |
+| **export** (`ios/Sources/Export/`) | PARTIAL | The export screen, the Booster, the trainer | Real: `.ply` write and read, `.spz` versions 1 to 3 write and read, `.glb` with the `KHR_gaussian_splatting` extension plus a fallback colour attribute so a plain glTF viewer still shows something, ZIP packaging of a capture bundle, and the share sheet. `SplatCloud.fuse3DFilter(_:)` folds the Mip-Splatting 3D low-pass filter into the stored log-scale and opacity, exactly, and is called from `MetalSplatTrainer.readCloud`. `SplatCloud.filter3DFused` is `true` / `false` / `nil`, and `nil` means "a file that cannot say", never a guess. A labelled refusal rather than a guess: `.spz` version 4 read throws `unsupportedVersion`, because nobody has published a sample. **No file in this module changed this round.** Its one trapconv candidate, the quaternion packer at `SPZCodec.swift:361`, was read and is genuinely safe: the rotation is length-checked and replaced with identity before `simd_normalize`, fourteen lines above the conversion. `ExportSelfTest.runAll()` runs in DEBUG builds only, from the export screen; the `TODO(nimbus)` asking for a real test target still stands. |
+| **booster-client** (`ios/Sources/Booster/`) | COMPLETE | The Booster tab, and the "send it to a computer" section of the processing screen | Bonjour discovery, code-confirmed pairing with the token in the Keychain, chunked resumable upload, live progress over a WebSocket with a polling fallback, and resumable download of the result. Pure Swift, no third-party dependencies. The routes and payload field names agree with `docs/BOOSTER_PROTOCOL.md` and the Python server. THIS ROUND: `BoosterUploadManager` gained `clampedOffset(_:fileByteCount:)`, which forces a byte offset the server reported into the file's real range before it is used, because a negative offset traps the `UInt64(_:)` conversion the seeks need and an offset past the end would seek off the back of the file. Its one trapconv candidate, the retry backoff at line 213, was read and is safe: `withRetry` is private with one call site that never overrides the default of three attempts, so the exponent is 0 or 1. **Never run against a real Booster.** |
+| **booster-pc** (`booster/`) | PARTIAL | Run by hand on a PC | Real: the aiohttp server, pairing, resumable chunked transfer, job queue, the PySide6 window, and a pipeline that turns an uploaded scan into real geometry (depth unprojected on its native grid, normal-aligned Gaussian discs, free-space carving) and writes `model.ply`, `model.spz`, `model.json` and a preview image the phone can download. Not written, and it says so rather than pretending: there is no `trainer/train.py`, so there is no photometric optimisation loop. `trainer/pipeline.py` line 26 states this in the file, `optimiser_available()` returns false, and the result carries `optimised: bool = False` so nothing downstream can mistake a raw initialisation for a trained model. That step will need an NVIDIA GPU with CUDA PyTorch and gsplat. Untouched this round. Note for whoever writes it: **Python has none of this problem.** `int(float('nan'))` raises a catchable `ValueError`, it does not kill the process, so the trap class this round eliminated does not port to the PC side. |
 | **blender-addon** (`blender_addon/`) | PARTIAL | Installed by hand in Blender | Real: `.ply` import and a geometry-nodes plus shader setup that renders the splats in Blender 4.x. Partial: `spz_reader.py` is written from the format description with no real sample file to test against, and says so. Untouched this round, and it remains the main beneficiary of the 3D-filter fuse: it will now draw the trained model rather than a sharper, more solid version of it. |
-| **ci** (`.github/workflows/ios.yml`) | COMPLETE | GitHub Actions | XcodeGen generates the project from `ios/project.yml`, `xcodebuild archive` builds it unsigned on `macos-15`, and the workflow hand-zips `Payload/<Product>.app` into an `.ipa`, finding the product name by globbing so a rename cannot break it. A separate Ubuntu job byte-compiles and lints `booster/`. Source directories are listed recursively, so a new `.swift` or `.metal` file is picked up with no edit here. THIS ROUND: a third job, `deadwire`, runs `tools/deadwire.py` against the allowlist on every push, on Ubuntu, in well under a minute. `on.push.branches` widened from `[main]` to `["**"]` so it sees every push, and the two expensive jobs carry an `if:` that reproduces their old trigger exactly (main, a `v*` tag, any PR, manual dispatch), so a feature-branch push runs the check and skips the 90-minute macOS runner. The archive job deliberately has no `needs:` on the check: a lint finding must never be the reason the owner cannot install a build. **It remains the only compiler this project has, and it has not yet seen this round.** |
+| **ci** (`.github/workflows/ios.yml`) | COMPLETE | GitHub Actions | XcodeGen generates the project from `ios/project.yml`, `xcodebuild archive` builds it unsigned on `macos-15`, and the workflow hand-zips `Payload/<Product>.app` into an `.ipa`, finding the product name by globbing so a rename cannot break it. A separate Ubuntu job byte-compiles and lints `booster/`. Source directories are listed recursively, so a new `.swift` or `.metal` file is picked up with no edit here. THIS ROUND: the checks job gained a second Python step running `tools/trapconv.py`, and the job's display name changed from `Dead-wire check (code nothing calls)` to `Static gates (dead code, trapping conversions)` to match what it now does. Same runner, same ten-minute timeout, same absence of a `needs:` from the archive job. Both steps fail with an explicit `::error::` if their script or their allowlist has been deleted, because a check that silently stops checking is worse than no check. **It remains the only compiler this project has, and it has not yet seen either of today's last two rounds.** |
 
 ---
 
@@ -166,22 +209,43 @@ Verified both ways before it was committed: exit 0 on the current tree, and exit
 
 The route exists end to end and has been walked once, by a person, on a phone.
 A scan was recorded, checked over, built into a model, and reviewed. What came
-out of it was almost nothing.
+out of it was almost nothing, and since then the app has been dying mid-use with
+memory free.
 
-Every fault found since has had the same shape: something was silently doing
-nothing, and the app reported success. Four of those were scan-destroying and
-all four were found by accident.
+Every fault found has had one of two shapes. Either something was silently doing
+nothing and the app reported success, or something was silently doing arithmetic
+it could not survive and the app died without a word. The first shape now has a
+gate. As of this round, so does the second.
 
-This round went looking on purpose. The five agents reported fourteen real
-findings between them (capture 3, prepass 0, trainer 2, viewer and export 3,
-core and smart and app 6); this gate re-read the load-bearing ones against the
-source rather than taking them on trust, and added a fifteenth. What it leaves
-behind is a check that fails the build the next time somebody writes code that
-nothing calls.
+Counted honestly, this round changed a float-to-integer conversion, or the
+guard in front of one, in sixteen files. Five of those the gate rates as traps
+that could fire on the owner's phone as it stands, and they are, in the order
+they would be met:
 
-The strongest evidence that the check is needed is that fifteenth. It was
-introduced earlier the same day, by the work that was hunting the other
-fourteen: a public property, counted every frame, read by nothing, with a log
-line pointing the reader at it.
+* `TrainerInitializer.medianNearestSpacing` (training). The strongest one.
+  `prepass/init_splats.ply` is read straight into seed positions with no finite
+  check, any scan recorded before this morning's tracking gate has a NaN
+  position in it, and this is the preferred seeding path. It would have fired
+  on the next attempt.
+* `ProcessingFormat.meters` (check-over), on the screen that explains the plan
+  before training starts, if the scene extent read back off disk is finite and
+  absurd.
+* `PrePassSurvey.coverageFraction` (check-over), on any scan that recorded
+  depth and did not record one usable cell, because `0/0` is NaN.
+* `ViewerMath.clamp` feeding `ScanCensus` (review), for a model whose
+  log-scales overflow `exp()`.
+* `PrePassColmapWriter.pointsText` (exporting), for any future caller handing
+  it a colour it did not read out of an image.
+
+The rest are the same shape without a live trigger today: a clamp written in
+the propagating order, or a guard that checks `isFinite` and not range. They
+were changed anyway, because "safe by agreement with a guard one stack frame
+away" is exactly the arrangement that let the original crash through.
+
+Five separate sites were found by this gate AFTER all five agents reported
+success, in `PrePassCarver`, `PrePassPoseRefiner`, `PrePassSurvey` (twice) and
+`PrePassMath`. That is the argument for the gate, and for the tool: the agents
+were reading a report, and the report's line numbers were fifteen lines out in
+the file with the most of them.
 
 The next thing that matters is a green CI run, and then a second scan.

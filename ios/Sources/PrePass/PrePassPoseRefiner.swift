@@ -270,7 +270,17 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
 
         let start = first.timestampSeconds
         let end = last.timestampSeconds
-        let duration = Swift.max(end - start, 0)
+        // `timestampSeconds` is a `Double` decoded straight from the frame
+        // sidecar with no validation, so a half-written bundle can make this
+        // subtraction NaN or astronomically large. `Swift.max(x, 0)` does NOT
+        // catch that: `max` is `y >= x ? y : x` and NaN compares false against
+        // everything, so with the value written FIRST the NaN is what
+        // survives. It then reached `Int(...)` sixteen lines below, which is a
+        // trapping conversion, and a corrupt sidecar killed the check-over
+        // instead of being reported as one unusable scan. A day is longer than
+        // any handheld capture, so anything past it is not a duration.
+        let span: Double = end - start
+        let duration: Double = (span.isFinite && span > 0) ? Swift.min(span, 86_400) : 0
 
         let window = Swift.min(Swift.max(tuning.submapWindowSeconds, 15), 30)
         let overlap = Swift.min(Swift.max(tuning.submapOverlapFraction, 0.20), 0.30)

@@ -470,6 +470,23 @@ public final class ARCaptureService: NSObject, CaptureService {
         let frames = recorded.snapshot()
         let pointCloud = self.pointCloud
 
+        // The tracking gate counts what it drops "so the census can say how
+        // many were dropped and why", and until now nothing read
+        // `framesSkippedNoTracking` at all: the number existed and nobody
+        // could see it, which is the entire reason the tracking drop was
+        // invisible in the first place. A field on the bundle would be a Core
+        // contract change; the log is where its sibling already goes, so both
+        // halves of the answer now end up in the same place.
+        CaptureLog.session.notice(
+            """
+            Scan finished with \(frames.count, privacy: .public) frames kept. \
+            Dropped while tracking was unusable: \
+            \(self.framesSkippedNoTracking, privacy: .public). \
+            Dropped for a camera transform that did not invert: \
+            \(self.framesSkippedBadPose, privacy: .public).
+            """
+        )
+
         do {
             let bundle: CaptureBundle = try await withCheckedThrowingContinuation {
                 continuation in

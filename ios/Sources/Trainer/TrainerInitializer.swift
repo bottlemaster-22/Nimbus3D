@@ -530,7 +530,20 @@ enum TrainerInitializer {
                     let pixel = SIMD2<Float>(Float(u) + 0.5, Float(v) + 0.5)
                     let camPoint = SmartCamera.unproject(pixel, depthZ: z, nativeK)
                     let world = SmartCamera.cameraToWorld(pose, camPoint)
-                    guard world.x.isFinite, world.y.isFinite, world.z.isFinite else {
+                    // Finite AND inside a plausible world, not merely finite.
+                    // `voxel` floors at 0.005 m, so the division below
+                    // multiplies this position by up to two hundred before it
+                    // reaches an `Int32`, and `Int32(someFloat)` TRAPS out of
+                    // range in release as well as in debug. The depth affine
+                    // and the pose both arrive from disk and can be finite and
+                    // still absurd. A position we cannot trust must not be
+                    // allowed to mark a real part of the room, so it is
+                    // rejected here rather than clamped onto a real voxel.
+                    guard world.x.isFinite, world.y.isFinite, world.z.isFinite,
+                          world.x.magnitude < 1_000_000,
+                          world.y.magnitude < 1_000_000,
+                          world.z.magnitude < 1_000_000
+                    else {
                         rejected += 1
                         u += stride
                         continue
@@ -550,10 +563,14 @@ enum TrainerInitializer {
                     let combinedTrust = TrainerMath.clamp(trustWeight * authorityValue, 0, 1)
                     let contribution = Swift.max(combinedTrust, 0.05)
 
+                    // `PrePassVoxelFrame.cellIndex`, not a bare `Int32(...)`.
+                    // The same non-trapping floor-and-clamp the pre-pass reader
+                    // uses, called rather than copied: three bare conversions
+                    // exactly like these were the crash in five separate files.
                     let key = SIMD3<Int32>(
-                        Int32((world.x / voxel).rounded(.down)),
-                        Int32((world.y / voxel).rounded(.down)),
-                        Int32((world.z / voxel).rounded(.down))
+                        PrePassVoxelFrame.cellIndex(world.x / voxel),
+                        PrePassVoxelFrame.cellIndex(world.y / voxel),
+                        PrePassVoxelFrame.cellIndex(world.z / voxel)
                     )
                     var cell = cells[key] ?? Cell()
                     cell.position += world * contribution
@@ -837,10 +854,21 @@ enum TrainerInitializer {
 
         var grid: [SIMD3<Int32>: [Int]] = [:]
         for (i, seed) in seeds.enumerated() {
+            let p = seed.position
+            // A pre-pass set read back off disk can carry NaN positions: any
+            // scan recorded before the capture tracking gate landed still has
+            // them in `prepass/init_splats.ply`, and this is the PREFERRED
+            // seeding path, so it is the ordinary case rather than the exotic
+            // one. `Int32(someFloat)` TRAPS on NaN, which killed the trainer
+            // here while it was only measuring spacing for a log line.
+            // A seed with no trustworthy position is not the nearest neighbour
+            // of anything, so it is left out of the grid entirely rather than
+            // being given a bucket of its own.
+            guard p.x.isFinite, p.y.isFinite, p.z.isFinite else { continue }
             let key = SIMD3<Int32>(
-                Int32((seed.position.x / cell).rounded(.down)),
-                Int32((seed.position.y / cell).rounded(.down)),
-                Int32((seed.position.z / cell).rounded(.down))
+                PrePassVoxelFrame.cellIndex(p.x / cell),
+                PrePassVoxelFrame.cellIndex(p.y / cell),
+                PrePassVoxelFrame.cellIndex(p.z / cell)
             )
             grid[key, default: []].append(i)
         }
@@ -850,10 +878,18 @@ enum TrainerInitializer {
         var i = 0
         while i < seeds.count {
             let position = seeds[i].position
+            // Same reason as the grid above, one stack frame earlier than the
+            // `best < greatestFiniteMagnitude` test at the bottom of the loop:
+            // that test could never run, because the conversion below had
+            // already trapped on the NaN.
+            guard position.x.isFinite, position.y.isFinite, position.z.isFinite else {
+                i += sampleStride
+                continue
+            }
             let key = SIMD3<Int32>(
-                Int32((position.x / cell).rounded(.down)),
-                Int32((position.y / cell).rounded(.down)),
-                Int32((position.z / cell).rounded(.down))
+                PrePassVoxelFrame.cellIndex(position.x / cell),
+                PrePassVoxelFrame.cellIndex(position.y / cell),
+                PrePassVoxelFrame.cellIndex(position.z / cell)
             )
             var best = Float.greatestFiniteMagnitude
             for dz in -1...1 {

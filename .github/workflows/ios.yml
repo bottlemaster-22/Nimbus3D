@@ -73,8 +73,35 @@ jobs:
   #  finding must never be the reason he cannot install one. Red check, IPA
   #  still produced.
   # ===========================================================================
+  # ===========================================================================
+  #  THE TRAPPING-CONVERSION GATE (second step in the same job)
+  #
+  #  This is the one that has actually been crashing the owner's phone.
+  #
+  #  `Int64(someFloat)`, `Int32(...)`, `Int(...)` and `UInt8(...)` are TRAPPING
+  #  conversions in Swift. They kill the process, in release as well as debug,
+  #  on NaN, on infinity, and on any finite value outside the destination type.
+  #  ARKit published a camera transform that did not invert, `simd_inverse` of
+  #  a singular matrix is silently NaN in every element, every world position
+  #  from that frame was NaN, and the first of roughly half a million
+  #  conversions per second killed the app. Memory was never involved, which is
+  #  why "it crashes with RAM free" was the clue that cracked it.
+  #
+  #  The same three lines were found in FIVE separate files. That is what makes
+  #  this a tool and not a code review: the shape spreads by copy and paste,
+  #  and clamping does not necessarily save you, because Swift's `min`/`max`
+  #  absorb their SECOND argument and propagate their first, so
+  #  `UInt8(max(0, min(255, x)))` is safe and `UInt8(min(max(x*255, 0), 255))`
+  #  traps, and the two look identical.
+  #
+  #  Every conversion in the tree today is listed with a written reason in
+  #  tools/trapconv_allowlist.txt, so this goes red for exactly one reason:
+  #  somebody added a NEW untriaged one.
+  #
+  #  Same deal as the dead-wire gate above: it does NOT block the IPA.
+  # ===========================================================================
   deadwire:
-    name: Dead-wire check (code nothing calls)
+    name: Static gates (dead code, trapping conversions)
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -101,6 +128,23 @@ jobs:
           # The script resolves ios/Sources from its own location, so it needs
           # no path argument and works the same here as on a Windows checkout.
           python tools/deadwire.py
+
+      - name: Look for trapping float-to-integer conversions
+        run: |
+          set -euo pipefail
+          if [ ! -f tools/trapconv.py ]; then
+            echo "::error::tools/trapconv.py is missing. It is the only automated guard against the crash the owner reported as 'crashing quite a bit, even with RAM free' - a trapping Int(someFloat) on a NaN world position. Restore it rather than deleting the check."
+            exit 1
+          fi
+          if [ ! -f tools/trapconv_allowlist.txt ]; then
+            echo "::error::tools/trapconv_allowlist.txt is missing. Without it every already-triaged conversion is reported and this check is useless noise. Restore it from git history rather than deleting the check."
+            exit 1
+          fi
+          # Resolves ios/Sources from its own location, like deadwire.py, so it
+          # needs no path argument and behaves identically on a Windows
+          # checkout. Exit 1 means somebody added a conversion that nobody has
+          # written a reason for; the failure output names the file and line.
+          python tools/trapconv.py
 
   build:
     name: Archive unsigned IPA

@@ -533,7 +533,14 @@ enum ProcessingFormat {
     }
 
     static func meters(_ value: Float) -> String {
-        guard value.isFinite else { return "an unknown distance" }
+        // `Int(_: Float)` traps on ANY value outside Int's range, not only on
+        // NaN, and this number is a scene extent measured from pose data read
+        // back off disk. A corrupt bundle can hand over a finite-but-absurd
+        // 1e30, which sails past `isFinite` and then kills the process on the
+        // conversion below, in the middle of explaining the plan to the user.
+        // Nothing larger than a very large building is a distance we can
+        // honestly print, so say we do not know rather than invent one.
+        guard value.isFinite, value < 100_000 else { return "an unknown distance" }
         return value < 10
             ? String(format: "%.1f metres", value)
             : "\(Int(value.rounded())) metres"

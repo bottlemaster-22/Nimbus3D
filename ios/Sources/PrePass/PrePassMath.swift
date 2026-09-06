@@ -549,7 +549,14 @@ enum PrePassStats {
         guard !values.isEmpty else { return 0 }
         var sorted = values
         sorted.sort()
-        let clamped = Swift.min(Swift.max(p, 0), 1)
+        // ARGUMENT ORDER IS LOAD-BEARING, and this was written the wrong way
+        // round. `Swift.max(p, 0)` is `0 >= p ? 0 : p`, and NaN compares false
+        // against everything, so a NaN `p` came straight back out of both
+        // calls and landed on the trapping `Int(...)` below. With the literal
+        // written FIRST the clamp absorbs it and a NaN quantile reads as the
+        // smallest value instead of killing the process. Identical result for
+        // every finite input.
+        let clamped = Swift.min(1, Swift.max(0, p))
         let index = Int((clamped * Float(sorted.count - 1)).rounded())
         return sorted[Swift.min(Swift.max(index, 0), sorted.count - 1)]
     }

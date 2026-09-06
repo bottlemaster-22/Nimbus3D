@@ -183,12 +183,21 @@ enum CaptureRevisitDetector {
 
     // MARK: - Spatial hash
 
+    /// Non-trapping, sharing the one implementation in `CaptureCoverageField`.
+    ///
+    /// This is the THIRD copy of the same three lines, and all three used a
+    /// bare `Int64(someFloat)`, which kills the process on NaN, on infinity and
+    /// on any out-of-range finite value. Revisit detection runs on camera
+    /// positions, which come from the same ARKit poses that could be NaN when
+    /// tracking was unavailable, so this had exactly the same trigger as the
+    /// coverage-field crash and simply needed the detector to run on the bad
+    /// frame first.
     @inline(__always)
     private static func cellKey(_ position: SIMD3<Float>, cellSize: Float) -> Int64 {
         key(
-            x: Int64((position.x / cellSize).rounded(.down)),
-            y: Int64((position.y / cellSize).rounded(.down)),
-            z: Int64((position.z / cellSize).rounded(.down))
+            x: CaptureCoverageField.voxelIndex(position.x, cellSize),
+            y: CaptureCoverageField.voxelIndex(position.y, cellSize),
+            z: CaptureCoverageField.voxelIndex(position.z, cellSize)
         )
     }
 
@@ -206,9 +215,9 @@ enum CaptureRevisitDetector {
         _ position: SIMD3<Float>,
         cellSize: Float
     ) -> [Int64] {
-        let cx = Int64((position.x / cellSize).rounded(.down))
-        let cy = Int64((position.y / cellSize).rounded(.down))
-        let cz = Int64((position.z / cellSize).rounded(.down))
+        let cx = CaptureCoverageField.voxelIndex(position.x, cellSize)
+        let cy = CaptureCoverageField.voxelIndex(position.y, cellSize)
+        let cz = CaptureCoverageField.voxelIndex(position.z, cellSize)
         var keys: [Int64] = []
         keys.reserveCapacity(27)
         for dx in -1...1 {

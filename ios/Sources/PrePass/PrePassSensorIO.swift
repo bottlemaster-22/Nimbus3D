@@ -153,14 +153,44 @@ struct PrePassVoxelFrame {
         self.init(origin: minimum, voxelSize: voxelSize)
     }
 
+    /// The voxel a world point falls in, WITHOUT the possibility of trapping.
+    ///
+    /// This is the pre-pass twin of the bug that was killing the app during
+    /// capture. `Int32(someFloat)`, like `Int64(someFloat)`, is a trapping
+    /// conversion: it kills the process on NaN, on infinity, and on any finite
+    /// value outside `Int32`. This used to be three bare `Int32(...)` calls.
+    ///
+    /// A non-finite point is not hypothetical here. Poses are read back from
+    /// disk, and until the capture fix landed a frame with an unusable ARKit
+    /// transform could be written down with a NaN pose. Any scan recorded
+    /// before that fix still has one on disk, so this path must survive reading
+    /// it rather than dying during the check-over.
+    ///
+    /// Note `key(_:)` below already returns an Optional because
+    /// `PrePassMorton.key(cell:)` range-checks the cell, and that check was
+    /// useless: it received the value AFTER this function had already trapped
+    /// on it. Exactly the same "the guard is one stack frame too late" mistake
+    /// the capture crash turned on.
+    ///
+    /// The sentinel is deliberately far outside any real scan, so
+    /// `PrePassMorton.key` rejects it and the sample is dropped rather than
+    /// silently landing in a real voxel and corrupting the occupancy grid.
     @inline(__always)
     func cell(_ point: SIMD3<Float>) -> SIMD3<Int32> {
         let local = (point - origin) * inverseVoxelSize
         return SIMD3<Int32>(
-            Int32(local.x.rounded(.down)),
-            Int32(local.y.rounded(.down)),
-            Int32(local.z.rounded(.down))
+            Self.cellIndex(local.x),
+            Self.cellIndex(local.y),
+            Self.cellIndex(local.z)
         )
+    }
+
+    @inline(__always)
+    static func cellIndex(_ value: Float) -> Int32 {
+        let floored = value.rounded(.down)
+        guard floored.isFinite else { return Int32.min }
+        let limit: Float = 1_000_000_000
+        return Int32(Swift.max(-limit, Swift.min(limit, floored)))
     }
 
     @inline(__always)

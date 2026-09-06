@@ -392,6 +392,29 @@ enum SmartMath {
         let idx = Int((Float(v.count - 1) * simd_clamp(p, 0, 1)).rounded())
         return v[idx]
     }
+
+    /// The integer pixel a continuous image coordinate falls in, or nil when
+    /// that coordinate is not one we are allowed to trust.
+    ///
+    /// `Int(someFloat)` is a TRAPPING conversion: it kills the process, in
+    /// release as well as debug, on NaN, on infinity, and on any finite value
+    /// outside `Int`'s range. A projected pixel is exactly the value that can
+    /// be all three, because it is a pose and a division away from the sensor,
+    /// and a pose read back off disk is not promised to be sane. Every
+    /// projected pixel in this module goes through here so that one bad frame
+    /// drops one sample instead of the app.
+    @inline(__always)
+    static func pixelIndex(
+        _ p: SIMD2<Float>,
+        width: Int,
+        height: Int
+    ) -> (x: Int, y: Int)? {
+        guard p.x.isFinite, p.y.isFinite else { return nil }
+        let fx = p.x.rounded(.down)
+        let fy = p.y.rounded(.down)
+        guard fx >= 0, fy >= 0, fx < Float(width), fy < Float(height) else { return nil }
+        return (Int(fx), Int(fy))
+    }
 }
 
 // MARK: - Morton keys
@@ -788,8 +811,15 @@ public struct SmartImage: Sendable {
     }
 
     /// Nearest-neighbour colour at a continuous pixel coordinate.
+    ///
+    /// Black for a coordinate that is off the image, not a number, or
+    /// infinite. `rgbAt` already range-checks, but the `Int()` conversions
+    /// that reach it are trapping, so the check has to happen BEFORE the
+    /// conversion, not after. `lumaBilinear` above clamps for the same reason.
     public func rgbNearest(_ p: SIMD2<Float>) -> SIMD3<Float> {
-        rgbAt(Int(p.x.rounded(.down)), Int(p.y.rounded(.down)))
+        guard let pixel = SmartMath.pixelIndex(p, width: width, height: height)
+        else { return .zero }
+        return rgbAt(pixel.x, pixel.y)
     }
 }
 

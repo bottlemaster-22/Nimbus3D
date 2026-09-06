@@ -105,12 +105,20 @@ enum ViewerError: LocalizedError {
 enum ViewerMath {
     @inline(__always)
     static func clamp(_ v: Float, _ lo: Float, _ hi: Float) -> Float {
-        Swift.min(Swift.max(v, lo), hi)
+        // ARGUMENT ORDER IS LOAD-BEARING. `Swift.max(x, y)` is
+        // `y >= x ? y : x`, and NaN compares false against everything, so the
+        // SECOND argument is the one that survives a NaN. Written the other
+        // way round (`min(max(v, lo), hi)`) this returns NaN for a NaN input,
+        // and every `Int(...)` downstream of it is a trapping conversion that
+        // kills the process. With `v` second in both calls, a NaN clamps to
+        // `lo` like any other out-of-range value.
+        Swift.min(hi, Swift.max(lo, v))
     }
 
     @inline(__always)
     static func clamp(_ v: Double, _ lo: Double, _ hi: Double) -> Double {
-        Swift.min(Swift.max(v, lo), hi)
+        // Same argument order, same reason, as the Float overload above.
+        Swift.min(hi, Swift.max(lo, v))
     }
 
     /// `normalize` that returns `fallback` instead of NaN for a zero vector.

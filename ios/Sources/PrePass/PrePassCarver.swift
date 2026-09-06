@@ -318,7 +318,24 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
 
         let stride = Swift.max(tuning.raySubsampleStride, 1)
         // A ray can only cross so many cells before it has left the scene.
-        let maxSteps = Int((maxRange / voxel).rounded(.up)) + 4
+        //
+        // `maxRange` is `bundle.settings.lidarMaxRangeMeters`, read straight
+        // off disk with no validation, and this was the ONE reader in the
+        // module that did not clamp it (the bundle adjuster, the glass
+        // detector, the initial splats and the survey all write
+        // `Swift.max(..., 0.5)`). `Int(someFloat)` is a trapping conversion:
+        // a NaN or a finite-but-absurd range from a half-written bundle killed
+        // the app here rather than being carved badly. The upper clamp also
+        // stops a corrupt range asking for a ray march of a billion steps.
+        // Types written out rather than inferred: a ternary whose branches are
+        // a clamped Float and a bare literal is the shape the type checker has
+        // given up on in this project before, and CI is the only compiler.
+        let clampedRange: Float = maxRange.isFinite
+            ? Swift.min(Swift.max(maxRange, 0.5), 50)
+            : 5
+        let stepsNeeded: Float = (clampedRange / Swift.max(voxel, 0.001)).rounded(.up)
+        let boundedSteps: Float = stepsNeeded.isFinite ? Swift.min(stepsNeeded, 100_000) : 100
+        let maxSteps = Int(boundedSteps) + 4
 
         for frame in keyframes {
             try Task.checkCancellation()
