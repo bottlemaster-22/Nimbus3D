@@ -229,8 +229,36 @@ public final class TwoScaleTrustField: TrustField {
         let nativeK = SmartCamera.nativeIntrinsics(
             bundle.intrinsics, depthWidth: width, depthHeight: height
         )
+
+        // WHAT THIS BUILD IS ALLOWED TO COST.
+        //
+        // `SmartLossSettings.economy` exists for "a phone that is already
+        // warm, or a house-sized scan where the trust build would otherwise
+        // dominate the pre-pass". Both of those are measurable right here, so
+        // the choice is made here rather than being left to a caller. It is
+        // logged either way: a cheaper build is a real difference in what was
+        // verified, and a difference nobody can see is how a quality change
+        // gets mistaken for a bad scan.
+        let costChoice = SmartLossSettings.trustBuildCost(
+            requested: settings,
+            frameCount: bundle.frames.count,
+            thermalLevel: ThermalLevel(ProcessInfo.processInfo.thermalState)
+        )
+        let cost = costChoice.settings
+        if let reason = costChoice.downshiftReason {
+            SmartLog.trust.notice(
+                """
+                Trust build running the economy preset because \
+                \(reason, privacy: .public): \(cost.trustPartnerFrames, privacy: .public) \
+                partner frames, stride \(cost.trustSampleStride, privacy: .public), \
+                plane-sweep budget \(cost.planeSweepSampleBudget, privacy: .public). \
+                Depth is verified less thoroughly than on a cool phone.
+                """
+            )
+        }
+
         let partners = Self.coVisibilityTable(
-            bundle: bundle, poses: poses, maxPartners: settings.trustPartnerFrames
+            bundle: bundle, poses: poses, maxPartners: cost.trustPartnerFrames
         )
 
         var accumulator = SmartBiasAccumulator(voxelSizeMeters: 0.25)
@@ -245,13 +273,13 @@ public final class TwoScaleTrustField: TrustField {
         let confidenceWriter = try SmartChunkedWriter(url: ref.url(forRelativePath: confidencePath))
 
         let depthCache = SmartDepthCache(
-            capacity: Swift.max(4, settings.trustPartnerFrames + 2), sampleCount: perFrame
+            capacity: Swift.max(4, cost.trustPartnerFrames + 2), sampleCount: perFrame
         )
         let imageCache = SmartImageCache(
-            capacity: Swift.max(3, settings.trustPartnerFrames + 1),
+            capacity: Swift.max(3, cost.trustPartnerFrames + 1),
             longEdge: Swift.max(width, height)
         )
-        var planeSweepBudget = settings.planeSweepSampleBudget
+        var planeSweepBudget = cost.planeSweepSampleBudget
         let startingSweepBudget = planeSweepBudget
 
         for slot in 0..<slotCount {
@@ -292,7 +320,7 @@ public final class TwoScaleTrustField: TrustField {
             }
 
             // --- 2. Cross-frame verification, strided. --------------------
-            let sampleStride = Swift.max(1, settings.trustSampleStride)
+            let sampleStride = Swift.max(1, cost.trustSampleStride)
             var partnerFrames: [CaptureFrame] = []
             for id in partners[frame.index] ?? [] {
                 if let partner = framesByIndex[Int(id)] { partnerFrames.append(partner) }
@@ -517,10 +545,13 @@ public final class TwoScaleTrustField: TrustField {
         )
 
         let sweepsRun = startingSweepBudget - planeSweepBudget
+        let presetName = costChoice.downshiftReason == nil ? "full" : "economy"
         SmartLog.trust.info(
             """
             Trust field built: \(slotCount) frame slots, \(biasCells.count) bias cells, \
-            \(affines.count) per-frame depth affines, \(sweepsRun) plane-sweep verifications
+            \(affines.count) per-frame depth affines, \(sweepsRun) plane-sweep verifications, \
+            \(presetName, privacy: .public) cost preset \
+            (\(cost.trustPartnerFrames) partner frames, stride \(cost.trustSampleStride))
             """
         )
 

@@ -47,6 +47,11 @@ struct OnboardingFlowView: View {
     let onFinish: () -> Void
 
     @State private var findings: DeviceCompatibilityFindings?
+
+    /// True when `findings` came off disk and is old enough that the screen
+    /// must say when it was measured rather than implying "now".
+    @State private var findingsAreStale = false
+
     @State private var page = 0
     @State private var isRechecking = false
     @State private var showsDetails = false
@@ -66,6 +71,7 @@ struct OnboardingFlowView: View {
                 OnboardingIncompatibleView(
                     report: currentReport,
                     findings: findings,
+                    findingsAreStale: findingsAreStale,
                     isRechecking: isRechecking,
                     onRecheck: { recheck() }
                 )
@@ -205,8 +211,11 @@ struct OnboardingFlowView: View {
                     OnboardingCopy.technicalDetailsHeading,
                     isExpanded: $showsDetails
                 ) {
-                    OnboardingDeviceFactsView(findings: findings)
-                        .padding(.top, 12)
+                    OnboardingDeviceFactsView(
+                        findings: findings,
+                        findingsAreStale: findingsAreStale
+                    )
+                    .padding(.top, 12)
                 }
                 .font(.callout.weight(.medium))
             }
@@ -272,7 +281,8 @@ struct OnboardingFlowView: View {
         let value = await Task.detached(priority: .userInitiated) {
             probe.findingsForDisplay()
         }.value
-        findings = value
+        findings = value.findings
+        findingsAreStale = value.isStale
     }
 
     /// Runs the whole check again and redraws from the new answer.
@@ -290,6 +300,9 @@ struct OnboardingFlowView: View {
                 probe.evaluateDetailed()
             }.value
             findings = value
+            // A re-check just measured this phone, so whatever was on disk is
+            // no longer what is on screen.
+            findingsAreStale = false
             isRechecking = false
         }
     }

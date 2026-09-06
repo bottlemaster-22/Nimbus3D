@@ -33,7 +33,6 @@ enum CaptureHUDPalette {
     static let unseen = Color(red: 0.62, green: 0.62, blue: 0.66)
     static let unreliable = Color(red: 0.35, green: 0.78, blue: 0.85)
     static let problem = Color(red: 1.00, green: 0.35, blue: 0.30)
-    static let panel = Color.black.opacity(0.55)
 }
 
 extension CaptureCoverageChannel {
@@ -283,10 +282,18 @@ struct CaptureWindowCard: View {
             }
 
             HStack(spacing: 10) {
+                // A hold has to be releasable from the same button that made
+                // it. Locking the exposure at a window and then walking into a
+                // dark hallway with no way to let it go is a worse scan than
+                // never having held it at all.
                 Button {
-                    model.lockExposureForWindow()
+                    if model.exposureIsLocked {
+                        model.releaseExposureLock()
+                    } else {
+                        model.lockExposureForWindow()
+                    }
                 } label: {
-                    Text(model.exposureIsLocked ? "Brightness held" : "Hold the brightness")
+                    Text(model.exposureIsLocked ? "Let the brightness go" : "Hold the brightness")
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
                 }
@@ -295,7 +302,6 @@ struct CaptureWindowCard: View {
                     in: RoundedRectangle(cornerRadius: 10)
                 )
                 .foregroundStyle(model.exposureIsLocked ? Color.white : Color.black)
-                .disabled(model.exposureIsLocked)
 
                 Button {
                     model.markWindow()
@@ -422,6 +428,32 @@ struct CaptureBottomPanel: View {
         VStack(alignment: .leading, spacing: 10) {
             Toggle("Talk to me", isOn: $model.soundOn)
             Toggle("Buzz when the picture smears", isOn: $model.hapticsOn)
+
+            // F5's switch. It lives here rather than only on the window card
+            // because the card is only on screen while a window is in front of
+            // you, and a user who wants the darker shots off wants them off
+            // for the whole walk.
+            Toggle("Slip in a darker shot for windows", isOn: $model.darkShotsOn)
+
+            // The release for a brightness hold, in a place that stays on
+            // screen after the window card has gone. The hold is made on the
+            // window card, but by the time it is hurting you, you are in the
+            // next room and the card is long gone.
+            if model.exposureIsLocked {
+                Button {
+                    model.releaseExposureLock()
+                } label: {
+                    Text("Let the brightness adjust itself again")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .background(
+                    Color.white.opacity(0.18),
+                    in: RoundedRectangle(cornerRadius: 10)
+                )
+                .foregroundStyle(.white)
+            }
+
             VStack(alignment: .leading, spacing: 4) {
                 Text("How strong the colour is")
                     .font(.footnote)

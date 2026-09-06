@@ -1031,12 +1031,20 @@ kernel void trainer_blur_h(
     const uint n = u.width * u.height;
     const uint idx = gid.y * u.width + gid.x;
 
-    // sigma = 1.5, 11 taps, normalised. Written out so nobody has to trust an
-    // exp() in a loop with fast-math enabled.
+    // sigma = 1.5, 11 taps, normalised so the eleven weights sum to exactly
+    // 1.0. Written out so nobody has to trust an exp() in a loop with
+    // fast-math enabled.
+    //
+    // THESE ELEVEN NUMBERS ARE CHECKED AGAINST SWIFT AT START-UP.
+    // `TrainerGPUConstants.ssimBlurWeights` carries the same table and
+    // `TrainerGPULayouts.verify()` re-derives it from `ssimSigma` and
+    // `ssimWindowRadius` and refuses to train if the three disagree. Change a
+    // digit here and the trainer says so on the phone instead of quietly
+    // blurring with the wrong window.
     const float k[11] = {
-        0.00102838f, 0.00759732f, 0.03600077f, 0.10936069f, 0.21296534f,
-        0.26361500f,
-        0.21296534f, 0.10936069f, 0.03600077f, 0.00759732f, 0.00102838f
+        0.00102838f, 0.00759876f, 0.03600077f, 0.10936069f, 0.21300554f,
+        0.26601172f,
+        0.21300554f, 0.10936069f, 0.03600077f, 0.00759876f, 0.00102838f
     };
 
     for (uint p = 0; p < u.planeCount; ++p) {
@@ -1059,10 +1067,12 @@ kernel void trainer_blur_v(
     const uint n = u.width * u.height;
     const uint idx = gid.y * u.width + gid.x;
 
+    // The same normalised sigma = 1.5 window as `trainer_blur_h`, checked
+    // against `TrainerGPUConstants.ssimBlurWeights` at start-up.
     const float k[11] = {
-        0.00102838f, 0.00759732f, 0.03600077f, 0.10936069f, 0.21296534f,
-        0.26361500f,
-        0.21296534f, 0.10936069f, 0.03600077f, 0.00759732f, 0.00102838f
+        0.00102838f, 0.00759876f, 0.03600077f, 0.10936069f, 0.21300554f,
+        0.26601172f,
+        0.21300554f, 0.10936069f, 0.03600077f, 0.00759876f, 0.00102838f
     };
 
     for (uint p = 0; p < u.planeCount; ++p) {

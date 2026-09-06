@@ -441,7 +441,18 @@ struct TrainerTuning: Sendable {
     var carveIntervalIterations: Int = 250
     /// How often a preview snapshot is read back off the GPU.
     var snapshotIntervalIterations: Int = 50
-    /// How often the loss accumulator is read back for the progress stream.
+    /// How often the loss accumulator WOULD be read back, if anything read
+    /// this.
+    ///
+    /// NOTHING READS THIS, and that is not a missing feature. The training
+    /// loop reads `lossAccum` once per iteration, straight after the
+    /// `waitUntilCompleted()` it already has to do, so the read costs four
+    /// bytes off a shared buffer that is already synchronised. Honouring an
+    /// interval here would not save anything and WOULD change the numbers: the
+    /// 0.98 exponential average the progress stream shows is tuned for a
+    /// sample every iteration, and feeding it one sample in ten would make it
+    /// lag by ten times as much. Left here rather than deleted so that the
+    /// next person to wonder why there is no interval finds the answer.
     var lossReadbackIntervalIterations: Int = 10
 
     // --- Densification --------------------------------------------------------
@@ -474,6 +485,11 @@ struct TrainerTuning: Sendable {
     /// smaller ones are CLONED.
     var splitScaleFraction: Float = 0.01
     /// How many children a split produces.
+    ///
+    /// Descriptive, not read. `TrainerDensifier` splits by shrinking the
+    /// parent in place and appending exactly one sibling, which is two
+    /// children for one slot, and that two is a property of the code rather
+    /// than a number it looks up. Changing this alone changes nothing.
     var splitChildCount: Int = 2
     /// Children are placed at +/- this many standard deviations along the
     /// split axis, and shrunk by `splitShrink`.
@@ -571,6 +587,12 @@ enum TrainerMath {
     }
 
     /// Bytes rounded up to a page, which is what Metal actually reserves.
+    ///
+    /// Unused today. The memory budget works in bytes-per-splat and
+    /// bytes-per-pixel, where per-buffer page rounding is at most a few
+    /// hundred kilobytes against hundreds of megabytes, so nothing would
+    /// change if it were applied. Kept because it is correct and because the
+    /// next person to compare an estimate against Instruments will want it.
     static func pageAligned(_ bytes: Int) -> Int {
         let page = 16 * 1024
         return ((Swift.max(bytes, 1) + page - 1) / page) * page

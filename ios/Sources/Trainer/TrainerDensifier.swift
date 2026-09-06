@@ -137,6 +137,16 @@ struct TrainerDensifyOutcome {
     /// computed.
     var relocationDonorsAvailable = 0
 
+    /// True when this pass created or deleted at least one Gaussian.
+    ///
+    /// Nothing reads this any more, ON PURPOSE. It used to gate the
+    /// per-interval reset of the densification accumulators in
+    /// `MetalSplatTrainer`, and gating that reset was a bug: a pass that
+    /// changed nothing skipped the reset and let `visAccum` run on into the
+    /// next interval, which loosens the visibility filter the longer
+    /// densification goes without changing anything. The reset is now
+    /// unconditional. Kept because the comment at that call site names this
+    /// property when it explains why.
     var changedTopology: Bool {
         cloned + split + prunedLowOpacity + prunedOversized
             + prunedNonFinite + carvedFromEmptySpace + trimmedToCap > 0

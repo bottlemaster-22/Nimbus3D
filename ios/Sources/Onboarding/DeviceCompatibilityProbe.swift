@@ -83,6 +83,27 @@ public struct DeviceCompatibilityFindings: Codable, Sendable {
     }
 }
 
+/// A set of findings a screen is about to draw, and whether they are old.
+///
+/// Two fields rather than a bare `DeviceCompatibilityFindings` because
+/// "measured a moment ago" and "read back from a file written by last
+/// month's build" produce the same struct and must not produce the same
+/// sentence on screen.
+public struct DeviceFindingsForDisplay: Sendable {
+
+    public var findings: DeviceCompatibilityFindings
+
+    /// True when these came off disk and `StoredDeviceReport.isStale` says the
+    /// build, the iOS version or the age has moved on. Stale does not mean
+    /// wrong: the screen still draws it, and says when it was measured.
+    public var isStale: Bool
+
+    public init(findings: DeviceCompatibilityFindings, isStale: Bool) {
+        self.findings = findings
+        self.isStale = isStale
+    }
+}
+
 // MARK: - The service
 
 /// `DeviceCompatibilityService` for `Sources/Onboarding`.
@@ -286,10 +307,24 @@ public final class DeviceCompatibilityProbe: DeviceCompatibilityService, @unchec
     /// already run, the persisted ones when a previous launch ran it, and a
     /// fresh check otherwise. Never returns nil, so no screen has to have an
     /// "unknown" state that only exists because of plumbing.
-    public func findingsForDisplay() -> DeviceCompatibilityFindings {
-        if let cached = lastFindings { return cached }
-        if let stored = DeviceReportStore.shared.load()?.findings { return stored }
-        return evaluateDetailed()
+    ///
+    /// `isStale` is the honest half of that convenience. A stored report can
+    /// have been written by a different build of the app, under a different
+    /// iOS version, or a month ago, and a screen that draws one without
+    /// saying so is implying it measured this phone just now.
+    /// `StoredDeviceReport.isStale` decides; this only carries the answer.
+    public func findingsForDisplay() -> DeviceFindingsForDisplay {
+        if let cached = lastFindings {
+            // Measured in this process, so it is current by construction.
+            return DeviceFindingsForDisplay(findings: cached, isStale: false)
+        }
+        if let stored = DeviceReportStore.shared.load() {
+            return DeviceFindingsForDisplay(
+                findings: stored.findings,
+                isStale: stored.isStale
+            )
+        }
+        return DeviceFindingsForDisplay(findings: evaluateDetailed(), isStale: false)
     }
 
     // MARK: - Tier

@@ -22,6 +22,7 @@
 //
 
 import SwiftUI
+import os
 
 // =============================================================================
 //  MARK: - INTEGRATION BLOCK
@@ -97,6 +98,36 @@ enum NimbusBootstrap {
         // --- Booster (Sources/Booster). Always optional, never required.
         services.booster = BoosterClient.shared
         ui.boosterScreen = { AnyView(BoosterTabView()) }
+
+        // THE HONEST ANSWER TO "WHAT IS ACTUALLY BUILT?", SAID OUT LOUD.
+        //
+        // `NimbusServices.installedModules` was written for exactly this and
+        // nothing read it, so the list above was only ever checkable by
+        // reading this file. It is derived from the registrations that just
+        // ran, not from a hand-kept list, so it cannot claim a module that
+        // failed to register.
+        // Built here rather than held as a static: this runs once, at launch.
+        let log = Logger(
+            subsystem: BrandConfig.loggingSubsystem, category: "App"
+        )
+        let installed = services.installedModules
+        log.info(
+            """
+            \(BrandConfig.displayName, privacy: .public) \
+            \(BrandConfig.versionString, privacy: .public) started. \
+            Modules in this build: \(installed.joined(separator: ", "), privacy: .public)
+            """
+        )
+        let expected = ["Onboarding", "Capture", "PrePass", "Trainer", "Viewer", "Export", "Booster"]
+        let missing = expected.filter { !installed.contains($0) }
+        if !missing.isEmpty {
+            log.error(
+                """
+                These modules did NOT register and their screens will say so: \
+                \(missing.joined(separator: ", "), privacy: .public)
+                """
+            )
+        }
     }
 }
 
@@ -556,6 +587,7 @@ private struct LimitedTierBanner: View {
 
 /// Shown in a tab whose screen did not register. Names what is missing, says
 /// what is safe, and stops. No fake progress bar, no "coming soon".
+@MainActor
 struct ScreenUnavailableView: View {
     /// Plain-language name of the missing part, e.g. "the scanning screen".
     let part: String
@@ -578,9 +610,22 @@ struct ScreenUnavailableView: View {
             .font(.subheadline)
             .foregroundStyle(.secondary)
             .multilineTextAlignment(.center)
+
+            // The registry's own answer to "what is in this build?", so the
+            // one screen a person reaches when something did not register can
+            // also say what did. Read out over a phone call, this is the
+            // difference between "it is broken" and one named missing module.
+            Text("Parts of the app that did load: \(installedModules)")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
         }
         .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var installedModules: String {
+        NimbusServices.shared.installedModules.joined(separator: ", ")
     }
 }
 

@@ -123,6 +123,7 @@ struct ScanLibraryScreen: View {
 
     private var listBody: some View {
         List {
+            nextUpSection
             Section {
                 ForEach(store.scans) { scan in
                     // Tapping a scan goes to whatever it needs next. A scan
@@ -165,6 +166,55 @@ struct ScanLibraryScreen: View {
                 ProgressView("Looking for your scans...")
             }
         }
+    }
+
+    // MARK: Next up
+
+    /// The one scan that is waiting on the user, put at the top of the list
+    /// with the words of the button that starts it.
+    ///
+    /// `ScanLibraryStore.nextUpScan` and `ScanSummary.primaryActionTitle` were
+    /// both written for this and neither had a reader, so the card never
+    /// appeared: coming back from the Capture tab, a freshly recorded scan was
+    /// one more identical row and nothing said which step it was waiting for.
+    /// The scan is still in the list below; this does not hide or reorder it.
+    @ViewBuilder
+    private var nextUpSection: some View {
+        if let next = store.nextUpScan, let action = next.primaryActionTitle {
+            Section {
+                NavigationLink {
+                    ScanProcessingScreen(summary: next)
+                } label: {
+                    nextUpLabel(next, action: action)
+                }
+            } header: {
+                Text("Next up")
+            } footer: {
+                Text("The scan waiting on you. It is in the list below as well.")
+            }
+        }
+    }
+
+    private func nextUpLabel(_ scan: ScanSummary, action: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            ScanThumbnailView(scan: scan)
+                .frame(width: 52, height: 52)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(scan.displayName)
+                    .font(.body.weight(.semibold))
+                    .lineLimit(1)
+                Text(scan.nextStep)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Text(action)
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+            }
+        }
+        .padding(.vertical, 2)
     }
 
     private var storageLine: String {

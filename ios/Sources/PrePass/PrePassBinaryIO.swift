@@ -49,6 +49,15 @@ enum PrePassPaths {
     /// because a report about the work must never be able to break the work.
     static var census: String { "\(directory)/census.json" }
     static var occupancy: String { "\(directory)/occupancy.bin" }
+    // The four F6 fields and the F3 edge folder below are WRITTEN by
+    // `Sources/Smart` (`TwoScaleTrustField`, `NativeDepthEdgeClassifier`),
+    // which builds the identical strings from `BrandConfig.Folder.prePass`
+    // itself instead of reading them from here. Verified identical, byte
+    // layouts included, on 2026-09-06. They are declared here anyway because
+    // this enum is the module's statement of where the pre-pass puts things,
+    // and `PrePassPaths.missing(_:at:)` uses them after those stages to catch
+    // the day the two spellings stop matching. Renaming one of these alone
+    // changes nothing on disk: change the Smart writer in the same commit.
     static var trustBias: String { "\(directory)/trust_bias.bin" }
     static var trustNoise: String { "\(directory)/trust_noise.bin" }
     static var depthAffine: String { "\(directory)/depth_affine.bin" }
@@ -76,6 +85,33 @@ enum PrePassPaths {
     /// `prepass/edges/frame_20260903_141205_512.edge8` for a given frame.
     static func edgeMap(for frame: CaptureFrame) -> String {
         "\(edgesDirectory)/\(stem(ofRelativePath: frame.imagePath)).edge8"
+    }
+
+    /// Which of `paths` are NOT on disk under `ref`.
+    ///
+    /// This exists because four of the names above (`trustBias`, `trustNoise`,
+    /// `confidenceRecalibrated`, `edgesDirectory`) are produced by
+    /// `Sources/Smart`, which builds the same strings itself from
+    /// `BrandConfig.Folder.prePass` rather than reading them from here. The two
+    /// spellings agree today. Nothing enforced that they keep agreeing, and a
+    /// silent disagreement looks exactly like a stage that ran and produced
+    /// nothing: the pre-pass reports success, the file the trainer opens is not
+    /// there, and every depth sample falls back to "no opinion".
+    ///
+    /// So the constants get used for the one thing they can be used for from
+    /// this side: after a stage says it wrote its files, check the files are
+    /// where this enum says they are, and put it on the QC card when they are
+    /// not. A drift that used to be silent becomes a sentence on the card the
+    /// owner reads after every scan.
+    static func missing(_ paths: [String], at ref: CaptureBundleRef) -> [String] {
+        var absent: [String] = []
+        for path in paths {
+            let url = ref.url(forRelativePath: path)
+            if !FileManager.default.fileExists(atPath: url.path) {
+                absent.append(path)
+            }
+        }
+        return absent
     }
 }
 
@@ -199,6 +235,12 @@ enum PrePassOccupancyFile {
 /// The distinct-times count is the whole reason this file is not just a mean:
 /// 400 samples from one pass past a wall is one observation repeated, and only
 /// separate visits earn real trust.
+///
+/// NOT CALLED. `Sources/Smart` writes this file with its own inline
+/// appenders (`SmartBinary`), which produce byte-identical records and
+/// apply the same non-finite guard. Kept because the layout table above
+/// is the one written down next to `docs/DATA_FORMAT.md`; the Smart
+/// writer has no table. See INTEGRATION_REQUESTS.md.
 enum PrePassTrustBiasFile {
     static let recordSize = 24
 
@@ -228,6 +270,12 @@ enum PrePassTrustBiasFile {
 /// Float32 shift)`, 12 bytes per record, one per frame that has a correction.
 /// Tightly constrained around `(1, 0)`; a large correction means something
 /// else is wrong and the QC card says so rather than quietly applying it.
+///
+/// NOT CALLED. `Sources/Smart` writes this file with its own inline
+/// appenders (`SmartBinary`), which produce byte-identical records and
+/// apply the same non-finite guard. Kept because the layout table above
+/// is the one written down next to `docs/DATA_FORMAT.md`; the Smart
+/// writer has no table. See INTEGRATION_REQUESTS.md.
 enum PrePassDepthAffineFile {
     static let recordSize = 12
 
@@ -249,6 +297,12 @@ enum PrePassDepthAffineFile {
 ///
 /// See the file header for why the block index is the frame index rather than
 /// the frame's position in the array.
+///
+/// NOT CALLED. `Sources/Smart` writes this file with its own inline
+/// appenders (`SmartBinary`), which produce byte-identical records and
+/// apply the same non-finite guard. Kept because the layout table above
+/// is the one written down next to `docs/DATA_FORMAT.md`; the Smart
+/// writer has no table. See INTEGRATION_REQUESTS.md.
 enum PrePassSampleFieldFile {
 
     /// - Parameters:

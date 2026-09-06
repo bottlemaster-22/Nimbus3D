@@ -684,6 +684,34 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
                 // re-deriving what is in it.
                 try await trustField.load(refs, at: ref)
                 trustLoaded = true
+                // The trust builder lives in `Sources/Smart` and spells these
+                // paths out itself. `PrePassPaths` is where this module says
+                // they are. If the two ever drift apart the pre-pass would
+                // still report success while the trainer opened nothing, so
+                // the disagreement is checked rather than assumed.
+                let absent = PrePassPaths.missing(
+                    [
+                        PrePassPaths.trustBias,
+                        PrePassPaths.trustNoise,
+                        PrePassPaths.confidenceRecalibrated
+                    ],
+                    at: ref
+                )
+                if !absent.isEmpty {
+                    let names = absent.joined(separator: ", ")
+                    log.error("Trust files missing after build: \(names, privacy: .public)")
+                    stageFindings.append(
+                        QCFinding(
+                            code: "trust_files_missing",
+                            severity: .problem,
+                            message: "The depth reliability measurements finished but were "
+                                + "not found where the rest of the app looks for them, so "
+                                + "training will ignore them.",
+                            fixHint: "This is a fault in the app rather than in the scan. "
+                                + "The scan itself is still usable."
+                        )
+                    )
+                }
                 result.qcCard = card(glassFraction: survey.apertureSampleFraction)
                 emit(result)
             } catch is CancellationError {
@@ -712,6 +740,25 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
                 )
                 result.edges = refs
                 edgesLoaded = true
+                // Same reasoning as the trust files above: the classifier
+                // builds `prepass/edges` from its own string, this module
+                // declares it in `PrePassPaths`, and a silent disagreement
+                // would read as "every surface is flat" rather than as an
+                // error.
+                if !PrePassPaths.missing([PrePassPaths.edgesDirectory], at: ref).isEmpty {
+                    log.error("Edge directory missing after classification.")
+                    stageFindings.append(
+                        QCFinding(
+                            code: "edge_maps_missing",
+                            severity: .problem,
+                            message: "The edge maps finished but were not found where the "
+                                + "rest of the app looks for them, so patterned surfaces "
+                                + "will be treated as if they were bumpy.",
+                            fixHint: "This is a fault in the app rather than in the scan. "
+                                + "The scan itself is still usable."
+                        )
+                    )
+                }
                 result.qcCard = card(glassFraction: survey.apertureSampleFraction)
                 emit(result)
             } catch is CancellationError {

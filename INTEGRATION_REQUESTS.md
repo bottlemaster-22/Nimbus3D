@@ -1900,3 +1900,364 @@ gives a render grid of at least 384 x 288, so the map is injective in both axes
 in portrait and in landscape. If anyone ever adds a rung below 256 columns or
 192 rows, this becomes a silent race in the depth gradient. Worth a comment at
 the ladder if that is ever considered.
+
+---
+
+## From `Sources/PrePass` to `Sources/Smart`: route the F6 and F3 sidecar paths and byte layouts through `PrePassPaths` / `PrePassBinaryIO`
+
+Raised 2026-09-06 during the dead-wire audit. Nothing is broken today. This is
+a request to remove a duplication that would fail silently if it ever drifted.
+
+**What is duplicated.** `PrePassPaths` declares `trustBias`, `trustNoise`,
+`depthAffine`, `confidenceRecalibrated` and `edgesDirectory`, and
+`PrePassBinaryIO` declares the record layouts for them in
+`PrePassTrustBiasFile`, `PrePassDepthAffineFile` and `PrePassSampleFieldFile`,
+each with the layout table quoted from `docs/DATA_FORMAT.md`. None of those five
+constants and none of those three codecs is called by anything.
+
+The files are still produced, because `Sources/Smart` builds the same strings
+and the same bytes itself:
+
+- `Smart/TwoScaleTrustField.swift` lines 212-215 build
+  `"\(BrandConfig.Folder.prePass)/trust_noise.bin"` and the other three as
+  local string literals.
+- `Smart/TwoScaleTrustField.swift` lines 492-507 serialise the bias records and
+  the affine records inline with `SmartBinary`.
+- `Smart/NativeDepthEdgeClassifier.swift` line 84 builds
+  `"\(BrandConfig.Folder.prePass)/edges"` the same way, and its
+  `stem(forImagePath:)` at line 442 duplicates `PrePassPaths.stem`.
+
+**Verified identical on 2026-09-06**, so this is not a bug report:
+
+- bias record: `UInt64` key, `Float32` mean, `Float32` variance, `UInt32`
+  count, `UInt16` distinct times, `UInt16` reserved = 24 bytes, both sides.
+- affine record: `UInt32` frame, `Float32` scale, `Float32` shift = 12 bytes,
+  both sides.
+- `SmartBinary.append(_ value: Float,...)` applies the same non-finite guard as
+  `PrePassBinary.appendFloat`, so the file header's rule 2 holds on both paths.
+- the two `stem` implementations are character for character the same.
+
+**Why it still matters.** A rename or a layout change on one side alone
+produces no compile error and no runtime error. The pre-pass would report the
+stage as successful, the trainer's `TwoScaleTrustField.load` would find nothing,
+and every depth sample would silently fall back to "no opinion" while the
+census still said the field was built. That is the same shape as the four
+scan-destroying bugs this audit exists to find.
+
+**Interim mitigation, already landed in `Sources/PrePass`.**
+`PrePassPaths.missing(_:at:)` is new, and `PrePassPipeline` now calls it right
+after the F6 and F3 stages report success. A disagreement now raises the QC
+findings `trust_files_missing` and `edge_maps_missing` at `.problem` severity
+instead of passing unnoticed. This detects drift; it does not prevent it.
+
+**The ask, for whoever owns `Sources/Smart`:**
+
+1. Replace the five local path strings with `PrePassPaths.trustBias`,
+   `.trustNoise`, `.depthAffine`, `.confidenceRecalibrated`,
+   `.edgesDirectory`, and the per-frame edge name with `PrePassPaths.edgeMap`.
+2. Replace the inline bias and affine serialisation with
+   `PrePassTrustBiasFile.encode` and `PrePassDepthAffineFile.encode`, and the
+   `.appendFloats` block writer with `PrePassSampleFieldFile.encode` if the
+   streaming writer can be reworked without losing its memory ceiling. If it
+   cannot, say so and the codec should be deleted rather than left as a
+   lookalike, since a second definition of a layout is worse than none.
+3. Once 1 and 2 land, the `PrePassPaths.missing` checks can stay as cheap
+   insurance or be dropped. They cost one `fileExists` per stage.
+
+There is no module-boundary objection to this: `project.yml` builds every
+`Sources/*` folder into the ONE Xcode target `App`, so `Sources/Smart` can name
+`PrePassPaths` directly with no import and no dependency cycle (`PrePassPipeline`
+already names `TwoScaleTrustField` the same way). If the folders are ever split
+into real modules, move `PrePassPaths` and the three codecs into `Sources/Core`
+instead so both sides read one definition. Either resolution is fine; two
+definitions is not.
+
+---
+
+## From Capture: `ARCaptureService.hasOpenScan` is a guard nobody asks for
+
+`ARCaptureService.hasOpenScan` (`phase == .recording || phase == .halted`) and
+`isRecording` are both public and both read nowhere in the app. They are
+harmless as they stand, but `hasOpenScan` is the exact question the app shell
+should be asking before it lets the user navigate away from the capture screen
+or open a second scan: a scan that is open but not finished has frames on disk
+and no index written for them.
+
+`App/NimbusApp.swift` and whatever owns navigation are not mine to touch. If
+the shell wants that guard, the property is there and is already correct.
+
+## From Capture: point-cloud coarsening is logged but not in the bundle
+
+`CapturePointCloudAccumulator.didDegrade` and `effectiveVoxelSizeMeters` record
+that the cloud had to coarsen past the format's nominal 1 cm to stay inside its
+cap. The coarsening logs itself (old size, new size) so it is not hidden, but
+`CaptureBundle` has no field for it, so a downstream stage reading the bundle
+cannot tell that the cloud it was handed is lower resolution than the format
+says. Adding a field to the bundle contract is a Core change, not a Capture one.
+
+---
+
+## From Core/Smart/App/Onboarding (deadwire pass): five cross-module wirings
+
+Five things I found unwired live in files I do not own. Each names the exact
+symbol and the exact call site.
+
+### 1. Trainer: the census cannot say the mid regime is a stub
+
+`DirectionalBackgroundModel.midRegimeProvenance` and `.isMidRegimeReal` exist so
+a stubbed run is never mistaken for a real one. On the phone
+`SmartMonocularDepthStub.isAvailable` is `false` and `estimate(...)` returns nil,
+so the 4.5 to 30 m band is routed around rather than measured, and until now
+nothing anywhere said so.
+
+Done on my side: `write(to:)` now puts the provenance into
+`model/background.json` (`summary`, plus new optional `midRegimeProvenance` and
+`midRegimeIsReal` fields), and `warmUp` logs it once per run.
+
+Wanted from Trainer: `MetalSplatTrainer` builds the model at
+`MetalSplatTrainer.swift:2646` (`DirectionalBackgroundModel(settings: settings)`).
+`TrainerCensus` should carry `background.isMidRegimeReal` and
+`background.midRegimeProvenance` so `model/train_census.json` states which of the
+two ran. Both are cheap property reads; neither infers anything.
+
+### 2. Trainer: the glass confirmation rate is measured and unread
+
+`SmartGlassMask.confirmedFraction` is the fraction of a frame's samples confirmed
+as glass. A confirmed pane multiplies authority by ZERO, so a frame that is
+mostly window contributes almost no depth evidence, however good the capture was.
+
+Done on my side: `SmartAuthorityMap.map(for:)` now reads it, warns once per
+prepared scan when a frame is at least half confirmed glass, and keeps a measured
+running total in the new `SmartAuthorityMap.glassDominatedFrameCount`.
+
+Wanted from Trainer: `TrainerSupervision.swift:282` already reads
+`authority?.map(for: frame.index)?.meanAuthority`. Read
+`authorityMap.glassDominatedFrameCount` at the end of the run and put it in
+`TrainerCensus` next to the frame count. It is a count, not an estimate; report
+it with the number of frames built or it cannot be interpreted.
+
+### 3. PrePass: the economy preset now selects itself, and the pipeline should
+know it can
+
+`SmartLossSettings.economy` was declared, documented ("a phone that is already
+warm, or a house-sized scan") and selected by nothing, so every trust build ran
+at full cost: 4 partner frames, stride 2, a 20 000-sample plane-sweep budget.
+`PrePassPipeline.swift:249` constructs `TwoScaleTrustField()` with `.default` in
+`init`, before `deviceTier` is known, so the pipeline could not have chosen.
+
+Done on my side: `SmartLossSettings.trustBuildCost(requested:frameCount:thermalLevel:)`
+makes the choice from two measurements, and `TwoScaleTrustField.build` calls it
+at the top of every build and logs which preset ran and why.
+
+Wanted from PrePass, optional: `deviceTier` is a better signal than either of
+mine for a phone that is merely small rather than hot. If `PrePassPipeline`
+rebuilds its trust field in `run` once the tier is known, pass
+`SmartLossSettings.economy` for `.limited` explicitly rather than leaving it to
+the thermal check.
+
+### 4. Viewer: the trained background is never shown
+
+`Viewer/SplatRenderShaders.metal:673` composites a flat grey
+(`float3 background = float3(0.09f, 0.095f, 0.105f)`) behind the splats. Nothing
+in `Sources/Viewer` reads `model/background.bin`, and
+`DirectionalBackgroundModel.load(from:)` and `.currentCubemap` are both
+documented "for the viewer" and called by nothing. So the direction-only far
+field the trainer fitted and froze is not in any preview or review render: every
+sky and every distant wall shows as that grey.
+
+`DirectionalBackgroundModel.composite(gaussianColor:accumulatedAlpha:direction:)`
+is the exact operator the trainer's photometric kernel uses
+(`splat + T * bg`, `TrainerShaders.metal:963`), written as a CPU mirror so both
+ends agree. It is the reference for whoever wires this up.
+
+### 5. Capture: `sparse/0` is spelled out rather than read from the brand block
+
+`BrandConfig.Folder.sparseModel` is `"sparse/0"`, the COLMAP model path
+`docs/DATA_FORMAT.md` specifies, and nothing reads it.
+`CaptureScanFolder.swift:48` builds the same path as
+`Folder.sparse` + `"0"`, and line 81 as `"\(BrandConfig.Folder.sparse)/0/points3D.txt"`.
+No drift today, because both spell "0" the same way. The brand block exists so
+there is one place to change it; two hand-written `"0"`s is where that stops
+being true.
+
+### 6. Docs: `model/background.json` has two new optional fields
+
+`docs/DATA_FORMAT.md:605` describes `background.bin` + `background.json` in one
+sentence and does not list the header's fields, so nothing there is now wrong.
+The header gained `midRegimeProvenance` (String, optional) and `midRegimeIsReal`
+(Bool, optional). Both are absent in files written by older builds and decode as
+nil; the format version is unchanged because no byte layout moved and no reader
+needs them.
+
+---
+
+# RESOLUTIONS - 2026-09-06, integration gate
+
+Every request open above is answered here: made, or rejected in writing with the
+reason. Nothing is left "noted". Where a request was made, the call site is
+named so it can be checked without trusting this note.
+
+## MADE
+
+### Trainer census now records the mid regime (request 1)
+
+`TrainerCensus` gained `midRegimeIsReal: Bool?` and `midRegimeProvenance:
+String?`, and `MetalSplatTrainer` fills both from `smart.background` right after
+`census.finalSplatCount` is set, at the end of the run. `buildLedger()` adds a
+sentence when the band was NOT measured: "depth from 4.5 to 30 m was not
+measured on this device and was worked out from camera movement instead."
+
+Left nil when the far field could not be fitted at all. That is a third case,
+distinct from `false`, and recording it as `false` would claim a measurement
+that never happened.
+
+`docs/DATA_FORMAT.md` section 8 now lists both fields, and the `background.json`
+paragraph now has a table for the matching pair on that side.
+
+### Trainer census now records the glass-dominated frame count (request 2)
+
+Made, and with the denominator the request itself asked for. Reading
+`glassDominatedFrameCount` alone would have been useless: "4 glass-dominated
+frames" is a catastrophe out of 5 and a footnote out of 400, and the property's
+own doc comment says so.
+
+So `SmartAuthorityMap` also gained `builtFrameCount`, backed by a `builtFrames`
+counter incremented inside the existing cache-insert lock in `map(for:)` and
+reset in `prepare(...)`. It counts frames whose map was actually BUILT rather
+than served from the LRU cache, which is the honest denominator.
+
+`TrainerCensus` gained `authorityFramesBuilt: Int?` and `glassDominatedFrames:
+Int?`, a ledger line, and a new check-severity alert `glass_dominated_frames`
+that fires at or above `glassDominatedRunPercent` (33 per cent). Below a third,
+a few windows in a room is normal, and saying it every time would train the
+reader to skip the alerts.
+
+Note for the record: when this gate started, `glassDominatedFrameCount` was
+itself dead. It was added earlier the same day, exposed publicly, and read by
+nothing. The log line it introduced even ended "The running total is in
+glassDominatedFrameCount", pointing at a number no screen and no file carried.
+That is the exact bug class this whole pass exists to find, re-introduced by the
+work that was doing the finding, which is the strongest argument there is for
+the CI gate described at the end of this section.
+
+### `sparse/0` now comes from the brand block (request 5)
+
+`BrandConfig.Folder.sparseModel` is now read by both places in
+`Capture/CaptureScanFolder.swift` that used to spell the `"0"` by hand:
+`sparseModelDirectory` and `pointCloudRelativePath`.
+
+The directory version appends one component at a time, in a plain loop, rather
+than passing `"sparse/0"` to `appendingPathComponent` in one go. The one-shot
+form is almost certainly fine, but "almost certainly" is not good enough for the
+path the COLMAP export writes to, and there is no compiler or device in this
+session to settle it. The loop makes no assumption at all and costs nothing.
+
+`BrandConfig.Folder.sparse` is still live (`Export/BoosterBundle.swift:47`), so
+nothing was orphaned by the change.
+
+### `docs/DATA_FORMAT.md` updated (request 6)
+
+Done, and wider than asked. The request only pointed out that
+`background.json`'s two new optional fields were undocumented. The same section
+did not list ANY of that header's fields, and section 8's census table did not
+carry the four fields added today either. Both are now written down, including
+what an ABSENT optional means in each case, because "absent" and "false" are
+different statements and a reader a year from now cannot tell them apart from
+the code.
+
+`glass_dominated_frames` is added to the stable `alerts[].code` list.
+
+## REJECTED, with reasons
+
+### Route Smart's F6/F3 sidecar writers through `PrePassPaths` / `PrePassBinaryIO`
+
+REJECTED FOR NOW. The analysis is right and the duplication is real:
+`Sources/Smart` builds the five sidecar paths and serialises the bias and affine
+records itself, byte-identically, and a rename on one side alone would produce
+no compile error and no runtime error.
+
+But the fix asked for is a rewrite of the writers that produce the files the
+trainer reads, performed with no Swift compiler and no device anywhere in this
+session. The failure mode of getting it subtly wrong is precisely the failure
+mode being defended against: the pre-pass reports success and the trainer opens
+nothing. Trading a hypothetical future drift for a possible present breakage is
+a bad trade on a project whose one real scan already came out looking like
+nothing.
+
+The mitigation that landed with the request is the part that actually matters,
+and it is already in: `PrePassPaths.missing(_:at:)` is called right after the F6
+and F3 stages report success, and a disagreement now raises
+`trust_files_missing` or `edge_maps_missing` at `.problem` severity on the QC
+card the owner reads after every scan. Silent drift is no longer possible. Loud
+drift is survivable.
+
+Do the refactor in a session that can build and run it, and do it in the
+direction the request's own last paragraph suggests: move `PrePassPaths` and the
+three codecs into `Sources/Core` so both sides read one definition.
+
+### `deviceTier` should also select the economy trust preset (request 3)
+
+REJECTED. The request marks itself optional, and the gap it describes is already
+closed by two measurements: `SmartLossSettings.trustBuildCost` downshifts on
+thermal state at or above `.serious`, or on more than 1,200 frames, and
+`TwoScaleTrustField.build` calls it at the top of every build and logs which
+preset ran and why.
+
+Honouring `deviceTier` as a third signal means restructuring when the trust
+field is constructed: `PrePassPipeline.swift:249` builds it in `init`, before
+the tier is known. Reordering construction to gain a third opinion about
+something two measurements already decide is not worth the risk today.
+
+### Show the trained background in the viewer (request 4)
+
+REJECTED AS OUT OF SCOPE FOR THIS GATE, and it is the most valuable thing left
+open. The finding is correct and it is not cosmetic: the trainer fits and
+freezes a direction-only far field, and `Viewer/SplatRenderShaders.metal:673`
+composites a flat grey behind the splats regardless. Every sky and every distant
+wall in every preview is that grey.
+
+It is rejected here because it is a FEATURE, not a wiring fix. It needs
+`model/background.bin` loaded, a cubemap uploaded as a texture, a new shader
+input, a decision about what to draw when the file is absent, and a look at the
+result on a screen. Every one of those steps is unverifiable in this session.
+Wiring a render path blind is how you ship a black screen, and this app has
+already shown the owner one thing that looked like nothing.
+
+`DirectionalBackgroundModel.composite(gaussianColor:accumulatedAlpha:direction:)`
+is kept, allowlisted and documented precisely so that whoever does this has the
+CPU reference for the operator the GPU uses. It is the first thing to pick up
+next.
+
+### `hasOpenScan` as a navigation guard (Capture to App)
+
+REJECTED. The property is correct and costs nothing where it is. Adding a
+navigation guard to the app shell is a UX change with a real failure mode of its
+own: a guard that misjudges "open" traps the user on the capture screen with no
+way out, which is worse than the problem it solves. The request itself says the
+properties are harmless as they stand.
+
+Both `hasOpenScan` and `isRecording` stay, allowlisted with that reasoning. The
+offer stands for whoever takes on navigation deliberately.
+
+### Point-cloud coarsening should be a field on `CaptureBundle` (Capture to Core)
+
+REJECTED. `CaptureBundle` is a `Codable` contract written to disk and read by
+three modules; adding a field to it is a format change. The coarsening is not
+hidden today: `CapturePointCloudAccumulator` logs the old and new voxel size
+when it degrades.
+
+The value of the change is that a downstream stage could react to it, and no
+downstream stage wants to yet. Change the contract in the commit that adds the
+first reader, and not before.
+
+## The gate that stops this list growing silently
+
+`tools/deadwire.py` now reads `tools/deadwire_allowlist.txt` and exits non-zero
+on any unreferenced declaration that is NOT on it, and a `deadwire` job in
+`.github/workflows/ios.yml` runs it on every push. The 112 known-harmless
+candidates are listed with a reason each. A NEW declaration that nothing calls
+fails the check.
+
+It deliberately does not block the IPA. The archive job has no `needs:` on it,
+because the phone build is how the owner gets a working app and a lint finding
+must never be the reason he cannot install one.

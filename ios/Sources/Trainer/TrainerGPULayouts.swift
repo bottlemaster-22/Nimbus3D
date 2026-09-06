@@ -88,8 +88,58 @@ enum TrainerGPUConstants {
 
     /// SSIM window: 11 taps, sigma 1.5, the constants the SSIM paper and every
     /// 3DGS implementation use.
+    ///
+    /// These two are READ, by `ssimGaussianWindow()` below and by
+    /// `TrainerGPULayouts.verify()`. They were decorative until the window
+    /// they describe was checked against the one the GPU actually blurs with,
+    /// and in that gap the GPU's copy drifted: see `ssimBlurWeights`.
     static let ssimWindowRadius = 5
     static let ssimSigma: Float = 1.5
+
+    /// The eleven taps `trainer_blur_h` and `trainer_blur_v` blur with,
+    /// transcribed from TrainerShaders.metal.
+    ///
+    /// The kernel writes its taps out as literals rather than calling exp() in
+    /// a loop with fast-math enabled, which is right, and which is also how
+    /// they drifted. The table the GPU shipped with summed to 0.99752 and had
+    /// a centre tap of 0.26361500 where the normalised sigma-1.5 Gaussian
+    /// wants 0.26601172, so every separable blur lost about half a percent of
+    /// its energy and the SSIM half of the loss was computed against slightly
+    /// wrong local means. Nothing caught it, because nothing compared the
+    /// numbers on the GPU with the sigma written down on the Swift side.
+    ///
+    /// `verify()` now does exactly that comparison, so this table and the two
+    /// constants above cannot disagree without the trainer refusing to start.
+    static let ssimBlurWeights: [Float] = [
+        0.00102838, 0.00759876, 0.03600077, 0.10936069, 0.21300554,
+        0.26601172,
+        0.21300554, 0.10936069, 0.03600077, 0.00759876, 0.00102838
+    ]
+
+    /// The window `ssimWindowRadius` and `ssimSigma` describe, normalised to
+    /// sum to one. This is the truth `ssimBlurWeights` is checked against.
+    static func ssimGaussianWindow() -> [Float] {
+        let radius: Int = ssimWindowRadius
+        let sigma: Float = ssimSigma
+        var weights: [Float] = []
+        weights.reserveCapacity(radius * 2 + 1)
+        var total: Float = 0
+        var tap: Int = -radius
+        while tap <= radius {
+            let x = Float(tap)
+            let w: Float = expf(-(x * x) / (2 * sigma * sigma))
+            weights.append(w)
+            total += w
+            tap += 1
+        }
+        guard total > 0 else { return weights }
+        var i: Int = 0
+        while i < weights.count {
+            weights[i] = weights[i] / total
+            i += 1
+        }
+        return weights
+    }
 
     /// Number of blurred planes the SSIM forward and backward passes carry.
     static let ssimPlaneCount = 5
@@ -537,6 +587,13 @@ enum TrainerBufferIndex {
     static let composited: Int = 27
 
     // ssim
+    //
+    // Three ids, three buffers, all three allocated and all three bound. The
+    // middle one is `ssimMid` in `TrainerResources` and `ssimDst` here, which
+    // is the same buffer under two names and the only place in this registry
+    // where the names differ. `blurUniforms` is the `TrainerBlurUniforms` the
+    // blur and prepare kernels take by `setBytes`, not a buffer anyone forgot
+    // to allocate.
     static let ssimSrc: Int = 28
     static let ssimDst: Int = 29
     static let ssimTmp: Int = 30
@@ -577,8 +634,10 @@ enum TrainerBufferIndex {
 
 enum TrainerGPULayouts {
 
-    /// Expected `MemoryLayout.stride` of every struct the GPU reads, matched
-    /// against `TrainerShaders.metal`.
+    /// Everything this file and `TrainerShaders.metal` have to agree about,
+    /// checked in one place: the `MemoryLayout.stride` and alignment of every
+    /// struct the GPU reads, the eleven SSIM blur taps, and the ceiling the
+    /// 16-bit tile id puts on the resolution ladder.
     ///
     /// Called once from `MetalSplatTrainer.prepare()`, before a single buffer
     /// is allocated. In DEBUG a mismatch traps with the offending struct
@@ -628,8 +687,67 @@ enum TrainerGPULayouts {
         // which is 16 bytes in Swift and 12 in Metal.
         check("Float (SH element)", MemoryLayout<Float>.stride, 4)
 
+        // --- The SSIM window, which is written down in two places -----------
+        //
+        // Strides are not the only thing that drifts between this file and
+        // TrainerShaders.metal. The blur taps are a number the GPU carries as
+        // eleven literals and Swift carries as a sigma, and until this check
+        // existed nothing compared them: the shipped table summed to 0.99752
+        // rather than 1, so SSIM ran on means that were half a percent short.
+        let derivedWindow = TrainerGPUConstants.ssimGaussianWindow()
+        let shippedWindow = TrainerGPUConstants.ssimBlurWeights
+        if derivedWindow.count != shippedWindow.count {
+            problems.append(
+                "SSIM window is \(shippedWindow.count) taps, radius "
+                    + "\(TrainerGPUConstants.ssimWindowRadius) wants "
+                    + "\(derivedWindow.count)"
+            )
+        } else {
+            var worstTapError: Float = 0
+            var shippedTotal: Float = 0
+            var i: Int = 0
+            while i < shippedWindow.count {
+                let difference = Swift.abs(shippedWindow[i] - derivedWindow[i])
+                if difference > worstTapError { worstTapError = difference }
+                shippedTotal += shippedWindow[i]
+                i += 1
+            }
+            if worstTapError > 1e-6 {
+                let formatted = String(format: "%.8f", Double(worstTapError))
+                problems.append(
+                    "SSIM blur taps are not the sigma "
+                        + "\(TrainerGPUConstants.ssimSigma) window: worst tap is off "
+                        + "by \(formatted)"
+                )
+            }
+            let totalError = Swift.abs(shippedTotal - 1)
+            if totalError > 1e-5 {
+                let formatted = String(format: "%.8f", Double(shippedTotal))
+                problems.append("SSIM blur taps sum to \(formatted), not 1")
+            }
+        }
+
+        // --- The tile id is 16 bits wide ------------------------------------
+        //
+        // `maxTileCount` is the ceiling that fact imposes, and it was written
+        // down and never enforced. Above it the sort key `(tileID << 16) |
+        // depth` wraps and tiles trade fragments with each other, which does
+        // not crash and does not warn. The trainer's own resolution ladder is
+        // the only thing that sets the render size, so the honest place to
+        // check is the top of that ladder, once, before anything allocates.
+        let tallestRung: Int = TrainerBudgetGovernor.resolutionLadder.max() ?? 0
+        let squarestRender = TrainerRenderSize(width: tallestRung, height: tallestRung)
+        let rungTiles: Int = squarestRender.tileCount
+        if tallestRung > 0, rungTiles > TrainerGPUConstants.maxTileCount {
+            problems.append(
+                "the resolution ladder tops out at \(tallestRung) px, which is "
+                    + "\(rungTiles) tiles, above the "
+                    + "\(TrainerGPUConstants.maxTileCount) a 16-bit tile id can address"
+            )
+        }
+
         guard !problems.isEmpty else { return nil }
-        let message = "Trainer GPU struct layout mismatch: "
+        let message = "Trainer GPU contract mismatch: "
             + problems.joined(separator: "; ")
         assertionFailure(message)
         return message

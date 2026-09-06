@@ -1,0 +1,209 @@
+# deadwire allowlist
+#
+# Declarations that `tools/deadwire.py` reports as unreferenced, and that a
+# person has looked at and judged safe. One `File.swift:name  # reason` per
+# line. Anything the detector finds that is NOT on this list fails CI.
+#
+# The reason column is the point of the file. It is the record that somebody
+# actually opened the source, and it is what the next person reads instead of
+# re-deriving the answer. A line with no reason is not triage.
+#
+# THREE VERDICTS were used when this list was built, on 2026-09-06, across all
+# 113 entries:
+#
+#   ARTEFACT  the detector is wrong. The name IS used, but only inside a string
+#             literal, and strings are stripped before counting. Or it is a
+#             Swift mirror of a Metal struct, which Swift must never name.
+#   HARMLESS  genuinely unreferenced, and nothing was supposed to happen. A
+#             spare helper, a convenience property, a wire-contract field.
+#   REAL      a feature the app was designed to do and does not, because the
+#             code that would do it is never reached. NONE of these are on this
+#             list. All of them were WIRED UP instead. That is the rule: fix by
+#             wiring, not by allowlisting.
+#
+# Adding a line here is a decision, not paperwork. If the honest answer to
+# "what feature silently does not happen?" names a feature, this file is the
+# wrong place for it.
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+NimbusApp.swift:showScans  # HARMLESS: spare navigation convenience beside the live showSavedScan; three lines, and the natural call for a future "see all scans" action.
+
+# ---------------------------------------------------------------------------
+# Booster (iOS client for the optional PC companion)
+# ---------------------------------------------------------------------------
+BoosterProtocol.swift:pathPrefix  # ARTEFACT: used eight times, at BoosterProtocol.swift:52-90, all inside "\(pathPrefix)/..." string interpolations the scanner strips. Every Booster URL is built from it.
+BoosterProtocol.swift:gpuName  # HARMLESS: wire-contract field the Python server really sends (booster/src/nimbus_booster/protocol/wire.py:225). No screen shows the PC's GPU yet; deleting it would drop a documented field from the contract.
+BoosterProtocol.swift:queueDepth  # HARMLESS: same wire contract (wire.py:224, sent unconditionally). Decoded and not displayed; the struct is the written record of what the two ends exchange.
+BoosterPairingManager.swift:pollStatus  # HARMLESS: verified against the server. booster/server/pairing.py:137 confirm() resolves to approved or expired synchronously, so the poll path is never needed; a wrong code leaves .pending and the phone already re-shows the code sheet.
+BoosterJobStore.swift:allPairings  # HARMLESS: spare store read beside allJobs/recordPairing/forgetPairing/upsertJob, which are all live. Nothing needs the full pairing list yet.
+BoosterJobStore.swift:removeJob  # HARMLESS: spare. There is no "delete one job from history" control; the history is small and forgetPairing clears what matters.
+
+# ---------------------------------------------------------------------------
+# Capture
+# ---------------------------------------------------------------------------
+ARCaptureService.swift:isRecording  # HARMLESS: convenience over `phase`; the screens switch on the phase enum directly, which is more informative.
+ARCaptureService.swift:hasOpenScan  # HARMLESS: same, a two-case read of `phase`.
+ARCaptureService.swift:freeMB  # ARTEFACT: local used on the next line inside the storage warning's own string interpolation.
+ARCaptureService.swift:windowCentreDistanceMeters  # HARMLESS: passthrough to windowMode; the HUD reads windowShouldStandBack, which is the number turned into advice.
+ARCaptureService.swift:coverageIsDone  # HARMLESS: a second accessor. The underlying coverageField.isDone IS live: ARCaptureService.swift:969 feeds it into CaptureLiveState, and CaptureGuidanceEngine.swift:237/252 is what announces "done". Nothing is unwired.
+ARCaptureService.swift:currentScanID  # HARMLESS: passthrough to folder?.scanID; callers that need the id hold the folder.
+CaptureMeshStore.swift:chunkCount  # HARMLESS: spare count for a debug readout that does not exist.
+CapturePointCloudAccumulator.swift:effectiveVoxelSizeMeters  # HARMLESS: reports the voxel size actually in force after clamping. Nothing displays it; the accumulator uses the value directly.
+
+# ---------------------------------------------------------------------------
+# Core
+# ---------------------------------------------------------------------------
+BrandConfig.swift:boosterDefaultPort  # HARMLESS: no Swift code hardcodes a port because Bonjour always resolves one; booster/brand.py:48 carries the mirror. No drift.
+# BrandConfig.swift:sparseModel was here. It is now READ, by
+# CaptureScanFolder.sparseModelDirectory and .pointCloudRelativePath, which used
+# to spell the "0" by hand. Integration request 5, actioned 2026-09-06.
+Contracts.swift:frameRange  # HARMLESS: spare on Submap. PrePassPipeline.fillCorrections deliberately uses an overflow-guarded while loop instead.
+Contracts.swift:needMB  # ARTEFACT: local used on the next line, inside the out-of-memory sentence's own interpolation.
+Contracts.swift:haveMB  # ARTEFACT: the other half of the same sentence.
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+BinaryIO.swift:appendInt32LE  # HARMLESS: no asymmetry. No format in the module writes a raw Int32 field (PLY/SPZ/GLB/ZIP all use UInt32LE), and its reader is unused too. A matched pair completing the little-endian toolbox.
+BinaryIO.swift:readInt32LE  # HARMLESS: the reader half of the same unused pair. Nothing is written and never read back.
+ExportService.swift:makeController  # HARMLESS: the owner CAN get files out. ScanExportScreen.readySection uses SwiftUI's ShareLink, which is the real share sheet; this is the UIKit fallback for a caller with its own presentation context.
+
+# ---------------------------------------------------------------------------
+# Onboarding
+# ---------------------------------------------------------------------------
+DeviceCompatibilityProbe.swift:incompatibilityError  # HARMLESS: the screen is not mute. OnboardingIncompatibleView renders report.incompatibleReason, which the probe fills on every .incompatible verdict; the two refusal sites in ARCaptureService.swift:1163/1169 compose their own sentences.
+OnboardingCopy.swift:capitalisedFirst  # ARTEFACT: used at OnboardingCopy.swift:299, inside a stripped string interpolation.
+OnboardingFormat.swift:head  # ARTEFACT: used on the very next line, inside the list-joining interpolation.
+
+# ---------------------------------------------------------------------------
+# PrePass
+# ---------------------------------------------------------------------------
+PrePassBinaryIO.swift:refinedModelDirectory  # ARTEFACT: consumed three lines below its own declaration, at PrePassBinaryIO.swift:69-71, to build refinedCameras/refinedImages/refinedPoints. All three are live and the refined poses really are written to prepass/sparse_refined.
+PrePassBundleAdjuster.swift:beforeCm  # ARTEFACT: local used only in the adjustment log line's interpolation.
+PrePassBundleAdjuster.swift:afterCm  # ARTEFACT: the other half of that same log line.
+PrePassCarver.swift:never  # ARTEFACT: local used only inside the carver's own log string.
+PrePassCarver.swift:example  # ARTEFACT: same log string.
+PrePassCarver.swift:framesText  # ARTEFACT: same, one line below its declaration.
+PrePassCensus.swift:lowest  # ARTEFACT: census sentence interpolation.
+PrePassCensus.swift:floorValue  # ARTEFACT: census sentence interpolation.
+PrePassCensus.swift:gateCm  # ARTEFACT: census sentence interpolation.
+PrePassCensus.swift:measuredCm  # ARTEFACT: census sentence interpolation.
+PrePassCensus.swift:looked  # ARTEFACT: census sentence interpolation.
+PrePassCensus.swift:solid  # ARTEFACT: census sentence interpolation.
+PrePassCensus.swift:scientific  # ARTEFACT: a plain call, used at PrePassCensus.swift:823.
+PrePassMath.swift:compose  # HARMLESS: spare pose algebra. The pipeline composes poses inline where it needs to, with the convention spelled out at the call site.
+PrePassSensorIO.swift:corner  # HARMLESS: spare voxel-key helper beside the live centre-of-voxel one.
+PrePassSensorIO.swift:saturatedFraction  # HARMLESS: whole-frame "how blown out was this" summary. Deliberately NOT the F5 saturation mask, which is per pixel and lives in SmartAuthorityMap; the glass detector has its own brightLuma test. Documented at the declaration.
+PrePassSensorIO.swift:sobelMagnitude  # HARMLESS: spare gradient helper. The edge classifier in Sources/Smart runs its own operator on the native depth grid, not on this greyscale image.
+PrePassSurvey.swift:centimetres  # ARTEFACT: local used only in the survey's own log interpolation.
+PrePassSurvey.swift:milliseconds  # ARTEFACT: same, in the time-offset log line.
+
+# ---------------------------------------------------------------------------
+# Smart
+# ---------------------------------------------------------------------------
+DirectionalBackgroundModel.swift:composite  # HARMLESS: the CPU reference for the GPU's splat + T * bg, which TrainerShaders.metal:963 really does. Kept as the reference the Viewer will need to composite a preview against the background.
+DirectionalBackgroundModel.swift:currentCubemap  # HARMLESS: the same accessor's other half, for a CPU caller that does not exist yet.
+SmartAuthorityMap.swift:windowAnchorCount  # ARTEFACT: local used only in the prepare() log line's interpolation.
+SmartCore.swift:huber  # HARMLESS: CPU mirror of the shader's Huber loss, kept as the readable reference for the GPU version.
+TwoScaleTrustField.swift:sweepsRun  # ARTEFACT: local used only in the trust-field summary log interpolation.
+TwoScaleTrustField.swift:presetName  # ARTEFACT: local used only in that same summary log line, which now says whether the run used the full or economy cost preset.
+
+# ---------------------------------------------------------------------------
+# Trainer - logging locals
+# ---------------------------------------------------------------------------
+MetalSplatTrainer.swift:kernelCount  # ARTEFACT: local consumed only in a log-string interpolation.
+MetalSplatTrainer.swift:skippedIterations  # ARTEFACT: local consumed only in the run-finished log line.
+MetalSplatTrainer.swift:skippedInSlice  # ARTEFACT: local consumed only in the per-slice log line.
+TrainerCensus.swift:examined  # ARTEFACT: local consumed only inside the densification alert's detail string.
+
+# ---------------------------------------------------------------------------
+# Trainer - deliberate non-readers, each documented at its declaration
+# ---------------------------------------------------------------------------
+TrainerDensifier.swift:changedTopology  # HARMLESS, deliberately dead. It used to gate the densify-stats reset, and gating that reset was itself a bug (see MetalSplatTrainer.swift:1214-1231). The reset is now unconditional; this is kept because that comment names it.
+TrainerSlices.swift:coVisibilityPartitioningEnabled  # HARMLESS: a flag with no path behind it. plan() never consults it and setting it true changes nothing. Kept, and labelled as such at the declaration, as the record that time-slice partitioning was chosen rather than forgotten.
+TrainerSupport.swift:lossReadbackIntervalIterations  # HARMLESS: honouring it would be worse. The loop reads lossAccum every iteration right after a waitUntilCompleted it already does, and the 0.98 EMA behind the progress number is tuned for one sample per iteration.
+TrainerSupport.swift:absGradThreshold  # HARMLESS: self-documented as dead; the real cut is the ranked score, and the census deliberately records this so it cannot present a dead setting as a live one.
+TrainerSupport.swift:splitChildCount  # HARMLESS: descriptive only. The densifier shrinks the parent in place and appends one sibling, so "two" is a property of the code, not a number it looks up.
+TrainerSupport.swift:pageAligned  # HARMLESS: correct and unused. The memory budget works in bytes-per-splat and bytes-per-pixel, where per-buffer page rounding is a rounding error against hundreds of megabytes.
+
+# ---------------------------------------------------------------------------
+# Trainer - Swift mirrors of Metal structs (TrainerGPULayouts.swift)
+#
+# These fields exist to fix the memory layout the GPU reads. Swift never names
+# them and never should: naming them is what a struct is for. Their sizes are
+# guarded from BOTH sides - 13 static_assert(sizeof(...)) lines in
+# TrainerShaders.metal, and TrainerGPULayouts.verify() on the Swift side.
+# Dismissed as a family.
+# ---------------------------------------------------------------------------
+TrainerGPULayouts.swift:rot0  # ARTEFACT: Metal struct mirror, TrainerSplat offset 0.
+TrainerGPULayouts.swift:rot1  # ARTEFACT: Metal struct mirror, TrainerSplat offset 4.
+TrainerGPULayouts.swift:rot2  # ARTEFACT: Metal struct mirror, TrainerSplat offset 8.
+TrainerGPULayouts.swift:rot3  # ARTEFACT: Metal struct mirror, TrainerSplat offset 12.
+TrainerGPULayouts.swift:mean0  # ARTEFACT: Metal struct mirror, TrainerSplat offset 16.
+TrainerGPULayouts.swift:mean1  # ARTEFACT: Metal struct mirror, TrainerSplat offset 20.
+TrainerGPULayouts.swift:mean2  # ARTEFACT: Metal struct mirror, TrainerSplat offset 24.
+TrainerGPULayouts.swift:scale0  # ARTEFACT: Metal struct mirror, TrainerSplat offset 32.
+TrainerGPULayouts.swift:scale1  # ARTEFACT: Metal struct mirror, TrainerSplat offset 36.
+TrainerGPULayouts.swift:scale2  # ARTEFACT: Metal struct mirror, TrainerSplat offset 40.
+TrainerGPULayouts.swift:unknownAccum  # ARTEFACT: Metal struct mirror, TrainerSplatStats offset 16.
+TrainerGPULayouts.swift:visibleFlag  # ARTEFACT: Metal struct mirror, TrainerSplatStats offset 24.
+TrainerGPULayouts.swift:meanCamX  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 0.
+TrainerGPULayouts.swift:meanCamY  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 4.
+TrainerGPULayouts.swift:meanCamZ  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 8.
+TrainerGPULayouts.swift:mean2DX  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 16.
+TrainerGPULayouts.swift:mean2DY  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 20.
+TrainerGPULayouts.swift:radiusPx  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 24.
+TrainerGPULayouts.swift:conicA  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 32.
+TrainerGPULayouts.swift:conicB  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 36.
+TrainerGPULayouts.swift:conicC  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 40.
+TrainerGPULayouts.swift:clampedMask  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 60.
+TrainerGPULayouts.swift:ssimC1  # ARTEFACT: Metal struct mirror, TrainerLossUniforms offset 56.
+TrainerGPULayouts.swift:ssimC2  # ARTEFACT: Metal struct mirror, TrainerLossUniforms offset 60.
+TrainerGPULayouts.swift:pad1  # ARTEFACT: Metal struct mirror, explicit padding at offset 12.
+
+# ---------------------------------------------------------------------------
+# Trainer - TrainerBufferIndex registry (TrainerGPULayouts.swift)
+#
+# The file's own header describes this as the logical registry of buffer slots.
+# Each id below names a buffer that IS allocated and IS bound; the id itself is
+# not spelled at the bind site, which is why the scanner cannot see it. Three
+# were checked individually and the rest as a family: gradFinalColor is
+# resources.gradFinal (allocated TrainerResources.swift:247, bound
+# TrainerPipelines.swift:507/571/612), ssimDst is resources.ssimMid (allocated
+# :255, bound TrainerPipelines.swift:551/555/564), blurUniforms is a
+# TrainerBlurUniforms passed by setBytes at TrainerPipelines.swift:547/595/603.
+# None of these is a forgotten binding.
+# ---------------------------------------------------------------------------
+TrainerGPULayouts.swift:gradFinalColor  # HARMLESS: registry id 19, buffer resources.gradFinal, allocated and bound.
+TrainerGPULayouts.swift:ssimDst  # HARMLESS: registry id 29, the buffer TrainerResources calls ssimMid. Same buffer, two names; the only naming mismatch in the registry, noted at the declaration.
+TrainerGPULayouts.swift:blurUniforms  # HARMLESS: registry id 31, a setBytes struct rather than an allocated buffer.
+TrainerGPULayouts.swift:regUniforms  # HARMLESS: registry id 41, allocated and bound.
+TrainerGPULayouts.swift:scanIn  # HARMLESS: registry id 42, prefix-scan input, allocated and bound.
+TrainerGPULayouts.swift:scanOut  # HARMLESS: registry id 43, prefix-scan output, allocated and bound.
+TrainerGPULayouts.swift:scanUniforms  # HARMLESS: registry id 45, allocated and bound.
+TrainerGPULayouts.swift:radixKeysIn  # HARMLESS: registry id 46, radix sort ping-pong buffer.
+TrainerGPULayouts.swift:radixValuesIn  # HARMLESS: registry id 47, radix sort ping-pong buffer.
+TrainerGPULayouts.swift:radixKeysOut  # HARMLESS: registry id 48, radix sort ping-pong buffer.
+TrainerGPULayouts.swift:radixValuesOut  # HARMLESS: registry id 49, radix sort ping-pong buffer.
+TrainerGPULayouts.swift:radixUniforms  # HARMLESS: registry id 51, allocated and bound.
+TrainerGPULayouts.swift:fillTarget  # HARMLESS: registry id 52, the buffer the fill kernel clears.
+TrainerGPULayouts.swift:fillUniforms  # HARMLESS: registry id 53, allocated and bound.
+
+# ---------------------------------------------------------------------------
+# Viewer / Export
+# ---------------------------------------------------------------------------
+ObservedDirectionField.swift:wasObserved  # HARMLESS: CPU mirror of work the GPU already does. SplatRenderShaders.metal:716 does the same seen-bit test for the heatmap.
+ObservedDirectionField.swift:observedDirectionCount  # HARMLESS: same. SplatRenderShaders.metal:719-720 does the popcount for the sparse-directions term.
+ScanCensus.swift:percentText  # ARTEFACT: used three times, at ScanCensus.swift:1129, :1169 and :1312, all inside stripped string interpolations.
+ScanLibraryStore.swift:nextUpScanID  # HARMLESS: spare beside nextUpScan, which is now live in the library's "Next up" card. The card wants the summary, not the id.
+SplatPreviewView.swift:dismantleUIView  # ARTEFACT: a UIViewRepresentable lifecycle hook. SwiftUI calls it; nothing in the app should. It correctly detaches the renderer.
+ViewerGPULayouts.swift:axis1X  # ARTEFACT: Metal struct mirror, ViewerSplatDraw offset 8. static_assert(sizeof(ViewerSplatDraw) == 48) guards it from the shader side.
+ViewerGPULayouts.swift:axis1Y  # ARTEFACT: Metal struct mirror, ViewerSplatDraw offset 12.
+ViewerGPULayouts.swift:axis2X  # ARTEFACT: Metal struct mirror, ViewerSplatDraw offset 16.
+ViewerGPULayouts.swift:axis2Y  # ARTEFACT: Metal struct mirror, ViewerSplatDraw offset 20.
+ViewerGPULayouts.swift:overlapNormalizer  # ARTEFACT: Metal struct mirror, Uniforms offset 136. The shader reads it at the heatmap.
+ViewerGPULayouts.swift:baseInstance  # ARTEFACT: Metal struct mirror, part of the indirect draw argument layout the GPU fills in.
+ViewerSupport.swift:readUInt16  # HARMLESS: spare little-endian reader, kept for the same reason as Export's Int32 pair.
+ViewerSupport.swift:remainder  # ARTEFACT: local used on the next line, inside "\(minutes)m \(remainder)s".

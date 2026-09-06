@@ -227,6 +227,20 @@ public struct SmartBackgroundHeader: Codable, Sendable {
     /// One line of plain language for the QC card.
     public var summary: String
 
+    /// What actually produced the mid-regime (4.5 to 30 m) depth on the run
+    /// that wrote this file, in one sentence.
+    ///
+    /// Optional so a `background.json` written before this field existed still
+    /// decodes; a reader that finds it absent knows only that the run did not
+    /// record it, which is different from knowing the regime was real.
+    public var midRegimeProvenance: String?
+
+    /// False when the mid regime was the on-device stub rather than a real
+    /// monocular depth model. Recorded because a run that fell back to
+    /// parallax routing produced different geometry from one that did not, and
+    /// the difference must be legible in the file a year later.
+    public var midRegimeIsReal: Bool?
+
     public init(
         formatVersion: Int = SmartBackgroundHeader.currentFormatVersion,
         kind: String = "cubemap",
@@ -234,7 +248,9 @@ public struct SmartBackgroundHeader: Codable, Sendable {
         warmUpIterations: Int,
         frozen: Bool,
         contributingSamples: Int,
-        summary: String
+        summary: String,
+        midRegimeProvenance: String? = nil,
+        midRegimeIsReal: Bool? = nil
     ) {
         self.formatVersion = formatVersion
         self.kind = kind
@@ -243,6 +259,8 @@ public struct SmartBackgroundHeader: Codable, Sendable {
         self.frozen = frozen
         self.contributingSamples = contributingSamples
         self.summary = summary
+        self.midRegimeProvenance = midRegimeProvenance
+        self.midRegimeIsReal = midRegimeIsReal
     }
 }
 
@@ -343,6 +361,22 @@ public final class DirectionalBackgroundModel: BackgroundModel {
         guard !alreadyFrozen else {
             SmartLog.background.notice("warmUp called after freeze; ignored, the field is final")
             return
+        }
+
+        // Said once per run, at the top, so a log from a scan that came out
+        // wrong shows immediately whether the 4.5 to 30 m band was measured or
+        // routed around.
+        if isMidRegimeReal {
+            SmartLog.background.info(
+                "Mid regime: \(self.midRegimeProvenance, privacy: .public)"
+            )
+        } else {
+            SmartLog.background.notice(
+                """
+                Mid regime (4.5 to 30 m) is NOT measured on this device: \
+                \(self.midRegimeProvenance, privacy: .public)
+                """
+            )
         }
 
         let width = bundle.settings.depthWidth
@@ -606,7 +640,7 @@ public final class DirectionalBackgroundModel: BackgroundModel {
 
         try SmartBinary.write(snapshot.encoded(), to: ref.url(forRelativePath: binaryPath))
 
-        let summary: String
+        var summary: String
         if samples == 0 {
             summary = "No sky or distant surface was ever visible, so the background is neutral grey."
         } else if isFrozen {
@@ -615,12 +649,28 @@ public final class DirectionalBackgroundModel: BackgroundModel {
             summary = "Distant surfaces were fitted from \(samples) pixels and are still being refined."
         }
 
+        // THE LIMITATION THIS FILE IS ALLOWED TO ADMIT.
+        //
+        // The mid regime (4.5 to 30 m) is a stub on the phone: it returns
+        // nothing and that range falls back to parallax routing plus this far
+        // field. `midRegimeProvenance` was written to say so and nothing read
+        // it, so no scan has ever recorded which of the two it got. It goes
+        // into the summary as well as its own field, because a reader that
+        // only shows the one line still has to see it.
+        let midProvenance = midRegimeProvenance
+        let midIsReal = isMidRegimeReal
+        if !midIsReal {
+            summary += " Mid-range depth (4.5 to 30 m) was not measured: \(midProvenance)"
+        }
+
         let header = SmartBackgroundHeader(
             faceSize: snapshot.faceSize,
             warmUpIterations: iterations,
             frozen: isFrozen,
             contributingSamples: samples,
-            summary: summary
+            summary: summary,
+            midRegimeProvenance: midProvenance,
+            midRegimeIsReal: midIsReal
         )
         let json = try ContractsJSON.encoder().encode(header)
         try SmartBinary.write(json, to: ref.url(forRelativePath: headerPath))

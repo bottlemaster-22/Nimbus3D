@@ -514,6 +514,31 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         )
         census.finalSplatCount = merged.cloud.count
 
+        // HOW MUCH OF WHAT THE TRAINER LOOKED AT WAS WINDOW.
+        //
+        // `SmartAuthorityMap` counts, per frame, the ones that were at least
+        // half confirmed glass. A confirmed pane multiplies depth authority by
+        // zero, so those frames hand the trainer almost no geometry. Both
+        // numbers are read here, at the end, when the count has finished
+        // rising. Left nil when there was no authority map: a run that
+        // measured nothing must not report a zero it did not measure.
+        if let authority = smart.authority {
+            census.authorityFramesBuilt = authority.builtFrameCount
+            census.glassDominatedFrames = authority.glassDominatedFrameCount
+        }
+
+        // WAS THE MIDDLE DISTANCE MEASURED, OR ROUTED AROUND.
+        //
+        // The monocular depth model is a stub on the phone, so the 4.5 to 30 m
+        // band falls back to parallax plus the far field. The background model
+        // has always known which of the two it did and nothing carried it
+        // anywhere, so no scan on disk records it. Left nil when the far field
+        // could not be fitted at all, which is a third case and not a false.
+        if let background = smart.background {
+            census.midRegimeIsReal = background.isMidRegimeReal
+            census.midRegimeProvenance = background.midRegimeProvenance
+        }
+
         lock.lock()
         latestSnapshot = merged.cloud
         lock.unlock()

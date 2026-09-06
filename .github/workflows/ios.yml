@@ -28,7 +28,13 @@ name: iOS build (unsigned IPA)
 
 on:
   push:
-    branches: [main]
+    # EVERY branch, not just main. This is here for the `deadwire` job below,
+    # which is cheap and must see every push. The expensive macOS archive is
+    # NOT widened with it: the `build` job carries an `if:` that reproduces the
+    # old trigger exactly (push to main, a v* tag, any PR, manual dispatch), so
+    # a push to a feature branch runs the checks and skips the 90-minute
+    # archive. Nothing about when an IPA gets built has changed.
+    branches: ["**"]
     tags: ["v*"]
   pull_request:
     branches: [main]
@@ -42,10 +48,71 @@ permissions:
   contents: write # needed only by the Release step on tag builds
 
 jobs:
+  # ===========================================================================
+  #  THE DEAD-WIRE GATE
+  #
+  #  Four scan-destroying bugs in this project were all the same bug: code that
+  #  was written, looked configured, compiled, and was never called. Pruning
+  #  ran ungated. Densification could never add a splat. Loop closure never ran
+  #  in any scan. Every export was drawn at the wrong opacity. All four were
+  #  found by accident.
+  #
+  #  `tools/deadwire.py` reports every declaration whose name appears nowhere
+  #  else in the module. Roughly 113 of those are known-harmless - scanner
+  #  false positives (a local used only inside a string literal, a Swift mirror
+  #  of a Metal struct) and genuine spare helpers. Each one is listed with a
+  #  reason in `tools/deadwire_allowlist.txt` and excluded here.
+  #
+  #  So this job goes red for exactly one reason: somebody wrote NEW code that
+  #  nothing calls. That is the signal, and it is the reason this is not just
+  #  "print the count and move on" - a check that is always red is a check
+  #  everybody learns to scroll past.
+  #
+  #  IT DOES NOT BLOCK THE IPA. The archive job does not depend on this one, on
+  #  purpose: the phone build is how the owner gets a working app, and a lint
+  #  finding must never be the reason he cannot install one. Red check, IPA
+  #  still produced.
+  # ===========================================================================
+  deadwire:
+    name: Dead-wire check (code nothing calls)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Look for code that was written and never wired
+        run: |
+          set -euo pipefail
+          if [ ! -f tools/deadwire.py ]; then
+            echo "::error::tools/deadwire.py is missing. It is the only automated guard against the bug class that cost this project four scan-destroying faults; do not delete it."
+            exit 1
+          fi
+          if [ ! -f tools/deadwire_allowlist.txt ]; then
+            echo "::error::tools/deadwire_allowlist.txt is missing. Without it every known-harmless candidate is reported and this check is useless noise. Restore it from git history rather than deleting the check."
+            exit 1
+          fi
+          # The script resolves ios/Sources from its own location, so it needs
+          # no path argument and works the same here as on a Windows checkout.
+          python tools/deadwire.py
+
   build:
     name: Archive unsigned IPA
     runs-on: macos-15
     timeout-minutes: 90
+    # Reproduces the pre-existing trigger exactly, now that `on.push` matches
+    # every branch for the deadwire job: main, a v* tag, any pull request, or a
+    # manual run. A push to a feature branch skips the macOS runner.
+    if: >-
+      github.event_name != 'push'
+      || github.ref == 'refs/heads/main'
+      || startsWith(github.ref, 'refs/tags/v')
 
     env:
       IOS_DIR: ios
@@ -145,6 +212,13 @@ jobs:
     name: PC Booster sanity check (booster/)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Same trigger as the archive job, for the same reason: `on.push` now
+    # matches every branch so the deadwire gate sees every push, and this job
+    # should keep the cadence it had.
+    if: >-
+      github.event_name != 'push'
+      || github.ref == 'refs/heads/main'
+      || startsWith(github.ref, 'refs/tags/v')
     # Independent of the iOS archive job: the Booster is an optional PC-side
     # companion (Python, PySide6 GUI), never required for the phone app to
     # work. This job just proves booster/ parses and lints clean; it does not

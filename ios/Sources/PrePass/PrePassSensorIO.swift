@@ -455,9 +455,16 @@ struct PrePassColorImage {
         return SIMD3<Float>(Float(pixels[i]), Float(pixels[i + 1]), Float(pixels[i + 2])) / 255
     }
 
-    /// Fraction of pixels with any channel at or above `threshold`. The
-    /// saturation mask of F5's authority map, and one of the glass detector's
-    /// inputs.
+    /// Fraction of pixels with any channel at or above `threshold`.
+    ///
+    /// A whole-frame summary, deliberately NOT the F5 saturation mask. That
+    /// mask is per pixel and lives in `Sources/Smart`'s `SmartAuthorityMap`,
+    /// which ramps each sample's authority down against
+    /// `SmartLossSettings.saturationLuma`; the glass detector likewise has its
+    /// own `brightLuma` test on the greyscale image and does not call this.
+    /// Nothing calls this today. It is kept as the one cheap "how blown out
+    /// was this frame" number, and anything that starts using it should say so
+    /// through `PrePassCensus` rather than quietly.
     func saturatedFraction(threshold: UInt8 = 250) -> Float {
         guard width * height > 0 else { return 0 }
         var saturated = 0

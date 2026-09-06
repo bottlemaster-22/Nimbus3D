@@ -218,6 +218,16 @@ final class CaptureScreenModel: ObservableObject {
         didSet { service?.isHapticsEnabled = hapticsOn }
     }
 
+    /// The user's own switch for the darker shots (F5).
+    ///
+    /// Defaults on, which is what `CaptureExposureController` defaults to, and
+    /// is re-read from the service in `prepare()` so the two never disagree.
+    /// Turning it back on only undoes the user's own switch: it cannot
+    /// override the tracking guard, which is one-way on purpose.
+    @Published var darkShotsOn = true {
+        didSet { service?.setBracketingEnabled(darkShotsOn) }
+    }
+
     @Published var isWindowModeActive = false
     @Published var windowCardDismissed = false
     @Published var windowActionNote: String?
@@ -250,6 +260,7 @@ final class CaptureScreenModel: ObservableObject {
         service = resolved
         soundOn = resolved.isSoundEnabled
         hapticsOn = resolved.isHapticsEnabled
+        darkShotsOn = !resolved.isBracketingTurnedOffByUser
         refreshOrientation()
         makeRenderer(for: resolved)
     }
@@ -466,6 +477,30 @@ final class CaptureScreenModel: ObservableObject {
             windowActionNote =
                 "This iPhone will not let the app hold the brightness steady. "
                 + "The scan carries on as normal."
+        }
+    }
+
+    /// Hands the brightness back to the camera.
+    ///
+    /// Without this the hold is a one-way door. A user taps "Hold the
+    /// brightness" at a bright window, walks on into a dark hallway, and every
+    /// remaining frame of the scan is exposed for the window: the hallway
+    /// comes out black, and there is no control anywhere in the app that gives
+    /// the exposure back. `exposureIsLocked` is re-read from the service
+    /// rather than assumed, because unlocking the white balance can fail on
+    /// its own while the exposure unlock succeeded.
+    func releaseExposureLock() {
+        guard let service else { return }
+        let released = service.unlockExposureAndWhiteBalance()
+        exposureIsLocked = service.isExposureLocked
+        if released {
+            windowActionNote =
+                "Brightness is back to adjusting itself, so the next room "
+                + "will not come out dark."
+        } else {
+            windowActionNote =
+                "This iPhone would not hand the brightness back. Finish this "
+                + "scan and start another one to clear it."
         }
     }
 

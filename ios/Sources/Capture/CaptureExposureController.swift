@@ -425,6 +425,17 @@ final class CaptureExposureController: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Whether the user is the reason bracketing is off.
+    ///
+    /// Deliberately narrower than `!isBracketingAvailable`: the tracking guard
+    /// and a device that will not be configured also turn bracketing off, and
+    /// a switch in the HUD must not claim the user did that.
+    var isTurnedOffByUser: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return unavailability == .turnedOffByUser
+    }
+
     /// The user's own switch, from the capture screen.
     func setBracketingEnabledByUser(_ enabled: Bool) {
         lock.lock()

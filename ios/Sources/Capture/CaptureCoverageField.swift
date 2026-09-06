@@ -46,18 +46,42 @@ struct CaptureCoverageVoxel {
     var surfaceClass: SurfaceClass = .none
 
     /// Distinct directions seen, 0...`coverageDirectionBuckets`.
-    var directionCount: Int { directionMask.nonzeroBitCount }
+    var directionCount: Int {
+        Swift.min(
+            directionMask.nonzeroBitCount,
+            CaptureTuning.coverageDirectionBuckets
+        )
+    }
 
     /// The three channels, each 0...1.
+    ///
+    /// ALL THREE ARE NORMALISED AGAINST THEIR OWN TARGET, so that "1.0" means
+    /// the same thing on all three: this patch has had enough of that. Angles
+    /// divide by `coverageDirectionsForFull`, distance is already a 0...1 band
+    /// score, and sharpness divides by `coverageSharpnessTarget` - the
+    /// sharpness at which a patch is as good as it is going to get.
+    ///
+    /// That last division is not cosmetic. `bestSharpness` is normalised
+    /// against the SESSION RUNNING MAXIMUM (see `CaptureSharpnessMeter`), so
+    /// feeding it in raw made the sharpness channel ask every patch to have
+    /// been seen by a frame within `coverageChannelDoneThreshold` of the
+    /// sharpest frame in the entire scan. That is a relative test against a
+    /// moving reference, not the absolute "sharp enough" the tuning constant
+    /// describes, and it is much harsher: a patch measured at exactly the
+    /// documented target of 0.55 scored 0.55, below the 0.7 done threshold,
+    /// and could never be counted as covered no matter how long the user
+    /// stood there.
     var channels: SIMD3<Float> {
         let angles = Swift.min(
             1,
             Float(directionCount) / Float(CaptureTuning.coverageDirectionsForFull)
         )
+        let sharpnessTarget = Swift.max(CaptureTuning.coverageSharpnessTarget, 0.0001)
+        let sharpness = Swift.min(1, Swift.max(0, bestSharpness / sharpnessTarget))
         return SIMD3<Float>(
             surfaceClass.isOpticallyUnreliable ? Swift.max(angles, 0.8) : angles,
             bestDistanceScore,
-            bestSharpness
+            sharpness
         )
     }
 
@@ -117,7 +141,29 @@ final class CaptureCoverageField: @unchecked Sendable {
         return ((ix & mask) << 42) | ((iy & mask) << 21) | (iz & mask)
     }
 
-    /// Bucket index for a viewing direction: 8 azimuth by 4 elevation.
+    /// Elevation bands the sphere is cut into.
+    static let elevationBins: Int = 4
+
+    /// Azimuth bins: whatever is left of `coverageDirectionBuckets` once the
+    /// elevation bands have their share.
+    ///
+    /// Derived rather than written out as an `8` so that
+    /// `CaptureTuning.coverageDirectionBuckets` is the single authority on the
+    /// size of `directionMask`, instead of a constant that describes two
+    /// literals living in another file and has no way of knowing when they
+    /// stop agreeing with it.
+    static let azimuthBins: Int = Swift.max(
+        1,
+        CaptureTuning.coverageDirectionBuckets / CaptureCoverageField.elevationBins
+    )
+
+    /// The highest bucket index a `UInt32` mask can hold, whatever the tuning
+    /// constant is set to. 32 bits is a hard ceiling, not a preference.
+    static let highestBucketIndex: Int =
+        Swift.min(CaptureTuning.coverageDirectionBuckets, 32) - 1
+
+    /// Bucket index for a viewing direction: `azimuthBins` azimuth by
+    /// `elevationBins` elevation.
     ///
     /// `direction` points from the surface towards the camera and must be a
     /// unit vector. 32 buckets over the sphere is roughly 20 degrees of
@@ -125,14 +171,18 @@ final class CaptureCoverageField: @unchecked Sendable {
     /// around it a bit more" is useful advice rather than pedantry.
     @inline(__always)
     static func directionBucket(_ direction: SIMD3<Float>) -> Int {
+        let azimuthCount = CaptureCoverageField.azimuthBins
+        let elevationCount = CaptureCoverageField.elevationBins
         let azimuth = atan2(direction.z, direction.x)  // -pi ... pi
-        let azimuthBin = Int(
-            ((azimuth + .pi) / (2 * .pi) * 8).rounded(.down)
-        ).clampedToRange(0...7)
+        let azimuthTurn: Float = (azimuth + .pi) / (2 * .pi)
+        let azimuthBin = Int((azimuthTurn * Float(azimuthCount)).rounded(.down))
+            .clampedToRange(0...(azimuthCount - 1))
         let elevation = Swift.max(-1, Swift.min(1, direction.y))  // -1 ... 1
-        let elevationBin = Int(((elevation + 1) / 2 * 4).rounded(.down))
-            .clampedToRange(0...3)
-        return elevationBin * 8 + azimuthBin
+        let elevationTurn: Float = (elevation + 1) / 2
+        let elevationBin = Int((elevationTurn * Float(elevationCount)).rounded(.down))
+            .clampedToRange(0...(elevationCount - 1))
+        let bucket = elevationBin * azimuthCount + azimuthBin
+        return Swift.min(bucket, CaptureCoverageField.highestBucketIndex)
     }
 
     // MARK: - Update

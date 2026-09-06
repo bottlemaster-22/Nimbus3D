@@ -67,8 +67,16 @@ struct TrainerSlice {
 enum TrainerSlicePlanner {
 
     /// Whole-house co-visibility partitioning (group by what sees what, rather
-    /// than by when it was walked). OFF by default, as the spec requires. The
-    /// time-slice partition below is what actually runs.
+    /// than by when it was walked). OFF, as the spec requires. The time-slice
+    /// partition below is what actually runs.
+    ///
+    /// READ THIS BEFORE FLIPPING IT TO `true`. There is no co-visibility path
+    /// behind this flag: `plan()` never consults it, and nothing else does
+    /// either. Setting it to `true` changes NOTHING except what this file
+    /// appears to promise. It stays here as the written record that the
+    /// partitioning strategy was chosen deliberately, not forgotten, and
+    /// anyone implementing the other strategy has to wire this into `plan()`
+    /// themselves.
     static let coVisibilityPartitioningEnabled = false
 
     /// Splits the run into slices. A capture with no submaps, or one whose

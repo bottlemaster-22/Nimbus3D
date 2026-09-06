@@ -606,6 +606,21 @@ No field was added or removed and no byte layout moved.
 field (F5). `model/exposure.bin` holds `(UInt32 frameIndex, Float32 gain,
 Float32 bias)` per frame.
 
+`background.json` carries the cubemap's face size, the warm-up iteration count,
+whether it was frozen, how many far-field pixels contributed, and one
+plain-language `summary`. Two of its fields are optional and describe HOW the
+run was done rather than what it produced:
+
+| field | type | meaning |
+|---|---|---|
+| `midRegimeIsReal` | Bool, optional | `false` when the 4.5 to 30 m depth band was NOT measured. On the phone the monocular depth model is a stub, so that band is routed around with parallax plus this far field. |
+| `midRegimeProvenance` | String, optional | One sentence naming what produced the mid regime on that run. |
+
+Both are absent in files written before 2026-09-06 and decode as `nil`. Absent
+means "this run did not record it", which is not the same as knowing the band
+was measured. The format version is unchanged: no byte layout moved and no
+reader needs either field.
+
 `model/held_out_frames.json` is which frames the training run kept out of
 training, so the viewer's photo-versus-scan slider can compare against photos
 the model provably never saw. Either a bare array of frame indices,
@@ -656,6 +671,8 @@ Top level:
 | `densifyPasses` | one row per densification / prune / carve pass |
 | `merge` | what the slice merge kept, dropped to another owner, and trimmed |
 | `keyframesSelected`, `sliceCount`, `iterationsRequested`, `iterationsCompleted`, `finalSplatCount` | the totals |
+| `authorityFramesBuilt`, `glassDominatedFrames` | optional pair. How many frames had a depth-authority map built, and how many of those were at least half CONFIRMED GLASS. A confirmed pane multiplies depth authority by zero, so a glass-dominated frame hands the trainer almost no geometry. Read them together or not at all: the count alone cannot say whether it is a catastrophe or a footnote. Both absent when the run had no SMART authority map, which is not the same as zero. |
+| `midRegimeIsReal`, `midRegimeProvenance` | optional pair, mirroring `background.json`. Whether the 4.5 to 30 m depth band was measured on this run, and what produced it. Absent when the far field could not be fitted at all, which is a third case and not a `false`. |
 
 A `densifyPasses` row carries the counts AND the context that makes them
 readable: `growthWindowOpen`, `pruneWindowOpen`, `carveRan`, `carverAvailable`,
@@ -680,7 +697,8 @@ without parsing English. The current set:
 `almost_no_seed_was_trusted`, `most_of_the_model_disappeared`,
 `final_count_far_below_the_cap`, `free_space_carving_removed_the_most`,
 `non_finite_points_reached_the_readback`, `merge_dropped_most_of_the_parts`,
-`run_ended_before_its_budget`, `many_iterations_did_no_work`.
+`run_ended_before_its_budget`, `many_iterations_did_no_work`,
+`glass_dominated_frames`.
 
 An empty `alerts` array means the census ran its checks and none of them
 tripped. A MISSING file means nobody wrote one, which is a different and weaker

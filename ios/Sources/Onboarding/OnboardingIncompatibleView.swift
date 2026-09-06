@@ -50,6 +50,11 @@ struct OnboardingIncompatibleView: View {
     /// conditional re-check button are omitted.
     var findings: DeviceCompatibilityFindings?
 
+    /// True when those measurements were read back from an older saved check
+    /// rather than taken now. The details table says so; the verdict above it
+    /// does not change, because a phone does not grow a scanner.
+    var findingsAreStale: Bool = false
+
     var isRechecking: Bool = false
 
     /// nil means "no re-check is possible here", which is different from a
@@ -61,11 +66,13 @@ struct OnboardingIncompatibleView: View {
     init(
         report: DeviceCapabilityReport,
         findings: DeviceCompatibilityFindings? = nil,
+        findingsAreStale: Bool = false,
         isRechecking: Bool = false,
         onRecheck: (() -> Void)? = nil
     ) {
         self.report = report
         self.findings = findings
+        self.findingsAreStale = findingsAreStale
         self.isRechecking = isRechecking
         self.onRecheck = onRecheck
     }
@@ -118,8 +125,11 @@ struct OnboardingIncompatibleView: View {
                         OnboardingCopy.technicalDetailsHeading,
                         isExpanded: $showsDetails
                     ) {
-                        OnboardingDeviceFactsView(findings: findings)
-                            .padding(.top, 12)
+                        OnboardingDeviceFactsView(
+                            findings: findings,
+                            findingsAreStale: findingsAreStale
+                        )
+                        .padding(.top, 12)
                     }
                     .font(.callout.weight(.medium))
                 } else {

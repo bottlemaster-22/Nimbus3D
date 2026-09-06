@@ -1057,6 +1057,12 @@ public final class ARCaptureService: NSObject, CaptureService {
     var isWhiteBalanceLocked: Bool { exposureController.isWhiteBalanceLocked }
     var isBracketingAvailable: Bool { exposureController.isBracketingAvailable }
 
+    /// Whether the darker shots are off because the USER turned them off, as
+    /// opposed to because this iPhone cannot do them or the tracking guard
+    /// took them away. The HUD switch mirrors this so it starts out telling
+    /// the truth rather than assuming.
+    var isBracketingTurnedOffByUser: Bool { exposureController.isTurnedOffByUser }
+
     var isWindowModeActive: Bool { windowMode.isActive }
     var windowShouldStandBack: Bool { windowMode.shouldStandBack }
     var windowCentreDistanceMeters: Float? { windowMode.centreDistanceMeters }

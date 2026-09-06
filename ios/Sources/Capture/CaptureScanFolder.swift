@@ -45,10 +45,22 @@ public struct CaptureScanFolder: Sendable {
     public var framesLogURL: URL {
         sensorDataDirectory.appendingPathComponent("frames.jsonl")
     }
+    /// `<scan>/sparse/0`, the COLMAP model directory.
+    ///
+    /// Built from `BrandConfig.Folder.sparseModel` rather than from
+    /// `Folder.sparse` plus a hand-written `"0"`. The brand block exists so
+    /// there is ONE place a folder name is written down, and two hand-written
+    /// zeroes in this file were where that stopped being true.
+    ///
+    /// Appended one component at a time on purpose: the constant contains a
+    /// separator, and this makes no assumption about how
+    /// `appendingPathComponent` treats one.
     public var sparseModelDirectory: URL {
-        root
-            .appendingPathComponent(BrandConfig.Folder.sparse, isDirectory: true)
-            .appendingPathComponent("0", isDirectory: true)
+        var url = root
+        for component in BrandConfig.Folder.sparseModel.split(separator: "/") {
+            url = url.appendingPathComponent(String(component), isDirectory: true)
+        }
+        return url
     }
     public var anchorsDirectory: URL {
         root.appendingPathComponent(BrandConfig.Folder.anchors, isDirectory: true)
@@ -78,7 +90,7 @@ public struct CaptureScanFolder: Sendable {
         "\(BrandConfig.Folder.sensorData)/confidence/\(stamp).conf8"
     }
     public static let pointCloudRelativePath =
-        "\(BrandConfig.Folder.sparse)/0/points3D.txt"
+        "\(BrandConfig.Folder.sparseModel)/points3D.txt"
 
     // MARK: - Creation
 

@@ -50,10 +50,19 @@ struct ScanExportScreen: View {
             if !model.produced.isEmpty {
                 readySection
             }
+            #if DEBUG
+            selfTestSection
+            #endif
         }
         .listStyle(.insetGrouped)
         .navigationTitle("Share this scan")
         .navigationBarTitleDisplayMode(.inline)
+        .task {
+            model.loadFilesAlreadyOnDisk()
+            #if DEBUG
+            model.runExportSelfTestOnce()
+            #endif
+        }
         .onAppear { discovery.start() }
         .onDisappear { discovery.stop() }
         .alert(
@@ -216,7 +225,41 @@ struct ScanExportScreen: View {
         }
     }
 
-    // MARK: Files made this session
+    // MARK: The module's own round-trip self-check (DEBUG builds only)
+
+    #if DEBUG
+    /// `ExportSelfTest.runAll()` writes a small model out in every format,
+    /// reads it back and checks it survived. It existed with no caller, so
+    /// the PLY, SPZ and GLB round trips had never actually been run on a
+    /// device. It runs once when this screen opens in a DEBUG build, and the
+    /// button runs it again. Release builds do not compile any of this.
+    private var selfTestSection: some View {
+        Section {
+            ForEach(model.selfTestReport.indices, id: \.self) { index in
+                selfTestLine(model.selfTestReport[index])
+            }
+            Button("Run the file checks again") {
+                model.runExportSelfTest()
+            }
+            .disabled(model.selfTestRunning)
+        } header: {
+            Text("Developer: file writers")
+        } footer: {
+            Text(
+                "Writes a small test model to a scratch file in each format, reads it "
+                + "back and checks nothing was lost. Only in a debug build."
+            )
+        }
+    }
+
+    private func selfTestLine(_ line: String) -> some View {
+        Text(line)
+            .font(.system(.caption, design: .monospaced))
+            .foregroundStyle(line.hasPrefix("FAIL") ? Color.orange : Color.secondary)
+    }
+    #endif
+
+    // MARK: Files ready to send
 
     private var readySection: some View {
         Section {
@@ -240,14 +283,21 @@ struct ScanExportScreen: View {
             Text("Ready to send")
         } footer: {
             Text(
-                "These are saved on this iPhone under this scan's own folder. Tap the "
-                + "share button to send one somewhere else."
+                "Every file this scan has already produced, saved on this iPhone under "
+                + "the scan's own folder. Tap the share button to send one somewhere "
+                + "else."
             )
         }
     }
 }
 
 // MARK: - Model
+
+/// What the export folder is allowed to offer for sharing. A top-level
+/// constant rather than a static on the model below, because the directory
+/// listing that reads it runs off the main actor and `ScanExportModel` is
+/// `@MainActor`.
+private let shareableExportExtensions: Set<String> = ["ply", "spz", "glb", "zip"]
 
 @MainActor
 final class ScanExportModel: ObservableObject {
@@ -261,10 +311,17 @@ final class ScanExportModel: ObservableObject {
     @Published private(set) var produced: [ExportedAsset] = []
     @Published private(set) var problem: String?
 
+    #if DEBUG
+    @Published private(set) var selfTestReport: [String] = []
+    @Published private(set) var selfTestRunning = false
+    private var didRunSelfTest = false
+    #endif
+
     static let offeredFormats: [ExportFormat] = [.ply, .spz, .glb]
 
     private let summary: ScanSummary
     private let detail: ScanDetail?
+    private var didLoadFilesOnDisk = false
 
     init(summary: ScanSummary, detail: ScanDetail?) {
         self.summary = summary
@@ -391,4 +448,107 @@ final class ScanExportModel: ObservableObject {
         produced.removeAll { $0.url == asset.url }
         produced.insert(asset, at: 0)
     }
+
+    // MARK: Files already on disk
+
+    /// Lists the files this scan exported in an EARLIER run of the app.
+    ///
+    /// Without this, `produced` only ever held what the current session made,
+    /// so a file exported yesterday sat in the scan's export folder with no
+    /// row and no share button anywhere in the app. The share sheet itself is
+    /// SwiftUI's `ShareLink` in `readySection`.
+    func loadFilesAlreadyOnDisk() {
+        guard !didLoadFilesOnDisk else { return }
+        didLoadFilesOnDisk = true
+        let root = summary.rootURL
+        let scanID = summary.scanID
+        Task { [weak self] in
+            let found = await Task.detached(priority: .utility) { () -> [ExportedAsset] in
+                ScanExportModel.filesOnDisk(scanRoot: root, scanID: scanID)
+            }.value
+            self?.merge(found)
+        }
+    }
+
+    /// Off the main actor: a directory listing plus one `resourceValues` call
+    /// per file, both of which touch the disk.
+    nonisolated static func filesOnDisk(scanRoot: URL, scanID: ScanID) -> [ExportedAsset] {
+        let directory = scanRoot.appendingPathComponent(
+            BrandConfig.Folder.exports,
+            isDirectory: true
+        )
+        let keys: [URLResourceKey] = [
+            .fileSizeKey, .contentModificationDateKey, .isRegularFileKey
+        ]
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: keys,
+            options: [.skipsHiddenFiles]
+        ) else {
+            // No export folder yet is the normal case for a scan nobody has
+            // exported, not a problem worth an alert.
+            return []
+        }
+
+        var assets: [ExportedAsset] = []
+        for url in entries {
+            let fileExtension = url.pathExtension.lowercased()
+            guard shareableExportExtensions.contains(fileExtension) else { continue }
+            let values = try? url.resourceValues(forKeys: Set(keys))
+            guard values?.isRegularFile == true else { continue }
+            assets.append(
+                ExportedAsset(
+                    url: url,
+                    fileExtension: fileExtension,
+                    byteCount: Int64(values?.fileSize ?? 0),
+                    createdAt: values?.contentModificationDate
+                        ?? Date(timeIntervalSince1970: 0),
+                    scanID: scanID,
+                    splatCount: nil
+                )
+            )
+        }
+        assets.sort { $0.createdAt > $1.createdAt }
+        return assets
+    }
+
+    /// Adds anything found on disk that this session has not already listed.
+    /// A file made in THIS session wins, because that record knows its splat
+    /// count and a directory listing does not.
+    private func merge(_ found: [ExportedAsset]) {
+        var combined = produced
+        for asset in found where !combined.contains(where: { $0.url == asset.url }) {
+            combined.append(asset)
+        }
+        produced = combined
+    }
+
+    // MARK: The Export module's own round-trip checks (DEBUG only)
+
+    #if DEBUG
+    /// Runs the checks once per screen. `ExportSelfTest.runAll()` had no
+    /// caller anywhere in the app, so its PLY / SPZ / GLB / zip round trips
+    /// had never been run on a device.
+    func runExportSelfTestOnce() {
+        guard !didRunSelfTest else { return }
+        didRunSelfTest = true
+        runExportSelfTest()
+    }
+
+    func runExportSelfTest() {
+        guard !selfTestRunning else { return }
+        selfTestRunning = true
+        selfTestReport = ["Checking the file writers..."]
+        Task { [weak self] in
+            let lines = await Task.detached(priority: .utility) { () -> [String] in
+                ExportSelfTest.runAll()
+            }.value
+            for line in lines where line.hasPrefix("FAIL") {
+                ViewerLog.review.error("export self-test: \(line, privacy: .public)")
+            }
+            self?.selfTestReport = lines
+            self?.selfTestRunning = false
+        }
+    }
+    #endif
 }

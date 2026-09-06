@@ -451,6 +451,36 @@ struct TrainerCensus: Codable {
     var iterationsCompleted: Int = 0
     var finalSplatCount: Int = 0
 
+    /// Frames whose authority map was built during this run, and how many of
+    /// those were at least half CONFIRMED GLASS.
+    ///
+    /// A confirmed pane multiplies depth authority by zero, so a frame that is
+    /// mostly window hands the trainer almost no geometry however good the
+    /// capture was. `SmartAuthorityMap` measured that per frame and nothing
+    /// carried it anywhere, so a scan of a conservatory could lose most of its
+    /// geometry with the census showing only a small final splat count and no
+    /// reason for it.
+    ///
+    /// Both are optional because a run with no SMART authority map measured
+    /// neither, and reporting 0 there would claim a measurement that never
+    /// happened. Always read them as a pair: the count alone cannot say
+    /// whether it is a catastrophe or a footnote.
+    var authorityFramesBuilt: Int?
+    var glassDominatedFrames: Int?
+
+    /// Whether the 4.5 to 30 m depth band was MEASURED on this run, and in one
+    /// sentence what produced it.
+    ///
+    /// On the phone the monocular depth model is a stub: it reports itself
+    /// unavailable and returns nothing, so that band is routed around with
+    /// parallax plus the far field rather than measured. A run that fell back
+    /// produced different geometry from one that did not, and until this was
+    /// recorded no scan said which it got.
+    ///
+    /// Optional because a run with no background model measured neither.
+    var midRegimeIsReal: Bool?
+    var midRegimeProvenance: String?
+
     /// The five second read: one ordered line per stage, from the seeds to the
     /// final count, so a reader sees WHERE the geometry went without adding
     /// anything up. Filled in by `sealed()`.
@@ -623,6 +653,24 @@ struct TrainerCensus: Codable {
                     + "were stretched along the viewing ray"
             )
         }
+        // Said before densification, because it explains what densification
+        // had to work WITH. Only printed when the SMART authority map actually
+        // ran; a run without one measured nothing and must not imply zero.
+        if let built = authorityFramesBuilt, built > 0, let glassy = glassDominatedFrames {
+            lines.append(
+                "the depth of \(n(glassy)) of \(n(built)) frame(s) looked at was thrown away "
+                    + "over most of the frame because it was confirmed glass"
+            )
+        }
+        // Whether the middle distance was measured or routed around. Said in
+        // the ledger and not only in the alerts, because it is a property of
+        // how the run was done rather than something that went wrong.
+        if let real = midRegimeIsReal, !real {
+            lines.append(
+                "depth from 4.5 to 30 m was not measured on this device and was worked "
+                    + "out from camera movement instead"
+            )
+        }
         lines.append(
             "densification ran \(t.passes) pass(es) and added \(n(t.added)) "
                 + "(\(n(t.addedBySplit)) by split, \(n(t.addedByClone)) by clone)"
@@ -695,6 +743,11 @@ struct TrainerCensus: Codable {
     /// the other.
     static let zeroGrowthStreakThatIsAStall = 10
 
+    /// The share of looked-at frames that has to be glass-dominated before the
+    /// census says so. A third: below that a few windows in a room is normal
+    /// and saying it every time would train the reader to skip the alerts.
+    static let glassDominatedRunPercent = 33
+
     /// The verdict that appears most often across a set of passes, or nil when
     /// there is nothing to report. It never invents one: every value here was
     /// written by the densifier from counters that pass actually measured.
@@ -736,6 +789,29 @@ struct TrainerCensus: Codable {
                         + "0. Across those passes \(n(scored)) of \(n(examined)) points scored "
                         + "above zero. A densification stage that adds nothing is a no-op, not a "
                         + "quiet run." + verdict
+                )
+            )
+        }
+
+        // 1a. MOST OF WHAT THE TRAINER LOOKED AT WAS WINDOW. Not a fault in
+        //     the code and not a fault in the capture: a confirmed pane
+        //     multiplies depth authority by zero, so a room that is mostly
+        //     glass genuinely hands the trainer very little to build on. It is
+        //     a "check", not a "loud", and it is stated so that a thin model
+        //     from a conservatory reads as a measured cause rather than as an
+        //     unexplained small number.
+        if let built = authorityFramesBuilt, built > 0,
+           let glassy = glassDominatedFrames,
+           glassy * 100 >= built * Self.glassDominatedRunPercent {
+            let percent = glassy * 100 / built
+            check.append(
+                TrainerCensusAlert(
+                    severity: "check",
+                    code: "glass_dominated_frames",
+                    detail: "\(n(glassy)) of \(n(built)) frame(s) the trainer looked at were at "
+                        + "least half confirmed glass (\(percent) per cent of them), so their "
+                        + "depth was ignored over most of the frame. Expect less geometry than "
+                        + "the number of photos suggests."
                 )
             )
         }

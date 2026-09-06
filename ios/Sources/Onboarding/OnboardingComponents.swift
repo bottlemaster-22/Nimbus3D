@@ -229,6 +229,15 @@ struct OnboardingDeviceFactsView: View {
 
     let findings: DeviceCompatibilityFindings
 
+    /// True when these measurements were read back from a saved check that
+    /// `StoredDeviceReport.isStale` considers old: a different build of the
+    /// app, a different iOS version, or more than thirty days ago.
+    ///
+    /// It changes one thing, deliberately: the "Checked" row explains that the
+    /// timestamp is when the phone was last measured, not now. Nothing else on
+    /// the screen moves, because a stale reading is not a wrong one.
+    var findingsAreStale: Bool = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             let report = findings.report
@@ -246,6 +255,13 @@ struct OnboardingDeviceFactsView: View {
                     value: findings.model.identifier
                 )
             }
+
+            OnboardingFactRow(
+                symbol: "wave.3.right",
+                label: "Laser scanner (LiDAR)",
+                value: lidarValue,
+                note: lidarNote
+            )
 
             OnboardingFactRow(
                 symbol: "cpu",
@@ -316,9 +332,40 @@ struct OnboardingDeviceFactsView: View {
             OnboardingFactRow(
                 symbol: "clock",
                 label: "Checked",
-                value: OnboardingFormat.timestamp(findings.checkedAt)
+                value: OnboardingFormat.timestamp(findings.checkedAt),
+                note: staleNote
             )
         }
+    }
+
+    /// Shown under the timestamp when the report on screen was saved by an
+    /// older build, under an older iOS, or over a month ago.
+    ///
+    /// nil when the check is current, which is the normal case: the probe runs
+    /// on every launch and the screen redraws from it.
+    private var staleNote: String? {
+        guard findingsAreStale else { return nil }
+        return "This is a saved check, not one taken just now. The app or iOS "
+            + "has changed since, or it is over a month old. Check again for "
+            + "today's numbers."
+    }
+
+    /// Whether this iPhone has the laser scanner.
+    ///
+    /// The one measurement the whole verdict turns on, so it is stated
+    /// outright rather than left to be inferred from which features are
+    /// ticked.
+    private var lidarValue: String {
+        OnboardingFormat.yesNo(findings.lidar.hasLiDAR)
+    }
+
+    /// The Simulator answers "no scanner" to every ARKit query, which is true
+    /// of the Simulator and says nothing about a phone. Saying so is the
+    /// difference between a stub and a verdict.
+    private var lidarNote: String? {
+        guard findings.lidar.isSimulator else { return nil }
+        return "Running in the Simulator, where this answer is a stub and "
+            + "says nothing about a real phone."
     }
 
     /// Where the chip generation came from. Shown because a guessed chip and a

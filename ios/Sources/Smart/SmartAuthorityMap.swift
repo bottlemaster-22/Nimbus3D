@@ -625,6 +625,26 @@ public final class SmartAuthorityMap {
     private var cache: [FrameID: SmartFrameAuthority] = [:]
     private let cacheCapacity: Int
 
+    /// Frames built so far whose confirmed-glass fraction was at or above
+    /// `glassDominatedFraction`, and whether the warning has been said.
+    ///
+    /// Counted rather than logged per frame: `map(for:)` runs once per frame
+    /// per batch and a line each time would bury everything else.
+    private var glassDominatedFrames = 0
+    private var glassWarningSaid = false
+
+    /// Frames whose authority map was actually BUILT, as opposed to served
+    /// from `cache`. The denominator `glassDominatedFrames` is meaningless
+    /// without: "4 glass-dominated frames" is a catastrophe out of 5 and a
+    /// footnote out of 400.
+    private var builtFrames = 0
+
+    /// At or above this confirmed-glass fraction, a frame's depth is being
+    /// thrown away over most of its area (a confirmed pane multiplies
+    /// authority by zero), so the frame contributes almost no geometry.
+    /// Half the frame is the point where that stops being a detail.
+    static let glassDominatedFraction: Float = 0.5
+
     public init(settings: SmartLossSettings = .default, cacheCapacity: Int = 6) {
         self.settings = settings
         self.cacheCapacity = Swift.max(1, cacheCapacity)
@@ -691,6 +711,9 @@ public final class SmartAuthorityMap {
         depthCache = SmartDepthCache(capacity: 4, sampleCount: Swift.max(1, w * h))
         cache.removeAll()
         cacheOrder.removeAll()
+        glassDominatedFrames = 0
+        glassWarningSaid = false
+        builtFrames = 0
         let windowAnchorCount = windowAnchors.count
         lock.unlock()
 
@@ -715,6 +738,30 @@ public final class SmartAuthorityMap {
         lock.lock()
         defer { lock.unlock() }
         return bundle != nil
+    }
+
+    /// Frames built so far that were at least half confirmed glass.
+    ///
+    /// A measured count, not an estimate: it only rises when a frame's own
+    /// mask says so. Zero can mean "no glass" or "no frame has been built
+    /// yet", so a census reporting it must also say how many frames were
+    /// built.
+    public var glassDominatedFrameCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return glassDominatedFrames
+    }
+
+    /// How many frames have had an authority map built, which is the
+    /// denominator `glassDominatedFrameCount` needs to mean anything.
+    ///
+    /// Not the same as the number of frames in the capture: a map is built
+    /// lazily on first request and only for frames something actually asks
+    /// about, so this counts work done rather than work available.
+    public var builtFrameCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return builtFrames
     }
 
     /// Authority for one native sample, 0...1. Synchronous and O(1) after the
@@ -774,6 +821,33 @@ public final class SmartAuthorityMap {
             windowAnchors: anchors,
             lidarMaxRangeMeters: maxRange
         )
+
+        // HOW MUCH OF THIS FRAME IS CONFIRMED GLASS.
+        //
+        // A confirmed pane multiplies authority by zero, so a frame that is
+        // mostly window contributes almost no depth evidence no matter how
+        // good the capture was. `SmartGlassMask.confirmedFraction` measured
+        // that and nothing read it, so a scan of a conservatory could lose
+        // most of its geometry with nothing anywhere saying why. Said once per
+        // prepared scan rather than per frame; the count keeps rising after.
+        let confirmedGlass = glass.confirmedFraction
+        if confirmedGlass >= Self.glassDominatedFraction {
+            lock.lock()
+            glassDominatedFrames += 1
+            let sayIt = !glassWarningSaid
+            glassWarningSaid = true
+            lock.unlock()
+            if sayIt {
+                let percent = Int((confirmedGlass * 100).rounded())
+                SmartLog.background.notice(
+                    """
+                    Frame \(frame, privacy: .public) is \(percent, privacy: .public)% \
+                    confirmed glass, so its depth is ignored over most of the frame. \
+                    The running total is in glassDominatedFrameCount.
+                    """
+                )
+            }
+        }
 
         let parallax = SmartParallaxField.build(
             depth: depth,
@@ -855,6 +929,7 @@ public final class SmartAuthorityMap {
         )
 
         lock.lock()
+        builtFrames += 1
         cache[frame] = built
         cacheOrder.append(frame)
         while cacheOrder.count > cacheCapacity {

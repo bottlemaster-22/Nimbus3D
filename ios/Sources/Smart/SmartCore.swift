@@ -239,11 +239,65 @@ public struct SmartLossSettings: Codable, Hashable, Sendable {
 
     /// Cheaper build for a phone that is already warm, or for a house-sized
     /// scan where the trust build would otherwise dominate the pre-pass.
+    ///
+    /// Selected by `trustBuildCost(requested:frameCount:thermalLevel:)`, which
+    /// `TwoScaleTrustField.build` calls at the top of every trust build. It is
+    /// not something a screen offers: the two things that decide it are both
+    /// measurements, and asking a person how warm their phone is would be a
+    /// worse answer than reading it.
     public static let economy = SmartLossSettings(
         trustPartnerFrames: 2,
         trustSampleStride: 3,
         planeSweepSampleBudget: 0
     )
+
+    /// Frames above which a walk is treated as house-sized.
+    ///
+    /// The same 1200 the processing screen uses to decide a scan is big for a
+    /// phone, so the two do not disagree about what "big" means.
+    public static let houseSizedFrameCount = 1_200
+
+    /// Which cost preset a trust build should actually run at.
+    ///
+    /// WHY THIS EXISTS: `economy` was written, documented, and then selected
+    /// by nothing, so every trust build ran at full cost no matter how warm
+    /// the phone was or how long the walk had been. This is the one place the
+    /// choice is made, and it is made from two measurements rather than a
+    /// preference: the live thermal state, and the number of frames in the
+    /// capture.
+    ///
+    /// Only the three BUILD-COST knobs are taken from `economy`. Everything
+    /// else in `requested` is kept, because the rest of this struct is
+    /// calibration (edge bands, ramps, thresholds) and quietly swapping
+    /// calibration for a preset's copy of it is how two runs stop being
+    /// comparable.
+    ///
+    /// - Parameters:
+    ///   - requested: what the caller asked for.
+    ///   - frameCount: frames in the capture being built.
+    ///   - thermalLevel: how warm the phone is right now.
+    /// - Returns: the settings to build with, and, when it downshifted, the
+    ///   plain-language reason it did. `nil` means full cost ran.
+    public static func trustBuildCost(
+        requested: SmartLossSettings,
+        frameCount: Int,
+        thermalLevel: ThermalLevel
+    ) -> (settings: SmartLossSettings, downshiftReason: String?) {
+        var reasons: [String] = []
+        if thermalLevel >= .serious {
+            reasons.append("the phone is already warm")
+        }
+        if frameCount > houseSizedFrameCount {
+            reasons.append("this scan is \(frameCount) frames")
+        }
+        guard !reasons.isEmpty else { return (requested, nil) }
+
+        var cheaper = requested
+        cheaper.trustPartnerFrames = economy.trustPartnerFrames
+        cheaper.trustSampleStride = economy.trustSampleStride
+        cheaper.planeSweepSampleBudget = economy.planeSweepSampleBudget
+        return (cheaper, reasons.joined(separator: " and "))
+    }
 }
 
 // MARK: - Errors
