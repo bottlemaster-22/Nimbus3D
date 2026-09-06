@@ -44,6 +44,7 @@ final class CaptureQCEvaluator {
     ///     exposure jump WE caused; that jump is signal, not a defect.
     func evaluate(
         angularVelocity: SIMD3<Float>,
+        netRotationRadians: Float,
         exposureDurationSeconds: Double,
         exposureOffsetEV: Float,
         sharpness: Float,
@@ -52,9 +53,14 @@ final class CaptureQCEvaluator {
         isBracketed: Bool
     ) -> FrameQC {
         let angularSpeed = simd_length(angularVelocity)
+
+        // Measured across the shutter, not sampled at its midpoint. The
+        // angular speed above is still recorded as itself, because
+        // `FrameQC.angularSpeedRadPerSec` means the rate and should keep
+        // meaning the rate; it is only the SMEAR that was being estimated
+        // wrongly from it.
         let blurPixels = CaptureTuning.motionBlurPixels(
-            angularSpeedRadPerSec: angularSpeed,
-            exposureDurationSeconds: exposureDurationSeconds
+            netRotationRadians: netRotationRadians
         )
 
         // Exposure is reported as an offset in EV from the metered target, so

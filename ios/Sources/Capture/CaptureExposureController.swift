@@ -93,6 +93,7 @@ final class CaptureExposureController: @unchecked Sendable {
     /// device after it owns it, so this cannot be answered at configuration
     /// time.
     func sessionDidStart() {
+        capExposureDuration()
         lock.lock()
         let hasDevice = device != nil
         if !hasDevice {
@@ -104,6 +105,54 @@ final class CaptureExposureController: @unchecked Sendable {
             let message = "No configurable capture device: exposure bracketing is off "
                     + "for this session and will be recorded as off."
             CaptureLog.exposure.notice("\(message, privacy: .public)")
+        }
+    }
+
+    /// Stops the camera choosing a shutter long enough to make the blur
+    /// meter unsatisfiable.
+    ///
+    /// Nothing capped this before. In a dim room auto-exposure would go to
+    /// 1/15 s or slower, at which point the blur meter goes red at about
+    /// 5 degrees per second of turn, which is slower than an ordinary hand
+    /// shakes. The app was telling the owner to slow down while he was
+    /// already holding still, and he said it felt like it needed a gimbal.
+    ///
+    /// `activeMaxExposureDuration` only bounds the AUTO exposure algorithm.
+    /// It makes the camera reach for ISO instead of shutter, which is the
+    /// right trade here: noise is independent between frames and the
+    /// trainer averages it out, while blur is not and it does not.
+    ///
+    /// Clamped into the range the active format actually supports, because
+    /// setting a value outside it is a hard exception rather than an error
+    /// return. A device that will not hand over its capture device gets
+    /// nothing done here and carries on, same as bracketing.
+    private func capExposureDuration() {
+        guard let device else { return }
+        let format = device.activeFormat
+        let requested = CMTime(
+            seconds: CaptureTuning.maxExposureDurationSeconds,
+            preferredTimescale: 1_000_000
+        )
+        var capped = requested
+        if CMTimeCompare(capped, format.minExposureDuration) < 0 {
+            capped = format.minExposureDuration
+        }
+        if CMTimeCompare(capped, format.maxExposureDuration) > 0 {
+            capped = format.maxExposureDuration
+        }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.activeMaxExposureDuration = capped
+            CaptureLog.exposure.notice(
+                """
+                Shutter capped at \(CMTimeGetSeconds(capped), privacy: .public) s so the blur meter is reachable by hand.
+                """
+            )
+        } catch {
+            CaptureLog.exposure.error(
+                "Could not cap the shutter: \(error.localizedDescription, privacy: .public)"
+            )
         }
     }
 

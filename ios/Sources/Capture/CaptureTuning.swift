@@ -97,6 +97,30 @@ public enum CaptureTuning {
     /// image: past that there is genuinely nothing left to supervise against.
     public static let blurWeightFloorPixels: Float = 12.0
 
+    /// Longest shutter the capture camera may choose, seconds.
+    ///
+    /// Nothing capped this before, and in a dim room the auto-exposure
+    /// algorithm happily went to 1/15 s or longer. Run that through the
+    /// blur meter: red is 8 px, so the turn rate that trips it is
+    /// 8 * 0.0426 / shutter degrees per second.
+    ///
+    ///     1/15 s  ->  red at  5.1 deg/s
+    ///     1/30 s  ->  red at 10.2 deg/s
+    ///     1/60 s  ->  red at 20.4 deg/s
+    ///
+    /// Ordinary hand tremor alone reaches something like 10 deg/s at its
+    /// peaks. At 1/15 s the app was therefore telling a person holding the
+    /// phone perfectly still that they were moving too fast, which is what
+    /// the owner ran into: "it feels like I have to use a gimbal".
+    ///
+    /// Capping the shutter makes the camera raise ISO instead of dragging
+    /// the shutter, and that is the right trade for THIS app. Sensor noise
+    /// is close to independent between frames, so the trainer averages it
+    /// away across the many photographs that see the same surface. Motion
+    /// blur is not: it destroys the high-frequency detail in every frame
+    /// that has it, and no amount of averaging brings it back.
+    public static let maxExposureDurationSeconds: Double = 1.0 / 60.0
+
     // MARK: - Exposure bracketing (F5)
 
     /// Every Nth *keyframe* is captured darker so a bright window has
@@ -389,6 +413,21 @@ public enum CaptureTuning {
         let degreesPerSecond = angularSpeedRadPerSec * 180 / .pi
         return degreesPerSecond * Float(exposureDurationSeconds)
             / angularPixelPitchDegrees
+    }
+
+    /// The same meter, fed the rotation the camera ACTUALLY turned through
+    /// while the shutter was open rather than a rate sampled at one instant
+    /// and assumed to hold for the whole window.
+    ///
+    /// `degreesPerSecond * exposureDuration` in the function above is just
+    /// an estimate of this angle that is exact only when the rate is
+    /// constant. See `CaptureGyroSampler.netRotationRadians` for why that
+    /// assumption fails badly for a shaking hand. The divisor, and so the
+    /// meaning of the number and every threshold quoted against it, is
+    /// unchanged.
+    public static func motionBlurPixels(netRotationRadians: Float) -> Float {
+        let degrees = netRotationRadians * 180 / .pi
+        return degrees / angularPixelPitchDegrees
     }
 
     /// Expected metric error of one LiDAR return, metres. Written into the

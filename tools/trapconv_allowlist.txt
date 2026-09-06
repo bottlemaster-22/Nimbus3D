@@ -49,7 +49,7 @@ Booster/BoosterUploadManager.swift:213  # SAFE: `withRetry` is private with one 
 # ---------------------------------------------------------------------------
 # Capture
 # ---------------------------------------------------------------------------
-Capture/ARCaptureService.swift:1009  # SAFE: `Swift.max(1, CaptureTuning.liveStateHz)` has the LITERAL first, so a NaN rate would be absorbed to 1. liveStateHz is a `static let Double = 10`, so the quotient is 1e8 and cannot exceed 1e9.
+Capture/ARCaptureService.swift:1017  # SAFE: `Swift.max(1, CaptureTuning.liveStateHz)` has the LITERAL first, so a NaN rate would be absorbed to 1. liveStateHz is a `static let Double = 10`, so the quotient is 1e8 and cannot exceed 1e9.
 Capture/CaptureCOLMAPWriter.swift:167  # SAFE: not a float at all. `CapturePointCloudAccumulator.Point.color` is `SIMD3<UInt8>`, so this is UInt8 -> Int. The detector matches on `.x`.
 Capture/CaptureCOLMAPWriter.swift:168  # SAFE: same, the green channel of a `SIMD3<UInt8>`.
 Capture/CaptureCOLMAPWriter.swift:169  # SAFE: same, the blue channel of a `SIMD3<UInt8>`.

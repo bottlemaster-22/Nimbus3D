@@ -139,9 +139,48 @@ final class CaptureGyroSampler: @unchecked Sendable {
     }
 
     /// Magnitude of the angular velocity at `timestamp`, rad/s. This is what
-    /// the blur meter and the bracket guard both actually want.
+    /// the bracket guard wants.
     func angularSpeed(at timestamp: TimeInterval) -> Float {
         simd_length(angularVelocity(at: timestamp))
+    }
+
+    /// How far the camera actually TURNED between two instants, radians.
+    ///
+    /// This exists because the blur meter was asking the wrong question.
+    /// It sampled the instantaneous rate at the midpoint of the exposure
+    /// and multiplied by the shutter time, which is only correct when the
+    /// rate is constant across the window. Hand tremor is not constant: it
+    /// is an oscillation at roughly 8 to 12 Hz, so within one 1/60 s
+    /// shutter the phone swings out and most of the way back again. The
+    /// instantaneous rate peaks as it passes through centre, so sampling
+    /// there and multiplying reports a large smear for a hand that has
+    /// barely moved by the time the shutter closes.
+    ///
+    /// The owner reported having to hold the phone like a gimbal to stop
+    /// the app complaining. This is why. Integrating the rate VECTOR lets
+    /// the out and back cancel the way the photons do, while a genuine pan
+    /// integrates to exactly what the old formula gave, because for a
+    /// constant rate the integral IS rate times duration. So this is a
+    /// better estimator of the same physical quantity, not a new quantity:
+    /// CONTRACTS.md section 7 fixes the smear-to-pixels conversion, and it
+    /// is untouched.
+    ///
+    /// Trapezoidal, over the interpolated rate. The gyro runs at 100 Hz so
+    /// a 1/60 s window holds only about two raw samples; the sub-steps do
+    /// not invent resolution the sampler does not have, they just stop the
+    /// single midpoint reading from standing in for the whole window.
+    func netRotationRadians(from start: TimeInterval, to end: TimeInterval) -> Float {
+        guard end > start, isReceivingSamples else { return 0 }
+        let steps = 8
+        let step = (end - start) / Double(steps)
+        var integral = SIMD3<Float>.zero
+        var previous = angularVelocity(at: start)
+        for i in 1...steps {
+            let current = angularVelocity(at: start + step * Double(i))
+            integral += (previous + current) * (0.5 * Float(step))
+            previous = current
+        }
+        return simd_length(integral)
     }
 
     // MARK: - Private

@@ -662,6 +662,13 @@ public final class ARCaptureService: NSObject, CaptureService {
         // and the leftover is exactly what the camera-to-IMU sweep measures.
         let angularVelocity = gyro.angularVelocity(at: timestamp + exposureDuration / 2)
 
+        // How far the camera turned while the shutter was open. This is
+        // what smears a photograph, and it is not the same as the rate at
+        // the midpoint times the duration once a hand is shaking.
+        let netRotation = gyro.netRotationRadians(
+            from: timestamp, to: timestamp + exposureDuration
+        )
+
         // NATIVE depth. Not `smoothedSceneDepth`, not the upsampled map.
         let depth = frame.sceneDepth.flatMap { CaptureDepthFrame(depthData: $0) }
         if let depth { lastDepthSize = (depth.width, depth.height) }
@@ -671,6 +678,7 @@ public final class ARCaptureService: NSObject, CaptureService {
 
         let qc = qcEvaluator.evaluate(
             angularVelocity: angularVelocity,
+            netRotationRadians: netRotation,
             exposureDurationSeconds: exposureDuration,
             exposureOffsetEV: camera.exposureOffset,
             sharpness: sharpness,
