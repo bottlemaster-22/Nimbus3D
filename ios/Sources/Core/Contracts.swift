@@ -239,9 +239,46 @@ public struct Pose: Codable, Hashable, Sendable {
     ///     pose          = inverse(T_world_cvcam)
     ///
     /// This is THE conversion. Nowhere else in the app may negate an axis.
+    /// True when every component is finite. A pose that fails this must not be
+    /// written down or used to place anything.
+    ///
+    /// This exists because the app used to have no such check anywhere: a
+    /// single non-finite pose poisoned every world position derived from that
+    /// frame, and those positions landed on trapping `Int64(Float)` conversions
+    /// in the coverage field and the point cloud, roughly half a million times a
+    /// second during a capture. One bad frame was a hard crash with plenty of
+    /// memory free.
+    public var isFinite: Bool {
+        rotation.x.isFinite && rotation.y.isFinite
+            && rotation.z.isFinite && rotation.w.isFinite
+            && translation.x.isFinite && translation.y.isFinite
+            && translation.z.isFinite
+    }
+
     public static func fromARKitCameraTransform(_ transform: simd_float4x4) -> Pose {
         let flip = simd_float4x4(diagonal: SIMD4<Float>(1, -1, -1, 1))
-        let worldToCamera = (transform * flip).inverse
+        let camToWorld = transform * flip
+
+        // ARKit does not promise an invertible transform. While tracking is
+        // unavailable or still initialising it can publish a matrix whose
+        // determinant is zero, and `simd_inverse` of a singular matrix is NaN
+        // in every element, with no error and no warning. Everything downstream
+        // then inherits the NaN.
+        //
+        // A real camera pose is a rigid transform, so its determinant is 1.
+        // Anything far from that is not a pose, and identity is the honest
+        // answer: it says "the camera is at the origin looking forward", which
+        // the tracking-state gate in `ARCaptureService` then discards, rather
+        // than a number that looks like a measurement and is not.
+        let determinant = simd_determinant(camToWorld)
+        guard determinant.isFinite, abs(determinant) > 1e-6 else {
+            return Pose(
+                rotation: Quaternion(simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))),
+                translation: Vector3(0, 0, 0)
+            )
+        }
+
+        let worldToCamera = camToWorld.inverse
         let rotation = simd_quatf(
             simd_float3x3(
                 simd_make_float3(worldToCamera.columns.0),

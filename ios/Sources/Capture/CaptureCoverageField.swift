@@ -134,11 +134,45 @@ final class CaptureCoverageField: @unchecked Sendable {
     @inline(__always)
     static func key(for position: SIMD3<Float>) -> Int64 {
         let size = CaptureTuning.coverageVoxelSizeMeters
-        let ix = Int64((position.x / size).rounded(.down))
-        let iy = Int64((position.y / size).rounded(.down))
-        let iz = Int64((position.z / size).rounded(.down))
+        let ix = voxelIndex(position.x, size)
+        let iy = voxelIndex(position.y, size)
+        let iz = voxelIndex(position.z, size)
         let mask: Int64 = 0x1F_FFFF  // 21 bits
         return ((ix & mask) << 42) | ((iy & mask) << 21) | (iz & mask)
+    }
+
+    /// One axis, converted WITHOUT the possibility of trapping.
+    ///
+    /// `Int64(someFloat)` is a trapping conversion: it kills the process on
+    /// NaN, on infinity, and on any finite value outside `Int64`. This used to
+    /// be three bare `Int64(...)` calls, and it is reached roughly half a
+    /// million times a second during a capture (12,288 depth samples a pass at
+    /// 8 Hz for coverage, plus the point cloud, plus window mode), so ONE bad
+    /// frame anywhere in a scan was a hard crash.
+    ///
+    /// A bad frame is not hypothetical. `Pose.fromARKitCameraTransform` inverts
+    /// the camera transform with no determinant check, so a singular transform
+    /// from ARKit (which can happen while tracking is unavailable) produces NaN
+    /// in every world position derived from that frame.
+    ///
+    /// There IS a NaN guard in `observe`, and it never got the chance to run:
+    /// `ARCaptureService` passes `meshStore.surfaceClass(at: point)` as an
+    /// ARGUMENT to `observe`, and Swift evaluates arguments first, so the
+    /// trapping conversion happened one stack frame before the guard.
+    ///
+    /// Dropping the sample is the right answer rather than clamping it to a
+    /// real voxel: a position we cannot trust must not be allowed to mark a
+    /// real part of the room as covered. Key 0 is a sentinel bucket that
+    /// `observe` rejects on distance anyway.
+    @inline(__always)
+    static func voxelIndex(_ value: Float, _ size: Float) -> Int64 {
+        let scaled = (value / Swift.max(size, 0.0001)).rounded(.down)
+        guard scaled.isFinite else { return 0 }
+        // The key only keeps 21 signed bits per axis, so clamping here costs
+        // nothing that the mask was not already discarding, and it closes the
+        // "finite but astronomically large" case that traps just as hard.
+        let limit: Float = 1_048_575  // 2^20 - 1
+        return Int64(Swift.max(-limit, Swift.min(limit, scaled)))
     }
 
     /// Elevation bands the sphere is cut into.

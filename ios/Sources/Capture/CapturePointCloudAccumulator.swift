@@ -296,10 +296,17 @@ final class CapturePointCloudAccumulator: @unchecked Sendable {
     /// that covers +-10 km, which is not a limit any scan will meet.
     @inline(__always)
     private static func key(for position: SIMD3<Float>, voxelSize: Float) -> Int64 {
+        // Non-trapping, for the reason written out at
+        // `CaptureCoverageField.voxelIndex`: `Int64(someFloat)` kills the
+        // process on NaN, on infinity and on any out-of-range finite value, and
+        // a single frame with a non-invertible camera transform poisons every
+        // world position it produces. This is the same bug in a second file, so
+        // it shares the one implementation rather than a second copy that can
+        // drift.
         let size = Swift.max(voxelSize, 0.0001)
-        let ix = Int64((position.x / size).rounded(.down))
-        let iy = Int64((position.y / size).rounded(.down))
-        let iz = Int64((position.z / size).rounded(.down))
+        let ix = CaptureCoverageField.voxelIndex(position.x, size)
+        let iy = CaptureCoverageField.voxelIndex(position.y, size)
+        let iz = CaptureCoverageField.voxelIndex(position.z, size)
         let mask: Int64 = 0x1F_FFFF
         return ((ix & mask) << 42) | ((iy & mask) << 21) | (iz & mask)
     }

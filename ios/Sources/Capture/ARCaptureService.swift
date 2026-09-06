@@ -261,6 +261,16 @@ public final class ARCaptureService: NSObject, CaptureService {
     private var didStartExposureController = false
 
     private var lastTrackingQuality: TrackingQuality = .notAvailable
+
+    /// Frames dropped because ARKit had no usable tracking, and frames dropped
+    /// because the camera transform did not invert.
+    ///
+    /// Counted rather than silently skipped. A scan that quietly kept a third
+    /// of its frames is a scan whose sparseness has an explanation nobody can
+    /// see, and this app has already lost a day to exactly that kind of
+    /// silence. Both are reported in the capture summary.
+    private var framesSkippedNoTracking = 0
+    private var framesSkippedBadPose = 0
     private var lastQC: FrameQC?
     /// Shutter length of the last frame that was measured, seconds. Half of
     /// the smear product, and the half the user cannot do anything about, so
@@ -384,6 +394,11 @@ public final class ARCaptureService: NSObject, CaptureService {
         sessionStartTimestamp = nil
         cachedIntrinsics = nil
         nextFrameIndex = 0
+        // Per scan, not per process: this object is a singleton for the life of
+        // the app, so a counter left over from the last scan would report the
+        // previous room's dropped frames against this one.
+        framesSkippedNoTracking = 0
+        framesSkippedBadPose = 0
         isKeyframeInFlight = false
         isCoverageInFlight = false
         didStartExposureController = false
@@ -573,6 +588,45 @@ public final class ARCaptureService: NSObject, CaptureService {
 
         let intrinsics = resolvedIntrinsics(from: camera)
         let pose = Pose.fromARKitCameraTransform(camera.transform)
+
+        // TWO GATES, AND THE APP HAD NEITHER.
+        //
+        // `quality` was read at the top of this function and then used for
+        // exactly one thing (the bracket check), so a frame delivered while
+        // ARKit had no tracking was processed exactly like a good one. Its
+        // transform can be singular, `fromARKitCameraTransform` now returns
+        // identity for that rather than NaN, and identity is not a measurement
+        // either: it would silently place the camera at the world origin and
+        // paint coverage onto a room that is not there.
+        //
+        // The second gate is belt and braces on the first. Every world position
+        // in this app comes from a pose, and a non-finite one used to reach
+        // trapping `Int64(Float)` conversions in the coverage field and the
+        // point cloud about half a million times a second. Those are safe now,
+        // but a pose that is not finite is still not data, and it must not be
+        // written to disk for the pre-pass to trip over later.
+        //
+        // Skipping is correct rather than stopping. Tracking drops for a second
+        // or two all the time (a hand over the lens, a fast turn, a dark
+        // corner) and recovers on its own. The frame is counted so the census
+        // can say how many were dropped and why, instead of a scan quietly
+        // having fewer photos than the user thinks.
+        guard quality != .notAvailable, quality != .limitedInitializing else {
+            framesSkippedNoTracking += 1
+            return
+        }
+        guard pose.isFinite else {
+            framesSkippedBadPose += 1
+            CaptureLog.session.error(
+                """
+                Dropped a frame whose camera transform did not invert. \
+                Tracking said \(String(describing: quality), privacy: .public). \
+                Total dropped this scan: \(self.framesSkippedBadPose, privacy: .public)
+                """
+            )
+            return
+        }
+
         let exposureDuration = camera.exposureDuration
         lastExposureDurationSeconds = exposureDuration
 
