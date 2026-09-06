@@ -165,6 +165,50 @@ enum PrePassInitialSplatBuilder {
         var maxThicknessFraction: Float = 0.35
         /// A doubtful ellipsoid's half-length along the ray, in sigmas.
         var rayLengthSigmas: Float = 2.5
+
+        /// The most of its own radius a DOUBTFUL seed may be long along
+        /// the view ray. Must stay below 1.
+        ///
+        /// This branch was deliberately left uncapped when the trusted one
+        /// was clamped, on the reasoning that a doubtful seed SHOULD be
+        /// stretched along the ray because range is what is uncertain about
+        /// it. That reasoning was wrong, and a screen recording of the
+        /// finished model shows why: the whole reconstruction was needles
+        /// radiating from a point, which is what a field of ray-aligned
+        /// prolate Gaussians looks like from anywhere but the camera that
+        /// made them.
+        ///
+        /// The reason is the disc prior in `trainer_regularizer`, which
+        /// drives the covariance towards an effective rank of 2. For an
+        /// (r, r, t) Gaussian with k = t/r, that target has TWO stable
+        /// solutions, not one:
+        ///
+        ///     k = 0     -> p = (.5, .5, 0),      rank 2   a disc
+        ///     k = 1     -> p = (1/3, 1/3, 1/3),  rank 3   the ridge
+        ///     k = 2.61  -> p = (.11, .11, .77),  rank 2   a NEEDLE
+        ///
+        /// So k = 1 is a watershed, not a midpoint. A seed starting above
+        /// it is not merely left elongated, it is actively driven further
+        /// from a disc every iteration until it settles at 2.61. The old
+        /// floor of `radius` put EVERY doubtful seed at k >= 1, and
+        /// `sigma * rayLengthSigmas` routinely put it well past. The prior
+        /// meant to prevent needles was manufacturing them.
+        ///
+        /// 0.9 keeps these the thickest seeds in the field, so they still
+        /// carry more range uncertainty than a trusted one at 0.35, while
+        /// sitting on the disc side of the watershed so the prior resolves
+        /// them instead of inflating them. The honest expression of "we do
+        /// not know the range here" is the lower opacity these already
+        /// carry, which training can raise as evidence arrives, not a shape
+        /// the prior will lock in.
+        /// 0.7 rather than 0.9 for MARGIN. k = 1 is an unstable
+        /// separatrix: a seed a little below it descends towards a disc,
+        /// a seed a little above it climbs towards the needle, and the
+        /// photometric gradient is perfectly capable of pushing one across
+        /// a boundary it is sitting against. 0.9 gives a rank of 2.99
+        /// against a ridge of 3.00, which is no margin at all. 0.7 gives
+        /// 2.83 and still leaves these the thickest seeds in the field.
+        var maxRayLengthFraction: Float = 0.7
         /// Hard ceiling regardless of what the budget asks for: the initial
         /// set is a starting point, and densification exists to grow it.
         var absoluteMaxSplats = 400_000
@@ -603,8 +647,15 @@ enum PrePassInitialSplatBuilder {
                 trustedCount += 1
             } else {
                 axis = viewDirection[i]
-                thirdScale = Swift.max(
-                    sigma[i] * settings.rayLengthSigmas, radius
+                // Below the k = 1 watershed. See `maxRayLengthFraction`:
+                // above it the disc prior drives this seed to a needle
+                // rather than towards a surface.
+                thirdScale = Swift.min(
+                    Swift.max(
+                        sigma[i] * settings.rayLengthSigmas,
+                        radius * settings.minThicknessFraction
+                    ),
+                    radius * settings.maxRayLengthFraction
                 )
                 opacityLogits[i] = doubtfulLogit
                 flags[i] |= Flag.elongated
