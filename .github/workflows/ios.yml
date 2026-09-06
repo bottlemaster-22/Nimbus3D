@@ -290,7 +290,27 @@ jobs:
       #  by accident.
       # =====================================================================
       - name: Publish to Bottle sideload broker (development only)
-        if: github.event_name == 'push' && github.ref != 'refs/heads/gh-pages'
+        # Publish whenever this job actually produced an IPA, which is NOT
+        # the same as "on a push".
+        #
+        # The `build` job above is skipped for a push to a feature branch,
+        # to keep the 90-minute macOS runner off every commit. So the old
+        # condition here, `github.event_name == 'push'`, could only ever be
+        # true at the same time as the job running for a push to main or to
+        # a v* tag. On the branch where the app is actually being developed
+        # the archive is built by the PULL REQUEST run, where event_name is
+        # 'pull_request', so the publish step never ran once. It was written
+        # and never called: the same defect class this repo has a CI gate
+        # for, in the CI file itself.
+        #
+        # The fork check is the security boundary. A pull request from a
+        # fork must never reach the publish token, and GitHub does not hand
+        # secrets to fork PRs anyway, so this makes that explicit rather
+        # than relying on it. gh-pages is excluded as before.
+        if: >-
+          github.ref != 'refs/heads/gh-pages'
+          && (github.event_name != 'pull_request'
+              || github.event.pull_request.head.repo.full_name == github.repository)
         working-directory: ${{ env.IOS_DIR }}
         env:
           BOTTLE_PUBLISH_URL: ${{ secrets.BOTTLE_PUBLISH_URL }}
