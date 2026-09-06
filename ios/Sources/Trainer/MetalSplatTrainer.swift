@@ -2085,20 +2085,54 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         renderSize: TrainerRenderSize
     ) throws {
         guard splatCount > 0, !keyframes.isEmpty else { return }
-        guard let buffer = queue.makeCommandBuffer(),
-              let encoder = buffer.makeComputeCommandEncoder()
-        else { throw TrainerError.noMetalDevice }
-        encoder.label = "trainer.filter3d"
+
+        // ONE COMMAND BUFFER PER CAMERA, not one for the whole sweep.
+        //
+        // This used to encode the clear, up to 64 per-camera passes over
+        // every Gaussian, and the finalise into a SINGLE command buffer and
+        // wait on it once. At the 204,000 Gaussians a room reaches by the
+        // time this first runs, that is around thirteen million kernel
+        // invocations in one submission, and every one of them does atomic
+        // work on the shared top-K list.
+        //
+        // A single submission that long is what the GPU driver watchdog
+        // exists to catch. When it fires, the driver resets the GPU and
+        // takes the process with it, and iOS writes no crash report a
+        // person can find in Settings.
+        //
+        // That matches the observed failure exactly. A screen recording of
+        // a full run shows the app vanish at round 500 of 3000 with memory
+        // flat at about 2.05 GB and 1.5 GB still available, so it is not
+        // memory, and there was no app-named crash report and no
+        // JetsamEvent at that time. Iteration 500 is the FIRST iteration
+        // this sweep ever runs, because filter3DIntervalIterations is 500.
+        //
+        // Splitting the work does not make it less work. It makes each
+        // submission short enough that the watchdog has nothing to catch,
+        // and it gives the driver a boundary to schedule other work at,
+        // including the preview.
+        func submit(_ label: String, _ body: (MTLComputeCommandEncoder) -> Void) throws {
+            guard let buffer = queue.makeCommandBuffer(),
+                  let encoder = buffer.makeComputeCommandEncoder()
+            else { throw TrainerError.noMetalDevice }
+            encoder.label = label
+            body(encoder)
+            encoder.endEncoding()
+            buffer.commit()
+            try Self.finish(buffer, label)
+        }
 
         // The top-K list is rebuilt from scratch: it is a running maximum, and
         // a Gaussian that moved since the last sweep would otherwise keep a
         // rate it earned somewhere else.
-        gpu.fillFloat(
-            encoder,
-            buffer: resources.samplingTopK,
-            count: splatCount * 4,
-            value: 0
-        )
+        try submit("the 3D filter clear") { encoder in
+            gpu.fillFloat(
+                encoder,
+                buffer: resources.samplingTopK,
+                count: splatCount * 4,
+                value: 0
+            )
+        }
 
         let intrinsics = supervision.renderIntrinsics
             ?? CameraIntrinsics(
@@ -2129,19 +2163,26 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             camera.farPlane = 100
             camera.splatCount = UInt32(splatCount)
             camera.shCoeffCount = UInt32(shCoefficientCount)
-            gpu.samplingRateUpdate(encoder, camera: &camera, splatCount: splatCount)
+            // Cancellation is honoured between cameras now that each one
+            // is its own submission. Before, a stop during the sweep had
+            // to wait for all 64 passes to finish first.
+            if Task.isCancelled { throw NimbusError.cancelled }
+            try submit("the 3D filter sweep") { encoder in
+                gpu.samplingRateUpdate(
+                    encoder, camera: &camera, splatCount: splatCount
+                )
+            }
             index += stride
         }
 
-        gpu.filter3DFinalize(
-            encoder,
-            splatCount: splatCount,
-            filterScale: tuning.filter3DScale,
-            fallback: tuning.filter3DFallbackMeters
-        )
-        encoder.endEncoding()
-        buffer.commit()
-        try Self.finish(buffer, "a reset pass")
+        try submit("the 3D filter finalise") { encoder in
+            gpu.filter3DFinalize(
+                encoder,
+                splatCount: splatCount,
+                filterScale: tuning.filter3DScale,
+                fallback: tuning.filter3DFallbackMeters
+            )
+        }
     }
 
     // MARK: - Camera delta

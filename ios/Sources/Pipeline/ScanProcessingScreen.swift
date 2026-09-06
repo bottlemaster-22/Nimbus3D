@@ -645,7 +645,10 @@ struct TrainingPreviewSection: View {
                         // then parked. Between bursts the preview costs
                         // nothing: the GPU belongs to the trainer.
                         isAnimating: preview.isSettling,
-                        gesturesEnabled: false
+                        gesturesEnabled: false,
+                        // Only redraw when a new snapshot has actually
+                        // landed. `frameCount` counts those.
+                        redrawToken: preview.frameCount
                     )
                 }
             }

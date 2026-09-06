@@ -241,6 +241,25 @@ struct SplatPreviewView: UIViewRepresentable {
     var isAnimating: Bool = true
     /// Whether touch gestures move the camera. Off in path mode by default.
     var gesturesEnabled: Bool = true
+    /// A number that changes ONLY when the drawn cloud actually changes.
+    ///
+    /// When this is nil, a paused view redraws on every SwiftUI update,
+    /// which is what it has always done. That is fine for a still
+    /// comparison, where updates are rare.
+    ///
+    /// It is NOT fine underneath the training screen. The live progress
+    /// text changes several times a second, every change is a SwiftUI
+    /// update, and every update was redrawing the whole field. At the
+    /// 204,000 Gaussians a room reaches, one redraw measured about 46 ms
+    /// of GPU on an A19 Pro, so the preview was taking most of the GPU
+    /// away from the trainer to draw a picture that had not changed. The
+    /// snapshot behind it only updates every 50 rounds, roughly every
+    /// twelve seconds.
+    ///
+    /// The screen comment above says "between bursts the preview costs
+    /// nothing: the GPU belongs to the trainer". This is what makes that
+    /// true. Pass the preview's frame counter.
+    var redrawToken: Int?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(renderer: renderer, camera: camera)
@@ -267,7 +286,14 @@ struct SplatPreviewView: UIViewRepresentable {
         view.isPaused = !isAnimating
         view.enableSetNeedsDisplay = !isAnimating
         if !isAnimating {
-            view.setNeedsDisplay()
+            if let redrawToken {
+                if context.coordinator.lastRedrawToken != redrawToken {
+                    context.coordinator.lastRedrawToken = redrawToken
+                    view.setNeedsDisplay()
+                }
+            } else {
+                view.setNeedsDisplay()
+            }
         }
     }
 
@@ -290,6 +316,9 @@ struct SplatPreviewView: UIViewRepresentable {
         let renderer: MetalSplatRenderer
         var camera: ViewerCameraController
         var gesturesEnabled = true
+        /// The last `redrawToken` this view was asked to draw for. Starts
+        /// below any real token so the first content always draws.
+        var lastRedrawToken = Int.min
 
         private var lastFrameTime: CFTimeInterval?
 
