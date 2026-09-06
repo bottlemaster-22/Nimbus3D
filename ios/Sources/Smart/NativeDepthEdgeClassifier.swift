@@ -91,56 +91,70 @@ public final class NativeDepthEdgeClassifier: EdgeClassifier {
         var written = 0
         var localPaths: [FrameID: String] = [:]
 
+        // One pool per frame. This loop walks EVERY frame in the capture,
+        // not just the keyframes, and each pass decodes a JPEG, reads two
+        // sidecars and writes an edge map. Draining per frame keeps one
+        // frame resident instead of all of them.
+        //
+        // The body hands back the path it wrote instead of using
+        // `continue`, which cannot cross a closure boundary. A nil means
+        // the frame was skipped, which is what both `continue`s meant.
         for frame in bundle.frames {
             if Task.isCancelled { throw NimbusError.cancelled }
-            guard let depthPath = frame.depthPath else { continue }
+            let relativePath = try autoreleasepool { () throws -> String? in
+                guard let depthPath = frame.depthPath else { return nil }
 
-            let depth: [Float]
-            do {
-                depth = try SmartBinary.readDepth16(
-                    ref.url(forRelativePath: depthPath), count: sampleCount
+                let depth: [Float]
+                do {
+                    depth = try SmartBinary.readDepth16(
+                        ref.url(forRelativePath: depthPath), count: sampleCount
+                    )
+                } catch {
+                    // A frame with an unreadable depth sidecar is skipped, loudly.
+                    // It is not fatal: `map(for:)` returns an empty map and the
+                    // loss simply has no depth opinion about that frame.
+                    SmartLog.edges.error(
+                        "Frame \(frame.index) depth unreadable, skipped: \(String(describing: error), privacy: .public)"
+                    )
+                    return nil
+                }
+
+                let confidence: [UInt8]
+                if let confidencePath = frame.confidencePath,
+                   let read = try? SmartBinary.readConfidence8(
+                       ref.url(forRelativePath: confidencePath), count: sampleCount
+                   ) {
+                    confidence = read
+                } else {
+                    // No confidence sidecar: treat everything as medium. Losing
+                    // the ranking costs precision in the `unknown` class, nothing
+                    // else, and ARKit's confidence is a weak signal anyway.
+                    confidence = [UInt8](repeating: 1, count: sampleCount)
+                }
+
+                let luma = nativeLuma(
+                    frame: frame, ref: ref, cache: imageCache, width: width, height: height
                 )
-            } catch {
-                // A frame with an unreadable depth sidecar is skipped, loudly.
-                // It is not fatal: `map(for:)` returns an empty map and the
-                // loss simply has no depth opinion about that frame.
-                SmartLog.edges.error(
-                    "Frame \(frame.index) depth unreadable, skipped: \(String(describing: error), privacy: .public)"
+
+                let classes = classifyFrame(
+                    depth: depth,
+                    confidence: confidence,
+                    luma: luma,
+                    width: width,
+                    height: height
                 )
-                continue
+
+                let relative = "\(directory)/\(Self.stem(forImagePath: frame.imagePath)).edge8"
+                var bytes = Data(capacity: sampleCount)
+                for c in classes { bytes.append(c.rawValue) }
+                try SmartBinary.write(bytes, to: ref.url(forRelativePath: relative))
+                return relative
             }
 
-            let confidence: [UInt8]
-            if let confidencePath = frame.confidencePath,
-               let read = try? SmartBinary.readConfidence8(
-                   ref.url(forRelativePath: confidencePath), count: sampleCount
-               ) {
-                confidence = read
-            } else {
-                // No confidence sidecar: treat everything as medium. Losing
-                // the ranking costs precision in the `unknown` class, nothing
-                // else, and ARKit's confidence is a weak signal anyway.
-                confidence = [UInt8](repeating: 1, count: sampleCount)
+            if let relativePath {
+                localPaths[frame.index] = relativePath
+                written += 1
             }
-
-            let luma = nativeLuma(
-                frame: frame, ref: ref, cache: imageCache, width: width, height: height
-            )
-
-            let classes = classifyFrame(
-                depth: depth,
-                confidence: confidence,
-                luma: luma,
-                width: width,
-                height: height
-            )
-
-            let relative = "\(directory)/\(Self.stem(forImagePath: frame.imagePath)).edge8"
-            var bytes = Data(capacity: sampleCount)
-            for c in classes { bytes.append(c.rawValue) }
-            try SmartBinary.write(bytes, to: ref.url(forRelativePath: relative))
-            localPaths[frame.index] = relative
-            written += 1
         }
 
         let produced = EdgeClassificationRefs(

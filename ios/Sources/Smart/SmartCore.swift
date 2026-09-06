@@ -830,23 +830,42 @@ public struct SmartImage: Sendable {
 /// between this being usable on a phone and not.
 enum SmartImageLoader {
 
+    // Everything ImageIO and CoreGraphics allocate in here is autoreleased,
+    // and this runs once per frame in loops that walk thousands of frames
+    // without ever suspending. A Swift concurrency job drains its
+    // autorelease pool when the job ENDS, not between iterations, so with
+    // no explicit pool every decode in the whole pre-pass stays resident
+    // until the stage finishes.
+    //
+    // Not theoretical. The phone reported the process growing 1814 MB in
+    // 158 seconds under a stack in ImageIO and CoreGraphics, and the crash
+    // lands in the second half of processing rather than at any particular
+    // frame, which is what running out of headroom looks like rather than
+    // hitting bad data. There was not one autoreleasepool in this codebase.
+    //
+    // Closing the pool around the return value is safe: each of these
+    // returns a Swift value type owning its own byte storage, so no
+    // CoreFoundation object outlives the pool.
     static func load(url: URL, longEdge: Int) -> SmartImage? {
         #if canImport(CoreGraphics)
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
-            SmartLog.general.error(
-                "Could not open image \(url.lastPathComponent, privacy: .public)"
-            )
-            return nil
+        return autoreleasepool { () -> SmartImage? in
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+                SmartLog.general.error(
+                    "Could not open image \(url.lastPathComponent, privacy: .public)"
+                )
+                return nil
+            }
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceThumbnailMaxPixelSize: longEdge
+            ]
+            guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+            else { return nil }
+            return decode(cg)
         }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: longEdge
-        ]
-        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
-        else { return nil }
-        return decode(cg)
+
         #else
         _ = url
         _ = longEdge

@@ -517,62 +517,84 @@ struct PrePassColorImage {
 /// single easiest way to make a pre-pass over 3000 frames take minutes.
 enum PrePassImageLoader {
 
+    // Everything ImageIO and CoreGraphics allocate in here is autoreleased,
+    // and this runs once per frame in loops that walk thousands of frames
+    // without ever suspending. A Swift concurrency job drains its
+    // autorelease pool when the job ENDS, not between iterations, so with
+    // no explicit pool every decode in the whole pre-pass stays resident
+    // until the stage finishes.
+    //
+    // Not theoretical. The phone reported the process growing 1814 MB in
+    // 158 seconds under a stack in ImageIO and CoreGraphics, and the crash
+    // lands in the second half of processing rather than at any particular
+    // frame, which is what running out of headroom looks like rather than
+    // hitting bad data. There was not one autoreleasepool in this codebase.
+    //
+    // Closing the pool around the return value is safe: each of these
+    // returns a Swift value type owning its own byte storage, so no
+    // CoreFoundation object outlives the pool.
     /// Greyscale at exactly `width` x `height`.
     static func loadGray(url: URL, width: Int, height: Int) -> PrePassGrayImage? {
-        guard width > 0, height > 0,
-              let cgImage = decode(url: url, maxPixelSize: Swift.max(width, height))
-        else { return nil }
+        return autoreleasepool { () -> PrePassGrayImage? in
+            guard width > 0, height > 0,
+                  let cgImage = decode(url: url, maxPixelSize: Swift.max(width, height))
+            else { return nil }
 
-        var pixels = [UInt8](repeating: 0, count: width * height)
-        let colorSpace = CGColorSpaceCreateDeviceGray()
-        let drawn: Bool = pixels.withUnsafeMutableBytes { buffer -> Bool in
-            guard let base = buffer.baseAddress,
-                  let context = CGContext(
-                      data: base,
-                      width: width,
-                      height: height,
-                      bitsPerComponent: 8,
-                      bytesPerRow: width,
-                      space: colorSpace,
-                      bitmapInfo: CGImageAlphaInfo.none.rawValue
-                  )
-            else { return false }
-            context.interpolationQuality = .high
-            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-            return true
+            var pixels = [UInt8](repeating: 0, count: width * height)
+            let colorSpace = CGColorSpaceCreateDeviceGray()
+            let drawn: Bool = pixels.withUnsafeMutableBytes { buffer -> Bool in
+                guard let base = buffer.baseAddress,
+                      let context = CGContext(
+                          data: base,
+                          width: width,
+                          height: height,
+                          bitsPerComponent: 8,
+                          bytesPerRow: width,
+                          space: colorSpace,
+                          bitmapInfo: CGImageAlphaInfo.none.rawValue
+                      )
+                else { return false }
+                context.interpolationQuality = .high
+                context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+                return true
+            }
+            guard drawn else { return nil }
+            return PrePassGrayImage(width: width, height: height, pixels: pixels)
         }
-        guard drawn else { return nil }
-        return PrePassGrayImage(width: width, height: height, pixels: pixels)
+
     }
 
     /// RGB at exactly `width` x `height`, 4 bytes per pixel.
     static func loadColor(url: URL, width: Int, height: Int) -> PrePassColorImage? {
-        guard width > 0, height > 0,
-              let cgImage = decode(url: url, maxPixelSize: Swift.max(width, height))
-        else { return nil }
+        return autoreleasepool { () -> PrePassColorImage? in
+            guard width > 0, height > 0,
+                  let cgImage = decode(url: url, maxPixelSize: Swift.max(width, height))
+            else { return nil }
 
-        var pixels = [UInt8](repeating: 0, count: width * height * 4)
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGImageAlphaInfo.noneSkipLast.rawValue
-            | CGBitmapInfo.byteOrder32Big.rawValue
-        let drawn: Bool = pixels.withUnsafeMutableBytes { buffer -> Bool in
-            guard let base = buffer.baseAddress,
-                  let context = CGContext(
-                      data: base,
-                      width: width,
-                      height: height,
-                      bitsPerComponent: 8,
-                      bytesPerRow: width * 4,
-                      space: colorSpace,
-                      bitmapInfo: bitmapInfo
-                  )
-            else { return false }
-            context.interpolationQuality = .high
-            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-            return true
+            var pixels = [UInt8](repeating: 0, count: width * height * 4)
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+            let bitmapInfo = CGImageAlphaInfo.noneSkipLast.rawValue
+                | CGBitmapInfo.byteOrder32Big.rawValue
+            let drawn: Bool = pixels.withUnsafeMutableBytes { buffer -> Bool in
+                guard let base = buffer.baseAddress,
+                      let context = CGContext(
+                          data: base,
+                          width: width,
+                          height: height,
+                          bitsPerComponent: 8,
+                          bytesPerRow: width * 4,
+                          space: colorSpace,
+                          bitmapInfo: bitmapInfo
+                      )
+                else { return false }
+                context.interpolationQuality = .high
+                context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+                return true
+            }
+            guard drawn else { return nil }
+            return PrePassColorImage(width: width, height: height, pixels: pixels)
         }
-        guard drawn else { return nil }
-        return PrePassColorImage(width: width, height: height, pixels: pixels)
+
     }
 
     private static func decode(url: URL, maxPixelSize: Int) -> CGImage? {
