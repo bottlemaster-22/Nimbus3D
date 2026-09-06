@@ -194,7 +194,12 @@ jobs:
           # got reported against a build three releases behind its fix;
           # identifying it afterwards meant matching Mach-O UUIDs to
           # release artefacts. This makes the running app say so itself.
-          REVISION=$(git -C "$GITHUB_WORKSPACE" rev-parse --short HEAD)
+          # For a pull_request event the checkout is an ephemeral MERGE
+          # commit that exists in no branch, so stamping HEAD would print
+          # a SHA nobody can look up, which defeats the point. Use the
+          # head commit of the branch being built.
+          REVISION=$(git -C "$GITHUB_WORKSPACE" rev-parse --short 
+            "${{ github.event.pull_request.head.sha || github.sha }}")
 
           xcodebuild archive \
             -project "$PROJECT" \
