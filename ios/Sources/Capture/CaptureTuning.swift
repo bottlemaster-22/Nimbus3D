@@ -37,7 +37,134 @@ public enum CaptureTuning {
 
     /// Never two keyframes closer together than this in time, whatever the
     /// motion says. Caps the write rate and therefore the storage burn.
-    public static let keyframeMinIntervalSeconds: Double = 1.0 / 6.0
+    ///
+    /// WHY 0.30 AND NOT 1/6, WHICH IS WHAT THIS WAS. Start with what this
+    /// number is, because it is easy to read it as a rate and it is not one:
+    /// it is a CEILING. A frame is only considered on the 15 Hz evaluation
+    /// grid above, so the effective floor is the first grid step at or past
+    /// this value. 1/6 landed on the third step, 0.200 s, so the old ceiling
+    /// was 5.0 keyframes a second. 0.30 lands on the fifth, 0.333 s, so the
+    /// new ceiling is 3.0 a second.
+    ///
+    /// WHAT THE PHONE ACTUALLY DID. Measured on the owner's own device and
+    /// not derivable from anything in this repository, so it is recorded here
+    /// as the outside measurement it is: one scan of 4 minutes 36 seconds
+    /// wrote 868 keyframes and about 651 MB. That is 3.1 keyframes a second
+    /// against a ceiling of 5.0, which says plainly that this constant was
+    /// not what set the rate. Motion, the QC floor and the
+    /// `isKeyframeInFlight` gate set it; the ceiling only clipped the bursts.
+    /// The per-keyframe split IS checkable from source:
+    /// docs/DATA_FORMAT.md section 5 fixes 98,304 bytes of `.depth16` and
+    /// 49,152 of `.conf8`, so of the 750 KB each keyframe cost, about 603 KB
+    /// was the JPEG. Roughly 80% of a scan is the photograph, and the same
+    /// section fixes that JPEG at quality 0.92, which makes it a contract
+    /// value. The count is the only lever this file has.
+    ///
+    /// WHAT 0.30 BUYS, WHICH IS LESS THAN IT LOOKS. Mean spacing on that scan
+    /// was 276 / 868 = 0.318 s, already just under the 0.333 the new ceiling
+    /// imposes. The same walk is therefore capped at 276 / 0.333 = 828
+    /// keyframes, a guaranteed cut of only about 5%. The rest of the cut is
+    /// whatever share of the walk was packed against the old 0.200 floor, and
+    /// a 3.1/s average says that was a minority of it, so expect something
+    /// near a tenth: 651 MB down to roughly 580 MB, with the pre-pass's
+    /// frame-major outputs falling in step (`trust_noise.bin` and
+    /// `confidence_recal.bin` at 4 bytes per native sample each, plus one
+    /// `.edge8` at 1 byte, is 442,368 bytes a frame, so about 384 MB becomes
+    /// about 366 MB).
+    ///
+    /// THIS DOES NOT FIX THE WRITE BUDGET and must not be read as having done
+    /// so. `Smart/TwoScaleTrustField` records what that budget looks like from
+    /// the phone's side: 1 GB of file writes in a 32-minute session and 4 GB
+    /// across one day, both tiers of the daily allowance breached. 651 MB in
+    /// 276 s is 2.4 MB/s sustained, which is orders of magnitude above what
+    /// iOS treats as sustainable, and a tenth off it is still orders of
+    /// magnitude above it. The only two levers that would move that are the
+    /// JPEG, which is a contract value, and an interval long enough to starve
+    /// the carver below. This change is worth making because it is nearly
+    /// free, not because it is the answer.
+    ///
+    /// THE COUNT NOBODY DOWNSTREAM ASKED FOR is the better argument for it.
+    /// Every consumer of these frames states its own appetite and 868 is far
+    /// above all of them. `TrainingBudget.recommended` wants 120 supervision
+    /// views for a room and 240 for a house.
+    /// `PrePassInitialSplatBuilder.Settings.maxKeyframes` is 160,
+    /// `PrePassSurveyor` 48 and `PrePassGlassDetector` 40, and all three
+    /// stride over the frames rather than reading more of them, so extra
+    /// frames only widen the stride. `PrePassBundleAdjuster` selects on 0.30 m
+    /// OR 0.75 s and then thins to 80, and the time term on its own selects
+    /// more than 80 on any scan past about a minute, so it thins either way.
+    /// `HeldOutFrameSelector.stride` is 20 whatever the total.
+    ///
+    /// THE ONE STAGE THAT WALKS EVERY FRAME AND WANTS THEM DENSE is the
+    /// carver, and it declares TWO appetites, the second of which argues
+    /// against this change and so has to be written down rather than left out.
+    /// `VoxelFreeSpaceCarver.Tuning` has `keyframeSpacingMeters` at 0.10 AND
+    /// `keyframeSpacingSeconds` at 0.20, and `keyframes(from:)` keeps a frame
+    /// when EITHER is satisfied. A stated appetite of five frames a second is
+    /// exactly the rate being capped. Two things answer it. First, that
+    /// thinner already never fires: at the measured 0.318 s mean spacing every
+    /// captured frame is already more than 0.20 s from the one before, so the
+    /// carver already carves from every frame the capture wrote and will still
+    /// do so at 0.333. Second, the time term exists to thin a camera that is
+    /// NOT moving, so a phone held still does not carve the same air thirty
+    /// times over; the frames it would have added are frames from a stationary
+    /// camera, carving air that is already carved. The SPATIAL term is the one
+    /// that binds, and against it three a second means anyone scanning at
+    /// 0.33 m/s or slower leaves consecutive keyframes 10 cm apart or closer.
+    /// Faster than that the spacing opens up, but it did at five a second too:
+    /// the crossover moves from 0.5 m/s to 0.33 m/s, it does not appear.
+    ///
+    /// WHAT IT DOES NOT TOUCH, which matters because earlier scans came out
+    /// too sparse and that must not be repeated. All four causes of that were
+    /// found and fixed and not one of them was the frame count: densification
+    /// never fired on a units mismatch, the thermal cap deleted live geometry,
+    /// the prune schedule was dead code, and the trust gate rejected
+    /// essentially every sample. `frameEvaluationHz` is untouched, so the
+    /// coverage field still updates on its own 8 Hz branch, the camera-to-IMU
+    /// calibrator still collects its `timeOffsetMinSamples` of 120 in about
+    /// eight seconds because `observe` is called ABOVE the in-flight gate, and
+    /// the blur meter, the HUD and the spoken guidance all run exactly as
+    /// before, because every one of them sits on the evaluation grid and not
+    /// on this one. `keyframeMaxIntervalSeconds` is untouched too, so someone
+    /// standing still still leaves no hole in the temporal track. Coverage in
+    /// fact gets slightly MORE reliable, because its branch sits below the
+    /// `isKeyframeInFlight` gate and a writer asked for less work blocks it
+    /// less often.
+    ///
+    /// WHAT IT DOES TOUCH. Three things move, and the measurement shrinks all
+    /// three to almost nothing, which is worth recording because sizing them
+    /// off the 5/s ceiling instead of the 3.1/s the phone really produced
+    /// makes every one of them sound serious. FIRST, short scans lose
+    /// supervision: `ProcessingBudgetPlanner.plan` clamps `keyframeCount` to
+    /// `min(budget, frameCount)` and every adjustment in that function is a
+    /// `min`, so reaching the full 120 views for a room takes about 40 seconds
+    /// of scanning rather than the 38 it took at 3.1/s. SECOND, the LiDAR
+    /// cloud loses that same tenth of its input, because `pointCloud.add` runs
+    /// only for accepted keyframes; its EXTENT does not shrink, since voxel
+    /// occupancy follows coverage rather than frame count, but each voxel
+    /// averages slightly fewer measurements. THIRD, brackets are counted in
+    /// KEYFRAMES, so `bracketEveryNKeyframes` of 12 arrives about every 4.0
+    /// seconds instead of about every 3.8, and window mode's 5 about every 1.7
+    /// instead of about every 1.6. One thing moves the other way for free:
+    /// `SmartLossSettings.houseSizedFrameCount` is 1200, above which the trust
+    /// build downshifts to the economy preset and verifies depth with two
+    /// partner frames instead of four and no plane sweep at all, and that
+    /// cliff moves from about 6.4 minutes of scanning to about 6.7.
+    ///
+    /// WHY 0.30 RATHER THAN 1.0 / 3.0, and how firm any of this is. The
+    /// evaluation grid is not a clean lattice: `shouldEvaluate` compares
+    /// against the last ACCEPTED evaluation timestamp, and at 60 fps four
+    /// inter-frame gaps sum to exactly 1/15, so ARKit's timestamp jitter
+    /// decides each time whether the step is 0.067 or 0.083. Landing points at
+    /// or past 0.30 are therefore around 0.333 to 0.35, about 2.9 to 3.0 a
+    /// second, and by the same argument the old ceiling was somewhere in four
+    /// to five a second rather than a firm five. 1.0 / 3.0 would sit exactly
+    /// on the 0.333 boundary and inherit that coin flip a second time, in this
+    /// comparison as well as in the grid, for nothing. 0.30 sits clear of it.
+    /// Hot, `thermalKeyframeIntervalMultiplier` doubles this to 0.60, which
+    /// lands on the tenth step at 0.667 for about 1.5 a second; the same
+    /// looseness applies there and neither is worth a second constant.
+    public static let keyframeMinIntervalSeconds: Double = 0.30
 
     /// If nothing has been written for this long, take one anyway. A user who
     /// stands perfectly still while thinking should not leave a hole in the

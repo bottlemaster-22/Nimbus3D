@@ -61,12 +61,16 @@ NON_TRAPPING = ('truncatingIfNeeded:', 'exactly:', 'clamping:', 'bitPattern:',
 # Evidence in the argument that a float is involved.
 FLOATY = re.compile(
     r'\.rounded\(|Float\(|Double\(|CGFloat\(|\bfloor\(|\bceil\(|/\s*[A-Za-z_]'
-    r'|\.x\b|\.y\b|\.z\b|\.w\b|Meters\b|Metres\b|Seconds\b|fraction|Fraction'
+    r'|\.x\b|\.y\b|\.z\b|\.w\b|[Mm]eters\b|[Mm]etres\b|[Ss]econds\b'
+    r'|fraction|Fraction'
     r'|sqrt|expf|logf|powf|sigmoid|\* *255|\* *100'
 )
 
 # Things that make an INTEGER argument obvious, so we do not flag Int(count).
 INTY = re.compile(r'\.count\b|\.utf8\b|\bindex\b|\bcount\b|<<|>>|0x[0-9A-Fa-f]')
+
+# PROSE_PLACEHOLDER_OPAQUE
+OPAQUE_ARG = re.compile(r'^[A-Za-z_][A-Za-z0-9_.]*$')
 
 
 def strip_comments_and_strings(text):
@@ -131,12 +135,89 @@ def argument_of(text, open_index):
     return ''
 
 
+def split_top_level_commas(text):
+    """Split on the commas that are not inside brackets, so the argument list
+    of `min(255, f(a, b))` reads as two parts and not three."""
+    parts, depth, start = [], 0, 0
+    for i, c in enumerate(text):
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return parts
+
+
+CLAMP_HEAD = re.compile(r'^(?:Swift\.)?(max|min)\(')
+
+# Rounding is allowed to sit OUTSIDE a clamp, because rounding a value that is
+# already inside [lo, hi] leaves it inside [lo, hi]. Stripping this tail is the
+# only way to see the clamp under `Swift.max(0, seconds).rounded()`.
+ROUNDING_TAIL = re.compile(r'\.rounded\((?:\.[A-Za-z]+)?\)$')
+
+# Only a plain numeric literal counts as a bound. An identifier bound may be
+# NaN or out of range itself, and then it bounds nothing.
+LITERAL_BOUND = re.compile(r'^-?[0-9][0-9_]*(?:\.[0-9]+)?(?:[eE]-?[0-9]+)?$')
+
+
+def clamp_bound(text):
+    """Read `text` as a whole `Swift.max(literal, rest)` or
+    `Swift.min(literal, rest)` and answer ('lower' or 'upper', rest). Answer
+    None for anything else.
+
+    The literal has to come FIRST. Swift's `max(x, y)` is `y >= x ? y : x`, so
+    the SECOND argument is the one that gets absorbed when a comparison
+    against NaN answers false, and `max(x, 0)` propagates the NaN it was
+    written to stop.
+    """
+    text = text.strip()
+    while True:
+        m = ROUNDING_TAIL.search(text)
+        if not m:
+            break
+        text = text[:m.start()]
+    m = CLAMP_HEAD.match(text)
+    if not m:
+        return None
+    open_index = m.end() - 1
+    inside = argument_of(text, open_index)
+    # The clamp has to BE the whole expression rather than merely start it.
+    # Without this, `max(0, x) * scale` would read as a bounded value even
+    # though the multiply can carry it straight back out of range.
+    if open_index + len(inside) + 2 != len(text):
+        return None
+    parts = split_top_level_commas(inside)
+    if len(parts) != 2 or not LITERAL_BOUND.match(parts[0].strip()):
+        return None
+    return ('lower' if m.group(1) == 'max' else 'upper'), parts[1]
+
+
 def nan_absorbed(arg):
-    """True when the OUTERMOST clamp puts the variable in a position Swift's
-    min/max absorbs (second argument), so a NaN cannot reach the conversion."""
+    """True when the argument is clamped on BOTH sides by literal bounds, so
+    neither a NaN nor a finite value outside the destination range can reach
+    the conversion.
+
+    A ONE-SIDED clamp used to be enough to get dropped here, and that was
+    wrong. `Swift.max(0, x)` does absorb a NaN, which is the only thing the
+    old one-line check looked at, but the docstring at the top of this file
+    says the tool exists to catch "any finite value outside the destination
+    type's range" too, and a lower bound alone stops none of those:
+    `Int(Swift.max(0, seconds))` still dies on an infinite or absurdly large
+    `seconds`. Sites dropped here appear in NEITHER the report NOR the
+    allowlist, so nobody was ever asked about them. Both bounds now have to be
+    present before the argument is treated as unable to trap.
+    """
     a = arg.replace(' ', '')
-    # max(0,min(255,x)) and min(255,max(0,x)) both absorb: the float is last.
-    return bool(re.match(r'^(?:Swift\.)?(?:max|min)\(-?[0-9.]+,', a))
+    outer = clamp_bound(a)
+    if outer is None:
+        return False
+    inner = clamp_bound(outer[1])
+    if inner is None:
+        return False
+    return outer[0] != inner[0]
 
 
 # Separator between the file and the exact source text that was triaged.
@@ -186,8 +267,25 @@ def load_allowlist():
     return seen
 
 
+def is_candidate(arg):
+    """The report test, pulled out of the walk so that the opaque count below
+    can ask the same question and never double-count a site as both."""
+    if any(k in arg for k in NON_TRAPPING):
+        return False
+    if not FLOATY.search(arg):
+        return False
+    if INTY.search(arg) and not re.search(r'\.rounded\(|Float\(', arg):
+        return False
+    if nan_absorbed(arg):
+        return False
+    return True
+
+
 def scan(root):
-    hits = []
+    """Answer (hits, opaque). `hits` are the conversions this tool can read
+    evidence about and CI fails on. `opaque` are the ones whose argument is a
+    bare name, which it cannot read either way and does not fail on."""
+    hits, opaque = [], []
     for dirpath, _, names in os.walk(root):
         for fn in names:
             if not fn.endswith('.swift'):
@@ -201,24 +299,22 @@ def scan(root):
                 arg = argument_of(code, open_index)
                 if not arg.strip():
                     continue
-                if any(k in arg for k in NON_TRAPPING):
-                    continue
-                if not FLOATY.search(arg):
-                    continue
-                if INTY.search(arg) and not re.search(r'\.rounded\(|Float\(', arg):
-                    continue
-                if nan_absorbed(arg):
-                    continue
                 line_no = code[:open_index].count('\n') + 1
                 rel = os.path.relpath(path, root).replace('\\', '/')
-                hits.append((rel, line_no, rawlines[line_no - 1].strip()[:110]))
-    return hits
+                text = rawlines[line_no - 1].strip()[:110]
+                if is_candidate(arg):
+                    hits.append((rel, line_no, text))
+                elif (not any(k in arg for k in NON_TRAPPING)
+                        and OPAQUE_ARG.match(arg.strip())):
+                    opaque.append((rel, line_no, text))
+    return hits, opaque
 
 
 def main(argv):
     listing = '--list' in argv
+    opaque_listing = '--opaque' in argv
     root = DEFAULT_ROOT
-    hits = scan(root)
+    hits, opaque = scan(root)
     allow = load_allowlist()
 
     untriaged = [h for h in hits if entry_key(h[0], h[2]) not in allow]
@@ -227,7 +323,13 @@ def main(argv):
     print('  trapping float-to-int conversions found: %d' % len(hits))
     print('  triaged and allowlisted:                 %d' % (len(hits) - len(untriaged)))
     print('  NOT triaged:                             %d' % len(untriaged))
+    print('  bare-name conversions, type unknown:     %d' % len(opaque))
     print()
+
+    if opaque_listing:
+        for rel, line, text in opaque:
+            print('? %s:%d  %s' % (rel, line, text))
+        return 0
 
     if listing:
         for rel, line, text in hits:
@@ -248,7 +350,11 @@ def main(argv):
             print('    %s%s%s  # WHY IS THIS SAFE?' % (rel, ENTRY_SEP, text))
         return 1
 
-    print('PASS: every trapping conversion has been looked at by a person.')
+    print('PASS: every conversion this tool can READ has been looked at by a')
+    print('person. It cannot read the %d counted above as "type unknown": those' % len(opaque))
+    print('are `Int(x)` and `Int(a.b)`, where the argument is a bare name and')
+    print('nothing in the text says it is a float. Run --opaque to see them.')
+    print('A green run here is not a promise that the tree is clean.')
     return 0
 
 

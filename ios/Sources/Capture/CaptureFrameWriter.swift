@@ -116,7 +116,7 @@ final class CaptureFrameWriter: @unchecked Sendable {
         // function returns, so a torn file is never named by any log line
         // and never reaches the bundle. The cost was two extra directory
         // and inode dirtyings per file and three renames per keyframe, at
-        // five keyframes a second, against a phone already over its daily
+        // three keyframes a second, against a phone already over its daily
         // write budget.
         let imageURL = folder.imagesDirectory.appendingPathComponent("\(stamp).jpg")
         try jpeg.write(to: imageURL)

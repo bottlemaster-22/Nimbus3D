@@ -733,7 +733,95 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
             var b: CaptureFrame
             var score: Float
         }
-        var candidates: [Candidate] = []
+        // This gate is O(anchors squared), and anchors are spaced only 0.25 m
+        // or 0.5 s apart, so a ten minute walk gives 1200-odd anchors and
+        // about 720,000 pairs. In a small room, where nearly every pair falls
+        // inside the 1.5 m centre gate, building a Candidate for each one and
+        // only then applying revisitMaxICPRuns meant a transient array of
+        // hundreds of megabytes: every entry carries two whole CaptureFrame
+        // values, each retaining its own image, depth and confidence path
+        // strings, on a device that is at the same time holding depth buffers.
+        // The peak was reached before a single ICP had run and before the cap
+        // had even been looked at, which is the worst possible place to spend
+        // memory: on candidates that were about to be thrown away.
+        //
+        // So the cap is applied AS the list is built, by a fixed-size min-heap
+        // keyed on the same score. It holds at most revisitMaxICPRuns
+        // (anchor index, anchor index, score) triples of about 24 bytes, so
+        // the full heap at the default cap of 600 is under 20 kB. Its root is
+        // the WORST pair currently kept, so the common case, where a pair
+        // cannot beat what is already held, costs one Float comparison and no
+        // allocation at all. The frames are fetched back out of `anchors` only
+        // for the survivors.
+        //
+        // The set this keeps is the set the old sort-then-truncate kept: the
+        // revisitMaxICPRuns highest scores. The only pairs that can differ are
+        // ones tied at exactly the score on the cut line, and which of those
+        // survived was already arbitrary, because Swift's sort is not stable.
+        // The ORDER they are then aligned in is unchanged as well: the sort by
+        // (a.index, b.index) below is a strict total order over distinct pairs,
+        // so it fully determines the order however the pairs arrived here.
+        //
+        // Carried over rather than fixed, and stated here so nobody has to
+        // rediscover it: a NaN score compares false against everything, so one
+        // sitting at the root could never be beaten and the heap would freeze
+        // holding the first icpRunCap pairs rather than the best ones. The
+        // only route to a NaN is a NaN qc.weight, because the distance and
+        // angle guards below already reject NaN geometry. This is not a
+        // regression, since the old `sort { $0.score > $1.score }` was not a
+        // strict weak ordering with a NaN in the array either, but it is not a
+        // fix, and it belongs with whatever would have produced the NaN.
+
+        // Clamped at zero so a nonsensical negative tuning value yields an
+        // empty list instead of the trap that removeSubrange((-1)...) took.
+        let icpRunCap = Swift.max(0, tuning.revisitMaxICPRuns)
+        var heap: [(anchorA: Int, anchorB: Int, score: Float)] = []
+        // Clamped so an absurdly large cap cannot pre-allocate megabytes for a
+        // heap that will never fill. It still grows on demand if it does.
+        heap.reserveCapacity(Swift.min(icpRunCap, 4096))
+
+        func heapSiftUp(from start: Int) {
+            var child = start
+            while child > 0 {
+                let parent = (child - 1) / 2
+                guard heap[child].score < heap[parent].score else { break }
+                heap.swapAt(child, parent)
+                child = parent
+            }
+        }
+
+        // `smallest` rather than the obvious `lowest`: deadwire counts bare
+        // identifier tokens across the whole module, and PrePassCensus.swift
+        // has a triaged `let lowest` that is only ever read inside a string
+        // interpolation, so it is allowlisted as a scanner artefact. Spending
+        // the name `lowest` here makes that entry look wired up and invites
+        // somebody to delete it, after which the census declaration fails the
+        // gate untriaged the next time this local is renamed.
+        func heapSiftDown(from start: Int) {
+            var parent = start
+            while true {
+                let left = 2 * parent + 1
+                let right = left + 1
+                var smallest = parent
+                if left < heap.count, heap[left].score < heap[smallest].score {
+                    smallest = left
+                }
+                if right < heap.count, heap[right].score < heap[smallest].score {
+                    smallest = right
+                }
+                if smallest == parent { break }
+                heap.swapAt(parent, smallest)
+                parent = smallest
+            }
+        }
+
+        // Counted separately from what is kept: `census.geometricCandidates`
+        // is every pair that passed the gates, and the QC card at
+        // PrePassCensus.swift:768 shows "the rest capped" only while it is
+        // strictly greater than `candidatesAfterCap`. If this became the
+        // number that fitted in the heap the two would always be equal and the
+        // card would silently stop reporting that capping happened at all.
+        var geometricCandidateCount = 0
         for i in 0..<anchors.count {
             let a = anchors[i]
             let centreA = a.rawPose.center.simd
@@ -758,14 +846,35 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
                 let score = quality
                     * (1 - distance / tuning.revisitMaxCentreDistanceMeters)
                     * (1 - angle / tuning.revisitMaxViewAngleDegrees)
-                candidates.append(Candidate(a: a, b: b, score: score))
+                geometricCandidateCount += 1
+                if heap.count < icpRunCap {
+                    heap.append((anchorA: i, anchorB: j, score: score))
+                    let inserted = heap.count - 1
+                    heapSiftUp(from: inserted)
+                } else if icpRunCap > 0, score > heap[0].score {
+                    // Beats the worst pair kept so far, so that one goes and
+                    // this one takes its place. Strictly greater, so a tie
+                    // never evicts an incumbent and the work stays bounded.
+                    heap[0] = (anchorA: i, anchorB: j, score: score)
+                    heapSiftDown(from: 0)
+                }
             }
         }
-        census.geometricCandidates = candidates.count
-        guard !candidates.isEmpty else { return [] }
-        candidates.sort { $0.score > $1.score }
-        if candidates.count > tuning.revisitMaxICPRuns {
-            candidates.removeSubrange(tuning.revisitMaxICPRuns...)
+        census.geometricCandidates = geometricCandidateCount
+        guard !heap.isEmpty else { return [] }
+
+        // Only now, for at most revisitMaxICPRuns survivors, are the frames
+        // themselves copied into Candidates.
+        var candidates: [Candidate] = []
+        candidates.reserveCapacity(heap.count)
+        for entry in heap {
+            candidates.append(
+                Candidate(
+                    a: anchors[entry.anchorA],
+                    b: anchors[entry.anchorB],
+                    score: entry.score
+                )
+            )
         }
         census.candidatesAfterCap = candidates.count
 

@@ -555,8 +555,22 @@ enum ViewerFormat {
         return formatter.string(from: date)
     }
 
+    /// Both callers pass a duration that came off disk, and both guard it with
+    /// `duration > 0`, which lets an infinity straight through.
+    /// `ScanLibraryStore` builds it as
+    /// `Swift.max(0, last.timestampSeconds - first.timestampSeconds)` over
+    /// `CaptureFrame.timestampSeconds`, a `Double` on a `Codable` struct read
+    /// out of `capture_bundle.json` with no validation anywhere. The leading
+    /// literal in `Swift.max(0, seconds)` does absorb a NaN, but a bundle
+    /// holding 1e308, or a subtraction that overflows to infinity, survives it
+    /// and then traps in `Int(_:)`, which cannot represent anything past
+    /// 9.2e18. `.rounded()` does not help: rounding an infinity is still an
+    /// infinity. Capped at 86_400 to match the cap `PrePassPoseRefiner`
+    /// already puts on the very same subtraction, and written with both
+    /// literals first so the clamp absorbs from either end. A bundle claiming
+    /// longer than a day now reads "1440m 0s" instead of killing the app.
     static func duration(_ seconds: Double) -> String {
-        let total = Int(Swift.max(0, seconds).rounded())
+        let total = Int(Swift.min(86_400, Swift.max(0, seconds)).rounded())
         let minutes = total / 60
         let remainder = total % 60
         if minutes == 0 { return "\(remainder)s" }

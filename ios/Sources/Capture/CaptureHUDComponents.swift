@@ -711,8 +711,24 @@ struct CaptureProblemPanel: View {
 /// Numbers as a person would write them.
 enum CaptureFormat {
 
+    /// The upper bound is not decoration. One of the two callers is
+    /// `CaptureReportView`, whose `durationSeconds` is
+    /// `max(0, last.timestampSeconds - first.timestampSeconds)` over
+    /// `CaptureFrame.timestampSeconds`, a plain `Double` on a `Codable` struct
+    /// decoded straight out of `capture_bundle.json` with nothing validating
+    /// it. `max(0, seconds)` alone stops a NaN, because the literal is first
+    /// and Swift's `max` absorbs its second argument, but it stops nothing at
+    /// the top: a bundle carrying 1e308, or two timestamps whose subtraction
+    /// overflows to infinity, walks through it and `Int(_:)` traps above
+    /// 9.2e18. That is the same trapping conversion the owner reported as
+    /// "crashing quite a bit, even with RAM free", reached from a formatter.
+    /// `PrePassPoseRefiner` already caps the same subtraction at 86_400; this
+    /// is that fix, in the shape `tools/trapconv.py` recognises as safe, with
+    /// both literals first so a NaN absorbs to 0 and an infinity to 86_400.
+    /// A capture claiming longer than a day now reads "1440:00" instead of
+    /// killing the app, and no caller reads the string back.
     static func duration(_ seconds: Double) -> String {
-        let total = Int(max(0, seconds))
+        let total = Int(Swift.min(86_400, Swift.max(0, seconds)))
         return String(format: "%d:%02d", total / 60, total % 60)
     }
 

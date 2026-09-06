@@ -229,7 +229,83 @@ enum PLYCodec {
         }
 
         let fieldsPerVertex = propertyNames.count
-        var values = [Float](repeating: 0, count: vertexCount * fieldsPerVertex)
+
+        // "element vertex N" is plain text in a file this app did not
+        // necessarily write, so N is whatever a corrupted or hand-edited byte
+        // says it is, and it feeds the array allocation a few lines below. The
+        // only check it has had so far is the `vertexCount > 0` guard above.
+        // That is not enough, so it is validated twice more before it is
+        // believed.
+        //
+        // First the arithmetic. `vertexCount * fieldsPerVertex` is an Int
+        // multiply of two numbers read out of the file, and the `Int(countString)`
+        // parse above happily accepts "9223372036854775807", so a single wrong
+        // digit in the header overflows that multiply and traps. A trap is not
+        // a Swift error, and that distinction matters here specifically:
+        // TrainerInitializer.swift line 336 wraps this whole call in
+        // `try? PLYCodec.read(from: url)` precisely so that a damaged
+        // prepass/init_splats.ply degrades to depth-map seeding instead of
+        // taking the scan down, and `try?` catches nothing at all in this case.
+        // The same is true of the allocation itself, where a merely large N is
+        // answered by the iOS jetsam killer terminating the process rather than
+        // by a nil.
+        let (totalValues, valueCountOverflowed) =
+            vertexCount.multipliedReportingOverflow(by: fieldsPerVertex)
+        guard !valueCountOverflowed else {
+            throw ExportError.malformedFile(
+                "PLY header claims \(vertexCount) vertices of \(fieldsPerVertex) properties "
+                    + "each, which is more values than can be counted"
+            )
+        }
+
+        // Second, cross-check that claim against how much data the file
+        // actually still holds, the same way SPZCodec.read already checks its
+        // own numPoints against `reader.remaining` before believing it. SPZ
+        // needs no overflow guard alongside it because its count is a UInt32;
+        // this one does, because a PLY vertex count is an unbounded decimal
+        // parse. Without the byte check a header can claim a hundred million
+        // vertices inside a four kilobyte file and the reader will allocate for
+        // every one of them before discovering, one float at a time, that the
+        // body ran out. The reader is parked immediately after "end_header" at
+        // this point, because nothing between the header loop and here moves
+        // it, so `reader.remaining` is exactly the length of the body.
+        //
+        // Both bounds below divide the byte count rather than multiplying the
+        // value count, so that a bound check cannot overflow in its turn, and
+        // both divisors are literals, so that neither can trap on a division by
+        // zero if the property checks above are ever reordered. Both are "at
+        // least" bounds rather than "exactly" ones, so a trailing newline or
+        // other padding after the body stays acceptable the way it was.
+        if isASCII {
+            // ASCII cannot be predicted exactly, because the same value may be
+            // written "0" or "-1.2345678e-09". The floor is still firm: the
+            // split below separates on space, tab, CR and LF, so every value
+            // costs at least one character of its own and every value but the
+            // last costs at least one separator byte after it, which makes N
+            // values cost at least 2N-1 bytes. The "+ 1" is load-bearing: it is
+            // what keeps the tightest legal body, single-character values one
+            // space apart with no trailing newline, from being rejected.
+            guard totalValues <= (reader.remaining + 1) / 2 else {
+                throw ExportError.malformedFile(
+                    "PLY header claims \(vertexCount) vertices of \(fieldsPerVertex) properties, "
+                        + "\(totalValues) values, but only \(reader.remaining) bytes of ascii body remain"
+                )
+            }
+        } else {
+            // Binary is exact: every value is one little-endian float32, so a
+            // body holding this many values cannot be shorter than four bytes
+            // per value. A body written by this file's own `write` is exactly
+            // that long, so the round-trips in ExportSelfTest sit on the
+            // boundary and pass rather than being rejected by one byte.
+            guard totalValues <= reader.remaining / 4 else {
+                throw ExportError.malformedFile(
+                    "PLY header claims \(vertexCount) vertices of \(fieldsPerVertex) properties, "
+                        + "\(totalValues) float32 values, but only \(reader.remaining) bytes remain"
+                )
+            }
+        }
+
+        var values = [Float](repeating: 0, count: totalValues)
 
         if isASCII {
             let rest = String(decoding: reader.bytes[reader.offset...], as: UTF8.self)

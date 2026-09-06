@@ -5,9 +5,9 @@
 //  The LiDAR cloud that gets baked into `sparse/0/points3D.txt`.
 //
 //  Why accumulate at all rather than dump every sample: a four-minute walk at
-//  6 keyframes a second is ~1,400 frames, and each one carries ~49k native
-//  depth samples. That is 70 million points, of which the overwhelming
-//  majority are the same square centimetre of wall measured eighty times.
+//  3 keyframes a second is ~720 frames, and each one carries ~49k native
+//  depth samples. That is 35 million points, of which the overwhelming
+//  majority are the same square centimetre of wall measured forty times.
 //  docs/DATA_FORMAT.md section 4 fixes the answer: voxel-downsample at 1 cm
 //  before writing.
 //

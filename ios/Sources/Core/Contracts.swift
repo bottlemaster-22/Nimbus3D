@@ -386,6 +386,67 @@ public struct CameraIntrinsics: Codable, Hashable, Sendable {
         self.cy = cy
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case width
+        case height
+        case fx
+        case fy
+        case cx
+        case cy
+    }
+
+    /// The largest number of pixels a frame may claim on either side before
+    /// this file calls the bundle malformed instead of trusting it.
+    ///
+    /// Not a guess at the real number, a ceiling far above it. ARKit hands
+    /// world tracking a 1920 x 1440 frame today, and 8192 is still above the
+    /// long edge of the largest still any iPhone camera has ever produced
+    /// (8064 x 6048, from the 48 MP sensor), so a future capture format has
+    /// room to grow several times over before this rejects a real scan, while
+    /// a number arriving above it did not come from a camera.
+    public static let maximumPlausiblePixelDimension = 8192
+
+    /// Written by hand for one reason: to check the two dimensions, because
+    /// everything downstream divides by them and nothing downstream checks
+    /// them.
+    ///
+    /// `scaled(toWidth:height:)` computes `Float(newWidth) / Float(width)`
+    /// with no guard, so a width of 0 in the JSON does not fail there, it
+    /// produces an infinite scale factor and a camera whose fx and cx are
+    /// infinite or NaN. `SmartCamera.nativeIntrinsics` calls exactly that on
+    /// every capture to build the native depth camera, so the NaN reaches
+    /// every projected pixel, and a NaN arriving at one of the trapping
+    /// `Int(...)` conversions that `tools/trapconv.py` exists to hunt kills
+    /// the process instead of reporting a bad scan.
+    ///
+    /// Nothing legitimate is rejected. These numbers have exactly one
+    /// producer, `ARCaptureService.resolvedIntrinsics(from:)`, which reads
+    /// `ARCamera.imageResolution` and therefore always writes the real sensor
+    /// size, and exactly one home on disk, `capture_bundle.json`. A session
+    /// that never received a frame writes no bundle at all rather than a
+    /// zeroed one, so no file this app has ever produced is refused here.
+    /// Unlike the depth size in `CaptureSettings` there is no zero sentinel
+    /// to preserve, so zero is refused.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        width = try container.decode(Int.self, forKey: .width)
+        height = try container.decode(Int.self, forKey: .height)
+        fx = try container.decode(Float.self, forKey: .fx)
+        fy = try container.decode(Float.self, forKey: .fy)
+        cx = try container.decode(Float.self, forKey: .cx)
+        cy = try container.decode(Float.self, forKey: .cy)
+
+        let limit = CameraIntrinsics.maximumPlausiblePixelDimension
+        guard width > 0, height > 0, width <= limit, height <= limit else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .width,
+                in: container,
+                debugDescription: "frame size \(width)x\(height) is not a size a "
+                    + "camera produces; each side must be between 1 and \(limit)"
+            )
+        }
+    }
+
     /// Rescales for a different render resolution (the trainer runs at
     /// 480-720 px, the frames are captured at 1920).
     public func scaled(toWidth newWidth: Int, height newHeight: Int) -> CameraIntrinsics {
@@ -883,6 +944,103 @@ public struct CaptureSettings: Codable, Hashable, Sendable {
         self.depthHeight = depthHeight
         self.lidarMaxRangeMeters = lidarMaxRangeMeters
         self.imageQuarterTurnsClockwiseToUpright = imageQuarterTurnsClockwiseToUpright
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case bracketEveryNFrames
+        case bracketStops
+        case exposureLocked
+        case whiteBalanceLocked
+        case depthWidth
+        case depthHeight
+        case lidarMaxRangeMeters
+        case imageQuarterTurnsClockwiseToUpright
+    }
+
+    /// The largest number of samples a depth map may claim on either side
+    /// before this file calls the bundle malformed instead of trusting it.
+    ///
+    /// Every LiDAR iPhone to date delivers 256 x 192, so this is not a guess
+    /// at the real number, it is a ceiling more than thirty times above it.
+    /// 8192 is above the long edge of the largest still any iPhone camera has
+    /// ever produced (8064 x 6048, from the 48 MP sensor), and the depth map
+    /// has always been a small fraction of the colour frame rather than a
+    /// multiple of it, so Apple can raise the depth resolution by more than an
+    /// order of magnitude before this rejects a real capture, while a number
+    /// arriving above it did not come from a sensor.
+    ///
+    /// The ceiling is what makes the products downstream safe.
+    /// `depthWidth * depthHeight` is computed at roughly fifteen sites, and
+    /// several of them multiply FIRST and clamp afterwards, which means the
+    /// clamp cannot save them:
+    /// `Swift.max(bundle.settings.depthWidth * bundle.settings.depthHeight, 1)`
+    /// in MetalSplatTrainer, `let perFrame = width * height` on the line above
+    /// `guard perFrame > 0` in TwoScaleTrustField, and `actualBytes:
+    /// width * height` inside the throw in NativeDepthEdgeClassifier, which
+    /// would trap while building the error that reports the bad size.
+    /// PrePassPipeline is the milder case: it clamps each side to 0 before
+    /// multiplying, so only the overflow half of this applies there. Bounded
+    /// here, the largest product any of them can reach is 8192 * 8192, which
+    /// leaves an Int room for a frame count no scan will ever have.
+    public static let maximumPlausibleDepthDimension = 8192
+
+    /// Written by hand so that the depth dimensions are checked ONCE, here,
+    /// where untrusted bytes become a struct, instead of at every site that
+    /// multiplies them.
+    ///
+    /// Two things go wrong without this check and neither of them fails
+    /// gracefully. A dimension large enough that `depthWidth * depthHeight`
+    /// overflows traps, and Swift's overflow trap is not catchable, so a
+    /// corrupt `capture_bundle.json` kills the app rather than being reported
+    /// as a bad scan. A NEGATIVE dimension is worse because it is silent: two
+    /// negatives multiply to a POSITIVE, so `TrainerInitializer` sees a
+    /// plausible looking `sampleCount > 0`, passes its own guard, and sizes
+    /// work against a shape the depth files on disk do not have.
+    ///
+    /// Zero stays legal on purpose. `ARCaptureService.currentSettings()`
+    /// writes 0 x 0 to mean "no depth map was ever delivered", and that fact
+    /// has to survive the decode: the stages downstream already turn it into a
+    /// named `SmartError.malformedSidecar` pointing at
+    /// `settings.depthWidth/Height`, which tells the user far more than
+    /// refusing to open the scan at all would. The two sides must agree about
+    /// it, because the one place that writes them writes them as a pair.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        bracketEveryNFrames = try container.decode(
+            Int.self,
+            forKey: .bracketEveryNFrames
+        )
+        bracketStops = try container.decode(Float.self, forKey: .bracketStops)
+        exposureLocked = try container.decode(Bool.self, forKey: .exposureLocked)
+        whiteBalanceLocked = try container.decode(
+            Bool.self,
+            forKey: .whiteBalanceLocked
+        )
+        depthWidth = try container.decode(Int.self, forKey: .depthWidth)
+        depthHeight = try container.decode(Int.self, forKey: .depthHeight)
+        lidarMaxRangeMeters = try container.decode(
+            Float.self,
+            forKey: .lidarMaxRangeMeters
+        )
+        imageQuarterTurnsClockwiseToUpright = try container.decodeIfPresent(
+            Int.self,
+            forKey: .imageQuarterTurnsClockwiseToUpright
+        )
+
+        let limit = CaptureSettings.maximumPlausibleDepthDimension
+        guard depthWidth >= 0, depthHeight >= 0,
+              depthWidth <= limit, depthHeight <= limit,
+              (depthWidth == 0) == (depthHeight == 0)
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .depthWidth,
+                in: container,
+                debugDescription: "depth map size \(depthWidth)x\(depthHeight) is "
+                    + "not a size a sensor produces; each side must be between 1 "
+                    + "and \(limit), or both must be 0 to mean that no depth map "
+                    + "was ever delivered"
+            )
+        }
     }
 }
 
