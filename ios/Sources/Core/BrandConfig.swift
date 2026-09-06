@@ -29,12 +29,12 @@ public enum BrandConfig {
     /// Keep these in step with the `brand` settings group in `ios/project.yml`.
     /// They are never read in a normal app launch.
     private enum Fallback {
-        static let displayName = "Nimbus3D"
-        static let productName = "Nimbus3D"
-        static let bundleIdentifier = "com.tombline.nimbus"
-        static let slug = "nimbus"
+        static let displayName = "LiKOVA"
+        static let productName = "LiKOVA"
+        static let bundleIdentifier = "com.tombline.likova"
+        static let slug = "likova"
         static let boosterServiceType = "_nimbusboost._tcp"
-        static let documentsFolderName = "Nimbus3D"
+        static let documentsFolderName = "LiKOVA"
     }
 
     private enum PlistKey {

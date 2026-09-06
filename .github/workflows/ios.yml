@@ -245,6 +245,96 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      # =====================================================================
+      #  PUBLISH TO THE BOTTLE SIDELOAD BROKER
+      #
+      #  TEMPORARY DEVELOPMENT FEATURE. Delete this one step to remove it
+      #  entirely; nothing else in this workflow depends on it. It exists so a
+      #  green build reaches the owner's phone without him shuttling .ipa files
+      #  by hand, and it should go away once there is a paid developer account
+      #  and TestFlight.
+      #
+      #  WHAT LEAVES CI, AND NOTHING ELSE: the unsigned .ipa. That is the same
+      #  app binary that is already installed on the owner's phone. No source,
+      #  no secrets, no scans, no logs, no user data. This app has no account,
+      #  no analytics and no telemetry, so there is no user data in CI to leak
+      #  even by accident.
+      #
+      #  WHY IT IS SAFE TO FAIL: `--fail-with-body` makes a rejected upload a
+      #  RED BUILD rather than a silent no-op, so a broken token or a changed
+      #  endpoint is visible immediately instead of quietly serving a stale
+      #  build to the phone for a week.
+      #
+      #  WHY IT CANNOT LEAK THE TOKEN: it is read from the environment, never
+      #  interpolated into the command line (where it would appear in `set -x`
+      #  output and in process listings), and GitHub masks registered secrets
+      #  in logs. `-sS` keeps curl quiet except on error.
+      #
+      #  WHY IT IS INERT UNTIL PROVISIONED: if the secret is absent the step
+      #  skips with a notice. So this can sit in the workflow doing nothing
+      #  until the owner adds the secret, and REMOVING the secret disables it
+      #  again without touching the repository.
+      #
+      #  NEVER ON PULL REQUESTS. Fork PRs cannot read secrets anyway, but the
+      #  condition is explicit so a future workflow trigger cannot widen this
+      #  by accident.
+      # =====================================================================
+      - name: Publish to Bottle sideload broker (development only)
+        if: github.event_name == 'push' && github.ref != 'refs/heads/gh-pages'
+        working-directory: ${{ env.IOS_DIR }}
+        env:
+          BOTTLE_PUBLISH_URL: ${{ secrets.BOTTLE_PUBLISH_URL }}
+          BOTTLE_PUBLISH_TOKEN: ${{ secrets.BOTTLE_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BOTTLE_PUBLISH_TOKEN:-}" ] || [ -z "${BOTTLE_PUBLISH_URL:-}" ]; then
+            echo "::notice::Bottle publish not configured (BOTTLE_PUBLISH_URL / BOTTLE_PUBLISH_TOKEN unset). Skipping."
+            exit 0
+          fi
+
+          IPA="build/${APP_NAME}.ipa"
+          SIZE=$(stat -f%z "$IPA")
+          SHA=$(shasum -a 256 "$IPA" | cut -d' ' -f1)
+
+          # Read the versions back out of the BUILT Info.plist rather than
+          # trusting what we think we passed in. If the CURRENT_PROJECT_VERSION
+          # override on the xcodebuild line is ever lost, this reports the
+          # stale value and the mismatch is visible, instead of the phone
+          # silently receiving another build numbered like the last one.
+          PLIST="build/ipa/Payload/${APP_NAME}.app/Info.plist"
+          SHORT_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")
+          BUILD_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")
+
+          if [ "$BUILD_VERSION" = "1" ] && [ "${{ github.run_number }}" != "1" ]; then
+            echo "::error::CFBundleVersion is 1 but this is CI run ${{ github.run_number }}. The version override has been lost and update detection is broken. Refusing to publish."
+            exit 1
+          fi
+
+          # The values Bottle needs for the manifest entry. It recomputes size
+          # and sha256 itself server-side; these are sent so a mismatch is
+          # detectable rather than assumed.
+          echo "Publishing $IPA"
+          echo "  bundle id : $BUNDLE_ID"
+          echo "  version   : $SHORT_VERSION"
+          echo "  build     : $BUILD_VERSION"
+          echo "  size      : $SIZE bytes"
+          echo "  sha256    : $SHA"
+
+          curl -sS --fail-with-body -X POST "$BOTTLE_PUBLISH_URL" \
+            -H "Authorization: Bearer $BOTTLE_PUBLISH_TOKEN" \
+            -F "bundleIdentifier=$BUNDLE_ID" \
+            -F "version=$SHORT_VERSION" \
+            -F "buildVersion=$BUILD_VERSION" \
+            -F "minOSVersion=17.0" \
+            -F "size=$SIZE" \
+            -F "sha256=$SHA" \
+            -F "commit=${{ github.sha }}" \
+            -F "ipa=@$IPA;type=application/octet-stream"
+
+          echo "Published."
+
       - name: Attach IPA to GitHub Release (tags only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2

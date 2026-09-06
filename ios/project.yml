@@ -41,11 +41,11 @@ name: App
 # -----------------------------------------------------------------------------
 settingGroups:
   brand:
-    NIMBUS_PRODUCT_NAME: Nimbus3D
-    NIMBUS_DISPLAY_NAME: Nimbus3D
-    NIMBUS_BUNDLE_ID: com.tombline.nimbus
-    NIMBUS_BRAND_SLUG: nimbus
-    NIMBUS_DOCS_FOLDER: Nimbus3D
+    NIMBUS_PRODUCT_NAME: LiKOVA
+    NIMBUS_DISPLAY_NAME: LiKOVA
+    NIMBUS_BUNDLE_ID: com.tombline.likova
+    NIMBUS_BRAND_SLUG: likova
+    NIMBUS_DOCS_FOLDER: LiKOVA
     # Derived - do not edit these two; they exist so the value is written once.
     NIMBUS_BOOSTER_SERVICE_TYPE: _$(NIMBUS_BRAND_SLUG)boost._tcp
     NIMBUS_MARKETING_VERSION: 0.1.0
