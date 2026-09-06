@@ -135,6 +135,34 @@ enum PrePassInitialSplatBuilder {
         /// splat never degenerates into a zero-volume sliver the rasteriser
         /// cannot integrate.
         var minThicknessFraction: Float = 0.10
+
+        /// The most of its own radius a TRUSTED seed may be thick.
+        ///
+        /// There was a floor here and no ceiling, and the floor was doing
+        /// nothing while the missing ceiling was doing real damage. The
+        /// thickness came out as `sigma * discThicknessSigmas`, and at the
+        /// 1.29 m stand-off this app actually measures, one sigma of LiDAR
+        /// noise is about the same size as the radius a seed gets from its
+        /// own sample spacing. So the "disc" was as thick as it was wide: a
+        /// blob, not a surface element.
+        ///
+        /// That is not merely a soft-looking seed. `TrainerDensifier`
+        /// clones along `splitAxis`, which returns the LONGEST local axis,
+        /// and for a seed thicker than it is wide the longest axis is the
+        /// SURFACE NORMAL. So every clone was displaced into the wall
+        /// instead of across it, and densification spent the whole growth
+        /// budget building depth into flat surfaces. A room reconstructed
+        /// out of blobs extruded along their normals is what the owner
+        /// described as only somewhat looking like his room.
+        ///
+        /// 0.35 keeps a trusted seat genuinely oblate, so the longest axis
+        /// is always in the surface and the existing clone logic becomes
+        /// correct by construction rather than by a second patch.
+        ///
+        /// The doubtful branch below is deliberately NOT capped. Those
+        /// seeds are elongated along the view ray on purpose, because the
+        /// thing that is uncertain about them is range.
+        var maxThicknessFraction: Float = 0.35
         /// A doubtful ellipsoid's half-length along the ray, in sigmas.
         var rayLengthSigmas: Float = 2.5
         /// Hard ceiling regardless of what the budget asks for: the initial
@@ -559,9 +587,16 @@ enum PrePassInitialSplatBuilder {
             let thirdScale: Float
             if trusted {
                 axis = normal[i]
-                thirdScale = Swift.max(
-                    sigma[i] * settings.discThicknessSigmas,
-                    radius * settings.minThicknessFraction
+                // Clamped from BOTH ends. See `maxThicknessFraction`: the
+                // ceiling is what keeps this a disc rather than a blob, and
+                // what keeps the surface normal from being the longest axis
+                // and so the axis densification clones along.
+                thirdScale = Swift.min(
+                    Swift.max(
+                        sigma[i] * settings.discThicknessSigmas,
+                        radius * settings.minThicknessFraction
+                    ),
+                    radius * settings.maxThicknessFraction
                 )
                 opacityLogits[i] = trustedLogit
                 flags[i] |= Flag.pinned

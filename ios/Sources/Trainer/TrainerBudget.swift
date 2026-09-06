@@ -702,6 +702,11 @@ final class TrainerBudgetGovernor {
         // trainer's buffers are made of nothing but Gaussians and pixels,
         // which `MemoryReading.trainerBufferBytes` explains they are not.
         var deficitBytes: UInt64 = 0
+        // Kept apart from the running maximum on purpose. `belowFloor` is
+        // the one gate allowed to shed without a step limit, so it must be
+        // sized by ITS OWN overage and not by whichever gate happened to be
+        // worse. See the exemption below.
+        var floorDeficitBytes: UInt64 = 0
         if overCeiling, footprint > reading.ceilingBytes {
             deficitBytes = Swift.max(deficitBytes, footprint - reading.ceilingBytes)
         }
@@ -712,8 +717,9 @@ final class TrainerBudgetGovernor {
             }
         }
         if belowFloor {
+            floorDeficitBytes = reading.headroomFloorBytes - reading.availableBytes
             deficitBytes = Swift.max(
-                deficitBytes, reading.headroomFloorBytes - reading.availableBytes
+                deficitBytes, floorDeficitBytes
             )
         }
 
@@ -787,9 +793,21 @@ final class TrainerBudgetGovernor {
             // scan. `belowFloor` is deliberately exempt: that gate says the
             // next allocation may be the one that gets the process killed, and
             // there is no time to converge on an answer.
+            //
+            // BUT THE EXEMPTION IS SIZED FROM THE FLOOR'S OWN OVERAGE, not
+            // from `deficitBytes`, and that distinction is the whole point.
+            // `deficitBytes` is the maximum across every gate that tripped,
+            // and `belowFloor` almost never trips alone: by the time headroom
+            // is short, `overShare` is usually short too, and its deficit is
+            // process-scale. Feeding the exempt path that maximum reinstated
+            // the exact ratchet the step limit above was added to remove,
+            // just through the one door left open. The floor's own overage is
+            // the distance back to a safe headroom and nothing more, so the
+            // cut it asks for is the cut that gate actually needs.
             let stepLimit = Swift.max(cutFrom / 4, 1)
+            let floorSplatsWanted = Int(floorDeficitBytes / perSplat)
             let splatsToShed = belowFloor
-                ? splatsWanted
+                ? Swift.max(floorSplatsWanted, Swift.min(splatsWanted, stepLimit))
                 : Swift.min(splatsWanted, stepLimit)
             let affordable = cutFrom > splatsToShed ? cutFrom - splatsToShed : 0
 
