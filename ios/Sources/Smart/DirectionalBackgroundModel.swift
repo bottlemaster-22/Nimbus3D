@@ -159,11 +159,47 @@ public struct SmartBackgroundCubemap: Sendable {
         Self.bilinearFootprint(direction, faceSize: faceSize)
     }
 
+    /// The same blend `bilinearFootprint` describes, WITHOUT the array.
+    ///
+    /// `bilinearFootprint` returns `[(index, weight)]`, and a Swift array
+    /// of tuples is a heap allocation. This function used to call it, and
+    /// `TrainerSupervision.backgroundImage` calls this function once per
+    /// pixel of the frame it builds: 388,800 allocations and frees per
+    /// iteration at 720x540, three thousand times, on the CPU, with the
+    /// GPU idle behind it. Measured at 18 to 33 ms of an 82 ms iteration,
+    /// which is the largest single item anywhere in the training loop and
+    /// is not GPU work at all.
+    ///
+    /// The header above this file says one cubemap lookup per pixel "is
+    /// milliseconds; it is not worth a shader". The lookup was never the
+    /// cost. The allocation was.
+    ///
+    /// EXACT: the four indices, the four weights, the accumulation order
+    /// and the `index < texels.count` guard are all what the array version
+    /// produced, so the same direction returns the same bits.
     public func radiance(_ direction: SIMD3<Float>) -> SIMD3<Float> {
+        let (face, u, v) = Self.faceAndUV(for: direction)
+        let n = Swift.max(2, faceSize)
+        let x = SmartMath.clamp(u * Float(n) - 0.5, 0, Float(n - 1))
+        let y = SmartMath.clamp(v * Float(n) - 0.5, 0, Float(n - 1))
+        let x0 = Int(x), y0 = Int(y)
+        let x1 = Swift.min(x0 + 1, n - 1), y1 = Swift.min(y0 + 1, n - 1)
+        let fx = x - Float(x0), fy = y - Float(y0)
+        let base = face * n * n
+        let count = texels.count
+
+        // Guarded per entry rather than once, because that is what the
+        // `where index < texels.count` clause did: a short texel array
+        // dropped individual corners rather than the whole sample.
         var out = SIMD3<Float>.zero
-        for (index, weight) in bilinearFootprint(direction) where index < texels.count {
-            out += texels[index] * weight
-        }
+        let i00 = base + y0 * n + x0
+        let i01 = base + y0 * n + x1
+        let i10 = base + y1 * n + x0
+        let i11 = base + y1 * n + x1
+        if i00 < count { out += texels[i00] * ((1 - fx) * (1 - fy)) }
+        if i01 < count { out += texels[i01] * (fx * (1 - fy)) }
+        if i10 < count { out += texels[i10] * ((1 - fx) * fy) }
+        if i11 < count { out += texels[i11] * (fx * fy) }
         return out
     }
 

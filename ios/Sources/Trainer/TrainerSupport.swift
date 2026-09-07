@@ -521,7 +521,36 @@ struct TrainerTuning: Sendable {
     var absGradThreshold: Float = 1e-9
     /// A Gaussian larger than this fraction of the scene extent is SPLIT;
     /// smaller ones are CLONED.
-    var splitScaleFraction: Float = 0.01
+    ///
+    /// WAS 0.01, WHICH NOTHING EVER REACHED. `addedBySplit` is 0 in all 29
+    /// densify passes of the owner's 3000-iteration run, every one of the
+    /// ~150,000 splats it added came from clone, and the reason is
+    /// arithmetic rather than a bug in the split code: measured on that
+    /// run's own PLY, the scene extent is 5.39 m, so 0.01 put the bar at
+    /// 5.39 cm, while the population sits at a 1.3 cm median, 1.81 cm p90
+    /// and 3.85 cm p99, with the single largest splat in the model at
+    /// 7.86 cm. 61 splats out of 151,355 cleared it, 0.04%, and those
+    /// still had to rank inside the growth allowance to be chosen.
+    ///
+    /// The bar sat above the 99.96th percentile of the thing it filters.
+    ///
+    /// 0.004 is p95 of that measured distribution, about 2.2 cm. Chosen
+    /// from the data rather than halved arbitrarily, and deliberately not
+    /// lower: split everything and the count explodes into the cap, which
+    /// costs time and solves nothing.
+    ///
+    /// The suspected consequence, not yet confirmed: growth being 100%
+    /// clone means an over-large blurry Gaussian gets DUPLICATED at the
+    /// same size rather than divided into two sharp ones, and the only
+    /// remaining way for the optimiser to remove the error it causes is to
+    /// drive both copies transparent. `prunedLowOpacity` on that run goes
+    /// 213, then 57,999 at iteration 2500, then 54,888, 19,456, 9,886,
+    /// 6,381, taking the model from 299,787 splats to 151,355 in the last
+    /// sixth of training. If this setting is the cause, that collapse is a
+    /// wall-clock bug as much as a quality one: the most expensive third
+    /// of the run trains 300,000 splats in order to delete 148,000 of
+    /// them.
+    var splitScaleFraction: Float = 0.004
     /// How many children a split produces.
     ///
     /// Descriptive, not read. `TrainerDensifier` splits by shrinking the
