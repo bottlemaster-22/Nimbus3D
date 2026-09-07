@@ -136,7 +136,7 @@ final class TrainerSupervisionPrefetch: @unchecked Sendable {
 
     /// What a prefetched frame is only valid for.
     private struct Key: Equatable {
-        var frameIndex: Int
+        var frameIndex: FrameID
         var iteration: Int
         var totalIterations: Int
     }
