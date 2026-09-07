@@ -448,7 +448,29 @@ struct TrainerTuning: Sendable {
     var warmupFraction: Float = 0.15
     /// Densification runs between these two fractions of the run.
     var densifyStartFraction: Float = 0.10
-    var densifyEndFraction: Float = 0.70
+    /// Raised from 0.70 after a measured run showed the budget being freed
+    /// and never spent.
+    ///
+    /// Once the prune learned to test the opacity that actually reaches a
+    /// pixel, it started removing the roughly half of the population that
+    /// was invisible. Measured on two exports of the same scan: 299,965
+    /// splats with a median peak alpha of 0.0038 before, 150,302 with a
+    /// median of 0.93 after. The dead half went, correctly.
+    ///
+    /// But growth stopped at 0.70 while pruning now runs to 1.0, so every
+    /// Gaussian that died after iteration 2,100 of 3,000 left a hole
+    /// nothing could fill. The run asked for a 300,000 budget and handed
+    /// back a 150,000 model. Splats do not die early: a clone starts with
+    /// its parent's opacity and fades over hundreds of iterations, so the
+    /// deaths are concentrated exactly where growth had already stopped.
+    ///
+    /// 0.85 leaves 450 iterations to settle. That is later than the 50
+    /// percent that photo-only 3DGS pipelines use, and the reason it is
+    /// defensible HERE is LiDAR: a clone inherits a parent already sitting
+    /// on a measured surface with a measured normal, so it starts in
+    /// roughly the right place and refines locally rather than searching
+    /// for geometry from scratch the way a photo-only clone must.
+    var densifyEndFraction: Float = 0.85
     var densifyIntervalIterations: Int = 100
     /// Opacity binarization runs over the last this-much of the run (F4).
     var binarizeLastFraction: Float = 0.20
