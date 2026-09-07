@@ -461,6 +461,15 @@ jobs:
       - name: Install pyflakes
         run: python -m pip install --upgrade pip pyflakes
 
+      - name: Phone and Booster agree about the brand
+        run: |
+          # Compiling and linting cannot notice that two constants in two
+          # languages have drifted apart. Renaming the app to LiKOVA edited
+          # only the Swift brand block, so the phone browsed for
+          # _likovaboost._tcp while the Booster kept registering
+          # _nimbusboost._tcp, and discovery silently stopped working.
+          python tools/brandmatch.py
+
       - name: Compile check (py_compile)
         run: |
           set -euo pipefail

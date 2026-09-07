@@ -18,19 +18,27 @@ from __future__ import annotations
 
 # --------------------------------------------------------------------------
 # The four brand values. Change these and nothing else to rename the product.
+#
+# AND CHANGE THE BRAND BLOCK IN ios/project.yml AT THE SAME TIME. These four
+# are one half of a pair; the phone carries the other half. When the product
+# was renamed to LiKOVA only the phone side was edited, so it began browsing
+# for _likovaboost._tcp while this file went on registering _nimbusboost._tcp
+# and the two could never see each other again. tools/brandmatch.py is now a
+# CI gate over exactly that, because compiling and linting cannot notice two
+# constants in two languages drifting apart.
 # --------------------------------------------------------------------------
 
 #: What the user reads: window title, "About", every sentence of UI copy.
-DISPLAY_NAME = "Nimbus3D"
+DISPLAY_NAME = "LiKOVA"
 
 #: Filesystem-safe form, no spaces. Top folder under the user's Documents.
-DOCUMENTS_FOLDER_NAME = "Nimbus3D"
+DOCUMENTS_FOLDER_NAME = "LiKOVA"
 
 #: Short lowercase token that derived identifiers are built from.
-SLUG = "nimbus"
+SLUG = "likova"
 
 #: Reverse-DNS identifier of the phone app we pair with. Informational here.
-BUNDLE_IDENTIFIER = "com.tombline.nimbus"
+BUNDLE_IDENTIFIER = "com.tombline.likova"
 
 
 # --------------------------------------------------------------------------
