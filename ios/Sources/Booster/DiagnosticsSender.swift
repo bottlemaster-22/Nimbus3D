@@ -102,7 +102,9 @@ public final class DiagnosticsSender: ObservableObject {
                 let data = try Data(contentsOf: source, options: .mappedIfSafe)
                 try await BoosterHTTP.putFile(
                     address,
-                    path: "/diagnostics/\(scanID)/\(relative)",
+                    path: BoosterAPI.diagnosticsFile(
+                        scanID: scanID, relativePath: relative
+                    ),
                     data: data
                 )
                 sent += 1

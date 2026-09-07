@@ -61,6 +61,18 @@ public enum BoosterAPI {
 
     public static func createJob() -> String { "\(pathPrefix)/jobs" }
     public static func job(_ jobID: String) -> String { "\(pathPrefix)/jobs/\(jobID)" }
+    /// DEVELOPMENT ONLY. Where a diagnostic file for one scan is written
+    /// on the Booster. Same encoding rule as `jobFile`: the relative path
+    /// is percent-encoded with `.urlPathAllowed` so its slashes survive as
+    /// real path segments, which is what the server splits on.
+    public static func diagnosticsFile(
+        scanID: String, relativePath: String
+    ) -> String {
+        let encoded = relativePath
+            .addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? relativePath
+        return "\(pathPrefix)/diagnostics/\(scanID)/\(encoded)"
+    }
+
     public static func jobFile(_ jobID: String, relativePath: String) -> String {
         let encoded = relativePath
             .addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? relativePath

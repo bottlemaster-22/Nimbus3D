@@ -26,7 +26,16 @@ public struct BoosterEndpointAddress: Sendable {
     public func url(path: String, query: [URLQueryItem] = []) -> URL? {
         var components = URLComponents()
         components.scheme = "http"
-        components.host = host
+        // `percentEncodedHost`, not `host`, for the same reason the path
+        // below uses the encoded setter. `BoosterDiscovery.hostString`
+        // already produced a URL-shaped host: an IPv6 address arrives
+        // bracketed with its zone written %25. The plain `host` setter
+        // treats its input as NOT yet encoded, so it would turn that %25
+        // into %2525 and the address would be wrong in a new way.
+        //
+        // For an IPv4 address or a Bonjour name, which are plain ASCII with
+        // nothing to escape, the two setters are identical.
+        components.percentEncodedHost = host
         components.port = Int(port)
         // `percentEncodedPath`, not `path`: every caller in BoosterAPI that
         // embeds a relative file path has already percent-encoded it with

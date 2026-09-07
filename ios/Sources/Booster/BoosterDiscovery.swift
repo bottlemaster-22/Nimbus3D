@@ -230,12 +230,37 @@ public final class BoosterDiscovery: ObservableObject {
     /// `nonisolated` because it is called from `stateUpdateHandler`, which
     /// Network delivers on its own queue rather than the main actor. It reads
     /// nothing but its argument, so there is no state to protect.
+    /// The resolved host in the form a URL can actually carry.
+    ///
+    /// This used to interpolate the address and hand the result straight to
+    /// URLComponents, which produced nil for every IPv6 result, and
+    /// `BoosterHTTP.makeRequest` turned that nil into "That computer's
+    /// address looks invalid." The owner saw exactly that, with the Booster
+    /// discovered and sitting on the same network.
+    ///
+    /// Two separate reasons it could not work:
+    ///
+    ///   * An IPv6 host must be BRACKETED in a URL. Without the brackets the
+    ///     colons are read as the port separator and the whole thing is
+    ///     malformed.
+    ///   * A link-local address carries a zone, as in fe80::1%en0, and it is
+    ///     not routable without it. In a URL that percent must be written
+    ///     %25, because a bare % begins an escape.
+    ///
+    /// Bonjour on iOS resolves to IPv6 link-local by preference, so this was
+    /// not an edge case: it was the ordinary path, and it failed every time.
+    ///
+    /// The IPv4 branch strips a zone too. NWEndpoint prints one for a
+    /// link-local v4 address, and a dotted quad needs no zone to be reached.
     nonisolated private static func hostString(_ host: NWEndpoint.Host) -> String {
         switch host {
         case .ipv4(let address):
-            return "\(address)"
+            return String("\(address)".split(separator: "%")[0])
         case .ipv6(let address):
-            return "\(address)"
+            let parts = "\(address)".split(separator: "%", maxSplits: 1)
+            let bare = String(parts[0])
+            guard parts.count == 2 else { return "[\(bare)]" }
+            return "[\(bare)%25\(String(parts[1]))]"
         case .name(let name, _):
             return name
         @unknown default:
