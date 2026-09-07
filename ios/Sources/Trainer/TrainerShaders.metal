@@ -744,6 +744,42 @@ kernel void trainer_preprocess(
     const float comp = comp2D * comp3D;
     const float alpha = trainer_sigmoid(s.opacityLogit) * comp;
 
+    // A GAUSSIAN THIS FAINT CANNOT REACH A SINGLE PIXEL, SO STOP HERE.
+    //
+    // This is exact, not an approximation, and the proof is two lines of
+    // this file. The rasteriser forms its per-pixel alpha as
+    // min(0.99, co.w * exp(power)) and rejects it below cam.minAlpha, and
+    // power is clamped at or below zero just above that test, so
+    // exp(power) <= 1 and the per-pixel alpha can never EXCEED co.w, which
+    // is this alpha. So alpha < minAlpha means every pixel of every tile in
+    // every view rejects it. The backward pass carries the identical test,
+    // so its raster gradient is exactly zero as well. Culling here changes
+    // the rendered image and the raster gradients by nothing at all.
+    //
+    // It is worth doing because half the model is in this state. An
+    // exported PLY of a finished 3000-iteration run, 299,965 splats, has a
+    // median peak alpha of 0.0038 and 50.1 percent of the population below
+    // minAlpha, which is 1/255. Every one of those was being projected,
+    // having its spherical harmonics evaluated, being expanded into tile
+    // instances, sorted through eight radix passes, and loaded into both
+    // rasteriser inner loops, to contribute nothing.
+    //
+    // The prologue at the top of this kernel already wrote tilesTouched 0,
+    // radiusPx 0 and opacity 0, which is precisely the state the rest of
+    // the pipeline reads as "not drawn". Returning here leaves that state
+    // intact rather than needing a second representation of it.
+    //
+    // What this DOES change, deliberately: visibleFlag and denom below are
+    // not written for these splats. Their raster gradient was already zero
+    // so nothing is lost there, and the densification score is
+    // absGrad2D / max(denom, 1) with absGrad2D also zero, so the score is
+    // unchanged at zero. The one real consequence is that the Adam passes,
+    // which gate on visibleFlag, now skip them, so they stop receiving the
+    // regulariser gradient too. That is why the prune must ALSO learn to
+    // see them: a splat that no longer moves and is never removed would be
+    // permanent dead weight. See TrainerDensifier.
+    if (alpha < cam.minAlpha) { return; }
+
     TrainerSplatDraw d;
     d.meanCam = packed_float3(meanCam);
     d.depth = meanCam.z;

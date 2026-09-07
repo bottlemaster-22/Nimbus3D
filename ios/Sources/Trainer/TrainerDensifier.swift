@@ -699,7 +699,45 @@ final class TrainerDensifier {
             // carry on being optimised rather than deleted for how it looks
             // part way through.
             guard allowPrune else { continue }
-            if TrainerMath.sigmoid(splat.opacityLogit) < tuning.pruneOpacity {
+
+            // WHAT REACHES A PIXEL, NOT WHAT IS STORED.
+            //
+            // This tested `sigmoid(opacityLogit)` alone, and that is not
+            // the opacity anything ever draws with. The rasteriser uses
+            // `sigmoid(opacityLogit) * comp2D * comp3D`, where comp3D is
+            // the Mip-Splatting low-pass compensation and can be far below
+            // 1 for a small Gaussian: SplatCloud puts it at 0.35 when an
+            // axis equals the filter width and 0.014 at a quarter of it.
+            //
+            // So the prune was structurally blind to the exact population
+            // it exists to remove. A splat storing a logit worth 0.04, EIGHT
+            // TIMES the 0.005 threshold and therefore never touched by any
+            // prune pass, draws at 0.004 once comp3D is applied, which is
+            // below the rasteriser's own 1/255 reject. It is invisible and
+            // it is immortal.
+            //
+            // Measured on a finished 3000-iteration run of 299,965 splats:
+            // median peak alpha 0.0038, and 50.1 percent of the model below
+            // 1/255. Half the budget was Gaussians the prune could not see
+            // and the renderer would not draw.
+            //
+            // This is now REQUIRED rather than an improvement. The alpha
+            // cull added to trainer_preprocess stops these splats setting
+            // visibleFlag, and the Adam passes gate on that, so they no
+            // longer move at all. A frozen Gaussian that no prune can see
+            // would be permanent dead weight.
+            //
+            // `filter3DCompensation` is called rather than reimplemented:
+            // MetalSplatTrainer says in as many words that the 3D filter
+            // lives in one place and warns against a second copy of it.
+            let sigma = SIMD3<Float>(
+                expf(logScale.x), expf(logScale.y), expf(logScale.z)
+            )
+            let compensation = SplatCloud.filter3DCompensation(
+                sigma: sigma, filter3D: stats[i].filter3D
+            )
+            let drawnOpacity = TrainerMath.sigmoid(splat.opacityLogit) * compensation
+            if drawnOpacity < tuning.pruneOpacity {
                 keep[i] = false
                 outcome.prunedLowOpacity += 1
                 continue
