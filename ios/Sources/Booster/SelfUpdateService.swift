@@ -288,9 +288,10 @@ public final class SelfUpdateService: ObservableObject {
             status = .updated
             message = "Updated from build \(asked) to build "
                 + "\(Self.installedBuildVersion)."
+            // One string literal, not a concatenation: the argument is an
+            // OSLogMessage, and `+` is not defined on those.
             log.notice(
-                "Self-update completed: \(asked, privacy: .public) -> "
-                + "\(Self.installedBuildVersion, privacy: .public)"
+                "Self-update completed: \(asked, privacy: .public) -> \(Self.installedBuildVersion, privacy: .public)"
             )
         } else {
             // Same build back again. The install did not happen, and the
@@ -301,8 +302,7 @@ public final class SelfUpdateService: ObservableObject {
                 + "\(Self.installedBuildVersion). Check the relay at home is "
                 + "powered on and try again."
             log.error(
-                "Self-update did not take: still build "
-                + "\(Self.installedBuildVersion, privacy: .public)"
+                "Self-update did not take: still build \(Self.installedBuildVersion, privacy: .public)"
             )
         }
     }

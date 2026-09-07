@@ -727,13 +727,14 @@ final class TrainerDensifier {
             // longer move at all. A frozen Gaussian that no prune can see
             // would be permanent dead weight.
             //
-            // `filter3DCompensation` is called rather than reimplemented:
+            // `SplatMath.filter3DCompensation` is called rather than
+            // reimplemented:
             // MetalSplatTrainer says in as many words that the 3D filter
             // lives in one place and warns against a second copy of it.
             let sigma = SIMD3<Float>(
                 expf(logScale.x), expf(logScale.y), expf(logScale.z)
             )
-            let compensation = SplatCloud.filter3DCompensation(
+            let compensation = SplatMath.filter3DCompensation(
                 sigma: sigma, filter3D: stats[i].filter3D
             )
             let drawnOpacity = TrainerMath.sigmoid(splat.opacityLogit) * compensation
