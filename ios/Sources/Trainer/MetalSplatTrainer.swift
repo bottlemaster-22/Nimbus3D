@@ -47,6 +47,12 @@ import simd
 
 public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
+    /// Where the run's time actually went. Written by `finish` and by the
+    /// supervision call in the training loop, copied into the census when
+    /// the run is sealed. Single-threaded: everything that touches it runs
+    /// on the training thread.
+    var timings = TrainerTimings()
+
     // MARK: - Configuration
 
     private let tuning: TrainerTuning
@@ -399,6 +405,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // lowered on the way out is still the one that gets recorded.
             census.budgetAsRun = TrainerCensusBudget(governor.current)
             census.budgetReductions = governor.changes.map { TrainerCensusBudgetReduction($0) }
+            // The clocks, copied in at the last moment so a run that ends
+            // any way at all still reports where its time went.
+            census.timings = timings
             TrainerCensusWriter.write(census, at: ref)
         }
 
@@ -1086,7 +1095,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             let frame = slice.keyframes[order[orderCursor]]
             orderCursor += 1
 
-            guard let frameSupervision = supervision.build(
+            let supervisionFrom = CFAbsoluteTimeGetCurrent()
+            let builtSupervision = supervision.build(
                 frame: frame,
                 iteration: iteration,
                 // The run that will actually happen, for the same reason
@@ -1094,7 +1104,12 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 // and the SH degree schedule, and keying those to a length the
                 // run will never reach means their tails never execute.
                 totalIterations: effectiveTotal
-            ) else {
+            )
+            // Timed whether or not it succeeded: a frame that fails to decode
+            // still spent the time trying, and hiding that would flatter the
+            // number.
+            timings.supervision += CFAbsoluteTimeGetCurrent() - supervisionFrom
+            guard let frameSupervision = builtSupervision else {
                 // A frame whose photo would not decode. Counted rather than
                 // skipped in silence: a run where most iterations land here is
                 // a run that trained on almost nothing, and the wall clock
@@ -1678,7 +1693,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             )
             encoderA.endEncoding()
             bufferA.commit()
-            try Self.finish(bufferA, "the tile scan")
+            try finish(bufferA, "the tile scan")
         }
 
         // The one unavoidable readback: how many (Gaussian, tile) pairs this
@@ -1763,7 +1778,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
             encoderB.endEncoding()
             bufferB.commit()
-            try Self.finish(bufferB, "the tile sort")
+            try finish(bufferB, "the tile sort")
         }
 
         // --- Readbacks ------------------------------------------------------------------
@@ -2084,7 +2099,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         gpu.resetDensifyStats(encoder, count: splatCount)
         encoder.endEncoding()
         buffer.commit()
-        try Self.finish(buffer, "a reset pass")
+        try finish(buffer, "a reset pass")
     }
 
     /// Wait for a batch of GPU work AND ask whether it actually worked.
@@ -2105,8 +2120,22 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// does is turn every fault the process SURVIVES into a named stage
     /// and a message, instead of a wrong model built from whatever was
     /// left in the buffers.
-    static func finish(_ buffer: MTLCommandBuffer, _ stage: String) throws {
+    ///
+    /// It is also where the run is timed. EVERY command buffer in this
+    /// file goes through here, so one pair of clocks in this function
+    /// measures the whole GPU side of the run: how long the CPU spent
+    /// blocked, and separately what Metal says the GPU spent executing.
+    /// Those two being far apart is itself the finding.
+    func finish(_ buffer: MTLCommandBuffer, _ stage: String) throws {
+        let blockedFrom = CFAbsoluteTimeGetCurrent()
         buffer.waitUntilCompleted()
+        timings.gpuWait += CFAbsoluteTimeGetCurrent() - blockedFrom
+        timings.commandBuffers += 1
+        // GPUStartTime and GPUEndTime are populated once the buffer has
+        // completed and are zero if the device did not report them, which
+        // is why this is guarded rather than trusted.
+        let executing = buffer.gpuEndTime - buffer.gpuStartTime
+        if executing.isFinite, executing > 0 { timings.gpuBusy += executing }
         if let error = buffer.error {
             TrainerLog.gpu.error(
                 """
@@ -2181,7 +2210,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             body(encoder)
             encoder.endEncoding()
             buffer.commit()
-            try Self.finish(buffer, label)
+            try finish(buffer, label)
         }
 
         // The top-K list is rebuilt from scratch: it is a running maximum, and
@@ -2406,7 +2435,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             )
             encoderA.endEncoding()
             bufferA.commit()
-            try Self.finish(bufferA, "the filter sweep")
+            try finish(bufferA, "the filter sweep")
 
             let lastOffset = resources.offsets.readElement(UInt32.self, at: splatCount - 1) ?? 0
             let lastTouched = resources.tilesTouched.readElement(UInt32.self, at: splatCount - 1) ?? 0
@@ -2423,7 +2452,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             gpu.rasterizeForward(encoderB, camera: &camera)
             encoderB.endEncoding()
             bufferB.commit()
-            try Self.finish(bufferB, "the filter finalise")
+            try finish(bufferB, "the filter finalise")
 
             // Composite and exposure are applied here rather than by a kernel,
             // because the evaluation must not touch the gradient buffers.

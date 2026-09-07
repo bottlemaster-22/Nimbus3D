@@ -437,6 +437,45 @@ struct TrainerCensusAlert: Codable {
 ///
 /// Written once, at the end of the run, to `model/train_census.json`. See
 /// `docs/DATA_FORMAT.md` section 8.
+/// WHERE THE TIME ACTUALLY GOES, per run, in seconds.
+///
+/// Until this existed the census recorded a start time and an end time and
+/// nothing in between, so every claim about which part of an iteration was
+/// expensive was an inference from which changes happened to help. That
+/// inference was wrong repeatedly: four GPU-side optimisations measured
+/// zero or negative, one CPU-side allocation fix took 17% off the run, and
+/// the owner reasonably asked whether the GPU was being used at all.
+///
+/// The decisive pair is `gpuBusy` against `wall`. `gpuBusy` is what Metal
+/// itself reports the GPU spent executing, summed over every command
+/// buffer. If that is a small fraction of `wall`, the GPU is idle most of
+/// the run and no amount of shader work can help; the answer is on the CPU.
+///
+/// `gpuWait` is NOT the same number. It is how long the CPU sat blocked in
+/// waitUntilCompleted, which includes queue latency and scheduling as well
+/// as execution. gpuWait much larger than gpuBusy means the cost is in
+/// round trips, not in the work.
+///
+/// Everything here is wall-clock seconds accumulated on the training
+/// thread. `supervision` and `gpuWait` are disjoint and are the two big
+/// blocks; what is left over after both is everything else the CPU does,
+/// which is itself a useful number. Only fields that are actually measured
+/// appear here, so a zero means zero rather than "not instrumented".
+struct TrainerTimings: Codable {
+    /// Building one frame of supervision on the CPU: photo decode, ground
+    /// truth, background image, depth samples.
+    var supervision: Double = 0
+    /// CPU time blocked in waitUntilCompleted, every command buffer.
+    var gpuWait: Double = 0
+    /// What Metal reports the GPU spent EXECUTING, summed over every
+    /// command buffer. The honest measure of how busy the GPU is.
+    var gpuBusy: Double = 0
+    /// How many command buffers were waited on. gpuWait divided by this is
+    /// the average round-trip cost, which is the number that says whether
+    /// merging command buffers would be worth anything.
+    var commandBuffers: Int = 0
+}
+
 struct TrainerCensus: Codable {
 
     /// Bumped only when a field changes MEANING. Adding an optional field does
@@ -457,6 +496,9 @@ struct TrainerCensus: Codable {
     /// Timings are only comparable between runs of a KNOWN build, so this
     /// is the field that makes every other number in here mean something.
     var appVersion: String = BrandConfig.versionString
+
+    /// Where the time went. See `TrainerTimings`.
+    var timings = TrainerTimings()
 
     var startedAt: Date
     var finishedAt: Date?
