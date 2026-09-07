@@ -184,7 +184,7 @@ public struct SmartLossSettings: Codable, Hashable, Sendable {
         freeSpaceLowerBoundWeight: Float = 0.5,
         freeSpaceBoundMarginMeters: Float = 0.05,
         pruneStartFraction: Float = 0.15,
-        pruneEndFraction: Float = 0.80,
+        pruneEndFraction: Float = 1.0,
         pruneIntervalIterations: Int = 200,
         pruneMaxFractionPerPass: Float = 0.02,
         discPriorWeight: Float = 0.01,
