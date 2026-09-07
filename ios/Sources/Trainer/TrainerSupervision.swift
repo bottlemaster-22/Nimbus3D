@@ -315,6 +315,17 @@ final class TrainerSupervisionBuilder {
         else { return [] }
 
         let edgeMap = edges?.map(for: frame.index) ?? []
+        // Hoisted out of the per-sample loop below, alongside edgeMap which
+        // was already being fetched once.
+        //
+        // `SmartAuthorityMap.regime(frame:sampleIndex:)` and its sibling are
+        // each `map(for: frame)?...`, and `map(for:)` takes a lock and does a
+        // dictionary lookup before it can answer. Calling them per sample
+        // meant two locked lookups for every one of up to 49,152 depth
+        // samples in a frame, roughly 98,000 per iteration, all returning the
+        // same object. `SmartFrameAuthority` is a Sendable struct whose own
+        // accessors take no lock, so one lookup serves the whole frame.
+        let frameAuthority = authority?.map(for: frame.index)
         let affine = trust?.depthAffine(frame: frame.index) ?? .identity
         let qcWeight = TrainerMath.clamp(frame.qc.weight, 0, 1)
         let modeRadius = Swift.max(settings.modeWindowRadius, 1)
@@ -336,8 +347,8 @@ final class TrainerSupervisionBuilder {
                 let pixelIndex = py * size.width + px
 
                 let rawEdge: EdgeClass = index < edgeMap.count ? edgeMap[index] : .none
-                let regime = authority?.regime(frame: frame.index, sampleIndex: index) ?? .near
-                let authorityValue = authority?.authority(frame: frame.index, sampleIndex: index)
+                let regime = frameAuthority?.regime(sampleIndex: index) ?? .near
+                let authorityValue = frameAuthority?.authority(sampleIndex: index)
                     ?? 0.5
 
                 var sample = TrainerDepthSample()
@@ -512,11 +523,23 @@ final class TrainerSupervisionBuilder {
     ) -> [Float] {
         var pixels = [Float](repeating: 0, count: size.pixelCount * 3)
         let rotationInverse = pose.rotation.simd.inverse
+        // ONE lock for the frame, not one per pixel.
+        //
+        // This loop used to call `background.radiance(forDirection:)`, which
+        // locks on every call, once for each of the 388,800 pixels of a
+        // 720x540 frame, every iteration, on the CPU, with the GPU waiting
+        // behind it. Every one of those calls read the same map.
+        //
+        // The snapshot is also the more correct object to sample: training
+        // updates the background as it goes, so a per-pixel read can build
+        // one image out of two different backgrounds, torn partway down the
+        // frame. This cannot.
+        let map = background.cubemapSnapshot
         for y in 0..<size.height {
             for x in 0..<size.width {
                 let ray = SmartCamera.ray(SIMD2<Float>(Float(x) + 0.5, Float(y) + 0.5), k)
                 let worldRay = rotationInverse.act(ray)
-                let radiance = background.radiance(forDirection: Vector3(worldRay))
+                let radiance = map.radiance(worldRay)
                 let i = (y * size.width + x) * 3
                 pixels[i + 0] = radiance.x
                 pixels[i + 1] = radiance.y

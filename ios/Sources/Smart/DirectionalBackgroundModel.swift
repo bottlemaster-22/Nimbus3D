@@ -508,6 +508,29 @@ public final class DirectionalBackgroundModel: BackgroundModel {
 
     // MARK: - BackgroundModel: query
 
+    /// The whole cubemap, taken once under the lock, to be read without it.
+    ///
+    /// `radiance(forDirection:)` below locks on EVERY call, and the trainer
+    /// calls it once per pixel to build the background image for a frame:
+    /// 388,800 lock/unlock pairs per iteration at 720x540, on the CPU, while
+    /// the GPU waits. That is the single largest CPU item on the training
+    /// loop and it buys nothing, because every one of those calls reads the
+    /// same map.
+    ///
+    /// Taking it once is also MORE correct. Sampling a map that training is
+    /// still updating means one image can be built from two different
+    /// backgrounds, torn somewhere down the frame. A snapshot cannot tear.
+    ///
+    /// Cheap: `SmartBackgroundCubemap` is a struct whose storage is a Swift
+    /// array, so this is a reference bump under copy-on-write, not a copy of
+    /// the texels. If the model mutates afterwards, the snapshot keeps the
+    /// values it was taken with, which is the point.
+    public var cubemapSnapshot: SmartBackgroundCubemap {
+        lock.lock()
+        defer { lock.unlock() }
+        return cubemap
+    }
+
     public func radiance(forDirection direction: Vector3) -> SIMD3<Float> {
         lock.lock()
         defer { lock.unlock() }
