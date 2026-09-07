@@ -1527,6 +1527,57 @@ kernel void trainer_rasterize_backward(
     // the background composite and the depth normalisation.
     const float dLdTTotal = dLdTExtra + dot(bg, dLdC);
 
+    // HOW FAR BACK ANY PIXEL IN THIS TILE ACTUALLY LOOKED.
+    //
+    // Every pixel already skips a Gaussian whose position in the tile list
+    // is past its own lastContributor, at the `globalIndex > lastContributor`
+    // test below. But it skips it AFTER the whole batch has been staged into
+    // threadgroup memory by a cooperative load and a barrier, and that
+    // staging is per batch rather than per pixel. A batch every pixel in the
+    // tile skips is loaded, barriered and thrown away in full.
+    //
+    // The forward pass writes renderNContrib per pixel, so the tile already
+    // knows the answer; it just was not being asked. Taking the maximum
+    // across the threadgroup gives the last list position any pixel here
+    // reached, and every batch beyond it can be skipped whole.
+    //
+    // This is EXACT. A skipped batch contains only entries with
+    // globalIndex > lastContributor for EVERY pixel in the tile, which is
+    // precisely the set the per-pixel test already rejected one at a time.
+    // Nothing that could contribute is skipped and no arithmetic changes.
+    //
+    // AND IT IS THREADGROUP-UNIFORM, which is the property that makes it
+    // safe. The loop below contains a threadgroup_barrier, so every thread
+    // must execute the same number of iterations or the barriers diverge
+    // and the result is undefined. `tgMaxContrib` is read from threadgroup
+    // memory after a barrier, so all 256 threads compute the same bound.
+    // A per-pixel bound here would be a correctness bug, not an
+    // optimisation.
+    threadgroup atomic_uint tgMaxContrib;
+    if (tid == 0u) {
+        atomic_store_explicit(&tgMaxContrib, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Outside pixels carry lastContributor 0, so every thread can take part
+    // without a branch and without affecting the maximum.
+    atomic_fetch_max_explicit(&tgMaxContrib, lastContributor,
+                              memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint deepest = atomic_load_explicit(&tgMaxContrib,
+                                              memory_order_relaxed);
+
+    // A Gaussian at list position g sits in batch (g - 1) / TRAINER_TILE_AREA,
+    // because globalIndex is one-based below. Batches above the one holding
+    // `deepest` cannot contain a contributor for any pixel in this tile.
+    int lastUsefulBatch = int(batches) - 1;
+    if (deepest == 0u) {
+        // No pixel in this tile had any contributor at all.
+        lastUsefulBatch = -1;
+    } else {
+        lastUsefulBatch = min(lastUsefulBatch,
+                              int((deepest - 1u) / TRAINER_TILE_AREA));
+    }
+
     float T = TFinal;
     float3 accumColor = float3(0.0f);
     float accumDepth = 0.0f;
@@ -1534,7 +1585,7 @@ kernel void trainer_rasterize_backward(
     float3 lastColor = float3(0.0f);
     float lastDepth = 0.0f;
 
-    for (int b = int(batches) - 1; b >= 0; --b) {
+    for (int b = lastUsefulBatch; b >= 0; --b) {
         const uint batchBase = uint(b) * TRAINER_TILE_AREA;
         const uint load = rangeStart + batchBase + tid;
         if (load < rangeEnd) {

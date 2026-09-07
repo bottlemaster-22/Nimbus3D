@@ -442,6 +442,13 @@ class BoosterServer:
             return self._error(web.HTTPBadRequest, "The scan id must be one segment.")
 
         base = self.save_root.root / "diagnostics"
+        # Created BEFORE resolve_within, not after. That helper proves a
+        # path stayed inside the base by walking up to the first ancestor
+        # that exists and checking THAT is inside; if the base itself does
+        # not exist yet the walk climbs straight past it and the check
+        # correctly reports the path as outside. The job routes never hit
+        # this because a job directory is made when the job is created.
+        base.mkdir(parents=True, exist_ok=True)
         try:
             destination = resolve_within(base, scan_id + "/" + relative)
         except UnsafeRelativePath as error:
