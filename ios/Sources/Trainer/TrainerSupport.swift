@@ -478,7 +478,16 @@ struct TrainerTuning: Sendable {
     /// Free-space carving deletion sweep interval, iterations.
     var carveIntervalIterations: Int = 250
     /// How often a preview snapshot is read back off the GPU.
-    var snapshotIntervalIterations: Int = 50
+    /// WAS 50. Raised on the owner's own observation that the preview was
+    /// updating far more often than he needed while the trainer waited.
+    ///
+    /// The snapshot itself is not free: it copies the whole model off the GPU
+    /// and re-boxes it into a SplatCloud on the training thread, so at 300,000
+    /// splats it is tens of milliseconds of the training loop each time. At
+    /// 0.068 s per iteration, 200 iterations is a preview that refreshes about
+    /// every 14 seconds, which for watching a model converge is often enough.
+    /// If it feels dead, this is the number to lower.
+    var snapshotIntervalIterations: Int = 200
     /// How often the loss accumulator WOULD be read back, if anything read
     /// this.
     ///

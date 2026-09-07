@@ -167,6 +167,17 @@ public final class MetalSplatRenderer: SplatRenderer {
     /// leaves the first frame cheap.
     private var residencyStep = 60_000
 
+    /// Whether a freshly loaded cloud is revealed over several frames.
+    ///
+    /// TRUE for the review screen, where the surface is running anyway and
+    /// spreading a large upload over a few frames keeps the first one
+    /// cheap. FALSE for the training preview, where it is actively
+    /// harmful: that surface is parked between snapshots and has to be
+    /// woken and run at 60 Hz purely to let the reveal finish, which cost
+    /// about 42 rendered frames per snapshot where one would do, on the
+    /// same GPU the trainer is waiting on.
+    var revealsProgressively = true
+
     // MARK: - Camera
 
     private var cameraPose: Pose = .identity
@@ -503,9 +514,12 @@ public final class MetalSplatRenderer: SplatRenderer {
         contentBounds = prepared.bounds
         hasContent = true
 
-        // First slice is drawable immediately; the rest arrives over the next
-        // few frames.
-        residentSplatCount = Swift.min(count, Swift.max(residencyStep, count / 8))
+        // First slice is drawable immediately and the rest arrives over the
+        // next few frames, unless the caller needs one frame to be the
+        // whole picture.
+        residentSplatCount = revealsProgressively
+            ? Swift.min(count, Swift.max(residencyStep, count / 8))
+            : count
         paddedSortCount = ViewerMath.nextPowerOfTwo(residentSplatCount)
 
         ViewerLog.renderer.notice(

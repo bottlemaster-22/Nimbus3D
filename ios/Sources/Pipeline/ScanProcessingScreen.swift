@@ -264,9 +264,9 @@ struct ScanProcessingScreen: View {
         Section {
             if coordinator.phase == .buildingModel, let preview = coordinator.preview {
                 // A view of its own, not a helper on this screen, because it
-                // has to observe the preview controller: `frameCount` and
-                // `isSettling` change several times a minute and this screen's
-                // own state does not change with them.
+                // has to observe the preview controller: `frameCount`
+                // changes several times a minute and this screen's own
+                // state does not change with it.
                 TrainingPreviewSection(preview: preview)
             }
 
@@ -623,7 +623,7 @@ struct ScanProcessingScreen: View {
 /// screen's job, and that is one tap away as soon as it is finished.
 ///
 /// A view of its own rather than a helper on `ScanProcessingScreen`, because
-/// it has to OBSERVE the controller: `frameCount` and `isSettling` change
+/// it has to OBSERVE the controller: `frameCount` changes
 /// several times a minute and the screen around them does not.
 @MainActor
 struct TrainingPreviewSection: View {
@@ -641,10 +641,12 @@ struct TrainingPreviewSection: View {
                     SplatPreviewView(
                         renderer: preview.renderer,
                         camera: preview.camera,
-                        // Redrawn in a short burst after each new frame lands,
-                        // then parked. Between bursts the preview costs
-                        // nothing: the GPU belongs to the trainer.
-                        isAnimating: preview.isSettling,
+                        // NEVER animated. One frame per snapshot, drawn on
+                        // demand by `redrawToken` below. The renderer is
+                        // told not to stage its reveal, so that one frame
+                        // is the whole cloud. The GPU belongs to the
+                        // trainer.
+                        isAnimating: false,
                         gesturesEnabled: false,
                         // Only redraw when a new snapshot has actually
                         // landed. `frameCount` counts those.

@@ -37,12 +37,19 @@
 //    higher-order colour, which is most of the bytes. `TrainingPreviewCloud`
 //    below does that, and the screen says it is a lighter version rather than
 //    letting the user believe they are looking at every point.
-//  * THE REDRAW IS A SHORT BURST, NOT A CONSTANT 60 Hz. The renderer reveals a
-//    freshly loaded cloud over several frames (`residencyStep` in
-//    MetalSplatRenderer), so a single redraw would show a fraction of the
-//    splats. `isSettling` therefore runs the surface for a moment after each
-//    load and then parks it. Between bursts the preview costs nothing, which
-//    is the point: the GPU belongs to the trainer.
+//  * THE REDRAW IS EXACTLY ONE FRAME. It used to be a 0.7 second burst at
+//    60 Hz, because the renderer reveals a freshly loaded cloud over
+//    several frames (`residencyStep` in MetalSplatRenderer) and a single
+//    redraw would have shown a fraction of the splats. That cost about 42
+//    rendered frames per snapshot to achieve what five would have, on the
+//    GPU the trainer is blocked on, roughly 3,400 full-cloud renders over a
+//    205 second run.
+//
+//    So the staging is switched off for this renderer instead
+//    (`revealsProgressively = false`) and the surface is never woken at
+//    all: `setNeedsDisplay` once per snapshot, one frame, the whole cloud.
+//    Safe here specifically because this screen passes
+//    `gesturesEnabled: false`, so nothing else can ask for a redraw.
 //
 
 import Foundation
@@ -65,7 +72,13 @@ final class TrainingPreviewController: ObservableObject {
     /// back. A private renderer costs one pipeline build per training run,
     /// which is milliseconds at the start of a job measured in minutes, and it
     /// is the same choice `ScanReviewModel` makes for the same reason.
-    let renderer = MetalSplatRenderer()
+    let renderer: MetalSplatRenderer = {
+        let made = MetalSplatRenderer()
+        // One frame per snapshot means that frame has to be the whole cloud,
+        // so the staged reveal is off. See the note at the top of this file.
+        made.revealsProgressively = false
+        return made
+    }()
 
     /// Fixed for the whole run. Framed once, then left alone.
     let camera = ViewerCameraController()
@@ -79,7 +92,6 @@ final class TrainingPreviewController: ObservableObject {
 
     /// True during the short redraw burst after a load. The surface animates
     /// while this is true and is parked when it is false.
-    @Published private(set) var isSettling = false
 
     /// Detail points the model actually had when this frame was taken.
     @Published private(set) var modelSplatCount = 0
@@ -106,16 +118,8 @@ final class TrainingPreviewController: ObservableObject {
     /// slow: the user is watching a model form over minutes, not frames.
     private let minimumInterval: TimeInterval = 2.5
 
-    /// How long the surface animates after a load, so the renderer's staged
-    /// reveal finishes. The renderer brings in 60k splats a frame and a preview
-    /// frame is capped at `TrainingPreviewCloud.splatCap`, so five frames is
-    /// enough and this is many times that: the margin is for a phone that is
-    /// busy training and not actually hitting 60 Hz.
-    private let settleSeconds: TimeInterval = 0.7
-
     private var lastRefreshStartedAt: Date?
     private var refreshTask: Task<Void, Never>?
-    private var settleTask: Task<Void, Never>?
     private var hasFramedCamera = false
     private var isTornDown = false
 
@@ -218,7 +222,6 @@ final class TrainingPreviewController: ObservableObject {
         drawnSplatCount = drawable.count
         frameCount += 1
         note = nil
-        beginSettling()
     }
 
     /// Frames the scene once and then leaves the camera exactly where it is
@@ -231,19 +234,6 @@ final class TrainingPreviewController: ObservableObject {
         camera.frame(bounds: bounds, fovDegrees: 70)
     }
 
-    /// Runs the surface for `settleSeconds` so the renderer's staged reveal of
-    /// a new cloud finishes, then parks it again.
-    private func beginSettling() {
-        isSettling = true
-        settleTask?.cancel()
-        let nanoseconds = UInt64(settleSeconds * 1_000_000_000)
-        settleTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: nanoseconds)
-            guard !Task.isCancelled else { return }
-            self?.isSettling = false
-        }
-    }
-
     // MARK: - Taking it down
 
     /// Gives the cloud back and stops everything this object started. Safe to
@@ -252,9 +242,6 @@ final class TrainingPreviewController: ObservableObject {
         isTornDown = true
         refreshTask?.cancel()
         refreshTask = nil
-        settleTask?.cancel()
-        settleTask = nil
-        isSettling = false
         renderer.unload()
     }
 }
