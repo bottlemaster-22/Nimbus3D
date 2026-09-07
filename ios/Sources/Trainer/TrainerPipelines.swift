@@ -86,37 +86,6 @@ final class TrainerPipelines {
             }
         }
 
-        /// Builds a kernel that reads `kTrainerSimdReduce`.
-        ///
-        /// Specialisation happens here, not on the GPU: the branch the
-        /// constant rules out is removed before the function is validated,
-        /// so a device without SIMD-group reductions never sees the
-        /// instruction it cannot execute.
-        func build(
-            _ name: String, simdReduce: Bool
-        ) throws -> MTLComputePipelineState {
-            let values = MTLFunctionConstantValues()
-            var flag = simdReduce
-            values.setConstantValue(&flag, type: .bool, index: 0)
-            let function: MTLFunction
-            do {
-                function = try library.makeFunction(
-                    name: name, constantValues: values
-                )
-            } catch {
-                throw TrainerError.missingKernel(name)
-            }
-            function.label = name
-            do {
-                return try device.makeComputePipelineState(function: function)
-            } catch {
-                throw TrainerError.pipelineFailed(
-                    kernel: name,
-                    reason: error.localizedDescription
-                )
-            }
-        }
-
         fillUInt = try build(TrainerKernel.fillUInt)
         fillFloat = try build(TrainerKernel.fillFloat)
         resetVisibility = try build(TrainerKernel.resetVisibility)
@@ -137,20 +106,7 @@ final class TrainerPipelines {
         ssimBackward = try build(TrainerKernel.ssimBackward)
         lossDepth = try build(TrainerKernel.lossDepth)
         lossFinalize = try build(TrainerKernel.lossFinalize)
-        // THE ONE KERNEL THAT IS SPECIALISED.
-        //
-        // Its gradient writes reduce across the SIMD-group before touching
-        // device memory, which needs simd_sum and simd_any: Apple GPU
-        // family 7, meaning A14 and later. Apple7 is the floor for FULL
-        // tier in DeviceCompatibilityProbe, not the floor for running, so
-        // an A12 or A13 can get here. Asking the device rather than
-        // assuming means such a phone builds the per-lane version instead
-        // of failing to build a pipeline and reporting it as a missing
-        // kernel.
-        rasterizeBackward = try build(
-            TrainerKernel.rasterizeBackward,
-            simdReduce: device.supportsFamily(.apple7)
-        )
+        rasterizeBackward = try build(TrainerKernel.rasterizeBackward)
         preprocessBackward = try build(TrainerKernel.preprocessBackward)
         samplingRateUpdate = try build(TrainerKernel.samplingRateUpdate)
         filter3DFinalize = try build(TrainerKernel.filter3DFinalize)

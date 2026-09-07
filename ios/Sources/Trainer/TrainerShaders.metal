@@ -69,22 +69,6 @@
 #include <metal_atomic>
 using namespace metal;
 
-/// Whether the backward rasteriser may use SIMD-group reductions.
-///
-/// simd_sum and simd_any are Apple GPU family 7 (A14) and later. That is
-/// the floor for FULL tier in DeviceCompatibilityProbe, not the floor for
-/// running at all, so an A12 or A13 device can reach this code. On such a
-/// device the instruction does not exist and makeComputePipelineState
-/// would fail, taking the whole trainer down with an error about a kernel
-/// rather than about the hardware.
-///
-/// A FUNCTION CONSTANT rather than a runtime branch, because it is
-/// resolved when the pipeline is specialised: the unused half is gone
-/// before the GPU ever validates the function, so the reduction is not
-/// merely skipped on old hardware, it is absent. TrainerPipelines sets it
-/// from device.supportsFamily(.apple7).
-constant bool kTrainerSimdReduce [[function_constant(0)]];
-
 // ============================================================================
 // MARK: - Constants (mirrored in TrainerGPUConstants)
 // ============================================================================
@@ -394,37 +378,21 @@ static inline float3 trainer_evalSH(
 /// NOT `isfinite(v)`. project.yml sets MTL_FAST_MATH: YES, which passes
 /// -ffinite-math-only, under which the compiler is entitled to assume no
 /// value is ever inf or NaN and fold `isfinite` to a constant true. The
-/// guard would then read as protection while providing none. An exponent
-/// field of all ones is inf or NaN whatever the optimiser believes about
-/// floating point, and a bitwise test is not a floating-point operation
-/// for fast math to reason about.
+/// guard below has therefore very probably never run, in any build, since
+/// the day it was written: a poisoned gradient would have been written
+/// rather than dropped, and the comment saying otherwise was wrong.
 ///
-/// This also repairs `trainer_atomicAdd` below, which has had the same
-/// hole since it was written: its `!isfinite(value)` guard was very
-/// probably compiled away, so a poisoned gradient would have been written
-/// rather than dropped. Closing it is a behaviour change, in the
-/// direction the comment always claimed.
+/// An exponent field of all ones is inf or NaN whatever the optimiser
+/// believes about floating point, and a bitwise test is not a
+/// floating-point operation for fast math to reason about.
+///
+/// MEASURED AS A NO-OP so far: `prunedNonFinite` is 0 in all 29 densify
+/// passes of the owner's 3000-iteration run, so non-finite gradients do
+/// not appear to be occurring in practice. This is repairing a guard, not
+/// fixing an observed failure.
 static inline float trainer_finiteOrZero(float value) {
     return ((as_type<uint>(value) & 0x7F800000u) == 0x7F800000u)
         ? 0.0f : value;
-}
-
-/// Sums one gradient component across the SIMD-group, dropping any lane
-/// whose value is not finite.
-///
-/// The drop is what keeps this identical to adding each lane separately.
-/// `trainer_atomicAdd` below refuses a non-finite value, so one bad pixel
-/// loses only its own contribution. Summing first would let that one NaN
-/// poison all 32 lanes, so it is zeroed here instead, before it can reach
-/// the sum. That is the whole reason trainer_finiteOrZero had to be made
-/// real: this change multiplies the blast radius of the hole by 32.
-///
-/// MUST be reached by every thread in the SIMD-group. A SIMD-group
-/// reduction in divergent control flow is undefined in Metal, which is why
-/// the caller pushes its skips into a zero contribution rather than a
-/// `continue`.
-static inline float trainer_simdSum(float value) {
-    return simd_sum(trainer_finiteOrZero(value));
 }
 
 /// Adds `value` to a device float atomically. One place so the memory order is
@@ -1532,8 +1500,7 @@ kernel void trainer_rasterize_backward(
     constant TrainerLossUniforms&   lu          [[buffer(16)]],
     uint2                           tgPos       [[threadgroup_position_in_grid]],
     uint2                           tPos        [[thread_position_in_threadgroup]],
-    uint                            tid         [[thread_index_in_threadgroup]],
-    uint                            lane        [[thread_index_in_simdgroup]]
+    uint                            tid         [[thread_index_in_threadgroup]]
 ) {
     threadgroup uint   tgIndex[TRAINER_TILE_AREA];
     threadgroup float2 tgXY[TRAINER_TILE_AREA];
@@ -1655,80 +1622,22 @@ kernel void trainer_rasterize_backward(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // TWELVE DEVICE ATOMICS PER PIXEL PER GAUSSIAN, DOWN TO TWELVE PER
-        // SIMD-GROUP PER GAUSSIAN.
-        //
-        // Every thread in this threadgroup walks the SAME tile list in the
-        // SAME order, so at step `j` all 256 threads are working on ONE
-        // Gaussian: `tgIndex[j]`. They were then each firing twelve
-        // read-modify-write atomics at the same twelve device addresses, so
-        // the hardware serialised every contributing thread onto one memory
-        // location, twelve times over, for every Gaussian in every tile it
-        // touches.
-        // At the 6.9 tiles per splat measured on the owner's scan, that is
-        // the dominant cost of the backward pass.
-        //
-        // A SIMD-group sums in registers. Reducing across the 32 lanes first
-        // and letting one lane do the write turns 32 contended atomics into
-        // one, per component. The threadgroup is 16x16, so eight writers
-        // instead of 256.
-        //
-        // THIS IS AS ACCURATE OR MORE. The atomics are relaxed, so today's
-        // summation order is whatever the hardware happened to pick and
-        // already varies from run to run; the reduction imposes a fixed
-        // pairwise tree, which is both reproducible and the better
-        // conditioned way to add 32 floats.
-        //
-        // THE `continue`s HAD TO GO. A SIMD-group reduction is undefined
-        // unless every lane reaches it, so a thread that does not contribute
-        // can no longer jump over it. It carries a zero contribution through
-        // instead, which adds nothing. Same for the `if (inside)` that used
-        // to wrap this whole loop: `here` is threadgroup-uniform, so the loop
-        // is now entered by all 256 threads and an outside pixel simply never
-        // sets `active`.
-        const uint here = min(TRAINER_TILE_AREA, total - batchBase);
-        for (int j = int(here) - 1; j >= 0; --j) {
-            // Uniform: the one Gaussian every lane is looking at this step.
-            const uint splatIndex = tgIndex[j];
+        if (inside) {
+            const uint here = min(TRAINER_TILE_AREA, total - batchBase);
+            for (int j = int(here) - 1; j >= 0; --j) {
+                const uint globalIndex = batchBase + uint(j) + 1u;
+                if (globalIndex > lastContributor) { continue; }
 
-            // This lane's contribution. Zero unless it turns out to
-            // contribute, so it can take part in the reduction regardless.
-            float3 gColor = float3(0.0f);
-            float  gOpacity = 0.0f;
-            float2 gMean2D = float2(0.0f);
-            float3 gConic = float3(0.0f);
-            float  gAbs = 0.0f;
-            float  gVis = 0.0f;
-            float  gUnknown = 0.0f;
-
-            const uint globalIndex = batchBase + uint(j) + 1u;
-            bool active = inside && (globalIndex <= lastContributor);
-
-            float2 delta = float2(0.0f);
-            float4 co = float4(0.0f);
-            float gaussian = 0.0f;
-            float alpha = 0.0f;
-            if (active) {
-                delta = tgXY[j] - pixelCenter;
-                co = tgConicOpacity[j];
+                const float2 delta = tgXY[j] - pixelCenter;
+                const float4 co = tgConicOpacity[j];
                 const float power = -0.5f * (co.x * delta.x * delta.x
                                              + co.z * delta.y * delta.y)
                                     - co.y * delta.x * delta.y;
-                if (power > 0.0f) {
-                    active = false;
-                } else {
-                    gaussian = exp(power);
-                    alpha = min(0.99f, co.w * gaussian);
-                    // `!(a < b)`, NOT `a >= b`. They differ for NaN: the
-                    // old `if (alpha < cam.minAlpha) { continue; }` let a
-                    // NaN alpha THROUGH, and `alpha >= cam.minAlpha` would
-                    // stop it. Small, but this is meant to be a pure
-                    // restructure, so it stays the exact complement.
-                    active = !(alpha < cam.minAlpha);
-                }
-            }
+                if (power > 0.0f) { continue; }
+                const float gaussian = exp(power);
+                const float alpha = min(0.99f, co.w * gaussian);
+                if (alpha < cam.minAlpha) { continue; }
 
-            if (active) {
                 // Undo one compositing step: T becomes the transmittance in
                 // FRONT of this Gaussian.
                 T = T / max(1.0f - alpha, 1e-6f);
@@ -1757,97 +1666,45 @@ kernel void trainer_rasterize_backward(
                 // scales T_final by 1/(1 - alpha).
                 dLdAlpha += (-TFinal / max(1.0f - alpha, 1e-6f)) * dLdTTotal;
 
+                const uint splatIndex = tgIndex[j];
+
                 // Colour gradient.
-                gColor = weight * dLdC;
+                trainer_atomicAdd(&aColor[splatIndex * 3u + 0u], weight * dLdC.x);
+                trainer_atomicAdd(&aColor[splatIndex * 3u + 1u], weight * dLdC.y);
+                trainer_atomicAdd(&aColor[splatIndex * 3u + 2u], weight * dLdC.z);
 
                 // alpha = opacity * gaussian, so:
                 const float dLdG = co.w * dLdAlpha;
-                gOpacity = gaussian * dLdAlpha;
+                trainer_atomicAdd(&aOpacity[splatIndex], gaussian * dLdAlpha);
 
                 // dG/d(power) = G; d(power)/d(delta) and d(power)/d(conic).
                 const float dGdPower = gaussian;
                 const float gdx = -(co.x * delta.x + co.y * delta.y);
                 const float gdy = -(co.z * delta.y + co.y * delta.x);
                 // delta = mean2D - pixel, so d/d(mean2D) == d/d(delta).
-                gMean2D = float2(dLdG * dGdPower * gdx,
-                                 dLdG * dGdPower * gdy);
+                const float2 dLdMean2D = float2(dLdG * dGdPower * gdx,
+                                                dLdG * dGdPower * gdy);
+
+                trainer_atomicAdd(&aMean2D[splatIndex * 2u + 0u], dLdMean2D.x);
+                trainer_atomicAdd(&aMean2D[splatIndex * 2u + 1u], dLdMean2D.y);
 
                 const float dLdPower = dLdG * dGdPower;
-                gConic = float3(dLdPower * (-0.5f * delta.x * delta.x),
-                                dLdPower * (-delta.x * delta.y),
-                                dLdPower * (-0.5f * delta.y * delta.y));
+                trainer_atomicAdd(&aConic[splatIndex * 3u + 0u],
+                                  dLdPower * (-0.5f * delta.x * delta.x));
+                trainer_atomicAdd(&aConic[splatIndex * 3u + 1u],
+                                  dLdPower * (-delta.x * delta.y));
+                trainer_atomicAdd(&aConic[splatIndex * 3u + 2u],
+                                  dLdPower * (-0.5f * delta.y * delta.y));
 
                 // --- AbsGS -------------------------------------------------
-                // The MAGNITUDE, taken per pixel BEFORE any summation. The
-                // signed sum cancels for a Gaussian straddling an edge, which
-                // is exactly the Gaussian that has to split. Still per pixel
-                // here: the length is of THIS lane's own gradient, and only
-                // the magnitudes are summed below.
-                gAbs = length(gMean2D);
-                gVis = weight;
-                gUnknown = (isUnknown > 0.0f) ? weight : 0.0f;
-            }
-
-            if (kTrainerSimdReduce) {
-                // THE VOTE IS NOT DECORATION. Without it, twelve
-                // reductions run for every entry in every staged batch
-                // even when not one lane in the SIMD-group contributed,
-                // and the old code reached its `continue` after about six
-                // flops. Those skips are the common case, not the rare
-                // one, so an unconditional reduction could easily have
-                // cost more than the atomics it removes.
-                //
-                // simd_any is a vote: one instruction, and its result is
-                // the same on every lane, so skipping on it keeps the
-                // reductions in uniform control flow.
-                if (simd_any(active)) {
-                    const float sColorX = trainer_simdSum(gColor.x);
-                    const float sColorY = trainer_simdSum(gColor.y);
-                    const float sColorZ = trainer_simdSum(gColor.z);
-                    const float sOpacity = trainer_simdSum(gOpacity);
-                    const float sMeanX = trainer_simdSum(gMean2D.x);
-                    const float sMeanY = trainer_simdSum(gMean2D.y);
-                    const float sConicX = trainer_simdSum(gConic.x);
-                    const float sConicY = trainer_simdSum(gConic.y);
-                    const float sConicZ = trainer_simdSum(gConic.z);
-                    const float sAbs = trainer_simdSum(gAbs);
-                    const float sVis = trainer_simdSum(gVis);
-                    const float sUnknown = trainer_simdSum(gUnknown);
-
-                    if (lane == 0u) {
-                        // trainer_atomicAdd drops a zero, so a component
-                        // nothing contributed to writes nothing.
-                        trainer_atomicAdd(&aColor[splatIndex * 3u + 0u], sColorX);
-                        trainer_atomicAdd(&aColor[splatIndex * 3u + 1u], sColorY);
-                        trainer_atomicAdd(&aColor[splatIndex * 3u + 2u], sColorZ);
-                        trainer_atomicAdd(&aOpacity[splatIndex], sOpacity);
-                        trainer_atomicAdd(&aMean2D[splatIndex * 2u + 0u], sMeanX);
-                        trainer_atomicAdd(&aMean2D[splatIndex * 2u + 1u], sMeanY);
-                        trainer_atomicAdd(&aConic[splatIndex * 3u + 0u], sConicX);
-                        trainer_atomicAdd(&aConic[splatIndex * 3u + 1u], sConicY);
-                        trainer_atomicAdd(&aConic[splatIndex * 3u + 2u], sConicZ);
-                        trainer_atomicAdd(&stats[splatIndex].absGrad2D, sAbs);
-                        trainer_atomicAdd(&stats[splatIndex].visAccum, sVis);
-                        trainer_atomicAdd(&stats[splatIndex].unknownAccum, sUnknown);
-                    }
+                // The MAGNITUDE, accumulated per pixel before any summation.
+                // The signed sum cancels for a Gaussian straddling an edge,
+                // which is exactly the Gaussian that has to split.
+                trainer_atomicAdd(&stats[splatIndex].absGrad2D, length(dLdMean2D));
+                trainer_atomicAdd(&stats[splatIndex].visAccum, weight);
+                if (isUnknown > 0.0f) {
+                    trainer_atomicAdd(&stats[splatIndex].unknownAccum, weight);
                 }
-            } else if (active) {
-                // Pre-A14 fallback: exactly what this kernel did before
-                // the reduction went in, one atomic per lane. Both halves
-                // share the arithmetic above, so there is one place where
-                // a gradient is defined and only the write differs.
-                trainer_atomicAdd(&aColor[splatIndex * 3u + 0u], gColor.x);
-                trainer_atomicAdd(&aColor[splatIndex * 3u + 1u], gColor.y);
-                trainer_atomicAdd(&aColor[splatIndex * 3u + 2u], gColor.z);
-                trainer_atomicAdd(&aOpacity[splatIndex], gOpacity);
-                trainer_atomicAdd(&aMean2D[splatIndex * 2u + 0u], gMean2D.x);
-                trainer_atomicAdd(&aMean2D[splatIndex * 2u + 1u], gMean2D.y);
-                trainer_atomicAdd(&aConic[splatIndex * 3u + 0u], gConic.x);
-                trainer_atomicAdd(&aConic[splatIndex * 3u + 1u], gConic.y);
-                trainer_atomicAdd(&aConic[splatIndex * 3u + 2u], gConic.z);
-                trainer_atomicAdd(&stats[splatIndex].absGrad2D, gAbs);
-                trainer_atomicAdd(&stats[splatIndex].visAccum, gVis);
-                trainer_atomicAdd(&stats[splatIndex].unknownAccum, gUnknown);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
