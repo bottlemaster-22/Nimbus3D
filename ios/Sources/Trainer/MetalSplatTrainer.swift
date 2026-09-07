@@ -682,6 +682,18 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             edges: smart.edges,
             background: smart.background
         )
+        // Builds the NEXT frame while the GPU works on this one. See
+        // TrainerSupervisionPrefetch: supervision and gpuWait measured 24.70
+        // and 24.69 ms per iteration on the owner's phone, one after the
+        // other, with the other device idle each time.
+        let prefetch = TrainerSupervisionPrefetch(builder: supervision)
+        defer {
+            prefetch.drain()
+            // Accumulated across slices: what the worker built off the
+            // critical path, which `timings.supervision` no longer sees.
+            timings.supervisionPrefetched += prefetch.workerSeconds
+        }
+
 
         var renderSize = TrainerBudgetGovernor.renderSize(
             forLongEdge: governor.current.renderLongEdgePixels,
@@ -1029,6 +1041,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                        level: thermal.level, currentSplatCount: splatCount
                    )
                 {
+                    // The governor can swap the builder's image cache out
+                    // from under a worker. Nothing may be in flight.
+                    prefetch.drain()
                     try applyBudgetChange(
                         change,
                         resources: resources,
@@ -1077,6 +1092,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                             previewAvailable: true
                         )
                     )
+                    // The governor can swap the builder's image cache out
+                    // from under a worker. Nothing may be in flight.
+                    prefetch.drain()
                     try applyBudgetChange(
                         change,
                         resources: resources,
@@ -1096,15 +1114,25 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             orderCursor += 1
 
             let supervisionFrom = CFAbsoluteTimeGetCurrent()
-            let builtSupervision = supervision.build(
-                frame: frame,
-                iteration: iteration,
-                // The run that will actually happen, for the same reason
-                // `progressFraction` uses it: this drives the depth-loss decay
-                // and the SH degree schedule, and keying those to a length the
-                // run will never reach means their tails never execute.
-                totalIterations: effectiveTotal
-            )
+            let builtSupervision: TrainerFrameSupervision?
+            switch prefetch.take(
+                frame: frame, iteration: iteration, totalIterations: effectiveTotal
+            ) {
+            case .hit(let ready):
+                // Built during the previous iteration's GPU wait. This is the
+                // whole point, and on this branch the loop pays nothing for it.
+                builtSupervision = ready
+            case .miss:
+                builtSupervision = supervision.build(
+                    frame: frame,
+                    iteration: iteration,
+                    // The run that will actually happen, for the same reason
+                    // `progressFraction` uses it: this drives the depth-loss decay
+                    // and the SH degree schedule, and keying those to a length the
+                    // run will never reach means their tails never execute.
+                    totalIterations: effectiveTotal
+                )
+            }
             // Timed whether or not it succeeded: a frame that fails to decode
             // still spent the time trying, and hiding that would flatter the
             // number.
@@ -1126,6 +1154,21 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 renderSize = frameSupervision.renderSize
                 try resources.resizeRenderSize(to: renderSize)
                 gpu = TrainerGPU(pipelines: pipelines, resources: resources)
+            }
+
+            // START THE NEXT FRAME NOW, so it is built during the GPU wait
+            // that `runIteration` is about to sit in rather than after it.
+            // `orderCursor` has already moved on, so this is genuinely the
+            // frame the next iteration will ask for, and `iteration + 1` is
+            // the number it will ask with; both are checked on the way out, so
+            // a wrong guess costs the work and nothing else.
+            if !order.isEmpty {
+                let nextFrame = slice.keyframes[order[orderCursor % order.count]]
+                prefetch.start(
+                    frame: nextFrame,
+                    iteration: iteration + 1,
+                    totalIterations: effectiveTotal
+                )
             }
 
             let exposure = exposures[frame.index] ?? SIMD2<Float>(1, 0)

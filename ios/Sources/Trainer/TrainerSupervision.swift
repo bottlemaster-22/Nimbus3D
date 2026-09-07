@@ -69,6 +69,148 @@ struct TrainerFrameSupervision {
 
 /// Builds `TrainerFrameSupervision`, and caches the decoded images so a
 /// keyframe visited twice in a row is not decoded twice.
+/// Builds ONE frame of supervision ahead, on a background queue, so the CPU
+/// work for frame N+1 happens while the GPU is busy with frame N.
+///
+/// WHY THIS EXISTS, measured on the owner's phone at build 102 over a 3000
+/// iteration run:
+///
+///     GPU actually executing      69.8 s   23.3 ms per iteration
+///     CPU blocked waiting for it  74.1 s   24.7 ms per iteration
+///     CPU building supervision    74.1 s   24.7 ms per iteration
+///
+/// Those last two are the same number, and they happen one after the other.
+/// The loop builds a frame for 25 ms with the GPU idle, submits it, then stops
+/// dead for 25 ms with the CPU idle. Neither device is ever busy at the same
+/// time as the other, and the frame the CPU will need next has been known
+/// since `order` was shuffled once at the start of the run.
+///
+/// Overlapping them is worth up to `min(24.7, 23.3)` ms of a 62.3 ms
+/// iteration without changing a single line of arithmetic. It is also why four
+/// separate attempts at making the GPU faster measured nothing: the GPU is 37%
+/// of the run.
+///
+/// -----------------------------------------------------------------------
+/// WHAT MAKES IT SAFE
+/// -----------------------------------------------------------------------
+/// `TrainerSupervisionBuilder` is not thread safe and is not made thread safe
+/// here. Instead EXACTLY ONE THREAD TOUCHES IT AT A TIME, by construction:
+///
+///   * `start` is called only after the main thread has finished with the
+///     builder for this iteration, and it waits for any previous worker first.
+///   * `take` waits for the worker before returning, so the main thread never
+///     reads the builder while the worker is inside it.
+///   * `drain` does the same and throws the result away. It MUST be called
+///     before anything that mutates the builder, which today means
+///     `lowerLongEdge` by way of `applyBudgetChange`. The budget governor
+///     lowers the render grid when the phone is hot or short of memory, and
+///     that swaps the image cache outright; a worker running through the old
+///     one at that moment is the one genuine hazard in this design.
+///
+/// There is no lock because there is no concurrent access, and
+/// `DispatchWorkItem.wait()` is the ordering barrier that makes the handoff of
+/// `built` well defined.
+///
+/// -----------------------------------------------------------------------
+/// WHY IT IS KEYED, AND WHY A MISS IS FINE
+/// -----------------------------------------------------------------------
+/// A prefetch is a guess about which frame the next iteration will want, at
+/// which iteration number, against which total. Every one of those can change:
+/// the loop skips an iteration when a photo will not decode, and the governor
+/// can shorten the run underneath it. So the result is keyed on all three and
+/// handed over only on an exact match. A miss costs nothing but the work
+/// already thrown away, and the caller simply builds the frame itself, exactly
+/// as it did before this class existed. Correctness never depends on the guess
+/// being right.
+final class TrainerSupervisionPrefetch: @unchecked Sendable {
+
+    /// A prefetched frame, or an admission that the guess was wrong.
+    enum Outcome {
+        /// The guess matched. The payload is what `build` returned, including
+        /// `nil` for a photo that would not decode: that is a real answer and
+        /// re-deriving it would just fail again more slowly.
+        case hit(TrainerFrameSupervision?)
+        /// No usable prefetch. Build it on this thread.
+        case miss
+    }
+
+    /// What a prefetched frame is only valid for.
+    private struct Key: Equatable {
+        var frameIndex: Int
+        var iteration: Int
+        var totalIterations: Int
+    }
+
+    private let builder: TrainerSupervisionBuilder
+    private let queue = DispatchQueue(
+        label: "\(BrandConfig.bundleIdentifier).trainer.supervision-prefetch",
+        qos: .userInitiated
+    )
+    private var work: DispatchWorkItem?
+    private var key: Key?
+    private var built: TrainerFrameSupervision?
+    private var didBuild = false
+
+    /// Seconds the WORKER spent building, which is the cost that moved off the
+    /// critical path rather than disappeared. Reported next to the main
+    /// thread's own supervision time so the two together show the overlap
+    /// actually happening.
+    private(set) var workerSeconds: Double = 0
+
+    init(builder: TrainerSupervisionBuilder) {
+        self.builder = builder
+    }
+
+    /// Starts building `frame` in the background. Waits for any previous
+    /// worker first, so only one is ever in flight.
+    func start(frame: CaptureFrame, iteration: Int, totalIterations: Int) {
+        drain()
+        let item = DispatchWorkItem { [self] in
+            let from = CFAbsoluteTimeGetCurrent()
+            built = builder.build(
+                frame: frame, iteration: iteration, totalIterations: totalIterations
+            )
+            didBuild = true
+            workerSeconds += CFAbsoluteTimeGetCurrent() - from
+        }
+        key = Key(
+            frameIndex: frame.index, iteration: iteration,
+            totalIterations: totalIterations
+        )
+        work = item
+        queue.async(execute: item)
+    }
+
+    /// The prefetched frame if it is the one being asked for. Blocks until the
+    /// worker is finished either way, so the builder is free afterwards.
+    func take(
+        frame: CaptureFrame, iteration: Int, totalIterations: Int
+    ) -> Outcome {
+        let wanted = Key(
+            frameIndex: frame.index, iteration: iteration,
+            totalIterations: totalIterations
+        )
+        work?.wait()
+        work = nil
+        let matched = (key == wanted) && didBuild
+        let value = built
+        key = nil
+        built = nil
+        didBuild = false
+        return matched ? .hit(value) : .miss
+    }
+
+    /// Waits for anything in flight and discards it. Call before touching the
+    /// builder from this thread.
+    func drain() {
+        work?.wait()
+        work = nil
+        key = nil
+        built = nil
+        didBuild = false
+    }
+}
+
 final class TrainerSupervisionBuilder {
 
     private let bundle: CaptureBundle

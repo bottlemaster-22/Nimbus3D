@@ -465,6 +465,11 @@ struct TrainerTimings: Codable {
     /// Building one frame of supervision on the CPU: photo decode, ground
     /// truth, background image, depth samples.
     var supervision: Double = 0
+    /// Seconds the PREFETCH WORKER spent building supervision, off the
+    /// critical path. `supervision` above is what the training loop itself
+    /// waited for; this is what was moved out of it. Before the prefetch
+    /// existed this was 0 and `supervision` carried the whole cost.
+    var supervisionPrefetched: Double = 0
     /// CPU time blocked in waitUntilCompleted, every command buffer.
     var gpuWait: Double = 0
     /// What Metal reports the GPU spent EXECUTING, summed over every
