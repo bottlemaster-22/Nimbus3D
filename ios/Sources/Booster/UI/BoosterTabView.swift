@@ -90,6 +90,10 @@ public struct BoosterTabView: View {
             .onAppear {
                 discovery.start()
                 jobs = client.resultsHistory()
+                // Says whether an update this app quit to allow actually
+                // landed. Cheap and local: it compares the build number
+                // written down before quitting against this one.
+                selfUpdate.resumeAfterRelaunch()
             }
             .onDisappear {
                 discovery.stop()

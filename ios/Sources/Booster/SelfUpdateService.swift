@@ -46,9 +46,13 @@
 //  so this is built from the summary and should be re-checked against the doc
 //  when it lands.
 //
-//      POST <endpoint>            {bundle_id, installed_build_version, force?}
-//      GET  <endpoint>/status?bundle_id=...
+//      POST <endpoint>   {bundle_id, installed_build_version, lan_ip, force?}
 //      Authorization: Bearer <token>
+//
+//  The contract also offers GET <endpoint>/status, and this service does not
+//  use it. It cannot: it has to be dead before the install can happen, so
+//  there is nobody left to poll. The outcome is read on the next launch from
+//  the build number instead.
 //
 //  Both routes answer with the same `status` enum and a plain-English
 //  `message` written for a screen. No X-Bottle-Proto header.
@@ -56,6 +60,13 @@
 //  `updated` means INSTALLED, not "signed and hosted". The Bottle agent caught
 //  and fixed a revision that reported success at the hosting step, which would
 //  have made this screen lie.
+//
+//  THE APP MUST QUIT ITSELF FOR THE INSTALL TO HAPPEN. iOS will not replace
+//  a running application, so an install requested from inside the app it is
+//  replacing simply stalls until the broker gives up, which is exactly the
+//  timeout the owner hit. Bottle closes itself for the same reason. So this
+//  service stops following the job and exits the process once the broker has
+//  accepted it, and reports the outcome on NEXT launch instead.
 //
 //  `lan_ip` is REQUIRED in practice even though the contract calls it
 //  optional. The installer reaches the phone through the relay bridge and has
@@ -100,10 +111,6 @@ public final class SelfUpdateService: ObservableObject {
         subsystem: BrandConfig.loggingSubsystem, category: "Booster.SelfUpdate"
     )
 
-    /// The broker asked for no faster than one poll every two seconds.
-    private static let pollIntervalNanoseconds: UInt64 = 2_000_000_000
-    /// Stops a stuck job polling forever. Ten minutes at two seconds.
-    private static let maximumPolls = 300
 
     public init() {}
 
@@ -142,30 +149,28 @@ public final class SelfUpdateService: ObservableObject {
             // `current` starts no job, so there is nothing to follow. Every
             // other non-terminal answer means the broker is working.
             guard started.status == .updating else { return }
-            try await follow(config: config)
+
+            // AND NOW GET OUT OF THE WAY.
+            //
+            // iOS will not replace a running application. An install driven
+            // from inside the app being replaced cannot complete, so it sat
+            // there until the broker timed out and reported that it could
+            // not install. Polling harder would not have helped; the app's
+            // continued existence WAS the failure.
+            //
+            // So the job is handed over and the process ends. Bottle does
+            // the same thing for the same reason.
+            Self.rememberPendingUpdate()
+            status = .updating
+            message = "Closing so the new build can be installed. Reopen "
+                + "LiKOVA in a moment."
+            await Self.quitForInstall()
+            return
         } catch {
             status = .failed
             message = Self.sentence(for: error)
             log.error("Self-update failed: \(error.localizedDescription, privacy: .public)")
         }
-    }
-
-    private func follow(config: BrandConfig.SelfUpdateEndpoint) async throws {
-        for _ in 0..<Self.maximumPolls {
-            try await Task.sleep(nanoseconds: Self.pollIntervalNanoseconds)
-            if Task.isCancelled { return }
-            let reply = try await status(config: config)
-            apply(reply)
-            switch reply.status {
-            case .updating:
-                continue
-            case .current, .updated, .failed, .idle:
-                return
-            }
-        }
-        status = .failed
-        message = "The update is taking longer than expected. It may still finish "
-            + "on its own; check again in a few minutes."
     }
 
     private func apply(_ reply: Reply) {
@@ -212,25 +217,6 @@ public final class SelfUpdateService: ObservableObject {
         return try await send(request)
     }
 
-    private func status(
-        config: BrandConfig.SelfUpdateEndpoint
-    ) async throws -> Reply {
-        var components = URLComponents(
-            url: config.url.appendingPathComponent("status"),
-            resolvingAgainstBaseURL: false
-        )
-        components?.queryItems = [
-            URLQueryItem(name: "bundle_id", value: BrandConfig.bundleIdentifier)
-        ]
-        guard let url = components?.url else { throw SelfUpdateError.badEndpoint }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.timeoutInterval = 30
-        request.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
-        return try await send(request)
-    }
-
     private func send(_ request: URLRequest) async throws -> Reply {
         let (data, response) = try await URLSession.shared.data(for: request)
 
@@ -248,6 +234,77 @@ public final class SelfUpdateService: ObservableObject {
         else { throw SelfUpdateError.unreadableReply(message: text) }
 
         return Reply(status: parsed, message: text)
+    }
+
+    // MARK: - Standing aside for the installer
+
+    private static var pendingKey: String {
+        BrandConfig.defaultsPrefix + "selfupdate.pending"
+    }
+
+    /// Records that this build asked to be replaced, so the NEXT launch can
+    /// say whether it worked.
+    ///
+    /// The build number is stored rather than a bare flag: on the next
+    /// launch, a CFBundleVersion different from this one is proof the
+    /// install happened, without asking the broker anything.
+    private static func rememberPendingUpdate() {
+        UserDefaults.standard.set(installedBuildVersion, forKey: pendingKey)
+    }
+
+    /// Ends the process so the installer can replace the bundle.
+    ///
+    /// `exit(0)` is a blunt instrument and Apple discourages it, because a
+    /// shipping app should never terminate itself. This one is not
+    /// shipping: the whole self-update feature is development-only and is
+    /// stripped before any submission, which is the condition the owner set
+    /// when he agreed to it. If this file ever survives into a release
+    /// build, THIS is the line that fails review.
+    ///
+    /// The pause is so the sentence above is readable before the screen
+    /// disappears. Without it the app vanishes the instant the button is
+    /// pressed, which is indistinguishable from a crash, and this app has
+    /// spent enough of its life being indistinguishable from a crash.
+    private static func quitForInstall() async {
+        try? await Task.sleep(nanoseconds: 1_800_000_000)
+        UserDefaults.standard.synchronize()
+        exit(0)
+    }
+
+    /// Called when the update screen appears. Reports the outcome of an
+    /// update this app quit to allow.
+    ///
+    /// No network call is needed for the happy path. The build number that
+    /// asked to be replaced was written down before quitting, so if this
+    /// launch reports a DIFFERENT CFBundleVersion then the installer did its
+    /// job, and saying so from local facts is more trustworthy than asking
+    /// the broker to grade its own homework.
+    public func resumeAfterRelaunch() {
+        let defaults = UserDefaults.standard
+        guard let asked = defaults.string(forKey: Self.pendingKey) else { return }
+        defaults.removeObject(forKey: Self.pendingKey)
+
+        if asked != Self.installedBuildVersion {
+            status = .updated
+            message = "Updated from build \(asked) to build "
+                + "\(Self.installedBuildVersion)."
+            log.notice(
+                "Self-update completed: \(asked, privacy: .public) -> "
+                + "\(Self.installedBuildVersion, privacy: .public)"
+            )
+        } else {
+            // Same build back again. The install did not happen, and the
+            // honest reading is that it failed rather than that nothing was
+            // asked for.
+            status = .failed
+            message = "The update did not install. This build is still "
+                + "\(Self.installedBuildVersion). Check the relay at home is "
+                + "powered on and try again."
+            log.error(
+                "Self-update did not take: still build "
+                + "\(Self.installedBuildVersion, privacy: .public)"
+            )
+        }
     }
 
     // MARK: - This phone's address
