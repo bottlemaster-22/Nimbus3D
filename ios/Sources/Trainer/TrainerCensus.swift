@@ -475,6 +475,18 @@ struct TrainerTimings: Codable {
     /// What Metal reports the GPU spent EXECUTING, summed over every
     /// command buffer. The honest measure of how busy the GPU is.
     var gpuBusy: Double = 0
+    /// The periodic passes, each including its own GPU waits. These are the
+    /// contents of the gap between `wall` and (`supervision` + `gpuWait`),
+    /// which measured 12.9 ms per iteration on build 102 with nine separate
+    /// findings claiming to live inside it. Now they can be checked instead of
+    /// believed.
+    var densify: Double = 0
+    var previewSnapshot: Double = 0
+    var filterSweep: Double = 0
+    /// Writing this frame's ground truth, background and depth samples into
+    /// the shared Metal buffers.
+    var upload: Double = 0
+
     /// How many command buffers were waited on. gpuWait divided by this is
     /// the average round-trip cost, which is the number that says whether
     /// merging command buffers would be worth anything.

@@ -1245,6 +1245,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             if iteration > 0,
                iteration % Swift.max(tuning.filter3DIntervalIterations, 1) == 0
             {
+                let sweepFrom = CFAbsoluteTimeGetCurrent()
+                defer { timings.filterSweep += CFAbsoluteTimeGetCurrent() - sweepFrom }
                 try updateFilter3D(
                     gpu: gpu,
                     resources: resources,
@@ -1271,6 +1273,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                iteration % Swift.max(tuning.densifyIntervalIterations, 1) == 0
             {
                 let carveDue = iteration % Swift.max(tuning.carveIntervalIterations, 1) == 0
+                let densifyFrom = CFAbsoluteTimeGetCurrent()
+                defer { timings.densify += CFAbsoluteTimeGetCurrent() - densifyFrom }
                 let outcome = try densifier.run(
                     resources: resources,
                     splatCount: splatCount,
@@ -1409,12 +1413,14 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             }
 
             if iteration % Swift.max(tuning.snapshotIntervalIterations, 1) == 0 {
+                let snapshotFrom = CFAbsoluteTimeGetCurrent()
                 let cloud = readCloud(
                     resources: resources, count: splatCount, shDegree: shDegree
                 )
                 lock.lock()
                 latestSnapshot = mergePreview(completedParts: completedParts, current: cloud)
                 lock.unlock()
+                timings.previewSnapshot += CFAbsoluteTimeGetCurrent() - snapshotFrom
             }
 
             // --- Progress ------------------------------------------------------------
@@ -1639,6 +1645,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         guard pixelCount > 0, splatCount > 0 else { return .skippedNothingToRender }
 
         // --- Upload this frame's supervision -------------------------------------
+        let uploadFrom = CFAbsoluteTimeGetCurrent()
         resources.gtColor.writeArray(supervision.groundTruth)
         if supervision.hasBackground, !supervision.background.isEmpty {
             resources.bgColor.writeArray(supervision.background)
@@ -1649,6 +1656,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         if sampleCount > 0 {
             resources.depthSamples.writeArray(Array(supervision.depthSamples.prefix(sampleCount)))
         }
+        timings.upload += CFAbsoluteTimeGetCurrent() - uploadFrom
 
         // --- Uniforms --------------------------------------------------------------
         var camera = cameraUniforms(
