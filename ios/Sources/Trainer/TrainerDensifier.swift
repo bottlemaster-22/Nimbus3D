@@ -827,9 +827,18 @@ final class TrainerDensifier {
             var outSHM: [Float] = []
             var outSHV: [Float] = []
             var outTopK: [TrainerSamplingTopK] = []
+            // All EIGHT, not three. The five that were missing grew by
+            // doubling, so compacting a 300,000 splat model reallocated and
+            // copied them about eighteen times each, every densification
+            // pass that removed anything. That is 29 passes in a real run.
             outSplats.reserveCapacity(survivorCount)
             outStats.reserveCapacity(survivorCount)
             outSH.reserveCapacity(survivorCount * shPerSplat)
+            outM.reserveCapacity(survivorCount)
+            outV.reserveCapacity(survivorCount)
+            outSHM.reserveCapacity(survivorCount * shPerSplat)
+            outSHV.reserveCapacity(survivorCount * shPerSplat)
+            outTopK.reserveCapacity(survivorCount)
 
             for i in 0..<liveCount where keep[i] {
                 outSplats.append(splats[i])

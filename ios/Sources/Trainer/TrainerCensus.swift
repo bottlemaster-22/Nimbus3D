@@ -348,6 +348,24 @@ struct TrainerCensusSlice: Codable {
     /// inferred from a gap in the wall clock.
     var iterationsSkippedNoSupervision: Int = 0
     var iterationsSkippedGrowingTileBuffer: Int = 0
+
+    /// The largest number of (Gaussian, tile) pairs any single iteration of
+    /// this slice produced, and the live population at that moment.
+    ///
+    /// These exist to answer one question with a measurement instead of a
+    /// guess: how many tiles does a Gaussian actually touch? The sort
+    /// buffers are sized at EIGHT instances per splat, which is 128 of the
+    /// 680 bytes each Gaussian costs, and nobody has ever checked whether 8
+    /// is right. A median splat in a finished model is about 1.09 cm across
+    /// at a 1.29 m stand-off rendered at 720 px with 16x16 tiles, which
+    /// suggests most cover ONE tile and that the multiplier is defensive
+    /// rather than measured.
+    ///
+    /// The ratio of these two numbers is that answer. If it is near 1, the
+    /// multiplier can come down a long way and every Gaussian gets cheaper.
+    /// The count was already computed every iteration and thrown away.
+    var peakTileInstances: Int = 0
+    var splatCountAtPeakTileInstances: Int = 0
     var iterationsSkippedNothingToRender: Int = 0
     /// Iterations that ran a real forward, backward and Adam step, as opposed
     /// to times round the loop. Measured directly by the loop rather than

@@ -78,6 +78,12 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     // held only for the assignment, never across GPU work.
 
     private let lock = NSLock()
+    /// Largest (Gaussian, tile) pair count any iteration of the CURRENT slice
+    /// produced, and the live population at that moment. Folded into the
+    /// census when the slice finishes, and reset there so the next slice
+    /// measures itself rather than inheriting.
+    private var peakTileInstances = 0
+    private var splatCountAtPeakTileInstances = 0
     private var cancelRequested = false
     private var latestSnapshot: SplatCloud?
     private var latestModel: SplatModel?
@@ -1412,6 +1418,12 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // path that stops being counted visible instead of invisible.
         census.slices[censusRow].iterationsWithGradientStep = gradientSteps
         census.slices[censusRow].splatCountAtEndOfTraining = splatCount
+        census.slices[censusRow].peakTileInstances = peakTileInstances
+        census.slices[censusRow].splatCountAtPeakTileInstances =
+            splatCountAtPeakTileInstances
+        // Reset so the next slice measures itself rather than inheriting.
+        peakTileInstances = 0
+        splatCountAtPeakTileInstances = 0
         // The size the buffers were actually at when the slice ended, which is
         // not the size it started at if the governor stepped the resolution
         // down mid-run.
@@ -1689,6 +1701,18 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             return .grewTileBufferAndRetried
         }
         instanceCount = Swift.max(instanceCount, 0)
+
+        // Recorded rather than discarded. See the census fields for why:
+        // this is the only place the app ever learns how many tiles a
+        // Gaussian really touches, and the sort buffers are sized on an
+        // assumption about it that has never been checked.
+        //
+        // Held on the instance because `runIteration` takes no census: it is
+        // folded into the slice row where the slice is finalised.
+        if instanceCount > peakTileInstances {
+            peakTileInstances = instanceCount
+            splatCountAtPeakTileInstances = splatCount
+        }
 
         // --- Command buffer B: everything else ---------------------------------------
         //

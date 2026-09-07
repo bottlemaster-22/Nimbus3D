@@ -894,7 +894,6 @@ kernel void trainer_rasterize_forward(
     uint2                           tPos        [[thread_position_in_threadgroup]],
     uint                            tid         [[thread_index_in_threadgroup]]
 ) {
-    threadgroup uint   tgIndex[TRAINER_TILE_AREA];
     threadgroup float2 tgXY[TRAINER_TILE_AREA];
     threadgroup float4 tgConicOpacity[TRAINER_TILE_AREA];
     threadgroup float4 tgColorDepth[TRAINER_TILE_AREA];
@@ -922,7 +921,11 @@ kernel void trainer_rasterize_forward(
         if (load < rangeEnd) {
             const uint splatIndex = values[load];
             const TrainerSplatDraw d = draws[splatIndex];
-            tgIndex[tid] = splatIndex;
+            // tgIndex was staged here and never read back in this
+            // kernel. 1 KB of threadgroup memory per threadgroup, on a
+            // GPU where threadgroup memory is what limits how many
+            // threadgroups run at once. The backward rasteriser keeps
+            // its own tgIndex because it genuinely reads it.
             tgXY[tid] = float2(d.mean2D);
             tgConicOpacity[tid] = float4(float3(d.conic), d.opacity);
             tgColorDepth[tid] = float4(float3(d.color), d.depth);
