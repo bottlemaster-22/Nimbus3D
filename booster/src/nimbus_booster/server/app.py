@@ -33,7 +33,7 @@ from ..config import BoosterConfig
 from ..protocol import wire
 from .jobs import ChunkChecksumMismatch, JobStore, UnknownManifestFile
 from .pairing import PairingManager
-from .paths import SaveRoot, UnsafeRelativePath, resolve_within
+from .paths import SaveRoot, UnsafeRelativePath, resolve_within, safe_relative_path
 from .progress import HEARTBEAT_SECONDS, ProgressHub
 
 log = logging.getLogger(__name__)
@@ -132,6 +132,10 @@ class BoosterServer:
                 web.get(
                     prefix + "/jobs/{job_id}/result/files/{rel:.*}",
                     self.handle_result_file,
+                ),
+                web.put(
+                    prefix + "/diagnostics/{scan_id}/{rel:.*}",
+                    self.handle_diagnostics_upload,
                 ),
                 web.get(prefix + "/jobs/{job_id}", self.handle_job_status),
                 web.delete(prefix + "/jobs/{job_id}", self.handle_job_cancel),
@@ -400,6 +404,65 @@ class BoosterServer:
                 "Your scan is here and waiting. This PC cannot build it yet.",
             )
         return self._json(response.to_json())
+
+    async def handle_diagnostics_upload(self, request: web.Request) -> web.Response:
+        """``PUT /v1/diagnostics/{scan_id}/{path}`` - one whole file, for a human.
+
+        DEVELOPMENT ONLY, and separate from the job routes on purpose.
+
+        This exists so the phone can hand over a census, a point cloud or a log
+        without anyone exporting it by hand, opening the Files app and moving it
+        somewhere. It is NOT part of the boost protocol: nothing here creates a
+        job, starts a train, or touches the manifest machinery. It writes a file
+        into a folder and says how big it was.
+
+        It is deliberately dumb. No chunking, no resume, no checksum, because
+        the files are small enough to send in one request and a failed
+        diagnostic upload costs a retry rather than a scan. The one thing it is
+        NOT casual about is the path: both segments go through
+        ``safe_relative_path`` and the result is confined with
+        ``resolve_within``, because this is a route that writes attacker-named
+        files to disk on a machine that is trusted by the person running it.
+
+        Behind the same bearer-token gate as everything except ``/info`` and
+        pairing, so an unpaired phone on the same network cannot use it.
+
+        To remove the feature entirely: delete this method and its ``web.put``
+        line above. Nothing else refers to either.
+        """
+        scan_id = request.match_info.get("scan_id", "")
+        relative = request.match_info.get("rel", "")
+        try:
+            scan_id = safe_relative_path(scan_id)
+            relative = safe_relative_path(relative)
+        except UnsafeRelativePath as error:
+            log.warning("Rejected a diagnostics path: %s", error)
+            return self._error(web.HTTPBadRequest, "That file path is not allowed.")
+        if "/" in scan_id:
+            return self._error(web.HTTPBadRequest, "The scan id must be one segment.")
+
+        base = self.save_root.root / "diagnostics"
+        try:
+            destination = resolve_within(base, scan_id + "/" + relative)
+        except UnsafeRelativePath as error:
+            log.warning("Rejected a diagnostics path: %s", error)
+            return self._error(web.HTTPBadRequest, "That file path is not allowed.")
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        written = 0
+        # Streamed rather than read() in one go: a model.ply is tens of
+        # megabytes and this server also runs on machines with very little to
+        # spare.
+        with open(destination, "wb") as handle:
+            while True:
+                block = await request.content.readany()
+                if not block:
+                    break
+                handle.write(block)
+                written += len(block)
+
+        log.info("Diagnostics: %s/%s (%d bytes)", scan_id, relative, written)
+        return self._json({"ok": True, "bytes": written, "path": str(destination)})
 
     async def handle_job_status(self, request: web.Request) -> web.Response:
         """``GET /v1/jobs/{id}`` - the 3-second polling fallback."""

@@ -33,6 +33,11 @@ public struct BoosterTabView: View {
     // `selfUpdateSection` below, its one use in the List, and
     // SelfUpdateService.swift. Nothing else refers to it.
     @StateObject private var selfUpdate = SelfUpdateService()
+    // DEVELOPMENT ONLY, same shape as the self-update feature: this line,
+    // the swipe action, the sheet, the one row below, and
+    // DiagnosticsSender.swift. Nothing else refers to any of them.
+    @StateObject private var diagnostics = DiagnosticsSender()
+    @State private var diagnosticsDevice: BoosterDevice?
 
     public init() {}
 
@@ -74,6 +79,13 @@ public struct BoosterTabView: View {
                                     Button("Forget", role: .destructive) {
                                         client.forgetPairing(boosterID: device.id)
                                     }
+                                    // Sends a scan's census, model and pre-pass
+                                    // result to this PC. Read-only copies: no
+                                    // job is created and nothing is trained.
+                                    Button("Diagnostics") {
+                                        diagnosticsDevice = device
+                                    }
+                                    .tint(.indigo)
                                 }
                             }
                         }
@@ -104,6 +116,17 @@ public struct BoosterTabView: View {
             .sheet(item: $pairingDevice) { device in
                 BoosterPairingSheet(device: device, pairing: pairing) {
                     jobs = client.resultsHistory()
+                }
+            }
+            .sheet(item: $diagnosticsDevice) { device in
+                BoosterScanPickerSheet(device: device) { scan in
+                    Task {
+                        await diagnostics.send(
+                            scanID: scan.scanID,
+                            scanDirectory: scan.directory,
+                            to: device
+                        )
+                    }
                 }
             }
             .sheet(item: $scanPickerDevice) { device in
@@ -175,6 +198,18 @@ public struct BoosterTabView: View {
                 // are shown as sent rather than reworded here. It cannot
                 // know this app is a scanner, and this app cannot know why
                 // a relay is offline.
+                if diagnostics.isSending {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("Sending diagnostics...")
+                    }
+                }
+                if let sent = diagnostics.message {
+                    Text(sent)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 if let message = selfUpdate.message {
                     Text(message)
                         .font(.footnote)

@@ -166,6 +166,31 @@ struct BoosterHTTP {
 
     // MARK: - Private
 
+    /// PUT one whole file and ignore the reply body.
+///
+    /// Separate from `putChunk` on purpose: that one carries an offset and
+    /// a checksum because a scan upload must survive being interrupted.
+    /// This is for development diagnostics, where a failure costs a retry
+    /// rather than a scan, so it is one request with no resume machinery.
+    static func putFile(
+        _ address: BoosterEndpointAddress,
+        path: String,
+        data: Data
+    ) async throws {
+        var request = try makeRequest(address, path: path)
+        request.httpMethod = "PUT"
+        request.setValue(
+            "application/octet-stream", forHTTPHeaderField: "Content-Type"
+        )
+        request.timeoutInterval = BoosterAPI.uploadChunkTimeout
+        request.httpBody = data
+        let (body, response) = try await sendRaw(request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BoosterError.connectionFailed("No reply from that computer.")
+        }
+        try checkStatus(http, data: body)
+    }
+
     private static func makeRequest(
         _ address: BoosterEndpointAddress,
         path: String,
