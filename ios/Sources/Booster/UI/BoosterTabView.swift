@@ -72,20 +72,20 @@ public struct BoosterTabView: View {
                                 device: device,
                                 isBusy: client.isBusy,
                                 onPair: { startPairing(with: device) },
-                                onSendScan: { scanPickerDevice = device }
+                                onSendScan: { scanPickerDevice = device },
+                                // Sends a scan's census, model and pre-pass
+                                // result to this PC. Read-only copies: no job
+                                // is created and nothing is trained. It is a
+                                // visible button on the row now, not a swipe
+                                // action, because a swipe action nobody can
+                                // see is not a feature.
+                                onSendDiagnostics: { diagnosticsDevice = device }
                             )
                             .swipeActions(edge: .trailing) {
                                 if device.isPaired {
                                     Button("Forget", role: .destructive) {
                                         client.forgetPairing(boosterID: device.id)
                                     }
-                                    // Sends a scan's census, model and pre-pass
-                                    // result to this PC. Read-only copies: no
-                                    // job is created and nothing is trained.
-                                    Button("Diagnostics") {
-                                        diagnosticsDevice = device
-                                    }
-                                    .tint(.indigo)
                                 }
                             }
                         }

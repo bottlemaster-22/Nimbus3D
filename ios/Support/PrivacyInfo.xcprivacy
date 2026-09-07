@@ -12,13 +12,25 @@
       Disk space            the capture storage guard and TrainingBudget
 
     NOTHING IS COLLECTED. This app has no account, no login, no analytics, no
-    third-party SDKs and no network calls to anywhere except a PC on the user's
-    own Wi-Fi that the user explicitly paired with. Scans, photographs, depth
-    measurements and models never leave the device unless the user sends them to
-    their own computer. That is why NSPrivacyCollectedDataTypes is empty, and it
-    is a genuinely strong position at review rather than a shortcut.
+    third-party SDKs. Scans, photographs, depth measurements and models never
+    leave the device unless the user sends them to their own computer. That is
+    why NSPrivacyCollectedDataTypes is empty, and it is a genuinely strong
+    position at review rather than a shortcut.
 
-    If that ever stops being true, this file must change in the same commit.
+    ONE EXCEPTION, AND IT MUST NOT SHIP. This file used to say there were no
+    network calls except to a PC on the user's own Wi-Fi. That stopped being
+    true when the over-the-air self-update went in: Sources/Booster/
+    SelfUpdateService.swift posts the bundle id, the installed build number
+    and the phone's LAN address to a build broker on the internet. It
+    collects nothing about the user and it is development-only, compiled in
+    only when CI injects an endpoint, but it is still a call off the local
+    network and this file is where that gets admitted.
+
+    BEFORE ANY SUBMISSION: strip SelfUpdateService.swift and its section in
+    BoosterTabView, then delete this paragraph. The two go together.
+
+    If anything else ever stops being true, this file must change in the same
+    commit.
 -->
 <plist version="1.0">
 <dict>

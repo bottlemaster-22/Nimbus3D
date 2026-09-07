@@ -13,6 +13,9 @@ struct BoosterDeviceRow: View {
     let isBusy: Bool
     let onPair: () -> Void
     let onSendScan: () -> Void
+    /// Development only. Nil on any build without the diagnostics sender,
+    /// and the button then does not exist rather than being greyed out.
+    let onSendDiagnostics: (() -> Void)?
 
     var body: some View {
         HStack(spacing: 12) {
@@ -26,6 +29,27 @@ struct BoosterDeviceRow: View {
                 Text(statusText)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+
+                // A BUTTON, NOT A SWIPE.
+                //
+                // This used to be a trailing swipe action, which meant the
+                // only way to know it existed was to be told. The owner had
+                // to be talked through finding it twice, which is the
+                // definition of the wrong control. It is a development
+                // feature, so it can afford to look plain, but it cannot
+                // afford to be invisible.
+                //
+                // `.bordered` rather than the automatic style on purpose:
+                // a List row containing more than one button needs an
+                // explicit style, or a tap anywhere on the row fires all of
+                // them.
+                if let sendDiagnostics = onSendDiagnostics, device.isPaired {
+                    Button("Send diagnostics", action: sendDiagnostics)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(!device.isReachable || isBusy)
+                        .padding(.top, 4)
+                }
             }
 
             Spacer()

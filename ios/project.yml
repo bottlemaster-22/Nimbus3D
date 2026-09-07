@@ -229,6 +229,18 @@ targets:
       # Bonjour discovery, pairing, chunked upload, job stream (iOS client).
       - path: Sources/Booster
         name: Booster
+      # THE PRIVACY MANIFEST, which was written months ago and then never
+      # referenced by anything, so it has been sitting in Support/ and NOT
+      # going into the bundle. Apple has required it for submission since
+      # May 2024, and a manifest that is not in the app is the same as no
+      # manifest at all.
+      #
+      # `buildPhase: resources` is load-bearing: without it XcodeGen puts a
+      # file in the compile-sources phase, and the build would either fail
+      # or silently drop it. It has to land at the bundle root under its
+      # own name, which a resource copy of a single file does.
+      - path: Support/PrivacyInfo.xcprivacy
+        buildPhase: resources
       # Bundled assets. STAYS optional, and this is the one case where that is
       # correct rather than temporary: the folder is empty, git does not track
       # empty folders, so it is genuinely absent on a fresh CI checkout.
