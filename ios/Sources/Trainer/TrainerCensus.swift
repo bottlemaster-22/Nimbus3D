@@ -443,6 +443,21 @@ struct TrainerCensus: Codable {
     /// not bump it, which is the rule the rest of the format already uses.
     var formatVersion: Int = 1
     var scanID: ScanID
+
+    /// WHICH BUILD TRAINED THIS. "0.1.0 (92)".
+    ///
+    /// Not derivable from anything else in the bundle. capture_bundle.json
+    /// carries an appVersion, but that is stamped when the scan is SHOT,
+    /// so a scan captured on one build and re-trained on three later ones
+    /// produces four censuses all claiming the capture build. That is
+    /// exactly what happened while measuring the speed work: two runs a
+    /// day apart both read "0.1.0 (44)" and there was no way to tell from
+    /// the file which trainer produced either of them.
+    ///
+    /// Timings are only comparable between runs of a KNOWN build, so this
+    /// is the field that makes every other number in here mean something.
+    var appVersion: String = BrandConfig.versionString
+
     var startedAt: Date
     var finishedAt: Date?
     /// "completed", "cancelled", "stopped early" or "failed: <reason>". The
