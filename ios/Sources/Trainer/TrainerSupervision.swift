@@ -326,6 +326,14 @@ final class TrainerSupervisionBuilder {
         // same object. `SmartFrameAuthority` is a Sendable struct whose own
         // accessors take no lock, so one lookup serves the whole frame.
         let frameAuthority = authority?.map(for: frame.index)
+        // The two fallbacks are NOT the same value, and collapsing them into
+        // one optional would have changed behaviour silently. The map-level
+        // accessors returned `.far` and 0 when the MAP existed but had no
+        // entry for this frame, and the call site's own `?? .near` / `?? 0.5`
+        // applied only when there was no authority map at all. Two distinct
+        // cases, two distinct answers, both preserved here.
+        let noEntryRegime: SmartDepthRegime = (authority == nil) ? .near : .far
+        let noEntryAuthority: Float = (authority == nil) ? 0.5 : 0
         let affine = trust?.depthAffine(frame: frame.index) ?? .identity
         let qcWeight = TrainerMath.clamp(frame.qc.weight, 0, 1)
         let modeRadius = Swift.max(settings.modeWindowRadius, 1)
@@ -347,9 +355,10 @@ final class TrainerSupervisionBuilder {
                 let pixelIndex = py * size.width + px
 
                 let rawEdge: EdgeClass = index < edgeMap.count ? edgeMap[index] : .none
-                let regime = frameAuthority?.regime(sampleIndex: index) ?? .near
-                let authorityValue = frameAuthority?.authority(sampleIndex: index)
-                    ?? 0.5
+                let regime = frameAuthority?.regime(sampleIndex: index)
+                    ?? noEntryRegime
+                let authorityValue = frameAuthority?.value(sampleIndex: index)
+                    ?? noEntryAuthority
 
                 var sample = TrainerDepthSample()
                 sample.pixelIndex = UInt32(pixelIndex)
