@@ -235,6 +235,32 @@ final class TrainerBudgetGovernor {
 
     private var lastThermalPoll = Date.distantPast
     private var cachedThermal: ThermalLevel = .nominal
+    /// Consecutive POLLS, not iterations, at or above `degradeAt`.
+    private var consecutiveWarmPolls = 0
+
+    /// How many consecutive warm polls it takes before the first thermal
+    /// cut. At the default five-second sample interval this is fifteen
+    /// seconds of sustained warmth.
+    ///
+    /// WHY THIS EXISTS. `degradeAt` defaults to `.fair`, and `.fair` is
+    /// iOS's LOWEST non-nominal thermal state. A phone running a Metal
+    /// trainer flat out sits at `.fair` as a matter of course; it is what
+    /// "this device is doing work" looks like, not a warning. Apple's own
+    /// guidance treats `.serious` as the point to shed load.
+    ///
+    /// So the first poll of any real run found `.fair`, cut immediately,
+    /// and because `lower(...)` is one-way and global the run never got it
+    /// back. The owner, on a build where the model quality had just been
+    /// fixed: "It still decreases everything almost instantly at normal
+    /// temperatures and normal temperature climbs." That is this.
+    ///
+    /// Raising `degradeAt` to `.serious` was the obvious alternative and it
+    /// does not work: `thermalVerdict` tests pause before degrade and
+    /// `pauseAt` is already `.serious`, so degrade would become unreachable
+    /// and the ladder would lose its middle rung entirely. With four
+    /// thermal states and three thresholds there is no room to shift the
+    /// ladder up. Hysteresis is the change that fits.
+    private static let warmPollsBeforeDegrading = 3
 
     // MARK: - Where the run is right now
     //
@@ -423,14 +449,35 @@ final class TrainerBudgetGovernor {
     /// battery.
     func thermalVerdict(now: Date = Date()) -> (verdict: TrainerThermalVerdict, level: ThermalLevel) {
         let policy = current.thermalPolicy
+        // The counter advances on a POLL, never on a call. This function
+        // runs every iteration and polls every few seconds, so counting
+        // calls would reach any threshold within a millisecond and the
+        // hysteresis below would be decorative.
         if now.timeIntervalSince(lastThermalPoll) >= policy.sampleIntervalSeconds {
             cachedThermal = ThermalLevel(ProcessInfo.processInfo.thermalState)
             lastThermalPoll = now
+            if cachedThermal >= policy.degradeAt {
+                consecutiveWarmPolls += 1
+            } else {
+                consecutiveWarmPolls = 0
+            }
         }
         let level = cachedThermal
+
+        // Pausing and aborting stay IMMEDIATE. Those levels are iOS saying
+        // the device is in trouble now, and waiting three polls to believe
+        // it would be the wrong kind of patience.
         if level >= policy.abortAt { return (.abort, level) }
         if level >= policy.pauseAt { return (.pause, level) }
-        if level >= policy.degradeAt { return (.degrade, level) }
+
+        // Degrading waits for the warmth to persist. See
+        // `warmPollsBeforeDegrading`: a single `.fair` reading is the normal
+        // condition of a phone doing this work, and treating it as a signal
+        // cut every run to pieces in its first seconds.
+        if level >= policy.degradeAt,
+           consecutiveWarmPolls >= Self.warmPollsBeforeDegrading {
+            return (.degrade, level)
+        }
         return (.run, level)
     }
 
