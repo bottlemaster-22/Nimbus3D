@@ -249,11 +249,22 @@ struct TrainerSplatRaster {
     packed_float2 mean2D;               //  0..7
     float         depth;                //  8..11
     half          radiusX, radiusY;     // 12..15
-    half          conic0, conic1, conic2; // 16..21
-    half          opacity;              // 22..23
-    half          color0, color1, color2; // 24..29
-    half          pad;                  // 30..31
-};                                      // 32 bytes
+    /// FLOAT, and this is the field that cost 2 dB when it was half.
+    ///
+    /// The conic is the INVERSE covariance, so the rasteriser evaluates
+    /// `a*dx*dx + 2*b*dx*dy + c*dy*dy` with dx and dy up to tens of pixels,
+    /// making the products hundreds of times the coefficients, and then feeds
+    /// the result to exp(). Half's three decimal digits of relative precision
+    /// go in at the widest point of that expression and come out amplified.
+    /// Measured: held-out PSNR 14.53 against a 16.0 to 16.8 band, and
+    /// trained-view 14.98 against 18.7, so the model got worse at fitting the
+    /// frames it looks at directly.
+    packed_float3 conic;                // 16..27
+    half          opacity;              // 28..29
+    half          color0, color1;       // 30..33
+    half          color2;               // 34..35
+    half          pad0, pad1;           // 36..39
+};                                      // 40 bytes
 
 struct TrainerSplatDraw {
     packed_float3 meanCam;    //  0..11
@@ -1006,9 +1017,7 @@ kernel void trainer_preprocess(
     r.depth = d.depth;
     r.radiusX = extent.x;
     r.radiusY = extent.y;
-    r.conic0 = half(conic.x);
-    r.conic1 = half(conic.y);
-    r.conic2 = half(conic.z);
+    r.conic = conic;
     r.opacity = half(d.opacity);
     r.color0 = half(rgb.x);
     r.color1 = half(rgb.y);
@@ -1085,14 +1094,14 @@ kernel void trainer_duplicate_keys(
     // is a real if small quality trade, taken deliberately for a quarter of
     // the sort's energy.
     const float norm = clamp((d.depth - cam.nearPlane) / span, 0.0f, 1.0f);
-    const uint depthKey = uint(norm * 8191.0f);
+    const uint depthKey = uint(norm * 65535.0f);
 
     uint cursor = offsets[gid];
     for (int ty = minY; ty < maxY; ++ty) {
         for (int tx = minX; tx < maxX; ++tx) {
             if (cursor >= instanceCap) { return; }
             const uint tile = uint(ty) * cam.tileCountX + uint(tx);
-            keys[cursor] = (tile << 13) | depthKey;
+            keys[cursor] = (tile << 16) | depthKey;
             values[cursor] = gid;
             cursor += 1u;
         }
@@ -1201,11 +1210,11 @@ kernel void trainer_tile_ranges(
     uint                 gid         [[thread_position_in_grid]]
 ) {
     if (gid >= count) { return; }
-    const uint tile = keys[gid] >> 13;
+    const uint tile = keys[gid] >> 16;
     if (gid == 0u) {
         tileRanges[2u * tile] = 0u;
     } else {
-        const uint prev = keys[gid - 1u] >> 13;
+        const uint prev = keys[gid - 1u] >> 16;
         if (prev != tile) {
             tileRanges[2u * prev + 1u] = gid;
             tileRanges[2u * tile] = gid;
@@ -1239,11 +1248,9 @@ kernel void trainer_rasterize_forward(
     uint                            tid         [[thread_index_in_threadgroup]]
 ) {
     threadgroup float2 tgXY[TRAINER_TILE_AREA];
-    // HALF, not float. The values now arrive from TrainerSplatRaster's half
-    // fields, so widening them here preserved nothing and cost 2 KB of
-    // threadgroup memory per threadgroup, on a GPU where threadgroup memory is
-    // one of the two things limiting how many run at once.
-    threadgroup half4 tgConicOpacity[TRAINER_TILE_AREA];
+    // FLOAT4 again. Staging as half was exact only while the conic itself was
+    // half, and the conic went back to float because half cost 2 dB there.
+    threadgroup float4 tgConicOpacity[TRAINER_TILE_AREA];
     threadgroup float4 tgColorDepth[TRAINER_TILE_AREA];
 
     const uint tileID = tgPos.y * cam.tileCountX + tgPos.x;
@@ -1275,14 +1282,12 @@ kernel void trainer_rasterize_forward(
             // threadgroups run at once. The backward rasteriser keeps
             // its own tgIndex because it genuinely reads it.
             tgXY[tid] = float2(d.mean2D);
-            tgConicOpacity[tid] = half4(
-                d.conic0, d.conic1, d.conic2, d.opacity
-            );
+            tgConicOpacity[tid] = float4(float3(d.conic), float(d.opacity));
             tgColorDepth[tid] = float4(
                 float(d.color0), float(d.color1), float(d.color2), d.depth
             );
         } else {
-            tgConicOpacity[tid] = half4(0.0h);
+            tgConicOpacity[tid] = float4(0.0f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1290,7 +1295,7 @@ kernel void trainer_rasterize_forward(
             const uint here = min(TRAINER_TILE_AREA, total - b * TRAINER_TILE_AREA);
             for (uint j = 0; j < here; ++j) {
                 const float2 delta = tgXY[j] - pixelCenter;
-                const float4 co = float4(tgConicOpacity[j]);
+                const float4 co = tgConicOpacity[j];
                 const float power = -0.5f * (co.x * delta.x * delta.x
                                              + co.z * delta.y * delta.y)
                                     - co.y * delta.x * delta.y;
@@ -1842,11 +1847,9 @@ kernel void trainer_rasterize_backward(
 ) {
     threadgroup uint   tgIndex[TRAINER_TILE_AREA];
     threadgroup float2 tgXY[TRAINER_TILE_AREA];
-    // HALF, not float. The values now arrive from TrainerSplatRaster's half
-    // fields, so widening them here preserved nothing and cost 2 KB of
-    // threadgroup memory per threadgroup, on a GPU where threadgroup memory is
-    // one of the two things limiting how many run at once.
-    threadgroup half4 tgConicOpacity[TRAINER_TILE_AREA];
+    // FLOAT4 again. Staging as half was exact only while the conic itself was
+    // half, and the conic went back to float because half cost 2 dB there.
+    threadgroup float4 tgConicOpacity[TRAINER_TILE_AREA];
     threadgroup float4 tgColorDepth[TRAINER_TILE_AREA];
 
 
@@ -1969,14 +1972,12 @@ kernel void trainer_rasterize_backward(
             const TrainerSplatRaster d = raster[splatIndex];
             tgIndex[tid] = splatIndex;
             tgXY[tid] = float2(d.mean2D);
-            tgConicOpacity[tid] = half4(
-                d.conic0, d.conic1, d.conic2, d.opacity
-            );
+            tgConicOpacity[tid] = float4(float3(d.conic), float(d.opacity));
             tgColorDepth[tid] = float4(
                 float(d.color0), float(d.color1), float(d.color2), d.depth
             );
         } else {
-            tgConicOpacity[tid] = half4(0.0h);
+            tgConicOpacity[tid] = float4(0.0f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1995,7 +1996,7 @@ kernel void trainer_rasterize_backward(
                 if (globalIndex > lastContributor) { continue; }
 
                 const float2 delta = tgXY[j] - pixelCenter;
-                const float4 co = float4(tgConicOpacity[j]);
+                const float4 co = tgConicOpacity[j];
                 const float power = -0.5f * (co.x * delta.x * delta.x
                                              + co.z * delta.y * delta.y)
                                     - co.y * delta.x * delta.y;

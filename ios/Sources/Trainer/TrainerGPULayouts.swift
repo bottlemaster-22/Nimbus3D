@@ -90,7 +90,7 @@ enum TrainerGPUConstants {
     /// tiles and a 720-pixel long edge the worst case is a square frame, 45 by
     /// 45, which is 2025. It fits, and it is worth knowing it fits by only
     /// twenty-two tiles.
-    static let radixKeyBits = 24
+    static let radixKeyBits = 32
     static var radixPasses: Int { radixKeyBits / radixBits }
 
     /// Hard ceiling on tile count, because the sort key gives the tile id 16
@@ -359,11 +359,13 @@ struct TrainerSplatRaster {
     var mean2DY: Float = 0          // offset  4
     var depth: Float = 0            // offset  8
     var radiusPackedHalf2: UInt32 = 0   // offset 12  radiusX, radiusY
-    var conicPackedHalf2A: UInt32 = 0   // offset 16  conic0, conic1
-    var conicPackedHalf2B: UInt32 = 0   // offset 20  conic2, opacity
-    var colorPackedHalf2A: UInt32 = 0   // offset 24  color0, color1
-    var colorPackedHalf2B: UInt32 = 0   // offset 28  color2, pad
-}                                   // 32 bytes
+    var conicX: Float = 0               // offset 16
+    var conicY: Float = 0               // offset 20
+    var conicZ: Float = 0               // offset 24
+    var opacityAndColor0: UInt32 = 0    // offset 28  opacity, color0
+    var colorPackedHalf2A: UInt32 = 0   // offset 32  color1, color2
+    var colorPackedHalf2B: UInt32 = 0   // offset 36  pad0, pad1
+}                                   // 40 bytes
 
 struct TrainerSamplingTopK {
     var r0: Float = 0   // offset  0
