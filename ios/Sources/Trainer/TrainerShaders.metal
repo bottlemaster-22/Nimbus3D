@@ -69,6 +69,17 @@
 #include <metal_atomic>
 using namespace metal;
 
+/// Whether the backward rasteriser may use SIMD-group reductions.
+///
+/// `simd_max` is Apple GPU family 7, A14 and later. Apple7 is the floor for
+/// FULL tier in DeviceCompatibilityProbe, NOT the floor for running, so an
+/// A12 or A13 reaches this kernel and the instruction does not exist there.
+/// A function constant rather than a runtime branch because it is resolved
+/// when the pipeline is specialised: on such a device the instruction is
+/// absent rather than merely skipped, so makeComputePipelineState succeeds
+/// instead of failing and being reported as a missing kernel.
+constant bool kTrainerSimdReduce [[function_constant(0)]];
+
 // ============================================================================
 // MARK: - Constants (mirrored in TrainerGPUConstants)
 // ============================================================================
@@ -718,7 +729,6 @@ kernel void trainer_preprocess(
     if (gid >= cam.splatCount) { return; }
 
     tilesTouched[gid] = 0u;
-    draws[gid].radiusPx = half2(0.0h);
     draws[gid].opacity = 0.0f;
 
     const TrainerSplat s = splats[gid];
@@ -1658,18 +1668,29 @@ kernel void trainer_rasterize_backward(
     // memory after a barrier, so all 256 threads compute the same bound.
     // A per-pixel bound here would be a correctness bug, not an
     // optimisation.
-    threadgroup atomic_uint tgMaxContrib;
-    if (tid == 0u) {
-        atomic_store_explicit(&tgMaxContrib, 0u, memory_order_relaxed);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    // Outside pixels carry lastContributor 0, so every thread can take part
-    // without a branch and without affecting the maximum.
-    atomic_fetch_max_explicit(&tgMaxContrib, lastContributor,
-                              memory_order_relaxed);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint deepest = atomic_load_explicit(&tgMaxContrib,
-                                              memory_order_relaxed);
+    // A SIMD-GROUP MAX, NOT A THREADGROUP MAX.
+    //
+    // This was 256 threads doing a contended atomic max on one threadgroup
+    // address plus two barriers, per tile, per iteration: 391,680 atomics and
+    // 3,060 extra barriers a frame. And it bought nothing, because the maximum
+    // over all 256 pixels of a tile is pinned near `total` by any single pixel
+    // that never saturates, so `lastUsefulBatch` stayed at batches - 1.
+    //
+    // 32 lanes is a different quantity, not a smaller version of the same one.
+    // A SIMD group here is two rows of a 16-wide tile, and how deep a pixel
+    // had to look is strongly correlated over two adjacent rows, so a group
+    // whose pixels all terminated early can skip entries the tile as a whole
+    // cannot. `simd_max` needs no threadgroup memory, no atomics and no
+    // barriers.
+    //
+    // MUST be called by every lane before any per-thread branch: a SIMD-group
+    // reduction with only some lanes participating is undefined. Outside
+    // pixels carry lastContributor 0 and cannot inflate it.
+    // `total` on a device without SIMD-group reductions, which bounds
+    // nothing and leaves the per-lane `continue` below as the only skip:
+    // exactly the behaviour before this optimisation existed.
+    const uint groupDeepest = kTrainerSimdReduce ? simd_max(lastContributor) : total;
+    const uint deepest = groupDeepest;
 
     // A Gaussian at list position g sits in batch (g - 1) / TRAINER_TILE_AREA,
     // because globalIndex is one-based below. Batches above the one holding
@@ -1705,7 +1726,15 @@ kernel void trainer_rasterize_backward(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (inside) {
+        // `batchBase >= groupDeepest` means every entry in this batch is past
+        // the deepest any pixel in THIS SIMD group reached, so the whole loop
+        // is skipped for the group rather than rejected entry by entry, which
+        // is what the forward pass's `if (!done)` does for a finished pixel.
+        //
+        // The two threadgroup_barrier calls stay OUTSIDE this branch, where
+        // they already are. Groups diverge here, and a barrier reachable by
+        // only some lanes is a hang, not a missed optimisation.
+        if (inside && batchBase < groupDeepest) {
             const uint here = min(TRAINER_TILE_AREA, total - batchBase);
             for (int j = int(here) - 1; j >= 0; --j) {
                 const uint globalIndex = batchBase + uint(j) + 1u;
@@ -1815,12 +1844,21 @@ kernel void trainer_preprocess_backward(
     device atomic_float*              cameraGrad [[buffer(9)]],   // omega[3], nu[3]
     const device TrainerSplatStats*   stats      [[buffer(10)]],
     constant TrainerCameraUniforms&   cam        [[buffer(11)]],
+    const device uint*                tilesTouched [[buffer(12)]],
     uint                              gid        [[thread_position_in_grid]]
 ) {
     if (gid >= cam.splatCount) { return; }
-    // Both halves are written together by trainer_preprocess, and a splat it
-    // rejected has both at zero, so one component answers the question.
-    if (draws[gid].radiusPx.x <= 0.0h) { return; }
+    // WAS `draws[gid].radiusPx.x <= 0.0h`, which cost trainer_preprocess two
+    // scattered stores into a 64-byte record for EVERY splat, drawn or not,
+    // purely so this line had something to read. `tilesTouched` answers the
+    // same question and is a dense uint per splat, so this is a coalesced
+    // 1.2 MB read instead of pulling a whole cache line per rejected splat.
+    //
+    // Provably the same predicate: every early return in trainer_preprocess
+    // leaves tilesTouched[gid] at the 0 its own prologue wrote, and the only
+    // path that writes `draws[gid]` writes tilesTouched[gid] = touched two
+    // lines later with touched > 0 guaranteed by the maxX <= minX check.
+    if (tilesTouched[gid] == 0u) { return; }
 
     const TrainerSplat s = splats[gid];
     const TrainerSplatDraw d = draws[gid];

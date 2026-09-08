@@ -344,6 +344,7 @@ enum TrainerBind {
         static let cameraGrad = 9
         static let stats = 10
         static let camera = 11
+        static let tilesTouched = 12
     }
 
     enum SamplingRateUpdate {

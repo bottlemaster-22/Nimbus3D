@@ -71,6 +71,31 @@ final class TrainerPipelines {
 
     init(device: MTLDevice, library: MTLLibrary) throws {
 
+        /// Builds a kernel that reads `kTrainerSimdReduce`. Specialisation
+        /// happens here, so the branch the constant rules out is gone before
+        /// the function is validated.
+        func build(
+            _ name: String, simdReduce: Bool
+        ) throws -> MTLComputePipelineState {
+            let values = MTLFunctionConstantValues()
+            var flag = simdReduce
+            values.setConstantValue(&flag, type: .bool, index: 0)
+            let function: MTLFunction
+            do {
+                function = try library.makeFunction(name: name, constantValues: values)
+            } catch {
+                throw TrainerError.missingKernel(name)
+            }
+            function.label = name
+            do {
+                return try device.makeComputePipelineState(function: function)
+            } catch {
+                throw TrainerError.pipelineFailed(
+                    kernel: name, reason: error.localizedDescription
+                )
+            }
+        }
+
         func build(_ name: String) throws -> MTLComputePipelineState {
             guard let function = library.makeFunction(name: name) else {
                 throw TrainerError.missingKernel(name)
@@ -106,7 +131,13 @@ final class TrainerPipelines {
         ssimBackward = try build(TrainerKernel.ssimBackward)
         lossDepth = try build(TrainerKernel.lossDepth)
         lossFinalize = try build(TrainerKernel.lossFinalize)
-        rasterizeBackward = try build(TrainerKernel.rasterizeBackward)
+        // Specialised: its batch bound uses simd_max, which is Apple7 (A14)
+        // and later. Asking the device means an A12 or A13 builds the
+        // unbounded variant instead of failing to build a pipeline.
+        rasterizeBackward = try build(
+            TrainerKernel.rasterizeBackward,
+            simdReduce: device.supportsFamily(.apple7)
+        )
         preprocessBackward = try build(TrainerKernel.preprocessBackward)
         samplingRateUpdate = try build(TrainerKernel.samplingRateUpdate)
         filter3DFinalize = try build(TrainerKernel.filter3DFinalize)
@@ -747,6 +778,13 @@ struct TrainerGPU {
             resources.cameraGrad, offset: 0, index: TrainerBind.PreprocessBackward.cameraGrad
         )
         encoder.setBuffer(resources.stats, offset: 0, index: TrainerBind.PreprocessBackward.stats)
+        // The "was this splat drawn" predicate. Replaces two scattered stores
+        // per splat in trainer_preprocess; see the note at that kernel's
+        // prologue.
+        encoder.setBuffer(
+            resources.tilesTouched, offset: 0,
+            index: TrainerBind.PreprocessBackward.tilesTouched
+        )
         encoder.setBytes(
             &camera,
             length: MemoryLayout<TrainerCameraUniforms>.stride,
