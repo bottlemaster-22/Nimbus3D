@@ -484,6 +484,23 @@ static inline float trainer_finiteOrZero(float value) {
         ? 0.0f : value;
 }
 
+/// Adds `value` to a plain device float. NOT atomic, and the caller has to
+/// have earned that.
+///
+/// `trainer_preprocess_backward` runs one thread per splat and is the only
+/// writer of `splatGrad[gid]`, so its eleven accumulations were eleven device
+/// atomics contending with nothing at all. 243,000 splats times eleven is 2.7
+/// million read-modify-writes an iteration that could be plain loads and
+/// stores.
+///
+/// Use this ONLY where one thread provably owns the address for the whole
+/// dispatch. The rasterisers do not: many pixels add to one splat there, and
+/// those keep `trainer_atomicAdd`.
+static inline void trainer_ownedAdd(device float* target, float value) {
+    if (trainer_finiteOrZero(value) == 0.0f) { return; }
+    *target += value;
+}
+
 /// Adds `value` to a device float atomically. One place so the memory order is
 /// the same everywhere.
 static inline void trainer_atomicAdd(device atomic_float* target, float value) {
@@ -828,12 +845,41 @@ kernel void trainer_preprocess(
     const float radius = 3.0f * sqrt(max(mid + disc, 1e-9f));
     if (radius < 0.5f) { return; }
 
-    // The tight per-axis half-extents of that same ellipse. Scaled up by a
-    // thousandth before the half conversion so rounding can only ever ADD a
-    // tile, never drop one: half has about 5e-4 of relative precision, so
-    // 1.001 covers it at any magnitude this reaches.
-    const half2 extent = half2(3.0f * sqrt(max(sa, 1e-9f)) * 1.001f,
-                               3.0f * sqrt(max(sc, 1e-9f)) * 1.001f);
+    // WHERE THIS GAUSSIAN CAN ACTUALLY EXCEED THE ALPHA THRESHOLD, which
+    // is nearly always tighter than three sigma and sometimes very much
+    // tighter.
+    //
+    // The rasteriser keeps a sample only when
+    //     opacity * exp(-0.5 * d^T Sigma^-1 d) >= cam.minAlpha
+    // so the whole region it can contribute to is the level set
+    //     d^T Sigma^-1 d <= 2 * ln(opacity / minAlpha)
+    // and the half-extent along an axis is sqrt(that) * sqrt(Sigma_axis).
+    // Three sigma is the level set at 9, so this is the same formula with a
+    // level that depends on how faint the splat is rather than a constant.
+    //
+    // EXACT. A tile outside this box contains no pixel where the alpha test
+    // can pass, and the rasteriser already rejects every one of those
+    // per pixel. Nothing that contributed is lost. Capped at 9 so it can only
+    // ever shrink the old box, never grow it.
+    //
+    // This matters because the population is faint. A finished run has a
+    // median peak alpha of 0.0038 against a minAlpha of 1/255: for a splat at
+    // alpha 0.01 the level set is 1.9 rather than 9, which is 1.4 sigma
+    // instead of 3 and a box a quarter of the area. The existing alpha cull
+    // below removes only the splats that reach NO pixel; this shrinks every
+    // splat that survives it.
+    const float alphaForExtent = trainer_sigmoid(s.opacityLogit) * comp2D * comp3D;
+    if (alphaForExtent < cam.minAlpha) { return; }
+    const float levelSet = clamp(
+        2.0f * log(alphaForExtent / max(cam.minAlpha, 1e-8f)), 0.0f, 9.0f
+    );
+    const float kExtent = sqrt(levelSet);
+
+    // Scaled up by a thousandth before the half conversion so rounding can
+    // only ever ADD a tile, never drop one: half has about 5e-4 of relative
+    // precision, so 1.001 covers it at any magnitude this reaches.
+    const half2 extent = half2(kExtent * sqrt(max(sa, 1e-9f)) * 1.001f,
+                               kExtent * sqrt(max(sc, 1e-9f)) * 1.001f);
     // Read back through the half so this kernel's tile count is computed from
     // exactly the bits `trainer_duplicate_keys` will later read.
     const float radiusX = float(extent.x);
@@ -865,7 +911,8 @@ kernel void trainer_preprocess(
     if (rgb.z < 0.0f) { rgb.z = 0.0f; clampedMask |= 4u; }
 
     const float comp = comp2D * comp3D;
-    const float alpha = trainer_sigmoid(s.opacityLogit) * comp;
+    // Already computed above, where it sized the tile footprint.
+    const float alpha = alphaForExtent;
 
     // A GAUSSIAN THIS FAINT CANNOT REACH A SINGLE PIXEL, SO STOP HERE.
     //
@@ -1956,7 +2003,12 @@ kernel void trainer_preprocess_backward(
     const device float*               sh         [[buffer(1)]],
     const device TrainerSplatDraw*    draws      [[buffer(2)]],
     const device TrainerSplatGrad2D*  splatGrad2D [[buffer(3)]],
-    device TrainerSplatGradAtomic*    splatGrad  [[buffer(7)]],
+    // PLAIN, not atomic. This kernel runs one thread per splat and is the
+    // only writer of splatGrad[gid] for the whole dispatch, so its eleven
+    // accumulations were eleven device read-modify-writes contending with
+    // nothing: 2.7 million of them an iteration. Same buffer, same bytes,
+    // same layout; only the view differs. See trainer_ownedAdd.
+    device TrainerSplatGrad*          splatGrad  [[buffer(7)]],
     device float*                     shGrad     [[buffer(8)]],
     device atomic_float*              cameraGrad [[buffer(9)]],   // omega[3], nu[3]
     const device TrainerSplatStats*   stats      [[buffer(10)]],
@@ -1993,7 +2045,7 @@ kernel void trainer_preprocess_backward(
     // stated approximation at the top of this file.
     const float sig = trainer_sigmoid(s.opacityLogit);
     const float dLdOpacityLogit = dLdAlphaMul * d.comp * sig * (1.0f - sig);
-    trainer_atomicAdd(&splatGrad[gid].opacity, dLdOpacityLogit);
+    trainer_ownedAdd(&splatGrad[gid].opacity, dLdOpacityLogit);
 
     // --- colour channels the forward clamped at 0 ---------------------------
     float3 dLdColor = dLdColor0;
@@ -2148,9 +2200,9 @@ kernel void trainer_preprocess_backward(
     const float3 dLdLogScale = float3(RtG[0][0] * scale.x,
                                       RtG[1][1] * scale.y,
                                       RtG[2][2] * scale.z);
-    trainer_atomicAdd(&splatGrad[gid].scale0, dLdLogScale.x);
-    trainer_atomicAdd(&splatGrad[gid].scale1, dLdLogScale.y);
-    trainer_atomicAdd(&splatGrad[gid].scale2, dLdLogScale.z);
+    trainer_ownedAdd(&splatGrad[gid].scale0, dLdLogScale.x);
+    trainer_ownedAdd(&splatGrad[gid].scale1, dLdLogScale.y);
+    trainer_ownedAdd(&splatGrad[gid].scale2, dLdLogScale.z);
 
     // --- rotation -----------------------------------------------------------
     // dL/dR = dL/dM * S^T (S diagonal).
@@ -2186,10 +2238,10 @@ kernel void trainer_preprocess_backward(
     const float qLen = max(length(qRaw), 1e-8f);
     const float4 qHat = qRaw / qLen;
     const float4 dLdQRaw = (dLdQ - qHat * dot(qHat, dLdQ)) / qLen;
-    trainer_atomicAdd(&splatGrad[gid].rot0, dLdQRaw.x);
-    trainer_atomicAdd(&splatGrad[gid].rot1, dLdQRaw.y);
-    trainer_atomicAdd(&splatGrad[gid].rot2, dLdQRaw.z);
-    trainer_atomicAdd(&splatGrad[gid].rot3, dLdQRaw.w);
+    trainer_ownedAdd(&splatGrad[gid].rot0, dLdQRaw.x);
+    trainer_ownedAdd(&splatGrad[gid].rot1, dLdQRaw.y);
+    trainer_ownedAdd(&splatGrad[gid].rot2, dLdQRaw.z);
+    trainer_ownedAdd(&splatGrad[gid].rot3, dLdQRaw.w);
 
     // --- mean ---------------------------------------------------------------
     // (a) through the projection of the centre
@@ -2218,9 +2270,9 @@ kernel void trainer_preprocess_backward(
     // World-space mean gradient: through the view rotation, plus the SH view
     // direction, which also depends on the world position.
     const float3 dLdMeanWorld = transpose(W) * dLdMeanCam + dLdRawDir;
-    trainer_atomicAdd(&splatGrad[gid].mean0, dLdMeanWorld.x);
-    trainer_atomicAdd(&splatGrad[gid].mean1, dLdMeanWorld.y);
-    trainer_atomicAdd(&splatGrad[gid].mean2, dLdMeanWorld.z);
+    trainer_ownedAdd(&splatGrad[gid].mean0, dLdMeanWorld.x);
+    trainer_ownedAdd(&splatGrad[gid].mean1, dLdMeanWorld.y);
+    trainer_ownedAdd(&splatGrad[gid].mean2, dLdMeanWorld.z);
 
     // --- camera se(3) delta (F1) --------------------------------------------
     // Left perturbation: p_cam -> (I + omega^) p_cam + nu, W -> (I + omega^) W.
