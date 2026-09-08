@@ -898,16 +898,33 @@ enum SmartImageLoader {
         }
         guard drew else { return nil }
 
-        var luma = [Float](repeating: 0, count: w * h)
-        var rgb = [SIMD3<Float>](repeating: .zero, count: w * h)
-        for i in 0..<(w * h) {
-            let r = Float(pixels[i * 4 + 0]) / 255
-            let g = Float(pixels[i * 4 + 1]) / 255
-            let b = Float(pixels[i * 4 + 2]) / 255
-            rgb[i] = SIMD3<Float>(r, g, b)
-            // Kept in sRGB space deliberately: saturation is a property of the
-            // encoded pixel, not of scene radiance.
-            luma[i] = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        // Both uninitialised on purpose. The loop assigns every element of
+        // both before anything reads either, so the `repeating:` form's
+        // zeroing was 7.78 MB of memset per decode that the very next
+        // instruction overwrote.
+        let count = w * h
+        let luma = [Float](unsafeUninitializedCapacity: count) { buffer, n in
+            n = count
+            for i in 0..<count {
+                let r = Float(pixels[i * 4 + 0]) / 255
+                let g = Float(pixels[i * 4 + 1]) / 255
+                let b = Float(pixels[i * 4 + 2]) / 255
+                // Kept in sRGB space deliberately: saturation is a property of
+                // the encoded pixel, not of scene radiance.
+                buffer[i] = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            }
+        }
+        let rgb = [SIMD3<Float>](
+            unsafeUninitializedCapacity: count
+        ) { buffer, n in
+            n = count
+            for i in 0..<count {
+                buffer[i] = SIMD3<Float>(
+                    Float(pixels[i * 4 + 0]) / 255,
+                    Float(pixels[i * 4 + 1]) / 255,
+                    Float(pixels[i * 4 + 2]) / 255
+                )
+            }
         }
         return SmartImage(width: w, height: h, luma: luma, rgb: rgb)
     }

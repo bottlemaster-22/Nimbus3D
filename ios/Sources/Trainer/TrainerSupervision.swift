@@ -403,12 +403,23 @@ final class TrainerSupervisionBuilder {
         }
 
         let pixelCount = fixedSize.pixelCount
-        var groundTruth = [Float](repeating: 0, count: pixelCount * 3)
-        for i in 0..<pixelCount {
-            let rgb = image.rgb[i]
-            groundTruth[i * 3 + 0] = rgb.x
-            groundTruth[i * 3 + 1] = rgb.y
-            groundTruth[i * 3 + 2] = rgb.z
+        // NOT `[Float](repeating: 0, ...)`. That form zeroes every byte and
+        // then this loop overwrites every byte, so the memset is pure waste:
+        // 18.66 MB of it per iteration across the five allocations the
+        // supervision build makes, on the CPU, on the thread the GPU is
+        // waiting behind. `unsafeUninitializedCapacity` skips the zeroing and
+        // is safe here for the one reason that matters: EVERY element is
+        // assigned before any element is read.
+        let groundTruth = [Float](
+            unsafeUninitializedCapacity: pixelCount * 3
+        ) { buffer, initialized in
+            for i in 0..<pixelCount {
+                let rgb = image.rgb[i]
+                buffer[i * 3 + 0] = rgb.x
+                buffer[i * 3 + 1] = rgb.y
+                buffer[i * 3 + 2] = rgb.z
+            }
+            initialized = pixelCount * 3
         }
 
         let framePose = pose(for: frame)
@@ -683,7 +694,6 @@ final class TrainerSupervisionBuilder {
         intrinsics k: CameraIntrinsics,
         size: TrainerRenderSize
     ) -> [Float] {
-        var pixels = [Float](repeating: 0, count: size.pixelCount * 3)
         let rotationInverse = pose.rotation.simd.inverse
         // ONE lock for the frame, not one per pixel.
         //
@@ -697,17 +707,26 @@ final class TrainerSupervisionBuilder {
         // one image out of two different backgrounds, torn partway down the
         // frame. This cannot.
         let map = background.cubemapSnapshot
-        for y in 0..<size.height {
-            for x in 0..<size.width {
-                let ray = SmartCamera.ray(SIMD2<Float>(Float(x) + 0.5, Float(y) + 0.5), k)
-                let worldRay = rotationInverse.act(ray)
-                let radiance = map.radiance(worldRay)
-                let i = (y * size.width + x) * 3
-                pixels[i + 0] = radiance.x
-                pixels[i + 1] = radiance.y
-                pixels[i + 2] = radiance.z
+        // Uninitialised on purpose: the loop below writes every element before
+        // anything reads one, so zeroing 4.67 MB first is a second full pass
+        // over the memory for nothing.
+        return [Float](
+            unsafeUninitializedCapacity: size.pixelCount * 3
+        ) { pixels, initialized in
+            for y in 0..<size.height {
+                for x in 0..<size.width {
+                    let ray = SmartCamera.ray(
+                        SIMD2<Float>(Float(x) + 0.5, Float(y) + 0.5), k
+                    )
+                    let worldRay = rotationInverse.act(ray)
+                    let radiance = map.radiance(worldRay)
+                    let i = (y * size.width + x) * 3
+                    pixels[i + 0] = radiance.x
+                    pixels[i + 1] = radiance.y
+                    pixels[i + 2] = radiance.z
+                }
             }
+            initialized = size.pixelCount * 3
         }
-        return pixels
     }
 }
