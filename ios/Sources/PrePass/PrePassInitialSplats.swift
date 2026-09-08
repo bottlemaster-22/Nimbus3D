@@ -53,6 +53,118 @@
 import Foundation
 import simd
 
+// MARK: - Reading one keyframe ahead
+
+/// Everything a keyframe needs decoded before its samples can be walked.
+struct PrePassSeedInputs {
+    var depthFrame: PrePassDepthFrame?
+    var points: PrePassFramePoints?
+    var image: PrePassColorImage?
+    /// True when the sidecar existed but would not open, which is data loss
+    /// and is counted differently from a frame that never recorded depth.
+    var depthUnreadable = false
+}
+
+/// Decodes ONE keyframe ahead, on a background queue, so the loading for
+/// frame N+1 happens while frame N's samples are being walked.
+///
+/// WHY: seeding measured 16.65 s of a 22.0 s pre-pass, 76% of it, across 174
+/// keyframes. That is 96 ms a frame, and each frame begins by reading a depth
+/// sidecar, unprojecting 49,152 samples into points and normals, and decoding
+/// a 1920x1440 JPEG, all before a single sample is examined. None of that
+/// needs the previous frame's answer.
+///
+/// The same shape as `TrainerSupervisionPrefetch`, and safe for the same
+/// reason: exactly one thread touches the work at a time. `start` waits for
+/// any previous worker, `take` waits before handing back. Everything captured
+/// here is read-only for the whole pass.
+///
+/// The edge map is deliberately NOT prefetched. `edgeMapFor` arrives as a
+/// non-escaping closure and cannot cross to a worker thread, and it is a
+/// cached lookup rather than a decode, so it stays where it is.
+final class PrePassSeedPrefetch: @unchecked Sendable {
+
+    private let bundle: CaptureBundle
+    private let ref: CaptureBundleRef
+    private let geometry: PrePassDepthGeometry
+    private let maxRange: Float
+    private let width: Int
+    private let height: Int
+
+    private let queue = DispatchQueue(
+        label: "likova.prepass.seed-prefetch", qos: .userInitiated
+    )
+    private var work: DispatchWorkItem?
+    private var key: FrameID?
+    private var built = PrePassSeedInputs()
+
+    init(
+        bundle: CaptureBundle, ref: CaptureBundleRef,
+        geometry: PrePassDepthGeometry, maxRange: Float,
+        width: Int, height: Int
+    ) {
+        self.bundle = bundle
+        self.ref = ref
+        self.geometry = geometry
+        self.maxRange = maxRange
+        self.width = width
+        self.height = height
+    }
+
+    /// Decodes `frame` on this thread. The worker calls it, and so does the
+    /// caller on a miss, so there is one definition of the work.
+    func load(_ frame: CaptureFrame) -> PrePassSeedInputs {
+        var out = PrePassSeedInputs()
+        do {
+            out.depthFrame = try PrePassDepthFrame.load(
+                frame: frame, settings: bundle.settings, at: ref
+            )
+        } catch {
+            out.depthUnreadable = true
+            return out
+        }
+        guard let depth = out.depthFrame else { return out }
+        out.points = PrePassFramePoints.build(
+            depthFrame: depth, geometry: geometry, maxRangeMeters: maxRange
+        )
+        out.image = PrePassImageLoader.loadColor(
+            url: ref.url(forRelativePath: frame.imagePath),
+            width: width, height: height
+        )
+        return out
+    }
+
+    func start(_ frame: CaptureFrame) {
+        drain()
+        let item = DispatchWorkItem { [self] in
+            built = load(frame)
+        }
+        key = frame.index
+        work = item
+        queue.async(execute: item)
+    }
+
+    /// The prefetched frame if it is the one being asked for, otherwise nil
+    /// and the caller loads it itself. Blocks until the worker is done either
+    /// way, so nothing is in flight afterwards.
+    func take(_ frame: CaptureFrame) -> PrePassSeedInputs? {
+        work?.wait()
+        work = nil
+        let matched = key == frame.index
+        let value = built
+        key = nil
+        built = PrePassSeedInputs()
+        return matched ? value : nil
+    }
+
+    func drain() {
+        work?.wait()
+        work = nil
+        key = nil
+        built = PrePassSeedInputs()
+    }
+}
+
 // MARK: - Result
 
 struct PrePassInitialSplatOutput {
@@ -357,40 +469,44 @@ enum PrePassInitialSplatBuilder {
         var confidenceHigh = 0
         census.keyframesSelected = keyframes.count
 
-        for frame in keyframes {
+        // Reads one keyframe ahead. See PrePassSeedPrefetch: the depth
+        // sidecar, the point-and-normal build and the JPEG decode are the bulk
+        // of a 96 ms frame and none of them needs the previous frame's answer.
+        let prefetch = PrePassSeedPrefetch(
+            bundle: bundle, ref: ref, geometry: geometry,
+            maxRange: maxRange, width: width, height: height
+        )
+        defer { prefetch.drain() }
+        if let first = keyframes.first { prefetch.start(first) }
+
+        for (keyframeIndex, frame) in keyframes.enumerated() {
             try Task.checkCancellation()
 
-            let depthFrame: PrePassDepthFrame?
-            do {
-                depthFrame = try PrePassDepthFrame.load(
-                    frame: frame, settings: bundle.settings, at: ref
-                )
-            } catch {
+            let inputs = prefetch.take(frame) ?? prefetch.load(frame)
+
+            // STARTED BEFORE THIS FRAME'S SAMPLE LOOP, which is the whole
+            // point: the next frame decodes while these 49,152 samples are
+            // walked. Above the skip guards below, so a frame with no depth
+            // still leaves a worker running for the one after it.
+            if keyframeIndex + 1 < keyframes.count {
+                prefetch.start(keyframes[keyframeIndex + 1])
+            }
+
+            if inputs.depthUnreadable {
                 // A corrupt or unreadable sidecar. Skipped in silence before
                 // the census, so a scan that read no depth at all and a scan
                 // whose depth was all out of range produced the same nothing.
                 keyframesDepthMissing += 1
                 continue
             }
-            guard let depthFrame else {
+            guard let depthFrame = inputs.depthFrame, let points = inputs.points
+            else {
                 keyframesDepthMissing += 1
                 continue
             }
             keyframesDepthLoaded += 1
 
-            // Normals come from the same unprojection ICP uses, so the surface
-            // orientation a splat gets and the orientation a loop closure was
-            // measured against are the same estimate.
-            let points = PrePassFramePoints.build(
-                depthFrame: depthFrame,
-                geometry: geometry,
-                maxRangeMeters: maxRange
-            )
-
-            let image = PrePassImageLoader.loadColor(
-                url: ref.url(forRelativePath: frame.imagePath),
-                width: width, height: height
-            )
+            let image = inputs.image
             // No picture means every splat from this frame comes out mid grey.
             // Worth knowing before someone spends a day wondering why the
             // model is the colour of concrete.
