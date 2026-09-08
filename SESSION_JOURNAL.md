@@ -518,3 +518,74 @@ The owner tests build 188. Read `addedBySplit` and the clone/split ratio first: 
 - `refinedPoses` is a dict keyed by a STRING frame index.
 - `maxRadiusPxBits` is a max over views and scales with 1/z. It is useless as a fixed threshold and its median grows with the number of views sampled.
 - A statistic's median measured over the whole population says nothing about the splats that actually reach a pixel.
+
+---
+
+## 2026-09-08 (late) : Relocation is the mechanism that matters, and it was starved, mis-shaped, and then mis-fixed
+
+**Since the last entry:** the harness answered the "what is wrong" question (the size distribution is 1.8x wide against a good model's 8.9x). This entry is about finding the mechanism that can widen it, which turned out not to be the one I had been changing.
+
+### RELOCATION IS A SPLIT, AND IT IS THE ONLY ONE RUNNING FOR 80% OF THE RUN
+
+Build 182's densify counters, summed over 29 passes:
+
+| counter | value |
+|---|---|
+| addedBySplit | 6,836 |
+| addedByClone | 64 |
+| **relocated** | **21,000** |
+
+Read the relocation code and it is a split: it takes a Gaussian contributing nothing, shrinks the TARGET, and places the pair at +/- an offset from the target's centre with an opacity correction. It uses a dead Gaussian's slot instead of a new one. And because the population reaches its cap around iteration 600, growth closes and relocation is the ONLY thing still able to make a Gaussian smaller for the remaining 80 per cent of the run.
+
+**So every split fix so far had gone onto the branch that barely fires.** `splitGeometry` is now one function with two callers.
+
+### THE DONOR POOL WAS EMPTY BY CONSTRUCTION, AND I EMPTIED IT
+
+`relocationDonorOpacity` and `pruneOpacity` were both 0.02. A Gaussian below `pruneOpacity` is deleted at the end of the same pass, so the band BETWEEN the two thresholds IS the donor pool, and equal thresholds make it empty. Measured on build 182's model: **113 Gaussians of 299,209 (0.04%)** below 0.02. Every donor the census recorded came from the other half of the test, `visAccum <= 0` ("not seen this interval"), giving 835 a pass against an allowance of 15,000. Donors were the binding limit by 18x.
+
+I raised `pruneOpacity` from 0.005 to 0.02 two builds earlier, for a good reason, without checking who else read it. Donor threshold is 0.05 now (22,005 Gaussians, 7.35%, just clearing the 5% allowance), and **the invariant is written on the constant**.
+
+### AND THEN I BROKE THE OPACITY CORRECTION
+
+Unifying `splitGeometry` handed relocation three-axis shrink. But relocation corrects opacity with `o_new = 1 - sqrt(1 - o_old)`, an identity derived for two Gaussians COVERING WHAT THE PARENT COVERED. Three-axis shrink leaves the pair at about half the parent's volume, so the correction dims a region it has also made smaller. At 15,000 relocations a pass that is the whole model losing brightness and coverage at once.
+
+`preserveCoverage: Bool` now makes each caller state its intent. Growth shrinks three axes (reference behaviour, no correction, densification fills the gap). Relocation shrinks one (coverage-preserving, which is what its correction assumes).
+
+### THE PATTERN OF THE NIGHT, WORTH NAMING
+
+Three regressions, all from changes that were individually defensible and interacted:
+
+1. seed fill-the-cap x seed resize
+2. `pruneOpacity` x `relocationDonorOpacity`
+3. unified split geometry x the opacity correction
+
+Every one was caught by reading MEASURED counters, not by reasoning forward. The audit that found the third was done deliberately before the owner tests, because the first two cost a device run each.
+
+### THE FULL UNTESTED STACK (build 182 was the last one measured)
+
+| change | from | to |
+|---|---|---|
+| seed fill fraction | 1.0 | 0.5 |
+| `seedSpacingCompensation` | on | 0 |
+| `splitScreenRadiusPx` | 10 | 0 |
+| `splitShareOfGrowth` | n/a | 0.2 |
+| `relocationDonorOpacity` | 0.02 | 0.05 |
+| relocation split geometry | one-axis, fixed offset | unchanged, now explicit |
+| growth split geometry | one-axis | three-axis + covariance offset |
+| `power > 0` branch | present | removed (provably dead) |
+| exp cutoff in `pad0` | n/a | shipped |
+| dead `tgCount` array | 16 KB | removed |
+
+Also still untested from the build-180 batch: `lateLRFraction` 0.1, `shDCLRMultiplier` 4, `discPriorWeight` 0.001, `pruneOpacity` 0.02, `heldOutFraction` 0.10, per-image PSNR averaging, mean-across-slices PSNR, `gpuStep`.
+
+### NEXT ACTION
+
+Owner tests build 198. Read in this order:
+
+1. **`relocated`** and **`addedBySplit`** vs the clone count. Relocation should be far above 21,000; the growth clone/split ratio should be near 80/20.
+2. **median splat size**, via `tools/offline/analyse.py`. It has never gone below LiDAR sample spacing. Anything under 13 mm is the first time.
+3. **the p90/p10 spread.** 1.8x is the disease. Movement toward 8.9x is the cure working.
+4. held-out PSNR, remembering the measurement itself changed (mean not min, per-image not MSE-domain, 12 frames not 6) so it reads higher for free.
+5. `gpuStep` and the pre-pass total.
+
+If the model comes back dim or dissolving, `relocationDonorOpacity` back to 0.02 first: 5% of the population churned per pass with fresh Adam state is the largest single behavioural change in the stack.
