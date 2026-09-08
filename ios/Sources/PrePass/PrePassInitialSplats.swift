@@ -207,6 +207,14 @@ enum PrePassInitialSplatBuilder {
         /// Never finer than the laser itself sampled.
         var minSpacingMeters: Float = 0.010
         var maxSpacingMeters: Float = 0.120
+        /// HOW FAR SEED SIZES SPREAD EITHER SIDE OF THE NOMINAL SPACING.
+        ///
+        /// 1 restores the old behaviour, where every seed in a scan was exactly
+        /// the same size: measured at 7.397 mm for 100 per cent of this scan's
+        /// 888,951 seeds, a spread of 1.0000x. 2 gives edges half size and flat
+        /// well-measured interiors double, so the seeder hands densification a
+        /// 4x spread to work with instead of nothing. See the use site.
+        var seedSizeSpread: Float = 2
         /// ABSOLUTE FLOOR for trust. Deliberately low, because the real
         /// decision is made RELATIVE to the scan (see `trustedQuantile`).
         ///
@@ -763,7 +771,58 @@ enum PrePassInitialSplatBuilder {
             // and the laser's own sample spacing at this range, which is the
             // range divided by the native focal length in pixels.
             let sensorSpacing = rangeMeters[i] / nativeFX
-            let radius = 0.5 * Swift.max(spacing, sensorSpacing)
+
+            // EVERY SEED IN THIS SCAN WAS THE SAME SIZE. 7.397 mm at every
+            // percentile from p1 to p99, for 100 per cent of the population,
+            // measured on the real pre-pass output. `spacing` is one global
+            // number and `sensorSpacing` only exceeds it beyond 2.726 m, while
+            // the p99 distance from any point to its nearest camera in this
+            // scan is 1.32 m. So the max() always picked the same constant and
+            // the seed set had a size spread of 1.0000x and a sd(log10) of
+            // exactly 0.0000 decades.
+            //
+            // That is the root of the quality gap. The reference capture of
+            // the same room has a size spread of 8.9x and its splat size
+            // tracks local neighbour spacing with a regression slope of 0.94
+            // and correlation 0.79; ours are 0.18 and 0.17, which is no
+            // relationship at all. And nothing downstream can repair it:
+            // cloning copies the parent's scale exactly, and splitting only
+            // ever divides by 1.6, so densification was being asked to
+            // manufacture 0.64 decades of spread out of zero.
+            //
+            // So the seeder produces a size for each sample from what it
+            // already knows about that sample, instead of one number for the
+            // whole scan:
+            //
+            //   * ON A GEOMETRIC EDGE, half size. An edge is where a splat too
+            //     big to fit produces the blur that is most visible, and the
+            //     edge flag is already computed and already stored per cell.
+            //   * ON A FLAT, WELL-MEASURED, HIGH-TRUST INTERIOR, double size.
+            //     A wall does not need millimetre Gaussians, and a bigger one
+            //     covers it for a quarter of the tile cost. `sigma` here is the
+            //     measured or predicted depth noise, so "the surface is where
+            //     we think it is" is exactly the condition under which a large
+            //     splat is safe.
+            //   * OTHERWISE unchanged.
+            //
+            // This is a 4x spread from the seeder alone against 1.0x today,
+            // and it is the only place in the pipeline where size can be made
+            // to follow anything about the local surface.
+            //
+            // `seedSizeSpread` in Settings turns it off: set it to 1 and every
+            // seed is the old single size again.
+            var detail: Float = 1
+            if settings.seedSizeSpread > 1 {
+                let k = settings.seedSizeSpread
+                if onEdge[i] {
+                    detail = 1 / k
+                } else if hasNormal[i]
+                            && weight[i] >= trustCut
+                            && sigma[i] <= 0.5 * Swift.max(spacing, sensorSpacing) {
+                    detail = k
+                }
+            }
+            let radius = 0.5 * Swift.max(spacing, sensorSpacing) * detail
 
             // Two gates, not one. A point can clear the trust cut and still be
             // doubtful because it never got a surface direction, and if the

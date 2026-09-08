@@ -1049,10 +1049,13 @@ kernel void trainer_preprocess(
     //
     // Both rasterisers compute `alpha = min(0.99, opacity * exp(power))` and
     // then drop the contribution when `alpha < minAlpha`, so the exp() is
-    // evaluated for every candidate and thrown away for MEASURED 60.76 per
-    // cent of them (offline simulation of the inner loop, 40 tiles of frame 4,
-    // 7,719,936 pairs; an earlier estimate of "four in five" was too
-    // generous). The test is exactly equivalent to `power < log(minAlpha
+    // evaluated for every candidate and thrown away for 60.76 per cent of
+    // them WITHOUT this cutoff. WITH it, re-measured on the same harness, the
+    // waste is 0.58 per cent: 75,529,323 pairs reach exp() per iteration and
+    // 75,089,548 clear the alpha test. So this is DONE, and anyone reading the
+    // 60.76 figure and proposing a cheaper exp or a harder pre-reject is
+    // costing themselves a build for nothing. The test is exactly equivalent
+    // to `power < log(minAlpha
     // / opacity)`, which needs no exp at all. Computing it here costs one
     // log per SPLAT per iteration in place of one exp per (pixel, splat)
     // pair, and it rides in a pad field the 40-byte record already carries.

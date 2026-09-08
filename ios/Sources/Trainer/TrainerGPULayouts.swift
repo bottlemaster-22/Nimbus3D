@@ -77,19 +77,29 @@ enum TrainerGPUConstants {
     /// and do not fit, which is why the sort is 8 passes and not 4.
     static let radixBits = 4
     static var radixBins: Int { 1 << radixBits }
-    /// Sort keys are 24 bits: `(tileID << 13) | quantisedDepth13`.
+    /// THIS COMMENT USED TO DESCRIBE A DESIGN THE CODE HAS NEVER IMPLEMENTED,
+    /// which is worse than no comment, so here is what actually ships.
     ///
-    /// WAS 32, of which only 27 were ever significant, so two of the eight
-    /// passes sorted bits that are always zero and moved 763,260 keys and
-    /// values for nothing. 24 divides by the 4-bit digit exactly, giving SIX
-    /// passes and an EVEN count, which matters: the sort swaps its buffers
-    /// every pass, so an odd count lands the result in the buffer no reader
-    /// expects.
+    /// Sort keys are 32 bits: `(tileID << 16) | quantisedDepth16`, built in
+    /// `trainer_duplicate_keys` as `uint(norm * 65535.0f)` with the tile
+    /// shifted by 16. Eight 4-bit passes.
     ///
-    /// The tile id gets 11 bits, so this holds up to 2047 tiles. At 16-pixel
-    /// tiles and a 720-pixel long edge the worst case is a square frame, 45 by
-    /// 45, which is 2025. It fits, and it is worth knowing it fits by only
-    /// twenty-two tiles.
+    /// The old text claimed 24 bits, a 13-bit depth, a `tileID << 13` and six
+    /// passes, and claimed "two of the eight passes sort bits that are always
+    /// zero". None of it was true of the code beneath it, and the constant
+    /// below has read 32 throughout. Measured against the real encoding and
+    /// the real 45 x 34 tile grid, only pass 7 (key bits 28 to 31) is
+    /// unconditionally zero. Pass 6 (bits 24 to 27) carries tile-id bits 8 to
+    /// 10, which are populated for every tile index at or above 256, and that
+    /// is the large majority of a 1,530-tile grid.
+    ///
+    /// SO: dropping to six passes is NOT a free removal of dead work. It
+    /// requires the coupled change the old text described - `uint(norm *
+    /// 8191.0f)` and `(tile << 13)` in TrainerShaders.metal together with a 24
+    /// here - landed as ONE commit. Changing this constant alone silently
+    /// drops real tile bits from every pass and corrupts the sort. The even
+    /// count still matters if it is ever done: the sort swaps buffers every
+    /// pass, so an odd count lands the result where no reader looks.
     static let radixKeyBits = 32
     static var radixPasses: Int { radixKeyBits / radixBits }
 
