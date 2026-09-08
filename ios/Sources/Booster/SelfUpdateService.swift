@@ -242,7 +242,7 @@ public final class SelfUpdateService: ObservableObject {
     /// install takes about twenty seconds, so this is awaited immediately
     /// before the request rather than at launch or on a timer.
     private static func touchRelay(config: BrandConfig.SelfUpdateEndpoint) async {
-        var target = URL(string: "http://bottle-relay.local/")
+        var target: URL?
 
         // The broker knows the relay's address; ask it rather than trusting
         // mDNS. `relay_lan_ip` is absent on an older broker and null when it
@@ -264,12 +264,70 @@ public final class SelfUpdateService: ObservableObject {
             }
         }
 
+        // FALLBACK, AND STRICTLY SECOND. The broker is authoritative: its
+        // answer is validated on ingest and again on the way out, and with two
+        // relays on an account it stays unambiguous where a `.local` name does
+        // not. This path exists for a broker too old to carry the key.
+        //
+        // Resolved HERE rather than handed to URLSession, so the SAME private
+        // address check applies to it. `bottle-relay.local` resolves to
+        // whatever answers on the local link, which is a weaker guarantee than
+        // an address the broker vouched for, and Bottle asked for exactly this
+        // gap to be closed.
+        if target == nil,
+           let resolved = await resolveIPv4("bottle-relay.local"),
+           isPrivateIPv4(resolved) {
+            target = URL(string: "http://\(resolved)/")
+        }
+
         guard let url = target else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 2
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         _ = try? await URLSession.shared.data(for: request)
+    }
+
+    /// The first IPv4 a hostname resolves to, or nil.
+    ///
+    /// On a BACKGROUND QUEUE because `getaddrinfo` blocks, and for a `.local`
+    /// name it blocks until mDNS answers or gives up. Calling it directly from
+    /// an async function would park one of Swift concurrency's cooperative
+    /// threads for the duration, which is a small pool and not something a
+    /// best-effort nicety is allowed to consume.
+    private static func resolveIPv4(_ host: String) async -> String? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                var hints = addrinfo()
+                hints.ai_family = AF_INET
+                hints.ai_socktype = SOCK_STREAM
+
+                var head: UnsafeMutablePointer<addrinfo>?
+                guard getaddrinfo(host, nil, &hints, &head) == 0, let first = head
+                else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                defer { freeaddrinfo(head) }
+
+                var text: String?
+                var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                for info in sequence(first: first, next: { $0.pointee.ai_next }) {
+                    guard info.pointee.ai_family == AF_INET,
+                          let raw = info.pointee.ai_addr
+                    else { continue }
+                    var sin = UnsafeRawPointer(raw)
+                        .assumingMemoryBound(to: sockaddr_in.self).pointee
+                    guard inet_ntop(
+                        AF_INET, &sin.sin_addr, &buffer,
+                        socklen_t(INET_ADDRSTRLEN)
+                    ) != nil else { continue }
+                    text = String(cString: buffer)
+                    break
+                }
+                continuation.resume(returning: text)
+            }
+        }
     }
 
     /// `relay_lan_ip` from the broker's status route, or nil for any reason at
