@@ -727,8 +727,15 @@ kernel void trainer_radix_scatter(
     uint                           tid        [[thread_position_in_threadgroup]],
     uint                           bid        [[threadgroup_position_in_grid]]
 ) {
-    // [bin][thread] counts. 16 * 256 * 4 = 16 KB.
-    threadgroup uint tgCount[TRAINER_RADIX_BINS][TRAINER_SCAN_THREADS];
+    // WAS two [bin][thread] arrays, 16 KB each, exactly saturating the
+    // 32 KB a threadgroup may hold on Apple 7 and later. The first was
+    // written by every thread, immediately read back by the SAME thread,
+    // and never touched again: 4,096 threadgroup stores, 4,096 loads and a
+    // barrier per threadgroup per pass, across 8 passes and ~746 blocks an
+    // iteration, to move a value from a register to itself.
+    //
+    // The counts live in `mine` already. Removing the array frees half the
+    // budget, which is what any wider radix digit would need.
     threadgroup uint tgScratch[TRAINER_RADIX_BINS][TRAINER_SCAN_THREADS];
 
     const uint base = bid * TRAINER_SCAN_BLOCK + tid * TRAINER_SCAN_PER_THREAD;
@@ -747,12 +754,12 @@ kernel void trainer_radix_scatter(
             digits[i] = TRAINER_RADIX_BINS;   // sentinel: skipped below
         }
     }
-    for (uint b = 0; b < TRAINER_RADIX_BINS; ++b) { tgCount[b][tid] = mine[b]; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     // Hillis-Steele inclusive scan across threads, all 16 bins at once.
+    // `acc` starts from this thread's own counts. No barrier is needed to
+    // read a register the same thread just wrote; the one that used to sit
+    // here existed only for the round trip through tgCount.
     uint acc[TRAINER_RADIX_BINS];
-    for (uint b = 0; b < TRAINER_RADIX_BINS; ++b) { acc[b] = tgCount[b][tid]; }
+    for (uint b = 0; b < TRAINER_RADIX_BINS; ++b) { acc[b] = mine[b]; }
     for (uint offset = 1; offset < TRAINER_SCAN_THREADS; offset <<= 1) {
         for (uint b = 0; b < TRAINER_RADIX_BINS; ++b) { tgScratch[b][tid] = acc[b]; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1022,7 +1029,22 @@ kernel void trainer_preprocess(
     r.color0 = half(rgb.x);
     r.color1 = half(rgb.y);
     r.color2 = half(rgb.z);
-    r.pad0 = 0.0h;
+    // THE POWER BELOW WHICH THIS GAUSSIAN CANNOT MATTER, so the rasterisers
+    // can reject a contribution with one compare instead of an exp().
+    //
+    // Both rasterisers compute `alpha = min(0.99, opacity * exp(power))` and
+    // then drop the contribution when `alpha < minAlpha`, so the exp() is
+    // evaluated for every candidate and thrown away for roughly four out of
+    // five of them. The test is exactly equivalent to `power < log(minAlpha
+    // / opacity)`, which needs no exp at all. Computing it here costs one
+    // log per SPLAT per iteration in place of one exp per (pixel, splat)
+    // pair, and it rides in a pad field the 40-byte record already carries.
+    //
+    // The 0.01 slack is deliberate: `half` is coarser than the float compare
+    // it replaces, and biasing the cutoff DOWN means the cheap test can only
+    // ever let through a contribution the exact test would have kept. The
+    // exact test still runs after the exp, so the result is unchanged.
+    r.pad0 = half(log(max(cam.minAlpha, 1e-8f) / max(float(d.opacity), 1e-8f)) - 0.01f);
     r.pad1 = 0.0h;
     raster[gid] = r;
 
@@ -1253,6 +1275,10 @@ kernel void trainer_rasterize_forward(
     // half, and the conic went back to float because half cost 2 dB there.
     threadgroup float4 tgConicOpacity[TRAINER_TILE_AREA];
     threadgroup float4 tgColorDepth[TRAINER_TILE_AREA];
+    /// Per-splat power cutoff, 512 B. See `r.pad0` in trainer_preprocess:
+    /// the power below which this Gaussian cannot clear minAlpha, so the
+    /// contribution is rejected with a compare instead of an exp().
+    threadgroup half tgCutoff[TRAINER_TILE_AREA];
 
     const uint tileID = tgPos.y * cam.tileCountX + tgPos.x;
     const uint2 pixel = uint2(tgPos.x * TRAINER_TILE_W + tPos.x,
@@ -1287,8 +1313,12 @@ kernel void trainer_rasterize_forward(
             tgColorDepth[tid] = float4(
                 float(d.color0), float(d.color1), float(d.color2), d.depth
             );
+            tgCutoff[tid] = d.pad0;
         } else {
             tgConicOpacity[tid] = float4(0.0f);
+            // A cutoff no power can fall below, so the padding entries are
+            // rejected by the cheap test and never reach the exp.
+            tgCutoff[tid] = 60000.0h;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1301,6 +1331,8 @@ kernel void trainer_rasterize_forward(
                                              + co.z * delta.y * delta.y)
                                     - co.y * delta.x * delta.y;
                 if (power > 0.0f) { continue; }
+                // Cheap reject BEFORE the exp: see `r.pad0`.
+                if (power < float(tgCutoff[j])) { continue; }
                 const float alpha = min(0.99f, co.w * exp(power));
                 if (alpha < cam.minAlpha) { continue; }
                 const float testT = T * (1.0f - alpha);
@@ -1852,6 +1884,10 @@ kernel void trainer_rasterize_backward(
     // half, and the conic went back to float because half cost 2 dB there.
     threadgroup float4 tgConicOpacity[TRAINER_TILE_AREA];
     threadgroup float4 tgColorDepth[TRAINER_TILE_AREA];
+    /// Per-splat power cutoff, 512 B. See `r.pad0` in trainer_preprocess:
+    /// the power below which this Gaussian cannot clear minAlpha, so the
+    /// contribution is rejected with a compare instead of an exp().
+    threadgroup half tgCutoff[TRAINER_TILE_AREA];
 
 
     const uint tileID = tgPos.y * cam.tileCountX + tgPos.x;
@@ -1977,8 +2013,12 @@ kernel void trainer_rasterize_backward(
             tgColorDepth[tid] = float4(
                 float(d.color0), float(d.color1), float(d.color2), d.depth
             );
+            tgCutoff[tid] = d.pad0;
         } else {
             tgConicOpacity[tid] = float4(0.0f);
+            // A cutoff no power can fall below, so the padding entries are
+            // rejected by the cheap test and never reach the exp.
+            tgCutoff[tid] = 60000.0h;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2002,6 +2042,8 @@ kernel void trainer_rasterize_backward(
                                              + co.z * delta.y * delta.y)
                                     - co.y * delta.x * delta.y;
                 if (power > 0.0f) { continue; }
+                // Cheap reject BEFORE the exp: see `r.pad0`.
+                if (power < float(tgCutoff[j])) { continue; }
                 const float gaussian = exp(power);
                 const float alpha = min(0.99f, co.w * gaussian);
                 if (alpha < cam.minAlpha) { continue; }
