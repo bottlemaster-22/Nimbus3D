@@ -1309,6 +1309,28 @@ public final class ARCaptureService: NSObject, CaptureService {
             CaptureLog.session.notice("\(note, privacy: .public)")
         }
 
+        // HDR VIDEO, IF THIS FORMAT OFFERS IT. Never asked for until now, and
+        // it is the only lever ARKit gives for the owner's blown-out windows.
+        //
+        // Everything else the app has for windows is opt-in: window mode's
+        // bracketing is wired, but `lockExposureAndWhiteBalance` fires from
+        // exactly one user action, and a grep for videoHDR across
+        // ios/Sources/Capture returned nothing at all. HDR is one to two extra
+        // stops of highlight headroom, which is the difference between a
+        // window recorded as pure white, where there is no gradient for any
+        // loss to fit and the splats behind it are unconstrained, and one with
+        // recoverable structure.
+        //
+        // GUARDED, so it cannot break a session. `isVideoHDRSupported` is a
+        // property of the chosen video FORMAT, and a format that also carries
+        // sceneDepth may well not offer it; on such a device this is a no-op
+        // rather than a failure. That also means it may quietly do nothing on
+        // this phone, which the census will show.
+        if configuration.videoFormat.isVideoHDRSupported {
+            configuration.videoHDRAllowed = true
+            CaptureLog.session.notice("HDR video enabled for capture.")
+        }
+
         configuration.planeDetection = [.horizontal, .vertical]
         configuration.environmentTexturing = .none
         configuration.isLightEstimationEnabled = false
