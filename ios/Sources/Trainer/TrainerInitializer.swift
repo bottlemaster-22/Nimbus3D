@@ -861,10 +861,40 @@ enum TrainerInitializer {
     /// which is set from sensor noise and has nothing to do with how far
     /// apart the samples are; scaling it too would inflate flat surfaces into
     /// slabs.
+    /// How much of the thinning ratio to give back as seed SIZE. 1 is the
+    /// geometrically correct compensation; 0 keeps the sizes the pre-pass
+    /// produced. See `thin`, where the measurement that set this to 0 is
+    /// written down.
+    static let seedSpacingCompensation: Float = 0
+
     private static func thin(_ seeds: [TrainerSeed], to cap: Int) -> [TrainerSeed] {
         guard cap > 0, seeds.count > cap else { return seeds }
         let keepRatio = Double(cap) / Double(seeds.count)
-        let growth = logf(sqrtf(Float(seeds.count) / Float(cap)))
+        // MEASURED, AND OFF BY DEFAULT.
+        //
+        // The reasoning for growing the survivors is sound in isolation: each
+        // seed's radius is cut from the FULL set's local sample spacing, so
+        // dropping one in N leaves them sqrt(N) further apart carrying discs
+        // sized for a density that no longer exists. Build 182 shipped it at
+        // full strength.
+        //
+        // What it did, measured on that run's own exported model: the median
+        // largest axis went 13.2 mm to **19.6 mm**, and tile instances per
+        // splat went 2.55 to 3.54. Scaniverse on the same room is 3.4 mm. The
+        // entire quality gap this project is chasing is that our Gaussians are
+        // too BIG, and this made them bigger while making the raster 39 per
+        // cent more expensive.
+        //
+        // It also amplifies in the wrong direction as the seed count falls: at
+        // fillFraction 0.5 the factor is sqrt(888951/150000) = 2.43x, LARGER
+        // than the 1.72x build 182 ran, so restoring the old fill fraction
+        // would have made the splats bigger still. Holes between thinned seeds
+        // are what densification exists to fill, and the census shows it doing
+        // exactly that: 152,991 Gaussians created in build 172.
+        let compensation = Swift.max(Self.seedSpacingCompensation, 0)
+        let growth = compensation > 0
+            ? compensation * logf(sqrtf(Float(seeds.count) / Float(cap)))
+            : 0
         var kept: [TrainerSeed] = []
         kept.reserveCapacity(cap)
         var accumulator = 0.0

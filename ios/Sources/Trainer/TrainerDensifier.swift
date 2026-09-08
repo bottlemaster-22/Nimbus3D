@@ -466,6 +466,48 @@ final class TrainerDensifier {
             }
         }
 
+        // THE SPLIT SHARE. See `splitShareOfGrowth`.
+        //
+        // `candidates` is already the ranked, truncated growth list, so this
+        // is a second ranking OF THAT LIST by world scale, and the largest
+        // `splitShareOfGrowth` of it takes the split path. Computing the cut
+        // as a quantile of the list itself is what makes it scale-free: it
+        // does not care what units the scale is in, how large the room is, or
+        // how the population's size distribution has drifted this run.
+        //
+        // Sorting a copy of the scales is O(n log n) on at most
+        // `growthAllowance` elements, which is 45,000 at a 300,000 cap, and it
+        // happens once per pass against the ~1.1 million comparisons the
+        // selection above already spends.
+        var splitScaleCut = Float.infinity
+        if tuning.splitShareOfGrowth > 0, !candidates.isEmpty, growthAllowance > 0 {
+            let considered = Swift.min(candidates.count, growthAllowance)
+            var scales = [Float](repeating: 0, count: considered)
+            for k in 0..<considered {
+                // The SAME clamp the split body applies, so the cut and the
+                // comparison are built from identical numbers.
+                let s = simd_clamp(
+                    splats[candidates[k]].logScale,
+                    SIMD3<Float>(repeating: -12), SIMD3<Float>(repeating: 3)
+                )
+                scales[k] = Swift.max(s.x, Swift.max(s.y, s.z))
+            }
+            scales.sort()
+            // The index below which a candidate is NOT split. Clamped so a
+            // share of 1 splits everything and a tiny list still splits one.
+            // Integer arithmetic, no float-to-int conversion at all. `share`
+            // is clamped to 0...1000 first, so NaN takes the else branch (every
+            // comparison against NaN is false) and the product cannot overflow:
+            // `considered` is at most the growth allowance.
+            let shareIsUsable = tuning.splitShareOfGrowth.isFinite
+            let perMille = shareIsUsable
+                ? Int(Swift.min(Swift.max(tuning.splitShareOfGrowth, 0), 1) * 1000)
+                : 0
+            let keepClone = considered * (1000 - perMille) / 1000
+            let idx = Swift.max(0, Swift.min(considered - 1, keepClone))
+            splitScaleCut = scales[idx]
+        }
+
         var newSplats: [TrainerSplat] = []
         var newSH: [Float] = []
         var newTopK: [TrainerSamplingTopK] = []
@@ -495,7 +537,12 @@ final class TrainerDensifier {
                     oversizedOnScreen = r.isFinite && r > tuning.splitScreenRadiusPx
                 }
 
-                if largest > splitThresholdScale || oversizedOnScreen {
+                // Log space, so this compares the same quantity the cut
+                // was built from rather than its exponential.
+                let logLargest = Swift.max(scale.x, Swift.max(scale.y, scale.z))
+                if largest > splitThresholdScale
+                    || oversizedOnScreen
+                    || logLargest >= splitScaleCut {
                     // SPLIT: over-reconstructed. Two children inside the
                     // parent's own ellipsoid.
                     let axis = splitAxis(for: parent, linearScale: linear)

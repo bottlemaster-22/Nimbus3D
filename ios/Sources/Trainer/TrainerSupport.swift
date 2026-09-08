@@ -627,8 +627,58 @@ struct TrainerTuning: Sendable {
     var splitChildCount: Int = 2
     /// Children are placed at +/- this many standard deviations along the
     /// split axis, and shrunk by `splitShrink`.
-    /// SPLIT ON SCREEN SIZE, not only on world size. Set to 0 to disable
-    /// and go back to the world-scale test alone.
+    /// WHAT FRACTION OF EACH GROWTH PASS SPLITS RATHER THAN CLONES.
+    ///
+    /// The candidates are already ranked by AbsGS score and truncated to the
+    /// allowance. This ranks that surviving list a second time, by world
+    /// scale, and sends the largest `splitShareOfGrowth` of it down the split
+    /// path. 0 falls back to the threshold tests alone.
+    ///
+    /// WHY A SHARE AND NOT A THRESHOLD. Both thresholds tried so far failed
+    /// the same way: each was a magnitude in a unit whose distribution nobody
+    /// had measured.
+    ///
+    ///   `splitScaleFraction` 0.01 put the bar at 5.39 cm against a model
+    ///   whose LARGEST Gaussian is 6.18 cm, so split fired 190 times against
+    ///   152,801 clones.
+    ///
+    ///   `splitScreenRadiusPx` 10 put the bar below the 1st percentile of its
+    ///   own statistic, so split took 6,836 of the 6,900 slots available.
+    ///
+    /// A share has no unit to be wrong about, and it is the same fix this
+    /// file's densification gate already received when `absGradThreshold`
+    /// broke on pixels-versus-NDC: compare against zero and let the ranked
+    /// truncation do the cutting.
+    ///
+    /// 0.2 is the measured reference behaviour. arXiv:2507.20239 reports
+    /// roughly 80 per cent clone / 20 per cent split for 3DGS and shows the
+    /// two do different jobs: split-dominated Gaussians displace 2.42 / 0.75 /
+    /// 2.40 scene units against 0.09 / 0.15 / 0.10 for clone-dominated ones.
+    /// Split diffuses, clone refines. We had almost none of the first, and
+    /// then briefly almost none of the second.
+    var splitShareOfGrowth: Float = 0.2
+
+    /// SPLIT ON SCREEN SIZE. WITHDRAWN, MEASURED WRONG, LEFT AT 0.
+    ///
+    /// The idea was that `stats.maxRadiusPxBits` identifies a Gaussian that is
+    /// over-reconstructed for the view being fitted, and that 10 px would cut
+    /// somewhere in the top few per cent. An offline copy of
+    /// `trainer_preprocess`, run over the owner's real model and real poses
+    /// and reproducing the census's peakTileInstances to 0.07 per cent, says
+    /// otherwise: the median of that statistic is 40 to 49 px depending on how
+    /// many views are sampled, and 10 px selects **99.18 per cent** of the
+    /// drawn population. 16 px selects 96 per cent. 48 px still selects 52.
+    ///
+    /// Moving the number cannot fix it. `maxRadiusPxBits` is a MAX over every
+    /// view in the interval and the 3-sigma radius scales with 1/z, so one
+    /// close-up frame sets it for the whole population, and the median climbs
+    /// as more views are sampled. 4.2 per cent of drawn Gaussians record a max
+    /// radius wider than the entire 720 px frame. The mean alpha extent, the
+    /// obvious alternative, is no better: a fixed 8 px on it selects 99.46 per
+    /// cent and 24 px selects 47.89, with no usable knee anywhere.
+    ///
+    /// Kept at 0 rather than deleted because build 182 ran with it at 10, and
+    /// that census only makes sense read next to this note.
     ///
     /// Split fired 190 times against 152,801 clones in the measured run:
     /// 0.12 per cent, where the reference implementation runs about 20 per
@@ -650,7 +700,7 @@ struct TrainerTuning: Sendable {
     /// of about 4.8 px. 10 px therefore cuts somewhere in the top few per
     /// cent, which is the right order for a criterion meant to fire on the
     /// worst offenders rather than on everything.
-    var splitScreenRadiusPx: Float = 10
+    var splitScreenRadiusPx: Float = 0
 
     /// SHRINK ALL THREE AXES ON A SPLIT, as the reference does, instead of
     /// only the split axis. Set false to restore the one-axis behaviour.
