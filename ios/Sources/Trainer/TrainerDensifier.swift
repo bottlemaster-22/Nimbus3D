@@ -548,7 +548,8 @@ final class TrainerDensifier {
                     let (shrunk, offset) = splitGeometry(
                         of: parent, scale: scale, linear: linear,
                         seed: UInt32(truncatingIfNeeded: index)
-                            &+ UInt32(truncatingIfNeeded: added)
+                            &+ UInt32(truncatingIfNeeded: added),
+                        preserveCoverage: false
                     )
 
                     // Child A replaces the parent in place, child B is new, so
@@ -673,10 +674,13 @@ final class TrainerDensifier {
                 let linear = SIMD3<Float>(expf(scale.x), expf(scale.y), expf(scale.z))
                 // THE SAME GEOMETRY THE GROWTH PATH USES. See splitGeometry:
                 // this branch is where nearly all splitting actually happens.
+                // preserveCoverage: the opacity correction below assumes the
+                // pair covers what the target covered. See splitGeometry.
                 let (shrunk, offset) = splitGeometry(
                     of: parent, scale: scale, linear: linear,
                     seed: UInt32(truncatingIfNeeded: target)
-                        &+ UInt32(truncatingIfNeeded: k)
+                        &+ UInt32(truncatingIfNeeded: k),
+                    preserveCoverage: true
                 )
 
                 let oldOpacity = TrainerMath.sigmoid(parent.opacityLogit)
@@ -1118,15 +1122,37 @@ final class TrainerDensifier {
     /// to widen the size distribution was fixed on the branch that almost
     /// never fires and left alone on the branch that does nearly all the work.
     ///
+    /// THE TWO CALLERS DELIBERATELY DIFFER ON ONE POINT, and `preserveCoverage`
+    /// is how each states which it is.
+    ///
+    /// The GROWTH path replaces a parent with two children and applies no
+    /// opacity correction, exactly as the reference does, so it can shrink all
+    /// three axes and let the rest of densification fill whatever gap that
+    /// leaves. That is the behaviour that widens the size distribution.
+    ///
+    /// The RELOCATION path cannot. It corrects both Gaussians' opacity with
+    ///     1 - (1 - o_new)^2 = o_old   ->   o_new = 1 - sqrt(1 - o_old)
+    /// and that identity is derived for two Gaussians COVERING WHAT THE PARENT
+    /// COVERED. Shrink all three axes and the pair occupies about 2/1.6^3, or
+    /// half the parent's volume, so the correction over-dims a region it has
+    /// also made smaller. Shrinking one axis and offsetting along it keeps the
+    /// pair's footprint close to the parent's, which is the assumption the
+    /// correction rests on.
+    ///
+    /// I shipped three-axis shrink on BOTH paths an hour before noticing this.
+    /// It is written down rather than quietly fixed because the failure would
+    /// have looked like "the model went dim and dissolved", which is a long
+    /// way from "an opacity identity stopped holding".
+    ///
     /// Returns the child log-scale and the offset to apply as +/- from the
     /// parent's centre.
     func splitGeometry(
         of parent: TrainerSplat, scale: SIMD3<Float>, linear: SIMD3<Float>,
-        seed: UInt32
+        seed: UInt32, preserveCoverage: Bool
     ) -> (shrunk: SIMD3<Float>, offset: SIMD3<Float>) {
         let axis = splitAxis(for: parent, linearScale: linear)
         let rotation = TrainerMath.rotationMatrix(parent.rotation)
-        if tuning.splitShrinkAllAxes {
+        if tuning.splitShrinkAllAxes && !preserveCoverage {
             let k = logf(tuning.splitShrink)
             let shrunk = scale - SIMD3<Float>(repeating: k)
             let g = TrainerDensifier.splitNoise(seed: seed)
