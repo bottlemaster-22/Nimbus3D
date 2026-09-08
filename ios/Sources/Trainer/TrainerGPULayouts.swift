@@ -336,6 +336,23 @@ struct TrainerBackgroundUniforms {
     var pad: UInt32 = 0
 }
 
+/// Mirrors `TrainerSplatRaster` in TrainerShaders.metal: the 32-byte subset
+/// of a projected Gaussian that the sort and both rasterisers actually read.
+///
+/// Nothing in Swift reads this struct's contents, only its stride, so the half
+/// fields are declared as packed 32-bit pairs. `Float16` does not exist on
+/// x86_64 and a faithful mirror would not build in an Intel simulator.
+struct TrainerSplatRaster {
+    var mean2DX: Float = 0          // offset  0
+    var mean2DY: Float = 0          // offset  4
+    var depth: Float = 0            // offset  8
+    var radiusPackedHalf2: UInt32 = 0   // offset 12  radiusX, radiusY
+    var conicPackedHalf2A: UInt32 = 0   // offset 16  conic0, conic1
+    var conicPackedHalf2B: UInt32 = 0   // offset 20  conic2, opacity
+    var colorPackedHalf2A: UInt32 = 0   // offset 24  color0, color1
+    var colorPackedHalf2B: UInt32 = 0   // offset 28  color2, pad
+}                                   // 32 bytes
+
 struct TrainerSamplingTopK {
     var r0: Float = 0   // offset  0
     var r1: Float = 0   // offset  4

@@ -219,6 +219,42 @@ struct TrainerSplatGrad2D {
     float pad[7];
 };
 
+/// WHAT THE HOT LOOPS ACTUALLY READ, AND NOTHING ELSE. 32 bytes.
+///
+/// ENERGY, not just time. `TrainerSplatDraw` below is 64 bytes and is read
+/// ONCE PER TILE INSTANCE by both rasterisers, so at 763,260 instances that is
+/// 98 MB of DRAM traffic an iteration purely to stage Gaussians. On mobile
+/// silicon a byte from DRAM costs on the order of a hundred times what an
+/// arithmetic operation costs, so bytes moved is where the joules go, and this
+/// was the largest single item.
+///
+/// The rasterisers only ever stage mean2D, conic, opacity, colour and depth:
+/// 40 bytes of the 64 they pull. duplicate_keys wants mean2D, the two radii
+/// and depth. This record is exactly that set, so the per-instance read halves
+/// to 49 MB.
+///
+/// WHAT IS FULL PRECISION AND WHY:
+///   mean2D  float2. Pixel coordinates up to 720 and the per-pixel delta is
+///           differenced against them, so half would lose sub-pixel accuracy
+///           where it matters most.
+///   depth   float. It becomes the low 16 bits of the SORT KEY, and half at
+///           30 m has about 3 cm of precision, which would coarsen compositing
+///           order into ties.
+///
+/// WHAT IS HALF AND WHY IT IS ACCEPTABLE: conic, opacity and colour all feed
+/// the alpha and colour of a splat that is then composited with hundreds of
+/// others. Half carries about three decimal digits, and the owner has asked
+/// for efficiency ahead of quality for now, with quality work to follow.
+struct TrainerSplatRaster {
+    packed_float2 mean2D;               //  0..7
+    float         depth;                //  8..11
+    half          radiusX, radiusY;     // 12..15
+    half          conic0, conic1, conic2; // 16..21
+    half          opacity;              // 22..23
+    half          color0, color1, color2; // 24..29
+    half          pad;                  // 30..31
+};                                      // 32 bytes
+
 struct TrainerSplatDraw {
     packed_float3 meanCam;    //  0..11
     float         depth;      // 12..15
@@ -747,6 +783,7 @@ kernel void trainer_preprocess(
     const device float*               sh      [[buffer(1)]],
     device TrainerSplatStatsAtomic*   stats   [[buffer(2)]],
     device TrainerSplatDraw*          draws   [[buffer(3)]],
+    device TrainerSplatRaster*        raster  [[buffer(8)]],
     device uint*                      tilesTouched [[buffer(4)]],
     constant TrainerCameraUniforms&   cam     [[buffer(5)]],
     uint                              gid     [[thread_position_in_grid]]
@@ -962,6 +999,23 @@ kernel void trainer_preprocess(
     d.clampedMask = clampedMask;
     draws[gid] = d;
 
+    // The compact copy the hot loops read. Same values, narrower where the
+    // narrowing is affordable. See TrainerSplatRaster.
+    TrainerSplatRaster r;
+    r.mean2D = d.mean2D;
+    r.depth = d.depth;
+    r.radiusX = extent.x;
+    r.radiusY = extent.y;
+    r.conic0 = half(conic.x);
+    r.conic1 = half(conic.y);
+    r.conic2 = half(conic.z);
+    r.opacity = half(d.opacity);
+    r.color0 = half(rgb.x);
+    r.color1 = half(rgb.y);
+    r.color2 = half(rgb.z);
+    r.pad = 0.0h;
+    raster[gid] = r;
+
     tilesTouched[gid] = touched;
 
     atomic_store_explicit(&stats[gid].visibleFlag, 1u, memory_order_relaxed);
@@ -977,7 +1031,7 @@ kernel void trainer_preprocess(
 // ============================================================================
 
 kernel void trainer_duplicate_keys(
-    const device TrainerSplatDraw*  draws        [[buffer(0)]],
+    const device TrainerSplatRaster* raster       [[buffer(0)]],
     const device uint*              tilesTouched [[buffer(1)]],
     const device uint*              offsets      [[buffer(2)]],
     device uint*                    keys         [[buffer(3)]],
@@ -990,7 +1044,9 @@ kernel void trainer_duplicate_keys(
     const uint touched = tilesTouched[gid];
     if (touched == 0u) { return; }
 
-    const TrainerSplatDraw d = draws[gid];
+    // The compact record, not the 64-byte one: this kernel wants mean2D, the
+    // two radii and depth, which is all TrainerSplatRaster holds.
+    const TrainerSplatRaster d = raster[gid];
     const float2 mean2D = float2(d.mean2D);
     // The same two halves trainer_preprocess counted tiles with. Recomputing
     // them from the conic instead would risk differing in the last bit, and
@@ -1153,7 +1209,7 @@ kernel void trainer_tile_ranges(
 kernel void trainer_rasterize_forward(
     const device uint*              values      [[buffer(0)]],
     const device uint*              tileRanges  [[buffer(1)]],
-    const device TrainerSplatDraw*  draws       [[buffer(2)]],
+    const device TrainerSplatRaster* raster     [[buffer(2)]],
     device float*                   outColor    [[buffer(3)]],   // 3 per pixel
     device float*                   outAlpha    [[buffer(4)]],
     device float*                   outDepth    [[buffer(5)]],
@@ -1190,15 +1246,20 @@ kernel void trainer_rasterize_forward(
         const uint load = rangeStart + b * TRAINER_TILE_AREA + tid;
         if (load < rangeEnd) {
             const uint splatIndex = values[load];
-            const TrainerSplatDraw d = draws[splatIndex];
+            const TrainerSplatRaster d = raster[splatIndex];
             // tgIndex was staged here and never read back in this
             // kernel. 1 KB of threadgroup memory per threadgroup, on a
             // GPU where threadgroup memory is what limits how many
             // threadgroups run at once. The backward rasteriser keeps
             // its own tgIndex because it genuinely reads it.
             tgXY[tid] = float2(d.mean2D);
-            tgConicOpacity[tid] = float4(float3(d.conic), d.opacity);
-            tgColorDepth[tid] = float4(float3(d.color), d.depth);
+            tgConicOpacity[tid] = float4(
+                float(d.conic0), float(d.conic1), float(d.conic2),
+                float(d.opacity)
+            );
+            tgColorDepth[tid] = float4(
+                float(d.color0), float(d.color1), float(d.color2), d.depth
+            );
         } else {
             tgConicOpacity[tid] = float4(0.0f);
         }
@@ -1740,7 +1801,7 @@ kernel void trainer_loss_finalize(
 kernel void trainer_rasterize_backward(
     const device uint*              values      [[buffer(0)]],
     const device uint*              tileRanges  [[buffer(1)]],
-    const device TrainerSplatDraw*  draws       [[buffer(2)]],
+    const device TrainerSplatRaster* raster     [[buffer(2)]],
     const device float*             renderTFinal[[buffer(3)]],
     const device uint*              renderNContrib [[buffer(4)]],
     const device float*             gradSplatColor [[buffer(5)]],
@@ -1880,11 +1941,16 @@ kernel void trainer_rasterize_backward(
         const uint load = rangeStart + batchBase + tid;
         if (load < rangeEnd) {
             const uint splatIndex = values[load];
-            const TrainerSplatDraw d = draws[splatIndex];
+            const TrainerSplatRaster d = raster[splatIndex];
             tgIndex[tid] = splatIndex;
             tgXY[tid] = float2(d.mean2D);
-            tgConicOpacity[tid] = float4(float3(d.conic), d.opacity);
-            tgColorDepth[tid] = float4(float3(d.color), d.depth);
+            tgConicOpacity[tid] = float4(
+                float(d.conic0), float(d.conic1), float(d.conic2),
+                float(d.opacity)
+            );
+            tgColorDepth[tid] = float4(
+                float(d.color0), float(d.color1), float(d.color2), d.depth
+            );
         } else {
             tgConicOpacity[tid] = float4(0.0f);
         }

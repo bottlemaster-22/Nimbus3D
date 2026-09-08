@@ -154,6 +154,7 @@ TrainerGPULayouts.swift:meanCamZ  # ARTEFACT: Metal struct mirror, TrainerSplatD
 TrainerGPULayouts.swift:mean2DX  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 16.
 TrainerGPULayouts.swift:mean2DY  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 20.
 TrainerGPULayouts.swift:radiusPxPackedHalf2  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 24. Two halves on the GPU side; Swift never reads it, only the stride.
+TrainerGPULayouts.swift:colorPackedHalf2B  # ARTEFACT: Metal struct mirror, TrainerSplatRaster offset 28. Swift never reads it, only the stride.
 TrainerGPULayouts.swift:conicA  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 32.
 TrainerGPULayouts.swift:conicB  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 36.
 TrainerGPULayouts.swift:conicC  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 40.

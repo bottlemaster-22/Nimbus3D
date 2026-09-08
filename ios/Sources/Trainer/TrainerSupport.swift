@@ -229,10 +229,14 @@ enum TrainerBind {
         static let draws = 3
         static let tilesTouched = 4
         static let camera = 5
+        /// The compact 32-byte copy the hot loops read. See
+        /// TrainerSplatRaster in TrainerShaders.metal.
+        static let raster = 8
     }
 
     enum DuplicateKeys {
-        static let draws = 0
+        /// The compact record, not the wide one.
+        static let raster = 0
         static let tilesTouched = 1
         static let offsets = 2
         static let keys = 3

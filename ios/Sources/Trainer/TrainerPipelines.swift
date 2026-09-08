@@ -419,6 +419,7 @@ struct TrainerGPU {
         encoder.setBuffer(resources.sh, offset: 0, index: TrainerBind.Preprocess.sh)
         encoder.setBuffer(resources.stats, offset: 0, index: TrainerBind.Preprocess.stats)
         encoder.setBuffer(resources.draws, offset: 0, index: TrainerBind.Preprocess.draws)
+        encoder.setBuffer(resources.raster, offset: 0, index: TrainerBind.Preprocess.raster)
         encoder.setBuffer(
             resources.tilesTouched, offset: 0, index: TrainerBind.Preprocess.tilesTouched
         )
@@ -437,7 +438,7 @@ struct TrainerGPU {
     ) {
         guard splatCount > 0 else { return }
         encoder.setComputePipelineState(pipelines.duplicateKeys)
-        encoder.setBuffer(resources.draws, offset: 0, index: TrainerBind.DuplicateKeys.draws)
+        encoder.setBuffer(resources.raster, offset: 0, index: TrainerBind.DuplicateKeys.raster)
         encoder.setBuffer(
             resources.tilesTouched, offset: 0, index: TrainerBind.DuplicateKeys.tilesTouched
         )
@@ -485,7 +486,7 @@ struct TrainerGPU {
         encoder.setBuffer(
             resources.tileRanges, offset: 0, index: TrainerBind.RasterizeForward.tileRanges
         )
-        encoder.setBuffer(resources.draws, offset: 0, index: TrainerBind.RasterizeForward.draws)
+        encoder.setBuffer(resources.raster, offset: 0, index: TrainerBind.RasterizeForward.draws)
         encoder.setBuffer(
             resources.renderColor, offset: 0, index: TrainerBind.RasterizeForward.outColor
         )
@@ -718,7 +719,7 @@ struct TrainerGPU {
         encoder.setBuffer(
             resources.tileRanges, offset: 0, index: TrainerBind.RasterizeBackward.tileRanges
         )
-        encoder.setBuffer(resources.draws, offset: 0, index: TrainerBind.RasterizeBackward.draws)
+        encoder.setBuffer(resources.raster, offset: 0, index: TrainerBind.RasterizeBackward.draws)
         encoder.setBuffer(
             resources.renderTFinal, offset: 0, index: TrainerBind.RasterizeBackward.renderTFinal
         )

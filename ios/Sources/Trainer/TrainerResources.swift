@@ -84,6 +84,9 @@ final class TrainerResources {
     /// The background cubemap, 6 faces of faceSize^2 linear-RGB texels, for
     /// `trainer_background`. 72 KB at the default face size of 32.
     private(set) var bgCubemap: MTLBuffer
+    /// The 32-byte subset of `draws` that the sort and both rasterisers read.
+    /// Halves the largest per-iteration DRAM item; see TrainerSplatRaster.
+    private(set) var raster: MTLBuffer
 
     private(set) var centers: MTLBuffer
 
@@ -188,6 +191,7 @@ final class TrainerResources {
         sh = try make("sh", shFloats * MemoryLayout<Float>.stride)
         stats = try make("stats", n * MemoryLayout<TrainerSplatStats>.stride)
         draws = try make("draws", n * MemoryLayout<TrainerSplatDraw>.stride)
+        raster = try make("raster", n * MemoryLayout<TrainerSplatRaster>.stride)
         samplingTopK = try make("samplingTopK", n * MemoryLayout<TrainerSamplingTopK>.stride)
 
         // The scan kernels read a whole 1024-element block whether or not the
@@ -297,7 +301,7 @@ final class TrainerResources {
         var list: [MTLBuffer] = [
             splats, sh, stats, draws, samplingTopK, tilesTouched, offsets,
             splatGrad, shGrad, adamM, adamV, shAdamM, shAdamV,
-            splatGrad2D, bgCubemap, centers,
+            splatGrad2D, bgCubemap, raster, centers,
             keysA, keysB, valuesA, valuesB, tileRanges,
             radixHistogram, radixHistogramScan,
             renderColor, renderAlpha, renderDepth, renderTFinal, renderNContrib,
@@ -563,6 +567,7 @@ final class TrainerResources {
         // observe what was in these ten when this method was called.
         let placeholder = try makePlaceholder()
         draws = placeholder
+        raster = placeholder
         tilesTouched = placeholder
         offsets = placeholder
         splatGrad = placeholder
@@ -603,6 +608,7 @@ final class TrainerResources {
         // Only now the transient ten, at the new capacity. Last, so that none of
         // the eight above ever had to be allocated around them.
         draws = try makeBuffer("draws", n * MemoryLayout<TrainerSplatDraw>.stride)
+        raster = try makeBuffer("raster", n * MemoryLayout<TrainerSplatRaster>.stride)
         tilesTouched = try makeBuffer("tilesTouched", paddedSplats * 4)
         offsets = try makeBuffer("offsets", paddedSplats * 4)
         splatGrad = try makeBuffer("splatGrad", n * gradStride)
