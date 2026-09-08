@@ -163,10 +163,40 @@ func captureAccumulateCoverage(
             }
             let world = cameraToWorld * SIMD4<Float>(cameraPoint, 1)
             let point = SIMD3<Float>(world.x, world.y, world.z)
+            // A WINDOW USED TO PAINT ITSELF GREEN.
+            //
+            // The LiDAR confidence map is recorded on every frame and was
+            // never consulted here: this loop checked only that a sample
+            // unprojected, so a low-confidence return off glass counted as a
+            // measurement and the HUD reported the patch as covered. Blown-out
+            // windows are one of the three capture defects the owner has
+            // actually hit.
+            //
+            // NOT a hard reject, deliberately. `observe` keeps
+            // `bestSharpness` as a MAX over everything that ever saw the
+            // voxel, so attenuating the sample's sharpness by its confidence
+            // means a patch seen only through doubtful returns keeps a low
+            // best and never satisfies the quality channel, while one good
+            // look still settles it. Dropping the samples outright would
+            // instead make the patch invisible, which reads as "not scanned"
+            // rather than "scanned badly" and would lengthen every scan.
+            //
+            // An empty confidence array means the sidecar was missing, not
+            // that the data is bad, so that case is not penalised.
+            let confidenceScale: Float
+            if depth.confidence.isEmpty {
+                confidenceScale = 1
+            } else {
+                switch depth.confidence[y * depth.width + x] {
+                case 0: confidenceScale = 0.35
+                case 1: confidenceScale = 0.75
+                default: confidenceScale = 1
+                }
+            }
             coverageField.observe(
                 worldPosition: point,
                 cameraCenter: center,
-                sharpness: sharpness,
+                sharpness: sharpness * confidenceScale,
                 surfaceClass: meshStore.surfaceClass(at: point)
             )
             x += step
