@@ -545,33 +545,11 @@ final class TrainerDensifier {
                     || logLargest >= splitScaleCut {
                     // SPLIT: over-reconstructed. Two children inside the
                     // parent's own ellipsoid.
-                    let axis = splitAxis(for: parent, linearScale: linear)
-                    let rotation = TrainerMath.rotationMatrix(parent.rotation)
-
-                    var shrunk = scale
-                    var offset: SIMD3<Float>
-                    if tuning.splitShrinkAllAxes {
-                        // The reference geometry: divide the WHOLE scale
-                        // vector by 0.8*N, which for N=2 is 1.6 and is
-                        // exactly `splitShrink`, then scatter the children
-                        // through the parent's volume by sampling the offset
-                        // from the parent's own covariance instead of
-                        // stepping a fixed distance along one axis. Shrinking
-                        // three axes while offsetting along one would leave a
-                        // gap across the other two.
-                        let k = logf(tuning.splitShrink)
-                        shrunk = scale - SIMD3<Float>(repeating: k)
-                        let g = TrainerDensifier.splitNoise(seed: UInt32(truncatingIfNeeded: index) &+ UInt32(truncatingIfNeeded: added))
-                        let local = SIMD3<Float>(
-                            g.x * linear.x, g.y * linear.y, g.z * linear.z
-                        ) * tuning.splitOffsetSigma
-                        offset = rotation[0] * local.x
-                            + rotation[1] * local.y
-                            + rotation[2] * local.z
-                    } else {
-                        shrunk[axis] = scale[axis] - logf(tuning.splitShrink)
-                        offset = rotation[axis] * (linear[axis] * tuning.splitOffsetSigma)
-                    }
+                    let (shrunk, offset) = splitGeometry(
+                        of: parent, scale: scale, linear: linear,
+                        seed: UInt32(truncatingIfNeeded: index)
+                            &+ UInt32(truncatingIfNeeded: added)
+                    )
 
                     // Child A replaces the parent in place, child B is new, so
                     // one split costs one slot rather than two.
@@ -693,16 +671,17 @@ final class TrainerDensifier {
                     parent.logScale, SIMD3<Float>(repeating: -12), SIMD3<Float>(repeating: 3)
                 )
                 let linear = SIMD3<Float>(expf(scale.x), expf(scale.y), expf(scale.z))
-                let axis = splitAxis(for: parent, linearScale: linear)
-                let rotation = TrainerMath.rotationMatrix(parent.rotation)
-                let offset = rotation[axis] * (linear[axis] * tuning.splitOffsetSigma)
+                // THE SAME GEOMETRY THE GROWTH PATH USES. See splitGeometry:
+                // this branch is where nearly all splitting actually happens.
+                let (shrunk, offset) = splitGeometry(
+                    of: parent, scale: scale, linear: linear,
+                    seed: UInt32(truncatingIfNeeded: target)
+                        &+ UInt32(truncatingIfNeeded: k)
+                )
 
                 let oldOpacity = TrainerMath.sigmoid(parent.opacityLogit)
                 let corrected = 1 - sqrtf(Swift.max(1 - oldOpacity, 0))
                 let correctedLogit = TrainerMath.logit(corrected)
-
-                var shrunk = scale
-                shrunk[axis] = scale[axis] - logf(tuning.splitShrink)
 
                 var moved = parent
                 moved.mean = parent.mean - offset
@@ -1125,6 +1104,45 @@ final class TrainerDensifier {
     /// what is wanted is a split across the edge normal, which is the second
     /// longest axis. That is the SAD-GS idea, expressed in the local frame the
     /// Gaussian already carries.
+    /// THE GEOMETRY OF ONE SPLIT, in one place, because there are two callers
+    /// and they were silently disagreeing.
+    ///
+    /// The growth path splits a Gaussian by replacing it with two children.
+    /// The RELOCATION path, which runs once the population is at its cap, does
+    /// exactly the same thing using a dead Gaussian's slot as the second
+    /// child. They are the same operation and must have the same geometry.
+    ///
+    /// They did not. `splitShrinkAllAxes` was added to the growth path alone,
+    /// and the census says which path actually matters: build 182 recorded
+    /// **190 growth splits against 21,000 relocations**. The mechanism meant
+    /// to widen the size distribution was fixed on the branch that almost
+    /// never fires and left alone on the branch that does nearly all the work.
+    ///
+    /// Returns the child log-scale and the offset to apply as +/- from the
+    /// parent's centre.
+    func splitGeometry(
+        of parent: TrainerSplat, scale: SIMD3<Float>, linear: SIMD3<Float>,
+        seed: UInt32
+    ) -> (shrunk: SIMD3<Float>, offset: SIMD3<Float>) {
+        let axis = splitAxis(for: parent, linearScale: linear)
+        let rotation = TrainerMath.rotationMatrix(parent.rotation)
+        if tuning.splitShrinkAllAxes {
+            let k = logf(tuning.splitShrink)
+            let shrunk = scale - SIMD3<Float>(repeating: k)
+            let g = TrainerDensifier.splitNoise(seed: seed)
+            let local = SIMD3<Float>(
+                g.x * linear.x, g.y * linear.y, g.z * linear.z
+            ) * tuning.splitOffsetSigma
+            let offset = rotation[0] * local.x
+                + rotation[1] * local.y
+                + rotation[2] * local.z
+            return (shrunk, offset)
+        }
+        var shrunk = scale
+        shrunk[axis] = scale[axis] - logf(tuning.splitShrink)
+        return (shrunk, rotation[axis] * (linear[axis] * tuning.splitOffsetSigma))
+    }
+
     /// A reproducible unit-normal triple for the split offset.
     ///
     /// The reference samples the child offset from N(0, Sigma). A real random
