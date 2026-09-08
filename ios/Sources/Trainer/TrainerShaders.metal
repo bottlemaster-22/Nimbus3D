@@ -917,12 +917,20 @@ kernel void trainer_preprocess(
     // per pixel. Nothing that contributed is lost. Capped at 9 so it can only
     // ever shrink the old box, never grow it.
     //
-    // This matters because the population is faint. A finished run has a
-    // median peak alpha of 0.0038 against a minAlpha of 1/255: for a splat at
-    // alpha 0.01 the level set is 1.9 rather than 9, which is 1.4 sigma
-    // instead of 3 and a box a quarter of the area. The existing alpha cull
-    // below removes only the splats that reach NO pixel; this shrinks every
-    // splat that survives it.
+    // STALE PREMISE, KEPT BECAUSE THE CODE IS STILL CORRECT. This used to
+    // say the population was faint: a median peak alpha of 0.0038 against a
+    // minAlpha of 1/255, so a typical splat got a level set of 1.9 rather
+    // than 9 and a box a quarter of the area. That was measured when late
+    // opacity binarization was still on. With it off, build 182's exported
+    // model has a median opacity of 0.344 and ZERO per cent of the population
+    // below 1/255, so the level set is 2*ln(0.344/0.00392) = 8.9 and this box
+    // is now barely tighter than the three sigma it replaced.
+    //
+    // The formula is still exact and still worth keeping, because a faint
+    // splat still gets a small box. But most of the 81 s to 65 s this change
+    // bought has been given back by the population becoming opaque again, and
+    // anyone hunting for that missing time should look here first rather than
+    // assume it is still being saved.
     const float alphaForExtent = trainer_sigmoid(s.opacityLogit) * comp2D * comp3D;
     if (alphaForExtent < cam.minAlpha) { return; }
     const float levelSet = clamp(
