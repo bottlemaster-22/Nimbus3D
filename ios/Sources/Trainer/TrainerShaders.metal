@@ -1022,7 +1022,8 @@ kernel void trainer_preprocess(
     r.color0 = half(rgb.x);
     r.color1 = half(rgb.y);
     r.color2 = half(rgb.z);
-    r.pad = 0.0h;
+    r.pad0 = 0.0h;
+    r.pad1 = 0.0h;
     raster[gid] = r;
 
     tilesTouched[gid] = touched;
