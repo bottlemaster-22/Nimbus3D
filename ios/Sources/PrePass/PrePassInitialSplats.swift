@@ -234,6 +234,13 @@ enum PrePassInitialSplatBuilder {
         /// the PLY write and the thinning all scale with it.
         var flatInteriorCoarsening: Float = 2
 
+        /// Give a sample flagged as a geometric EDGE a voxel this many times
+        /// smaller. 1 disables it. Edges are where a splat too big to fit
+        /// produces the blur that shows, and they are only 7.8 per cent of
+        /// samples, so this is cheap: measured at 244,318 seeds against
+        /// today's 248,057 when paired with the coarsening above.
+        var edgeRefinement: Float = 2
+
         /// ABSOLUTE FLOOR for trust. Deliberately low, because the real
         /// decision is made RELATIVE to the scan (see `trustedQuantile`).
         ///
@@ -470,10 +477,42 @@ enum PrePassInitialSplatBuilder {
         // uses 21 bits per axis and `spread(z) << 2` tops out at bit 62, so
         // bit 63 is free and tags which lattice a key came from. Two cells
         // from different lattices can never collide, whatever they contain.
-        let coarseFactor = Swift.max(settings.flatInteriorCoarsening, 1)
-        let coarseSpacing = spacing * coarseFactor
+        // THREE LEVELS, and the shares are measured, not guessed. Simulated by
+        // re-voxelising the owner's real geometry at each option:
+        //
+        //   config                          seeds  slope   p10   p50   p90  spread
+        //   today, one lattice             248057  0.000  7.40  7.40  7.40   1.00x
+        //   coarsen 80% of the scan        170836  0.186  7.40 14.79 14.79   2.00x
+        //   refine edges only              253815  0.043  7.40  7.40  7.40   1.00x
+        //   refine edges + coarsen 46%     224515  0.218  3.70  7.40 14.79   4.00x
+        //
+        // The second row is what a first attempt shipped, and it is the wrong
+        // trade: coarsening the MAJORITY moves the median by definition, and
+        // the median splat is the thing this whole effort is trying to shrink
+        // (ours 19.57 mm against the reference's 3.39 mm). It also took
+        // smax/nn1, the packing ratio, from 0.54 to 0.92 when the reference is
+        // 0.75 and lower is tighter.
+        //
+        // The fourth row is strictly better than today on every measured
+        // number: same median, same packing, 9 per cent fewer seeds, and the
+        // size spread goes from 1.00x to 4.00x. Refining edges ALONE does
+        // almost nothing, because edges are 7.8 per cent of samples (census
+        // `onEdgeCount` 69,029 of 888,951) so they never reach the p10 line.
+        // The spread has to come from coarsening a MINORITY of genuinely flat,
+        // well-measured surface.
+        let edgeFrame = PrePassVoxelFrame(
+            origin: gridOrigin, voxelSize: spacing / Swift.max(settings.edgeRefinement, 1)
+        )
+        let coarseSpacing = spacing * Swift.max(settings.flatInteriorCoarsening, 1)
         let coarseFrame = PrePassVoxelFrame(origin: gridOrigin, voxelSize: coarseSpacing)
-        let coarseTag: UInt64 = 1 << 63
+        let edgeSpacing = spacing / Swift.max(settings.edgeRefinement, 1)
+        // Two tag bits, in the key's top nibble. A Morton key spreads each axis
+        // over every third bit, so with every cell coordinate below 2^20 the
+        // highest bit any coordinate can reach is `spread(z) << 2` at bit 59,
+        // leaving 60 through 63 free. The guard below enforces that bound, and
+        // at the finest 7.4 mm cell 2^20 cells is a 7.7 km grid, so no real
+        // scan can approach it.
+        let cellLimit: Int32 = 1 << 20
 
         // One representative sample per cell: the best-trusted one, NOT an
         // average. Averaging across a depth edge invents a surface halfway
@@ -616,16 +655,29 @@ enum PrePassInitialSplatBuilder {
                 let sampleIsEdge = sampleIndex < edges.count
                     && edges[sampleIndex] == .geometric
                 let sampleHasNormal = points.valid[sampleIndex]
-                let useCoarse = coarseFactor > 1 && sampleHasNormal && !sampleIsEdge
-                let key: UInt64
-                if useCoarse {
-                    guard let k = coarseFrame.key(world) else { continue }
-                    key = k | coarseTag
+                // High depth confidence, a usable normal and no edge flag is
+                // "flat, well-measured interior", and it selects about 46 per
+                // cent of samples on this scan (census: 4,878,493 high of
+                // 8,552,448 inspected, 773,856 of 888,951 seeds with a normal,
+                // 69,029 on an edge). That is the share the sweep above found.
+                let highConfidence = depthFrame.confidenceLevel(at: sampleIndex) >= 2
+                let frame: PrePassVoxelFrame
+                let cellSpacing: Float
+                let levelTag: UInt64
+                if sampleIsEdge && settings.edgeRefinement > 1 {
+                    frame = edgeFrame; cellSpacing = edgeSpacing; levelTag = 1
+                } else if settings.flatInteriorCoarsening > 1
+                            && sampleHasNormal && !sampleIsEdge && highConfidence {
+                    frame = coarseFrame; cellSpacing = coarseSpacing; levelTag = 2
                 } else {
-                    guard let k = voxelFrame.key(world) else { continue }
-                    key = k
+                    frame = voxelFrame; cellSpacing = spacing; levelTag = 0
                 }
-                let cellSpacing = useCoarse ? coarseSpacing : spacing
+                let cell = frame.cell(world)
+                guard cell.x >= 0, cell.y >= 0, cell.z >= 0,
+                      cell.x < cellLimit, cell.y < cellLimit, cell.z < cellLimit,
+                      let morton = PrePassMorton.key(cell: cell)
+                else { continue }
+                let key = morton | (levelTag << 60)
                 samplesInsideGrid += 1
 
                 let sampleWeight = clamp01(frameTrust?.weight(sampleIndex: sampleIndex) ?? 0)
