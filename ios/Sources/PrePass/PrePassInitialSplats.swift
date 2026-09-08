@@ -207,14 +207,33 @@ enum PrePassInitialSplatBuilder {
         /// Never finer than the laser itself sampled.
         var minSpacingMeters: Float = 0.010
         var maxSpacingMeters: Float = 0.120
-        /// HOW FAR SEED SIZES SPREAD EITHER SIDE OF THE NOMINAL SPACING.
+        /// COARSEN FLAT INTERIORS: give a sample with a good surface normal
+        /// and no edge flag a voxel this many times larger, and therefore a
+        /// seed this many times bigger. 1 disables it.
         ///
-        /// 1 restores the old behaviour, where every seed in a scan was exactly
-        /// the same size: measured at 7.397 mm for 100 per cent of this scan's
-        /// 888,951 seeds, a spread of 1.0000x. 2 gives edges half size and flat
-        /// well-measured interiors double, so the seeder hands densification a
-        /// 4x spread to work with instead of nothing. See the use site.
-        var seedSizeSpread: Float = 2
+        /// THIS IS THE VERSION THE MEASUREMENTS SUPPORT, and the radius-only
+        /// a radius-only version is not. Setting a seed's RADIUS from local
+        /// detail while every seed still sits on one uniform lattice was
+        /// measured to be worth essentially nothing at the 300,000 cap: the
+        /// best monotone rule over 16 detail buckets reached 16.90 dB against
+        /// the as-built 16.97.
+        ///
+        /// What the reference model actually does is couple size to SPACING.
+        /// Regressing log splat size on log local neighbour spacing gives
+        /// Scaniverse a slope of 0.94 with correlation 0.79; ours are 0.18 and
+        /// 0.17, which is no relationship at all. Their median splat is 0.75x
+        /// its nearest-neighbour distance so splats touch but barely overlap,
+        /// ours is 1.66x so each swallows several neighbours, and 69.3
+        /// neighbours fall inside one of our splats against 15.2 of theirs.
+        ///
+        /// A second lattice makes size follow spacing BY CONSTRUCTION, because
+        /// the radius is already cut from the cell size. Flat interiors get
+        /// one seed where they used to get four, which is also why the seed
+        /// count and the seeding stage's cost both fall: 888,951 seeds for a
+        /// room is four times what the trainer keeps, and the shaping loop,
+        /// the PLY write and the thinning all scale with it.
+        var flatInteriorCoarsening: Float = 2
+
         /// ABSOLUTE FLOOR for trust. Deliberately low, because the real
         /// decision is made RELATIVE to the scan (see `trustedQuantile`).
         ///
@@ -443,10 +462,18 @@ enum PrePassInitialSplatBuilder {
         // same envelope the carver and the survey use.
         var pathMin = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
         for frame in frames { pathMin = simd_min(pathMin, poseFor(frame).center.simd) }
-        let voxelFrame = PrePassVoxelFrame(
-            origin: pathMin - SIMD3<Float>(repeating: maxRange + 1),
-            voxelSize: spacing
-        )
+        let gridOrigin = pathMin - SIMD3<Float>(repeating: maxRange + 1)
+        let voxelFrame = PrePassVoxelFrame(origin: gridOrigin, voxelSize: spacing)
+        // THE SECOND LATTICE. See `flatInteriorCoarsening`.
+        //
+        // Both lattices share one hash, which is safe because a Morton key
+        // uses 21 bits per axis and `spread(z) << 2` tops out at bit 62, so
+        // bit 63 is free and tags which lattice a key came from. Two cells
+        // from different lattices can never collide, whatever they contain.
+        let coarseFactor = Swift.max(settings.flatInteriorCoarsening, 1)
+        let coarseSpacing = spacing * coarseFactor
+        let coarseFrame = PrePassVoxelFrame(origin: gridOrigin, voxelSize: coarseSpacing)
+        let coarseTag: UInt64 = 1 << 63
 
         // One representative sample per cell: the best-trusted one, NOT an
         // average. Averaging across a depth edge invents a surface halfway
@@ -474,6 +501,10 @@ enum PrePassInitialSplatBuilder {
         var rangeMeters: [Float] = []
         var hasNormal: [Bool] = []
         var onEdge: [Bool] = []
+        /// The size of the cell this seed came from. The radius is cut from
+        /// it, which is what makes splat size follow splat SPACING rather
+        /// than being one number for the whole scan.
+        var cellSize: [Float] = []
 
         position.reserveCapacity(expectedSeeds)
         normal.reserveCapacity(expectedSeeds)
@@ -485,6 +516,7 @@ enum PrePassInitialSplatBuilder {
         rangeMeters.reserveCapacity(expectedSeeds)
         hasNormal.reserveCapacity(expectedSeeds)
         onEdge.reserveCapacity(expectedSeeds)
+        cellSize.reserveCapacity(expectedSeeds)
 
         // The funnel, counted. Plain Ints on the stack: the inner loop runs
         // about eight million times on a room scan and does one add per
@@ -571,7 +603,29 @@ enum PrePassInitialSplatBuilder {
 
                 let direction = rotationInverse.act(geometry.rayDirections[sampleIndex])
                 let world = cameraCentre + direction * range
-                guard let key = voxelFrame.key(world) else { continue }
+                // WHICH LATTICE. A sample with a usable surface normal and no
+                // edge flag is a flat interior: a wall does not need a
+                // millimetre Gaussian and one seed covers what four used to.
+                // Everything else keeps the fine lattice, because an edge is
+                // exactly where a splat too big to fit produces the blur that
+                // shows.
+                //
+                // Both predicates are plain array reads, hoisted above the key
+                // so the routing decision costs nothing beyond the two loads
+                // it already had to do further down.
+                let sampleIsEdge = sampleIndex < edges.count
+                    && edges[sampleIndex] == .geometric
+                let sampleHasNormal = points.valid[sampleIndex]
+                let useCoarse = coarseFactor > 1 && sampleHasNormal && !sampleIsEdge
+                let key: UInt64
+                if useCoarse {
+                    guard let k = coarseFrame.key(world) else { continue }
+                    key = k | coarseTag
+                } else {
+                    guard let k = voxelFrame.key(world) else { continue }
+                    key = k
+                }
+                let cellSpacing = useCoarse ? coarseSpacing : spacing
                 samplesInsideGrid += 1
 
                 let sampleWeight = clamp01(frameTrust?.weight(sampleIndex: sampleIndex) ?? 0)
@@ -622,6 +676,7 @@ enum PrePassInitialSplatBuilder {
                     rangeMeters.append(range)
                     hasNormal.append(normalValid)
                     onEdge.append(isEdge)
+                    cellSize.append(cellSpacing)
                 } else {
                     let s = slot.index
                     position[s] = world
@@ -636,6 +691,7 @@ enum PrePassInitialSplatBuilder {
                     // An edge seen in any frame stays an edge: a curve that is
                     // a silhouette from one side is still a real 3D edge.
                     onEdge[s] = onEdge[s] || isEdge
+                    cellSize[s] = cellSpacing
                 }
             }
         }
@@ -794,35 +850,20 @@ enum PrePassInitialSplatBuilder {
             // already knows about that sample, instead of one number for the
             // whole scan:
             //
-            //   * ON A GEOMETRIC EDGE, half size. An edge is where a splat too
-            //     big to fit produces the blur that is most visible, and the
-            //     edge flag is already computed and already stored per cell.
-            //   * ON A FLAT, WELL-MEASURED, HIGH-TRUST INTERIOR, double size.
-            //     A wall does not need millimetre Gaussians, and a bigger one
-            //     covers it for a quarter of the tile cost. `sigma` here is the
-            //     measured or predicted depth noise, so "the surface is where
-            //     we think it is" is exactly the condition under which a large
-            //     splat is safe.
-            //   * OTHERWISE unchanged.
+            // The fix is the LATTICE, not the radius. See
+            // `flatInteriorCoarsening`: setting a radius from local detail
+            // while every seed still sits on one uniform grid was measured to
+            // be worth essentially nothing, because size has to follow
+            // SPACING, and on a uniform grid the spacing is a constant.
             //
-            // This is a 4x spread from the seeder alone against 1.0x today,
-            // and it is the only place in the pipeline where size can be made
-            // to follow anything about the local surface.
-            //
-            // `seedSizeSpread` in Settings turns it off: set it to 1 and every
-            // seed is the old single size again.
-            var detail: Float = 1
-            if settings.seedSizeSpread > 1 {
-                let k = settings.seedSizeSpread
-                if onEdge[i] {
-                    detail = 1 / k
-                } else if hasNormal[i]
-                            && weight[i] >= trustCut
-                            && sigma[i] <= 0.5 * Swift.max(spacing, sensorSpacing) {
-                    detail = k
-                }
-            }
-            let radius = 0.5 * Swift.max(spacing, sensorSpacing) * detail
+            // THE CELL THIS SEED ACTUALLY OCCUPIES, not one global number.
+            // `cellSize[i]` is `spacing` on the fine lattice and
+            // `spacing * flatInteriorCoarsening` on the coarse one, so a
+            // seed's size follows its own local spacing by construction. That
+            // is the property the reference model has and we did not: their
+            // log-size on log-spacing slope is 0.94, ours was 0.18.
+            let localSpacing = cellSize.isEmpty ? spacing : cellSize[i]
+            let radius = 0.5 * Swift.max(localSpacing, sensorSpacing)
 
             // Two gates, not one. A point can clear the trust cut and still be
             // doubtful because it never got a surface direction, and if the
