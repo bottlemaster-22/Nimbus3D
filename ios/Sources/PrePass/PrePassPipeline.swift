@@ -326,6 +326,14 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
     ) async throws {
         report(.preparing)
         let startedAt = Date()
+        // Per-stage clocks. See PrePassCensus.Stages for why: the pass is 22%
+        // of the wall clock and nothing has ever said which part of it.
+        var stageMark = Date()
+        func markStage(_ keyPath: WritableKeyPath<PrePassCensus.Stages, Double>) {
+            let now = Date()
+            census.stages[keyPath: keyPath] += now.timeIntervalSince(stageMark)
+            stageMark = now
+        }
         // The census is built up as the stages run and written ONCE at the
         // end, next to the result. Nothing in a hot loop touches it.
         var census = PrePassCensus()
@@ -411,6 +419,7 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
                 )
             )
         }
+        markStage(\.timeOffset)
         census.timeOffset = poseRefiner.lastTimeOffsetCensus
         if timeOffset == nil, let carried = bundle.cameraToIMUTimeOffsetSeconds {
             // The capture measured one and the pre-pass did not. Later stages
@@ -450,6 +459,7 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
             revisits = bundle.revisitPairs
             revisitsCameFromCapture = true
         }
+        markStage(\.revisits)
         census.revisits = poseRefiner.lastRevisitCensus
         census.revisits.usedCaptureFallback = revisitsCameFromCapture
         if revisitsCameFromCapture {
@@ -480,6 +490,7 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
             revisits: revisits,
             timeOffsetSeconds: timeOffset
         )
+        markStage(\.poseGraph)
         census.poseGraph = poseRefiner.lastPoseGraphCensus
 
         // --- 4b. Optional LiDAR-anchored, triangulation-free refinement.
@@ -666,6 +677,7 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
             // Read on both paths. The carver resets its counters at the start
             // of every carve, so even a carve that threw halfway reports how
             // far it got rather than the previous run's numbers.
+            markStage(\.carving)
             census.carving = carver.lastCensus
         }
 
@@ -877,6 +889,7 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
                         + "which takes longer and comes out softer."
                 ))
             }
+            markStage(\.seeding)
             census.seeding = seedingCensus
         }
 

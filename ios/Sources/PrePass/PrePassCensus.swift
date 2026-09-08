@@ -141,6 +141,37 @@ public struct PrePassCensus: Codable, Sendable {
     /// Wall-clock seconds the whole pass took. 0 until the pipeline fills it.
     public var durationSeconds: Double = 0
 
+    /// WHERE THOSE SECONDS WENT, per stage.
+    ///
+    /// The pre-pass measured 21.89 s on the owner's scan while training had
+    /// been ground from 247 s to 77 s, so it is now 22% of the wall clock and
+    /// has never been looked at. `durationSeconds` alone cannot say which of
+    /// five stages to look at, and guessing wasted a build on the trainer
+    /// earlier: every real win there came after the clocks went in, and none
+    /// of the changes made before them did anything.
+    ///
+    /// Seconds, cumulative over the pass. They do not have to sum to
+    /// `durationSeconds`: bundle loading and the writes at the end are outside
+    /// all five, and what is left over after subtracting them is itself the
+    /// answer to "is the I/O the problem".
+    public struct Stages: Codable, Sendable, Equatable {
+        /// Sweeping the camera-to-IMU time offset.
+        public var timeOffset: Double = 0
+        /// Finding and confirming revisited surfaces, ICP included.
+        public var revisits: Double = 0
+        /// The pose graph, plus the fine refinement that follows it.
+        public var poseGraph: Double = 0
+        /// Free-space carving. 10.7 million rays over 868 keyframes on the
+        /// owner's scan, every one of which needs a depth map loaded.
+        public var carving: Double = 0
+        /// Building the seed Gaussians from 174 keyframes.
+        public var seeding: Double = 0
+
+        public init() {}
+    }
+
+    public var stages = Stages()
+
     public var input = Input()
     public var timeOffset = TimeOffset()
     public var revisits = Revisits()
