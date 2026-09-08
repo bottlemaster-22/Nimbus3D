@@ -306,3 +306,86 @@ He also asked, unprompted and correctly reasoned: *"Can you run the camera at 24
 Commit `85e3f09`, ~20 files. **CI run 33988092964 GREEN ON THE FIRST ATTEMPT** despite the size of the change. Artifact verified by reading it: arm64 Mach-O 3,305,248 bytes, default.metallib 299,112 bytes, com.tombline.nimbus, minOS 17.0. Published as release **v0.1.1** and handed to the owner.
 
 **Next step:** he scans again. That is the only test that matters. If it is still sparse, the instrumentation agent's splat census (frames -> keyframes -> seeds -> after densify -> after prune -> after carve -> final) is the next thing to build, because we are still inferring where geometry goes instead of measuring it. Also outstanding: the `gate` and `converge` agents never ran (session limit), so nothing has re-audited these fixes as a set.
+
+---
+
+## 2026-09-08 : 247s to 71s of training, and the accounting error that made it look better than it is
+
+_Appended at the bottom to match this file's stated convention ("newest entry at the bottom"), not the session-continuity skill's newest-on-top default._
+
+**Since the last entry (2026-09-05):** three days of nothing but performance and quality work on the on-device trainer, none of it journalled until now. That gap is why a context compaction hurt so much: the entire cost model, every failed experiment, and the reason for each revert lived only in conversation. This entry closes it.
+
+### THE NUMBER THAT MATTERS, AND THE MISTAKE IN IT
+
+`scratchpad/census.py` prints a line labelled `wall`. It is computed from `train_census.json`'s `startedAt` to `finishedAt`. **That window covers TRAINING ONLY.** The pre-pass has its own census file and is printed separately, below it. Total processing is the sum, and nothing prints the sum.
+
+I quoted the owner "86s to 71s" this session. That was wrong: 86 was a TOTAL and 71 was TRAINING ONLY. Corrected, measured, same scan (`scan_20260906_164840`), 3000 iterations:
+
+| build | pre-pass | training | **total** | splats | held-out PSNR |
+|---|---|---|---|---|---|
+| 102 | not timed | 187 | ? | 152,335 | 16.78 |
+| 130 | not timed | 80 | ? | 151,761 | 16.34 |
+| 144 | 21.7 | 68 | 89.7 | 153,164 | 15.94 |
+| 156 | 20.9 | 65 | **85.9** | 150,554 | 16.00 |
+| 164 | 21.3 | 64 | 85.3 | 158,220 | 14.53 (half-conic regression, reverted) |
+| **172** | **17.8** | **71** | **88.8** | **299,883** | **17.30** |
+
+So training did climb 65 to 71, because the model now carries twice the splats. Pre-pass fell 20.9 to 17.8. **Total went 85.9 to 88.8: 2.9 s worse.** In exchange: +99% splats and +1.30 dB, against a measured noise band of +/-0.4 dB. A good trade, but it is a trade, and the headline "71s" was never a total.
+
+### VERIFIED (each with its proof)
+
+- **Trainer 247 s to 65 s of training time**, six changes, each measured on the same scan. Full table and the failed list live in the `likova-trainer-perf` memory file, which is the authoritative copy.
+- **The pattern held 6 for 6 against 0 for 5:** changes that REDUCE the quantity of work paid; changes that keep the same work and rearrange it never did.
+- **Binarization was destroying half the model.** `binarizeLastFraction` 0.2 starts the opacity ramp at 80% of the run while the growth window closes at 85%, so roughly 90,000 splats were driven to zero and pruned after densification could no longer replace them. Set to 0 as a null test in build 172: splats 150,554 to 299,883, PSNR 16.00 to 17.30. Proof: build 172 census.
+- **Seeding's 15.9 s was mostly file writing, not the per-sample loop.** Two prior optimisations of that loop moved 16.4 to 16.38 to 15.89, which should have been the clue. `Data.appendUInt32LE` was four one-byte `Data.append` calls; the PLY write is ~15M values, so 60M appends where 15M do. Plus `points3D.txt`, a `String(format:)` loop over 888,951 points with ZERO consumers in the app, now off by default (`PrePassPipeline.writeRefinedColmapModel = false`). Proof: seeding 15.9 to 12.93, pre-pass 21.3 to 17.8.
+- **Thermals are not the constraint at this length.** `nominal` for 99.4% of a 71 s run, peak `nominal`. Proof: build 172 thermals block.
+- **`tools/splat_to_blender.py` works.** Converts any 3DGS .ply into a Blender-readable coloured point cloud (INRIA `0.5 + 0.282095*dc`, sigmoid on the opacity logit, RDF to Z-up). Verified on the 427,710-splat Scaniverse capture: 427,550 kept, mean sampled colour 120/108/101, so mid-range rather than clipped.
+- **Build 172 is green and published** on `build/first-ci`.
+
+### ASSUMED / UNVERIFIED
+
+- **Splat SIZE is the whole Scaniverse gap.** The reasoning is mechanical and consistent (splats only shrink by SPLITTING; clone copies at the same size; build 172 fired 190 splits against 152,801 clones; our median splat is 13.2 mm against their 3.4 mm) but no build has yet changed the routing, so this is inference, not measurement.
+- **The 300,000 cap is now the binding constraint.** 299,883 final strongly implies it, but no run has been done with a higher cap.
+- **Raising SH degree 1 to 3 is worth its cost.** Scaniverse ships degree 3. Untested here, and it is 3x the colour coefficients through every gradient.
+
+### DECISIONS & RATIONALE
+
+- **Binarization stays off**, pending one confirming run. It was costing half the model to save file size we are not short of.
+- **Do not ship the split/clone routing change alone.** Routing split on SCREEN radius instead of world scale raises the split rate, and against the CURRENT one-axis shrink that makes tile count worse, which is the opposite of the point. It ships together with three-axis split geometry or not at all.
+- **Journal at the bottom, not the top.** This file has said "newest entry at the bottom" since day one and eight entries follow that. Consistency beats the skill's default.
+- **No workflow this session.** The owner was at 78% of the 5-hour limit and said so. The work is being done inline instead.
+
+### OPEN THREADS (priority order)
+
+1. **Split/clone routing + three-axis split geometry.** The direct attack on 13.2 mm vs 3.4 mm. Must ship as one change.
+2. **Raise the 300,000 splat cap** now that it binds, and measure memory and energy at the new count on the A19 Pro.
+3. **The GPU timing buckets are blind.** In build 172 `gpuForward`, `gpuLosses`, `gpuBackward` and `gpuOptimiser` all read exactly 0.00 while `gpuSort` reads 18.81 ms/iter and `gpuScan` 1.83, summing to `gpuBusy` 20.69 exactly. That is not a sort regression, it is every stage in that command buffer being credited to the sort bucket. Until this is fixed we cannot see where GPU time goes.
+4. **SH degree 1 to 3.**
+5. **Repo is TEMPORARILY PUBLIC** for free CI minutes. Flip back with `gh repo edit bottlemaster-22/Nimbus3D --visibility private` as soon as billing allows. Owner: "that's how our hard work gets scraped."
+6. Tag-gated CI builds, offered and never actioned, to stop burning Actions minutes on every push.
+
+### NEXT ACTION
+
+Fix the timing buckets (item 3) before any further GPU work, because every remaining speed decision is currently being made blind.
+
+### MAP
+
+- `ios/Sources/Trainer/TrainerShaders.metal` : all Metal kernels. `TrainerSplatRaster` is the 40-byte compact record the hot loops read. The alpha-threshold tile footprint in `trainer_preprocess` was the single biggest speed win.
+- `ios/Sources/Trainer/MetalSplatTrainer.swift` : the loop, the command buffers, `timings` reset per run.
+- `ios/Sources/Trainer/TrainerSupport.swift` : `binarizeLastFraction`, `splitScaleFraction` (0.004), `snapshotIntervalIterations` (200).
+- `ios/Sources/PrePass/PrePassPipeline.swift` : `writeRefinedColmapModel` (now false).
+- `ios/Sources/Export/BinaryIO.swift` : `appendUInt32LE`, the bulk-append fix.
+- `ios/Sources/Core/Contracts.swift:1820` : iteration count per tier.
+- `tools/splat_to_blender.py` : 3DGS .ply to Blender-readable coloured points.
+- `scratchpad/census.py` : reads the latest diagnostics. NOT in the repo, lives in the session scratchpad.
+
+### GOTCHAS
+
+- **`wall` in census.py is TRAINING ONLY.** Add the pre-pass line to it before quoting a processing time. This caused a wrong claim to the owner today.
+- **Inside an extension on `Data`, bare `withUnsafeBytes` binds to Data's own instance method.** Build 170 failed on exactly this. It must be written `Swift.withUnsafeBytes`.
+- **A SIMD-group reduction can gate work inside a threadgroup-uniform loop; it can never decide how many times that loop runs.** Shipped as a model-corrupting bug in builds 132 to 138.
+- **`MTL_FAST_MATH: YES` implies `-ffinite-math-only`,** so `isfinite()` folds to constant true. Use a bitwise exponent test.
+- **`simd_sum`/`simd_max` are Apple GPU family 7+.** Gate behind a function constant; A12 devices reach this code.
+- **Half precision on the conic cost 2 dB.** Reverted. Do not retry.
+- **The diagnostics arrive through the Booster**, not by hunting the filesystem.
+- CI is the only compiler available; there is no Xcode on the owner's Windows machine.
