@@ -765,7 +765,39 @@ struct TrainerTuning: Sendable {
     /// much of the population one pass ranks.
     var maxRelocationFractionPerPass: Float = 0.05
     /// Opacity below which a Gaussian is a relocation donor.
-    var relocationDonorOpacity: Float = 0.02
+    /// INVARIANT: this MUST stay above `pruneOpacity`, or the donor pool is
+    /// empty by construction. A Gaussian below `pruneOpacity` is deleted at
+    /// the end of the same pass, so it can never be picked up and reused; the
+    /// band between the two thresholds IS the donor pool.
+    ///
+    /// Both were 0.02, which made that band empty. Measured on build 182's
+    /// exported model, only 113 Gaussians of 299,209 (0.04 per cent) sat below
+    /// 0.02 at all, so essentially every donor the census recorded came from
+    /// the OTHER half of the test, `visAccum <= 0`, meaning "not seen in any
+    /// frame this interval" rather than "faint". 24,222 donors across 29
+    /// passes, 835 a pass, against a `maxRelocationFractionPerPass` allowance
+    /// of 15,000. Donors were the binding limit by a factor of eighteen.
+    ///
+    /// That matters because relocation is not a side mechanism. It is a SPLIT
+    /// that uses a dead Gaussian's slot, and once the population reaches its
+    /// cap around iteration 600 it is the ONLY thing still able to make a
+    /// Gaussian smaller, for the remaining 80 per cent of the run. Starving it
+    /// is what keeps our size distribution 1.8x wide against a good model's
+    /// 8.9x.
+    ///
+    /// 0.05 is chosen so the pool just clears the allowance rather than
+    /// dwarfing it: 22,005 Gaussians (7.35 per cent) sit below it, against an
+    /// allowance of 5 per cent. A Gaussian at alpha 0.02 to 0.05 contributes
+    /// two to five per cent of a pixel, and the relocation's opacity
+    /// correction hands its coverage to the target it lands on.
+    ///
+    /// THE RISK, stated plainly: this raises relocation from about 835 a pass
+    /// to as many as 15,000, which is 5 per cent of the population churned per
+    /// pass with fresh Adam state each time. That is the 3DGS-MCMC design
+    /// working as intended, but it is a large change in how much the model
+    /// moves, and it is the first constant to look at if the run becomes
+    /// unstable.
+    var relocationDonorOpacity: Float = 0.05
 
     // --- Mip-Splatting --------------------------------------------------------
 
