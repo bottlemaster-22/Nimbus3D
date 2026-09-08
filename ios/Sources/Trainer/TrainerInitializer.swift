@@ -278,7 +278,14 @@ enum TrainerInitializer {
     /// the finding priced at roughly +4 s on a 65 s run.
     static func seedTarget(forSplatCap cap: Int, fillFraction: Float = 1.0) -> Int {
         guard cap > 0 else { return 0 }
-        let wanted = Int((Float(cap) * Swift.max(fillFraction, 0.05)).rounded())
+        // Clamped to 0.05...1 BEFORE the conversion, and NaN takes the `else`
+        // branch because every comparison against NaN is false. So the product
+        // is at most `cap`, which is an Int already, and the rounded Double
+        // cannot be non-finite or out of Int's range.
+        let f = fillFraction.isFinite
+            ? Double(Swift.min(Swift.max(fillFraction, 0.05), 1))
+            : 1.0
+        let wanted = Int((Double(cap) * f).rounded())
         return Swift.max(1, Swift.min(cap, wanted))
     }
 
