@@ -317,10 +317,16 @@ targets:
         #     adds a "save a picture of this scan" button, and not before.
         NSLocalNetworkUsageDescription: >-
           Used to find your PC on your own Wi-Fi so it can help finish a large
-          scan. Everything stays on your local network and nothing goes to the
-          internet.
+          scan, and in development builds to reach the update relay on the same
+          network. Your scans stay on your local network.
         NSBonjourServices:
           - $(NIMBUS_BOOSTER_SERVICE_TYPE)
+          # DEVELOPMENT ONLY, and it goes when SelfUpdateService does. The
+          # over-the-air update reaches a relay on the owner's own Wi-Fi at
+          # `bottle-relay.local`, and resolving a plain `.local` HTTP host
+          # needs `_http._tcp` declared here or the lookup fails silently with
+          # no permission prompt and no error.
+          - _http._tcp
 
     # -------------------------------------------------------------------------
     #  Entitlements.

@@ -1654,7 +1654,12 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             supervision.depthSamples.count, resources.depthSampleCapacity
         )
         if sampleCount > 0 {
-            resources.depthSamples.writeArray(Array(supervision.depthSamples.prefix(sampleCount)))
+            // NOT `Array(...prefix(sampleCount))`. That allocated and copied
+            // 1.57 MB every iteration to produce exactly what writeArray
+            // would have written anyway: it clamps to `length / stride`,
+            // which IS `sampleCount`, since sampleCount is already
+            // min(count, depthSampleCapacity).
+            resources.depthSamples.writeArray(supervision.depthSamples)
         }
         timings.upload += CFAbsoluteTimeGetCurrent() - uploadFrom
 

@@ -144,6 +144,8 @@ public final class SelfUpdateService: ObservableObject {
         defer { isWorking = false }
 
         do {
+            // WAKE THE LAN PATH FIRST. See `touchRelay`.
+            await Self.touchRelay()
             let started = try await post(config: config, force: force)
             apply(started)
             // `current` starts no job, so there is nothing to follow. Every
@@ -188,6 +190,51 @@ public final class SelfUpdateService: ObservableObject {
     private struct Reply {
         var status: Status
         var message: String?
+    }
+
+    /// Sends one throwaway request to the relay on the LAN, and ignores
+    /// everything about the answer.
+    ///
+    /// WHY THIS IS HERE, from the Bottle agent who root-caused it:
+    ///
+    ///   Asking for an update and receiving one travel different paths. This
+    ///   app POSTs the broker over the internet, which always works. The
+    ///   broker then installs by reaching this phone over the LAN through a
+    ///   relay on the owner's Wi-Fi, and THAT path decays: if the phone has
+    ///   not talked to the relay in about ten minutes, the relay's packets
+    ///   stop arriving entirely, an 8 second connect timeout and zero bytes.
+    ///   The phone initiating contact fixes it, verified by the owner opening
+    ///   the relay's address in Safari and having the very next install
+    ///   succeed with no reboot.
+    ///
+    /// It is a WORKAROUND, and Bottle says so plainly: the decay is below the
+    /// app layer, somewhere between iOS and the access point, and has not been
+    /// explained. It may be replaced by a real fix later. Bottle's own app
+    /// carries the same call so the contract stays symmetric.
+    ///
+    /// Deliberately weak by design:
+    ///   * The NAME is resolved, not an IP. The relay answers to
+    ///     `bottle-relay.local` and its address today is 192.168.4.51, which
+    ///     is exactly the kind of thing that changes without warning.
+    ///   * Two seconds, then give up.
+    ///   * EVERY outcome is success. 200, 404, connection refused, timeout,
+    ///     no permission: all fine. The only thing that matters is that
+    ///     packets left this phone toward the relay.
+    ///   * It can never fail or delay the update. If the owner denies Local
+    ///     Network access the request fails instantly, the update is still
+    ///     requested, and the install fails exactly the way it does today
+    ///     rather than the app refusing to try.
+    ///
+    /// The gap to the POST matters: the window is under ten minutes and an
+    /// install takes about twenty seconds, so this is awaited immediately
+    /// before the request rather than at launch or on a timer.
+    private static func touchRelay() async {
+        guard let url = URL(string: "http://bottle-relay.local/") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 2
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        _ = try? await URLSession.shared.data(for: request)
     }
 
     private func post(

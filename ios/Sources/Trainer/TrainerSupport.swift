@@ -751,12 +751,37 @@ extension MTLBuffer {
     /// Writes `values` to the front of the buffer. Silently writes as many as
     /// fit, and returns how many that was, so an over-long write is a number
     /// the caller can check rather than a heap corruption.
+    ///
+    /// ONE memcpy, NOT an element-at-a-time loop.
+    ///
+    /// It was a loop, `for i in 0..<fits { raw[i] = values[i] }`, and the
+    /// trainer calls this three times per iteration with the frame's ground
+    /// truth, its background and its depth samples: about 2.3 million Floats
+    /// plus 49,000 structs, every iteration, each one going through Array
+    /// subscripting with its bounds check and retain traffic rather than a
+    /// bulk copy.
+    ///
+    /// Measured on the owner's phone at build 108: 35.8 seconds of a 126
+    /// second run, 11.95 ms per iteration, 28% of the whole thing. It was the
+    /// largest single item left anywhere in the loop and it was invisible
+    /// until `timings.upload` existed. An adversarial reviewer had dismissed
+    /// this exact finding as "0.3-0.5 ms per iteration, below the bar"; the
+    /// measurement says it was wrong by about twenty-five times, which is the
+    /// argument for measuring rather than arguing.
+    ///
+    /// Safe as a raw byte copy: these buffers are storageModeShared, so
+    /// `contents()` is the same physical memory the GPU reads, and every T
+    /// written here is a trivially-copyable Float or POD struct shared with
+    /// the Metal side. `copyFront` elsewhere in this file already does exactly
+    /// this for the same reason.
     @discardableResult
     func writeArray<T>(_ values: [T]) -> Int {
         let fits = Swift.min(values.count, length / Swift.max(MemoryLayout<T>.stride, 1))
         guard fits > 0 else { return 0 }
-        let raw = contents().bindMemory(to: T.self, capacity: fits)
-        for i in 0..<fits { raw[i] = values[i] }
+        values.withUnsafeBytes { source in
+            guard let base = source.baseAddress else { return }
+            memcpy(contents(), base, fits * MemoryLayout<T>.stride)
+        }
         return fits
     }
 
