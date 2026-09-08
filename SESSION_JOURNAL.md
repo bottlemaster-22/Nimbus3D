@@ -657,3 +657,53 @@ Owner tests. `cd tools/offline && python census.py` prints the verdict: the clon
 - A Morton key here leaves bit 63 free (21 bits x 3 axes, top at bit 62), which is what makes a second lattice safe in one hash.
 - `clearPerIteration` wipes all 16 floats of `splatGrad2D` every iteration; `stats` survives a densify interval. Never move an interval-scoped accumulator into that record without a fold.
 - Growth allowance after the cap equals the previous pass's TOTAL deletions, including `carvedFromEmptySpace`, not just `prunedLowOpacity`.
+
+---
+
+## 2026-09-08 (very late) : The seeding fix was the wrong half, and the capture side got its first attention
+
+**Since the last entry:** two things. I measured my own seeding change and it was wrong, and then the capture-side findings from the FIRST workflow, which nobody had ever touched, finally got acted on.
+
+### I SHIPPED THE WRONG HALF OF THE SEEDING FIX, THEN MEASURED IT
+
+Build 212 coarsened flat interiors onto a second lattice. Re-voxelising the owner's real geometry says that was a bad trade:
+
+| config | seeds | slope | p10 | p50 | p90 | spread | smax/nn1 |
+|---|---|---|---|---|---|---|---|
+| one lattice (before) | 248,057 | 0.000 | 7.40 | 7.40 | 7.40 | 1.00x | 0.54 |
+| build 212, coarsen 80% | 170,836 | 0.186 | 7.40 | **14.79** | 14.79 | 2.00x | **0.92** |
+| refine edges only | 253,815 | 0.043 | 7.40 | 7.40 | 7.40 | 1.00x | 0.55 |
+| **shipped, build 216** | 224,515 | 0.218 | **3.70** | **7.40** | 14.79 | **4.00x** | **0.54** |
+
+The predicate "has a normal and is not an edge" selects about **80 per cent** of the scan, because the census records 69,029 of 888,951 seeds on an edge and 773,856 with a normal. Coarsening the MAJORITY moves the median by definition, and the median is the exact thing this work exists to shrink. Our model runs about 2.6x its seed size, so 7.40 mm seeds would have become roughly 38 mm.
+
+Refining edges alone does nothing either: 7.8 per cent of samples never reach the p10 line.
+
+Build 216 is three levels, and is strictly better than the original on every measured number: same median, same packing, 9 per cent fewer seeds, spread 1.00x to 4.00x. The 46 per cent coarse share is not tuned; it is what "high depth confidence, usable normal, not an edge" actually selects. Three levels need two tag bits, which fit because a Morton key with cells under 2^20 tops out at bit 59.
+
+### THE CAPTURE SIDE, UNTOUCHED UNTIL NOW
+
+- **A window painted itself green.** The LiDAR confidence map is written every frame and read nowhere in the coverage path. Now it attenuates the sample's sharpness (0.35 low, 0.75 medium, 1.0 high) rather than rejecting it, because `observe` keeps `bestSharpness` as a MAX: a patch seen only through doubtful returns never satisfies the quality channel, while one good look still settles it. Rejecting outright would read as "not scanned" and lengthen every scan.
+- **The angle channel counted looks, never sides.** `directionCount / 4` against a 0.7 threshold means three buckets OF ANY KIND, so one direction at three heights passed. That is the owner's 50-degree dead zone, invisible to the HUD built to prevent it. Now `min(count, azimuthSpread/90)`. The research proposed "no gap wider than 90 degrees", which nothing can satisfy: a wall patch is visible only from the hemisphere in front of it, so the largest gap is always at least 180. The reachable question is the width of the OBSERVED arc. Verified on all eight occupancy cases including the wrap-around before shipping.
+- **Capture wrote 868 frames; the largest consumer reads 240.** Seeder 174, survey 48, glass 40, trainer 120 or 240. About 630 MB written, some 450 MB never opened, 9 to 13 s of JPEG encode with the heat behind it. `keyframeMinIntervalSeconds` 0.30 to 0.45 still writes ~610, 2.5x the largest consumer. **This is the one change tonight whose trade could not be measured offline**: a thinner pool gives `keyframeMinQCWeight` fewer alternatives on a shaky scan.
+- **HDR was never requested.** Guarded on `videoFormat.isVideoHDRSupported`, so a format carrying sceneDepth that lacks HDR makes it a no-op rather than a failure. One to two stops of highlight headroom is the difference between a window as pure white, with no gradient for any loss to fit, and one with recoverable structure.
+
+### A RESEARCH CLAIM REFUTED WITH THE DEVICE'S OWN NUMBERS
+
+The blur meter's 0.0426 deg/px divisor was said to under-report smear by 17 per cent, from a 0.0365 derived from Apple's 24 mm-equivalent MARKETING figure. This app writes the real intrinsics to disk: fx 1381.8971 at width 1920, a 69.575 degree horizontal field of view, on-axis pitch 2*atan(0.5/fx) = 0.04146. The constant is **2.7 per cent** high, not 17. It stays: the amber and red thresholds are calibrated against it, CONTRACTS.md fixes it, and 2.7 per cent on a "you are moving too fast" warning is far below the spread of a hand-held scan.
+
+### VERIFIED
+
+Builds 216 through 224 green and published. `trapconv` and `deadwire` pass on every one. The azimuth gap walk was checked against eight hand-computed cases; the blur pitch was computed from the capture bundle on disk.
+
+### ASSUMED / UNVERIFIED
+
+Every capture-side change. None of them can be measured offline at all, unlike the trainer work, because they alter what the device records rather than what is computed from a recording.
+
+### OPEN, AND IT NEEDS A DECISION RATHER THAN A CONSTANT
+
+An unseen ceiling is not in the coverage denominator. `recomputeFraction` iterates `voxels.values`, and unobserved space is not a voxel, so a ceiling nobody looked at can never make the percentage go down. Fixing it means deciding what "space you should have scanned" IS: the ARKit scene mesh is the obvious candidate since `meshStore` already exists, but that is a design question, not a tuning one, and guessing it would be the same mistake as the seeding predicate.
+
+### NEXT ACTION
+
+Owner tests build 224. `cd tools/offline && python census.py` prints the verdict. Read the size distribution's p90/p10 spread first: 1.76x is the disease, and seeding alone should now supply 4x before densification's contribution.
