@@ -1137,6 +1137,32 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // still spent the time trying, and hiding that would flatter the
             // number.
             timings.supervision += CFAbsoluteTimeGetCurrent() - supervisionFrom
+
+            // START THE NEXT FRAME NOW, so it is built during the GPU wait
+            // that `runIteration` is about to sit in rather than after it.
+            // `orderCursor` has already moved on, so this is genuinely the
+            // frame the next iteration will ask for, and `iteration + 1` is
+            // the number it will ask with; both are checked on the way out, so
+            // a wrong guess costs the work and nothing else.
+            //
+            // ABOVE THE SKIP GUARD, not below it. It used to sit after the
+            // `guard let frameSupervision`, so a frame whose photo would not
+            // decode took the `continue` straight past this and left no worker
+            // running at all. The next iteration then missed its key and built
+            // the whole frame inline on the main thread: about 38 ms of
+            // supervision charged to one skipped frame, on top of the wasted
+            // build. Nothing between here and the old position touches the
+            // builder, and `iteration += 1` happens on the skip path too, so
+            // the guess stays correct.
+            if !order.isEmpty {
+                let nextFrame = slice.keyframes[order[orderCursor % order.count]]
+                prefetch.start(
+                    frame: nextFrame,
+                    iteration: iteration + 1,
+                    totalIterations: effectiveTotal
+                )
+            }
+
             guard let frameSupervision = builtSupervision else {
                 // A frame whose photo would not decode. Counted rather than
                 // skipped in silence: a run where most iterations land here is
@@ -1156,20 +1182,6 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 gpu = TrainerGPU(pipelines: pipelines, resources: resources)
             }
 
-            // START THE NEXT FRAME NOW, so it is built during the GPU wait
-            // that `runIteration` is about to sit in rather than after it.
-            // `orderCursor` has already moved on, so this is genuinely the
-            // frame the next iteration will ask for, and `iteration + 1` is
-            // the number it will ask with; both are checked on the way out, so
-            // a wrong guess costs the work and nothing else.
-            if !order.isEmpty {
-                let nextFrame = slice.keyframes[order[orderCursor % order.count]]
-                prefetch.start(
-                    frame: nextFrame,
-                    iteration: iteration + 1,
-                    totalIterations: effectiveTotal
-                )
-            }
 
             let exposure = exposures[frame.index] ?? SIMD2<Float>(1, 0)
 
