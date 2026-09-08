@@ -876,30 +876,55 @@ struct TrainerGPU {
     // is written out explicitly rather than "zero everything", which would
     // also wipe the densification statistics the interval is meant to gather.
 
-    func clearPerIteration(_ encoder: MTLComputeCommandEncoder, splatCount: Int) {
+    /// Zeroes everything the step accumulates into, with the BLIT engine.
+    ///
+    /// Was nine compute dispatches running `trainer_fill_float`, one per
+    /// buffer, each with its own threadgroup setup and its own barrier against
+    /// the next. A blit `fill` is a DMA: no threads, no dispatch, and it runs
+    /// at copy bandwidth rather than at whatever a one-float-per-thread kernel
+    /// manages. Nine dispatches become nine fills inside one encoder.
+    ///
+    /// Only legal because the value is ZERO. `MTLBlitCommandEncoder.fill`
+    /// writes a repeated BYTE, and the float whose four bytes are all zero is
+    /// 0.0. Any other value would still need the compute kernel, which is why
+    /// `fillFloat` stays.
+    ///
+    /// The visibility reset stays on the compute side: it writes a flag, not a
+    /// float, and it is one dispatch.
+    func clearPerIteration(_ blit: MTLBlitCommandEncoder, splatCount: Int) {
         let px = resources.renderSize.pixelCount
         let shFloats = splatCount * resources.shFloatsPerSplat
 
+        func zero(_ buffer: MTLBuffer, floats: Int) {
+            let bytes = Swift.min(floats * 4, buffer.length)
+            guard bytes > 0 else { return }
+            blit.fill(buffer: buffer, range: 0..<bytes, value: 0)
+        }
+
         // Accumulated by the backward kernels through atomics.
-        fillFloat(encoder, buffer: resources.splatGrad, count: splatCount * 12, value: 0)
-        fillFloat(encoder, buffer: resources.shGrad, count: shFloats, value: 0)
-        // ONE fill where there were four: the four gradient buffers are now
-        // one interleaved record of 16 floats per splat, so this is a quarter
-        // of the dispatches and a single contiguous write.
-        fillFloat(encoder, buffer: resources.splatGrad2D, count: splatCount * 16, value: 0)
+        zero(resources.splatGrad, floats: splatCount * 12)
+        zero(resources.shGrad, floats: shFloats)
+        zero(resources.splatGrad2D, floats: splatCount * 16)
 
         // Accumulated per pixel with `+=`.
-        fillFloat(encoder, buffer: resources.gradDepthRend, count: px, value: 0)
-        fillFloat(encoder, buffer: resources.gradTFinal, count: px, value: 0)
-        fillFloat(encoder, buffer: resources.unknownMask, count: px, value: 0)
+        zero(resources.gradDepthRend, floats: px)
+        zero(resources.gradTFinal, floats: px)
+        zero(resources.unknownMask, floats: px)
 
         // Scalars.
-        fillFloat(encoder, buffer: resources.lossAccum, count: 1, value: 0)
-        fillFloat(encoder, buffer: resources.exposureGrad, count: 2, value: 0)
-        fillFloat(encoder, buffer: resources.cameraGrad, count: 6, value: 0)
+        zero(resources.lossAccum, floats: 1)
+        zero(resources.exposureGrad, floats: 2)
+        zero(resources.cameraGrad, floats: 6)
 
-        // The visibility mask is per step; the densification statistics are
-        // per interval and are deliberately NOT touched here.
+    }
+
+    /// The one part of the per-iteration reset that is not a zero fill.
+    ///
+    /// The visibility mask is per step; the densification statistics are per
+    /// interval and are deliberately NOT touched here.
+    func resetVisibilityForIteration(
+        _ encoder: MTLComputeCommandEncoder, splatCount: Int
+    ) {
         resetVisibility(encoder, count: splatCount)
     }
 }
