@@ -458,3 +458,63 @@ Every change is a single named constant with its reasoning written on it, specif
 ### NEXT ACTION
 
 Read the census when the owner tests: splat count, held-out PSNR, `addedBySplit`, clone/split ratio, `gpuStep`, and the pre-pass total. `addedBySplit` is the one that says whether the headline change did anything at all.
+
+---
+
+## 2026-09-08 (night) : An offline copy of the rasteriser, and six research findings put to the test
+
+**Since the last entry:** the owner cannot test again until tomorrow and asked for proof rather than guesses. So the work moved off the device entirely. `tools/offline/` is now a numpy reimplementation of the trainer's hot path, run against the model, poses and intrinsics already sitting in `Documents/LiKOVA/Scans/diagnostics/`.
+
+### THE HARNESS, AND WHY IT CAN BE TRUSTED
+
+- `project.py` : `trainer_preprocess`. 3D covariance from log-scale and quaternion, EWA projection, the Mip-Splatting 2D low-pass and its compensation, the alpha-threshold tile box, tile counts.
+- `raster.py` : the rasteriser inner loop, front-to-back, on a sample of tiles. Exposes `geometry()` and `composite()`.
+- `backward.py` : what the backward pass walks under each of the four possible gating schemes.
+
+**Validation: on frame 4 it computes 1,059,741 tile instances against the census's recorded `peakTileInstances` of 1,058,989. 0.07 per cent.** Two traps cost an hour and are worth recording: the PLY is written in RDF while the trainer works in RUB, so BOTH the position and the quaternion's imaginary part need y and z negated; and `refinedPoses` in `prepass_result.json` is a dict keyed by frame index as a STRING, not a list.
+
+### SIX FINDINGS TESTED. TWO SURVIVED.
+
+**1. Split on screen radius: WRONG, and shipped wrong in build 182.** The research put the median projected half-extent at 4.8 px, so `splitScreenRadiusPx = 10` was meant to select the top few per cent. Measured, the median of the statistic the code actually reads is **40 to 49 px**, and 10 px selects **99.18 per cent** of the drawn population. 16 px selects 96. 48 px still selects 52. It cannot be rescued by moving the number: `maxRadiusPxBits` is a MAX over every view in the interval and the 3-sigma radius scales with 1/z, so one close-up frame sets it, and the median CLIMBS as more views are sampled. 4.2 per cent of drawn Gaussians record a max radius wider than the whole 720 px frame. Mean alpha extent is no better: 8 px selects 99.46 per cent, 24 px selects 47.89, no knee anywhere. Replaced with `splitShareOfGrowth = 0.2`, a RATIO of the already-ranked candidate list. A share has no unit to be wrong about.
+
+**2. `if (power > 0) continue;` is provably dead.** 100.00 per cent of 7,719,936 pairs pass it. `power` equals `-(0.5/det) * (quadratic form of the adjugate of Sigma2D)`, and the adjugate of a positive definite 2x2 is positive definite, so it cannot be positive wherever a splat is emitted at all. A compare and a branch on every pair, in a loop entered ~294 million times an iteration in each of two kernels. Removed.
+
+**3. "Early termination never fires, the model is a fog": WRONG.** It fires on **93.71 per cent** of pixels, median final transmittance 0.0000. The finding reasoned from a median peak alpha of 0.0038 taken over the WHOLE population including the invisible half, while the splats that reach a pixel are nowhere near median: a typical pixel gets 296 alpha-passing contributions. The measurement it rested on also predates binarization being switched off. An entropy prior and a scale-reset schedule were the proposed fix; both would have been a day spent on a problem that does not exist.
+
+**4. The backward's traversal is at 1.12x the theoretical ideal.** Pairs walked on 40 tiles of frame 4: forward 4,381,243, ideal per-pixel backward 4,381,243, **SIMD-group gate as shipped 4,912,416**, threadgroup gate 5,487,616, no gate 7,719,936. So the backward walks only 12 per cent more than the forward and costs 3.6x. The cost is per-pair work, the twelve gradients and their atomics, NOT traversal. Three separate findings proposing smarter traversal are dead; the one blaming the atomics is right. It also explains why the SIMD-reduction attempt came out 6 per cent slower: right target, wrong instrument.
+
+**5. `filter2DVariance` contributes 0.2 per cent of tile cost** across its whole plausible range (0.0 to 0.5). Our Gaussians are tens of pixels wide, so half a pixel of blur is nothing. Dead lever.
+
+**6. The `pad0` exp cutoff: right, but I overstated it.** I wrote "roughly four out of five" exp evaluations killed. Measured **60.76 per cent**. Still the largest single item in that loop.
+
+### WHAT IT ALL POINTS AT
+
+Per pixel on frame 4: **754 pairs evaluated, 296 clear the alpha test, 178 genuinely composited.** 3.54 tile instances per splat on average, 10.35 on a busy frame. Every one of those numbers is set by how big the Gaussians are on screen, and the median largest axis is 19.6 mm against Scaniverse's 3.4 mm on the same room.
+
+**And splat size has always equalled SEED size,** because clone copies the parent's size and split was firing 190 times against 152,801 clones. That is why the model has never gone finer than LiDAR sample spacing. With split now routed by share, this is the first build that can.
+
+### DECISIONS
+
+- **Seed spacing compensation OFF** (`seedSpacingCompensation = 0`). Geometrically correct in isolation, but it took the median from 13.2 mm to 19.6 mm and tile instances per splat from 2.55 to 3.54, and it amplifies as the seed count falls (2.43x at fillFraction 0.5 against the 1.72x build 182 ran). The whole gap being chased is that our Gaussians are too big.
+- **Do not optimise backward traversal.** Measured at 1.12x optimal.
+- **Do not build the entropy prior / scale reset.** The problem it targets does not exist in this model.
+- **No risky densification-statistics subsampling for now.** It is worth about 5 per cent of `gpuStep` and it degrades the AbsGS score and the visibility test, and quality is currently the binding constraint.
+
+### VERIFIED
+
+Builds 184, 186 and 188 all green and published. `trapconv` and `deadwire` pass. The harness reproduces the census to 0.07 per cent.
+
+### ASSUMED / UNVERIFIED
+
+Everything about what these changes do to a real run. Nothing since build 182 has been tested on the device.
+
+### NEXT ACTION
+
+The owner tests build 188. Read `addedBySplit` and the clone/split ratio first: with `splitShareOfGrowth = 0.2` and a restored growth budget, the ratio should land near 80/20, and the median splat size should fall below the seed spacing for the first time.
+
+### GOTCHAS
+
+- The PLY is RDF, the trainer is RUB: negate y and z on BOTH position and quaternion imaginary part when reading a model back.
+- `refinedPoses` is a dict keyed by a STRING frame index.
+- `maxRadiusPxBits` is a max over views and scales with 1/z. It is useless as a fixed threshold and its median grows with the number of views sampled.
+- A statistic's median measured over the whole population says nothing about the splats that actually reach a pixel.

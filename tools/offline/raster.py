@@ -27,6 +27,85 @@ D = P.D
 TILE = 16
 
 
+def geometry(col, count, R, t, fx, fy, cx, cy):
+    """Per-splat screen position, 2D conic and drawn opacity.
+
+    The same quantities trainer_preprocess writes into TrainerSplatRaster,
+    kept rather than thrown away so the inner-loop simulations can use them.
+    """
+    mean = np.stack([col['x'], -col['y'], -col['z']], axis=1).astype(np.float64)
+    cam = mean @ R.T + t
+    z = cam[:, 2]
+    inv_z = 1.0 / np.where(z != 0, z, 1)
+    mx = fx * cam[:, 0] * inv_z + cx
+    my = fy * cam[:, 1] * inv_z + cy
+
+    scale = np.exp(np.clip(np.stack(
+        [col['scale_0'], col['scale_1'], col['scale_2']], axis=1
+    ).astype(np.float64), -12, 3))
+    q = np.stack([col['rot_1'], -col['rot_2'], -col['rot_3'], col['rot_0']],
+                 axis=1).astype(np.float64)
+    q = q / np.linalg.norm(q, axis=1, keepdims=True)
+    x_, y_, z_, w_ = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    Rm = np.empty((count, 3, 3))
+    Rm[:, 0, 0] = 1 - 2 * (y_ * y_ + z_ * z_)
+    Rm[:, 0, 1] = 2 * (x_ * y_ - w_ * z_)
+    Rm[:, 0, 2] = 2 * (x_ * z_ + w_ * y_)
+    Rm[:, 1, 0] = 2 * (x_ * y_ + w_ * z_)
+    Rm[:, 1, 1] = 1 - 2 * (x_ * x_ + z_ * z_)
+    Rm[:, 1, 2] = 2 * (y_ * z_ - w_ * x_)
+    Rm[:, 2, 0] = 2 * (x_ * z_ - w_ * y_)
+    Rm[:, 2, 1] = 2 * (y_ * z_ + w_ * x_)
+    Rm[:, 2, 2] = 1 - 2 * (x_ * x_ + y_ * y_)
+    M = Rm * scale[:, None, :]
+    sigma_cam = R @ (M @ np.transpose(M, (0, 2, 1))) @ R.T
+    j00 = fx * inv_z
+    j11 = fy * inv_z
+    j02 = -fx * cam[:, 0] * inv_z * inv_z
+    j12 = -fy * cam[:, 1] * inv_z * inv_z
+    s00, s01, s02 = sigma_cam[:, 0, 0], sigma_cam[:, 0, 1], sigma_cam[:, 0, 2]
+    s11, s12, s22 = sigma_cam[:, 1, 1], sigma_cam[:, 1, 2], sigma_cam[:, 2, 2]
+    a0 = j00 * s00 + j02 * s02
+    a1 = j00 * s01 + j02 * s12
+    a2 = j00 * s02 + j02 * s22
+    b1 = j11 * s11 + j12 * s12
+    b2 = j11 * s12 + j12 * s22
+    sa = a0 * j00 + a2 * j02 + P.FILTER_2D_VARIANCE
+    sb = a1 * j11 + a2 * j12
+    sc = b1 * j11 + b2 * j12 + P.FILTER_2D_VARIANCE
+    det = np.maximum(sa * sc - sb * sb, 1e-12)
+    inv_det = 1.0 / det
+    det_before = np.maximum(
+        (sa - P.FILTER_2D_VARIANCE) * (sc - P.FILTER_2D_VARIANCE) - sb * sb,
+        1e-12)
+    comp2d = np.sqrt(np.clip(det_before / det, 0, 1))
+    opacity = (1.0 / (1.0 + np.exp(-col['opacity'].astype(np.float64)))) * comp2d
+    return {
+        'z': z, 'mx': mx, 'my': my,
+        'cx': sc * inv_det, 'cy': -sb * inv_det, 'cz': sa * inv_det,
+        'opacity': opacity,
+    }
+
+
+def composite(g, order, tile_x, tile_y):
+    """Front-to-back over one tile. Returns (alpha_passes, T_before_entry)."""
+    px = tile_x * TILE + np.arange(TILE) + 0.5
+    py = tile_y * TILE + np.arange(TILE) + 0.5
+    gx, gy = np.meshgrid(px, py)
+    gx, gy = gx.ravel(), gy.ravel()
+    dx = gx[:, None] - g['mx'][order][None, :]
+    dy = gy[:, None] - g['my'][order][None, :]
+    power = -0.5 * (g['cx'][order][None, :] * dx * dx
+                    + g['cz'][order][None, :] * dy * dy)         - g['cy'][order][None, :] * dx * dy
+    alpha = np.minimum(0.99, g['opacity'][order][None, :]
+                       * np.exp(np.clip(power, -60, 0)))
+    alpha_ok = alpha >= P.MIN_ALPHA
+    keep = np.where(alpha_ok, alpha, 0.0)
+    T = np.cumprod(1.0 - keep, axis=1)
+    before = np.concatenate([np.ones((T.shape[0], 1)), T[:, :-1]], axis=1)
+    return alpha_ok, before
+
+
 def main():
     frame = int(sys.argv[1]) if len(sys.argv) > 1 else 4
     n_tiles = int(sys.argv[2]) if len(sys.argv) > 2 else 60
