@@ -569,6 +569,35 @@ struct TrainerCensus: Codable {
     /// Where the time went. See `TrainerTimings`.
     var timings = TrainerTimings()
 
+    /// HOW HOT IT GOT, AND WHEN.
+    ///
+    /// Everything measured so far is time per iteration. Energy per iteration
+    /// is a different quantity and nothing has ever recorded it. They diverge:
+    /// making the same work finish sooner draws the same joules over fewer
+    /// seconds, which is more watts and more heat. Over this run's 66 s that
+    /// is free. Over the 11 minutes a 30,000-iteration run would take at the
+    /// current speed, it is the whole problem.
+    ///
+    /// The census already records `budgetReductions`, but only AFTER the
+    /// governor has degraded something, which is the last event in the story
+    /// rather than the first. This is the trajectory: seconds spent at each
+    /// thermal level, and the iteration at which the run first reached each
+    /// one. A run that spends its second half at `serious` is not the same run
+    /// as one that never leaves `nominal`, even when both finish in 66 s.
+    struct Thermals: Codable, Sendable, Equatable {
+        /// Seconds at each level, indexed by ThermalLevel's raw value:
+        /// nominal, fair, serious, critical.
+        public var secondsAtLevel: [Double] = [0, 0, 0, 0]
+        /// The iteration each level was first observed at, -1 if never.
+        public var firstReachedAtIteration: [Int] = [-1, -1, -1, -1]
+        /// The worst level seen at any point.
+        public var peak: Int = 0
+
+        public init() {}
+    }
+
+    var thermals = Thermals()
+
     var startedAt: Date
     var finishedAt: Date?
     /// "completed", "cancelled", "stopped early" or "failed: <reason>". The

@@ -395,6 +395,25 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // is the second. Putting the write on the success path only would give
         // us a census for exactly the runs that did not need one.
         var census = TrainerCensus(scanID: bundle.scanID, requested: budget)
+        // The thermal trajectory. Sampled where the loop already reads the
+        // level, so it costs one subtraction and one array write per
+        // iteration and needs no new polling.
+        var thermalMark = Date()
+        var thermalLevel = thermal.level.rawValue
+        census.thermals.firstReachedAtIteration[thermalLevel] = 0
+        census.thermals.peak = thermalLevel
+        func markThermal(_ level: ThermalLevel, iteration: Int) {
+            let now = Date()
+            census.thermals.secondsAtLevel[thermalLevel] +=
+                now.timeIntervalSince(thermalMark)
+            thermalMark = now
+            thermalLevel = level.rawValue
+            if census.thermals.firstReachedAtIteration[thermalLevel] < 0 {
+                census.thermals.firstReachedAtIteration[thermalLevel] = iteration
+            }
+            census.thermals.peak = Swift.max(census.thermals.peak, thermalLevel)
+        }
+
         // ZEROED PER RUN, beside the census it will be copied into.
         //
         // `timings` is a stored property on this class, so a trainer instance
@@ -419,6 +438,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // The clocks, copied in at the last moment so a run that ends
             // any way at all still reports where its time went.
             census.timings = timings
+            // Close the open thermal interval so the seconds add up to the run.
+            census.thermals.secondsAtLevel[thermalLevel] +=
+                Date().timeIntervalSince(thermalMark)
             TrainerCensusWriter.write(census, at: ref)
         }
 
@@ -1047,6 +1069,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
             case .degrade:
                 consecutivePauses = 0
+                if thermal.level.rawValue != thermalLevel {
+                    markThermal(thermal.level, iteration: iteration)
+                }
                 if iteration > 0, iteration % 100 == 0,
                    let change = governor.degradeForHeat(
                        level: thermal.level, currentSplatCount: splatCount
