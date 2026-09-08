@@ -77,8 +77,20 @@ enum TrainerGPUConstants {
     /// and do not fit, which is why the sort is 8 passes and not 4.
     static let radixBits = 4
     static var radixBins: Int { 1 << radixBits }
-    /// Sort keys are 32 bits: `(tileID << 16) | quantisedDepth16`.
-    static let radixKeyBits = 32
+    /// Sort keys are 24 bits: `(tileID << 13) | quantisedDepth13`.
+    ///
+    /// WAS 32, of which only 27 were ever significant, so two of the eight
+    /// passes sorted bits that are always zero and moved 763,260 keys and
+    /// values for nothing. 24 divides by the 4-bit digit exactly, giving SIX
+    /// passes and an EVEN count, which matters: the sort swaps its buffers
+    /// every pass, so an odd count lands the result in the buffer no reader
+    /// expects.
+    ///
+    /// The tile id gets 11 bits, so this holds up to 2047 tiles. At 16-pixel
+    /// tiles and a 720-pixel long edge the worst case is a square frame, 45 by
+    /// 45, which is 2025. It fits, and it is worth knowing it fits by only
+    /// twenty-two tiles.
+    static let radixKeyBits = 24
     static var radixPasses: Int { radixKeyBits / radixBits }
 
     /// Hard ceiling on tile count, because the sort key gives the tile id 16

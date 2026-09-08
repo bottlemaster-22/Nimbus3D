@@ -1052,8 +1052,8 @@ kernel void trainer_duplicate_keys(
     // them from the conic instead would risk differing in the last bit, and
     // then this kernel writes a different number of instances than `offsets`
     // reserved for it.
-    const float radiusX = float(d.radiusPx.x);
-    const float radiusY = float(d.radiusPx.y);
+    const float radiusX = float(d.radiusX);
+    const float radiusY = float(d.radiusY);
 
     const int minX = max(0, int(floor((mean2D.x - radiusX) / float(TRAINER_TILE_W))));
     const int minY = max(0, int(floor((mean2D.y - radiusY) / float(TRAINER_TILE_H))));
@@ -1066,15 +1066,33 @@ kernel void trainer_duplicate_keys(
     // that is 0.5 mm, far finer than any ordering ambiguity that matters, and
     // it halves both the key width and the number of sort passes.
     const float span = max(cam.farPlane - cam.nearPlane, 1e-3f);
+    // THIRTEEN BITS OF DEPTH, NOT SIXTEEN, so the whole key fits in 24 and
+    // the radix sort runs SIX four-bit passes instead of eight.
+    //
+    // The sort moves roughly 98 MB an iteration: 763,260 instances times eight
+    // bytes of key and value, read and written, once per pass. Two of those
+    // eight passes were sorting bits that are always zero, because the key
+    // only ever used 27 of its 32 bits. Dropping depth to 13 takes it to 24,
+    // which divides by four exactly, so the pass count stays EVEN and the
+    // result still lands in the buffer every reader already expects. An odd
+    // pass count would leave it in the other one and corrupt the sort
+    // silently.
+    //
+    // What it costs: 8192 depth levels over the working range instead of
+    // 65536, so about 3.7 mm at a 30 m far plane instead of 0.5 mm. Two
+    // instances in the same tile closer together than that now tie and fall
+    // back to splat-index order. Alpha compositing is order-dependent, so this
+    // is a real if small quality trade, taken deliberately for a quarter of
+    // the sort's energy.
     const float norm = clamp((d.depth - cam.nearPlane) / span, 0.0f, 1.0f);
-    const uint depthKey = uint(norm * 65535.0f);
+    const uint depthKey = uint(norm * 8191.0f);
 
     uint cursor = offsets[gid];
     for (int ty = minY; ty < maxY; ++ty) {
         for (int tx = minX; tx < maxX; ++tx) {
             if (cursor >= instanceCap) { return; }
             const uint tile = uint(ty) * cam.tileCountX + uint(tx);
-            keys[cursor] = (tile << 16) | depthKey;
+            keys[cursor] = (tile << 13) | depthKey;
             values[cursor] = gid;
             cursor += 1u;
         }
@@ -1183,11 +1201,11 @@ kernel void trainer_tile_ranges(
     uint                 gid         [[thread_position_in_grid]]
 ) {
     if (gid >= count) { return; }
-    const uint tile = keys[gid] >> 16;
+    const uint tile = keys[gid] >> 13;
     if (gid == 0u) {
         tileRanges[2u * tile] = 0u;
     } else {
-        const uint prev = keys[gid - 1u] >> 16;
+        const uint prev = keys[gid - 1u] >> 13;
         if (prev != tile) {
             tileRanges[2u * prev + 1u] = gid;
             tileRanges[2u * tile] = gid;
