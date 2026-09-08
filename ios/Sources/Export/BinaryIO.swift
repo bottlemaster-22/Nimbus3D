@@ -19,11 +19,24 @@ extension Data {
         append(UInt8((v >> 8) & 0xFF))
     }
 
+    /// FOUR BYTES IN ONE APPEND, not four appends.
+    ///
+    /// This was four separate `Data.append(UInt8)` calls, each of which is a
+    /// real function call with a bounds check and a possible reallocation. The
+    /// pre-pass writes `init_splats.ply` through here: 888,951 points times 17
+    /// floats is about 15 million values, so 60 million appends where 15
+    /// million would do, and it happens INSIDE the timed seeding stage that
+    /// measures 15.9 s of a 21.3 s pre-pass.
+    ///
+    /// Two attempts to speed that stage up by optimising its per-sample loop
+    /// moved nothing, because the loop was never where the time was.
+    ///
+    /// `littleEndian` is the identity on every platform this ships to, and the
+    /// byte order is the same one the four explicit shifts produced, so the
+    /// file is byte for byte what it was.
     mutating func appendUInt32LE(_ v: UInt32) {
-        append(UInt8(v & 0xFF))
-        append(UInt8((v >> 8) & 0xFF))
-        append(UInt8((v >> 16) & 0xFF))
-        append(UInt8((v >> 24) & 0xFF))
+        var le = v.littleEndian
+        withUnsafeBytes(of: &le) { append(contentsOf: $0) }
     }
 
     mutating func appendInt32LE(_ v: Int32) {

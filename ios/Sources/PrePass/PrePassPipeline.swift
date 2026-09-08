@@ -188,7 +188,16 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
         public var buildInitialSplats = true
         /// Written into `prepass/sparse_refined/`, so any COLMAP-reading tool
         /// can be pointed straight at the folder.
-        public var writeRefinedColmapModel = true
+        /// OFF. `points3D.txt` has exactly one producer and zero consumers
+        /// anywhere in the app: nothing in LiKOVA ever reads it back.
+        ///
+        /// It is written with a `String(format:)` loop over 888,951 points,
+        /// eight CVarArg arguments each, then copied again as UTF8, and all of
+        /// it lands inside the timed seeding stage the owner waits on. It
+        /// exists so a desktop COLMAP pipeline could consume the refined
+        /// poses, which is a thing worth keeping the ability to do, not a
+        /// thing worth paying for on every scan.
+        public var writeRefinedColmapModel = false
 
         public init() {}
     }

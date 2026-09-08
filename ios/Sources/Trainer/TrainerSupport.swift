@@ -479,7 +479,20 @@ struct TrainerTuning: Sendable {
     var densifyEndFraction: Float = 0.85
     var densifyIntervalIterations: Int = 100
     /// Opacity binarization runs over the last this-much of the run (F4).
-    var binarizeLastFraction: Float = 0.20
+    /// ZERO, AS A NULL TEST. Was 0.2.
+    ///
+    /// The binarization ramp starts at 80% of the run and the growth window
+    /// closes at 85%, so about 90,611 splats are driven to zero opacity and
+    /// pruned AFTER densification can no longer replace them. The population
+    /// goes 299,787 to 151,355 in the last sixth of training, and the owner's
+    /// own Scaniverse comparison has 427,710 splats against our 158,220.
+    ///
+    /// Before rescheduling the ramp or retuning its weight, find out whether
+    /// it earns its cost at all: at 0 the term is skipped entirely
+    /// (MetalSplatTrainer applies it only when binarizeLastFraction > 0). If
+    /// PSNR improves and the population survives, the answer is to weaken or
+    /// remove binarization, not to move it.
+    var binarizeLastFraction: Float = 00
     var binarizeWeight: Float = 0.02
     /// Free-space carving deletion sweep interval, iterations.
     var carveIntervalIterations: Int = 250
