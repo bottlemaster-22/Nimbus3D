@@ -53,6 +53,27 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// on the training thread.
     var timings = TrainerTimings()
 
+    /// How hot it got and when. A class property for the same reason
+    /// `timings` is: the loop that sees the thermal level lives in
+    /// `trainSlice`, and the census is sealed in `run`.
+    var thermals = TrainerCensus.Thermals()
+    private var thermalMark = Date()
+    private var thermalLevel = 0
+
+    /// Closes the interval at the current level and opens one at `level`.
+    /// Called only when the level actually changes, from the one place in the
+    /// loop that already reads it, so it adds no polling.
+    func markThermal(_ level: ThermalLevel, iteration: Int) {
+        let now = Date()
+        thermals.secondsAtLevel[thermalLevel] += now.timeIntervalSince(thermalMark)
+        thermalMark = now
+        thermalLevel = level.rawValue
+        if thermals.firstReachedAtIteration[thermalLevel] < 0 {
+            thermals.firstReachedAtIteration[thermalLevel] = iteration
+        }
+        thermals.peak = Swift.max(thermals.peak, thermalLevel)
+    }
+
     // MARK: - Configuration
 
     private let tuning: TrainerTuning
@@ -395,25 +416,6 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // is the second. Putting the write on the success path only would give
         // us a census for exactly the runs that did not need one.
         var census = TrainerCensus(scanID: bundle.scanID, requested: budget)
-        // The thermal trajectory. Sampled where the loop already reads the
-        // level, so it costs one subtraction and one array write per
-        // iteration and needs no new polling.
-        var thermalMark = Date()
-        var thermalLevel = thermal.level.rawValue
-        census.thermals.firstReachedAtIteration[thermalLevel] = 0
-        census.thermals.peak = thermalLevel
-        func markThermal(_ level: ThermalLevel, iteration: Int) {
-            let now = Date()
-            census.thermals.secondsAtLevel[thermalLevel] +=
-                now.timeIntervalSince(thermalMark)
-            thermalMark = now
-            thermalLevel = level.rawValue
-            if census.thermals.firstReachedAtIteration[thermalLevel] < 0 {
-                census.thermals.firstReachedAtIteration[thermalLevel] = iteration
-            }
-            census.thermals.peak = Swift.max(census.thermals.peak, thermalLevel)
-        }
-
         // ZEROED PER RUN, beside the census it will be copied into.
         //
         // `timings` is a stored property on this class, so a trainer instance
@@ -425,6 +427,11 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // conclusions drawn from splat counts and wall clock survive; only the
         // timings table was wrong, and only on a second run.
         timings = TrainerTimings()
+        thermals = TrainerCensus.Thermals()
+        thermalMark = Date()
+        thermalLevel = ThermalLevel(ProcessInfo.processInfo.thermalState).rawValue
+        thermals.firstReachedAtIteration[thermalLevel] = 0
+        thermals.peak = thermalLevel
         defer {
             if census.outcome == TrainerCensus.unfinishedOutcome,
                isCancelled || Task.isCancelled
@@ -438,9 +445,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // The clocks, copied in at the last moment so a run that ends
             // any way at all still reports where its time went.
             census.timings = timings
-            // Close the open thermal interval so the seconds add up to the run.
-            census.thermals.secondsAtLevel[thermalLevel] +=
+            // Close the open interval so the seconds add up to the run.
+            thermals.secondsAtLevel[thermalLevel] +=
                 Date().timeIntervalSince(thermalMark)
+            census.thermals = thermals
             TrainerCensusWriter.write(census, at: ref)
         }
 
