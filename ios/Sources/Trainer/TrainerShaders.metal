@@ -212,7 +212,31 @@ struct TrainerSplatDraw {
     packed_float3 meanCam;    //  0..11
     float         depth;      // 12..15
     packed_float2 mean2D;     // 16..23
-    float         radiusPx;   // 24..27
+    /// HALF-EXTENTS OF THE 3-SIGMA ELLIPSE, x and y, in pixels.
+    ///
+    /// Was one float: the radius of a CIRCLE around the ellipse's major axis,
+    /// used for both axes. That circle is what made peakTileInstances 2.07
+    /// million against 300,000 splats, 6.91 tiles per splat, when the splats
+    /// are 89.7% discs and a disc seen at an angle is nowhere near circular on
+    /// screen. Every excess tile is paid for three times: once in the sort,
+    /// once in the forward raster and once in the backward raster, which
+    /// together are 20.4 ms of a 25.8 ms GPU iteration.
+    ///
+    /// The exact extent of {x : x^T Sigma^-1 x <= 9} along x is 3*sqrt(Sigma_xx)
+    /// and along y is 3*sqrt(Sigma_yy), so this is the TIGHT bounding box of
+    /// the same 3-sigma ellipse the circle was containing. It is a strict
+    /// subset of the old square and still contains the whole ellipse, so no
+    /// splat/pixel pair that contributed before is lost.
+    ///
+    /// TWO HALVES IN THE OLD FLOAT'S FOUR BYTES, on purpose. This struct is
+    /// exactly 64 bytes, one cache line, and it is read once per tile instance
+    /// by both rasterisers: 4.14 million reads an iteration. Growing it to 72
+    /// would cost more than the tiles saved. Half precision is ample for a
+    /// pixel extent that only ever picks 16-pixel tiles, and both kernels read
+    /// the SAME stored halves, which is what keeps trainer_preprocess's
+    /// tilesTouched exactly equal to what trainer_duplicate_keys then writes.
+    /// A mismatch there would not be slow, it would be a buffer overrun.
+    half2         radiusPx;   // 24..27
     float         comp;       // 28..31
     packed_float3 conic;      // 32..43
     float         opacity;    // 44..47
@@ -694,7 +718,7 @@ kernel void trainer_preprocess(
     if (gid >= cam.splatCount) { return; }
 
     tilesTouched[gid] = 0u;
-    draws[gid].radiusPx = 0.0f;
+    draws[gid].radiusPx = half2(0.0h);
     draws[gid].opacity = 0.0f;
 
     const TrainerSplat s = splats[gid];
@@ -778,11 +802,24 @@ kernel void trainer_preprocess(
     const float invDet = 1.0f / det;
     const float3 conic = float3(sc * invDet, -sb * invDet, sa * invDet);
 
-    // 3-sigma screen radius from the larger eigenvalue.
+    // 3-sigma screen radius from the larger eigenvalue. Still wanted: it is
+    // what `stats.maxRadiusPxBits` records and what the "too big on screen"
+    // prune tests, both of which mean the WORST extent, not a per-axis one.
     const float mid = 0.5f * (sa + sc);
     const float disc = sqrt(max(mid * mid - det, 1e-9f));
     const float radius = 3.0f * sqrt(max(mid + disc, 1e-9f));
     if (radius < 0.5f) { return; }
+
+    // The tight per-axis half-extents of that same ellipse. Scaled up by a
+    // thousandth before the half conversion so rounding can only ever ADD a
+    // tile, never drop one: half has about 5e-4 of relative precision, so
+    // 1.001 covers it at any magnitude this reaches.
+    const half2 extent = half2(3.0f * sqrt(max(sa, 1e-9f)) * 1.001f,
+                               3.0f * sqrt(max(sc, 1e-9f)) * 1.001f);
+    // Read back through the half so this kernel's tile count is computed from
+    // exactly the bits `trainer_duplicate_keys` will later read.
+    const float radiusX = float(extent.x);
+    const float radiusY = float(extent.y);
 
     const float2 mean2D = float2(
         cam.fx * meanCam.x * invZ + cam.cx,
@@ -790,12 +827,12 @@ kernel void trainer_preprocess(
     );
 
     // --- tile footprint -----------------------------------------------------
-    const int minX = max(0, int(floor((mean2D.x - radius) / float(TRAINER_TILE_W))));
-    const int minY = max(0, int(floor((mean2D.y - radius) / float(TRAINER_TILE_H))));
+    const int minX = max(0, int(floor((mean2D.x - radiusX) / float(TRAINER_TILE_W))));
+    const int minY = max(0, int(floor((mean2D.y - radiusY) / float(TRAINER_TILE_H))));
     const int maxX = min(int(cam.tileCountX),
-                         int(ceil((mean2D.x + radius) / float(TRAINER_TILE_W))));
+                         int(ceil((mean2D.x + radiusX) / float(TRAINER_TILE_W))));
     const int maxY = min(int(cam.tileCountY),
-                         int(ceil((mean2D.y + radius) / float(TRAINER_TILE_H))));
+                         int(ceil((mean2D.y + radiusY) / float(TRAINER_TILE_H))));
     if (maxX <= minX || maxY <= minY) { return; }
     const uint touched = uint(maxX - minX) * uint(maxY - minY);
 
@@ -852,7 +889,7 @@ kernel void trainer_preprocess(
     d.meanCam = packed_float3(meanCam);
     d.depth = meanCam.z;
     d.mean2D = packed_float2(mean2D);
-    d.radiusPx = radius;
+    d.radiusPx = extent;
     d.comp = comp;
     d.conic = packed_float3(conic);
     d.opacity = alpha;
@@ -890,14 +927,19 @@ kernel void trainer_duplicate_keys(
 
     const TrainerSplatDraw d = draws[gid];
     const float2 mean2D = float2(d.mean2D);
-    const float radius = d.radiusPx;
+    // The same two halves trainer_preprocess counted tiles with. Recomputing
+    // them from the conic instead would risk differing in the last bit, and
+    // then this kernel writes a different number of instances than `offsets`
+    // reserved for it.
+    const float radiusX = float(d.radiusPx.x);
+    const float radiusY = float(d.radiusPx.y);
 
-    const int minX = max(0, int(floor((mean2D.x - radius) / float(TRAINER_TILE_W))));
-    const int minY = max(0, int(floor((mean2D.y - radius) / float(TRAINER_TILE_H))));
+    const int minX = max(0, int(floor((mean2D.x - radiusX) / float(TRAINER_TILE_W))));
+    const int minY = max(0, int(floor((mean2D.y - radiusY) / float(TRAINER_TILE_H))));
     const int maxX = min(int(cam.tileCountX),
-                         int(ceil((mean2D.x + radius) / float(TRAINER_TILE_W))));
+                         int(ceil((mean2D.x + radiusX) / float(TRAINER_TILE_W))));
     const int maxY = min(int(cam.tileCountY),
-                         int(ceil((mean2D.y + radius) / float(TRAINER_TILE_H))));
+                         int(ceil((mean2D.y + radiusY) / float(TRAINER_TILE_H))));
 
     // Depth quantised to 16 bits over the working range. At a 30 m far plane
     // that is 0.5 mm, far finer than any ordering ambiguity that matters, and
@@ -1776,7 +1818,9 @@ kernel void trainer_preprocess_backward(
     uint                              gid        [[thread_position_in_grid]]
 ) {
     if (gid >= cam.splatCount) { return; }
-    if (draws[gid].radiusPx <= 0.0f) { return; }
+    // Both halves are written together by trainer_preprocess, and a splat it
+    // rejected has both at zero, so one component answers the question.
+    if (draws[gid].radiusPx.x <= 0.0h) { return; }
 
     const TrainerSplat s = splats[gid];
     const TrainerSplatDraw d = draws[gid];

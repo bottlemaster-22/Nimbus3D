@@ -287,7 +287,12 @@ struct TrainerSplatDraw {
     var depth: Float = 0        // offset 12   == meanCamZ, kept explicit
     var mean2DX: Float = 0      // offset 16   pixel coordinates
     var mean2DY: Float = 0      // offset 20
-    var radiusPx: Float = 0     // offset 24   3-sigma screen radius
+    /// TWO `half`s on the GPU side: the per-axis half-extents of the 3-sigma
+    /// ellipse. Declared here as one 32-bit field because nothing in Swift
+    /// reads this struct's contents, only its stride, and `Float16` does not
+    /// exist on x86_64 so a faithful mirror would not build in an Intel
+    /// simulator. See TrainerSplatDraw in TrainerShaders.metal.
+    var radiusPxPackedHalf2: UInt32 = 0   // offset 24
     /// Combined Mip-Splatting 2D and 3D opacity compensation, already folded
     /// into `opacity`. Kept so the backward can divide it out to reach
     /// `d alpha / d opacityLogit` without recomputing both determinants.
