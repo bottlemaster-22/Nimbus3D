@@ -111,6 +111,13 @@ public final class SelfUpdateService: ObservableObject {
         subsystem: BrandConfig.loggingSubsystem, category: "Booster.SelfUpdate"
     )
 
+    /// The same log, reachable from the static helpers. `touchRelay` and
+    /// `relayAddress` are static because they need nothing from an instance,
+    /// and a static function cannot see `log` above.
+    private static let staticLog = Logger(
+        subsystem: BrandConfig.loggingSubsystem, category: "Booster.SelfUpdate"
+    )
+
 
     public init() {}
 
@@ -145,7 +152,7 @@ public final class SelfUpdateService: ObservableObject {
 
         do {
             // WAKE THE LAN PATH FIRST. See `touchRelay`.
-            await Self.touchRelay()
+            await Self.touchRelay(config: config)
             let started = try await post(config: config, force: force)
             apply(started)
             // `current` starts no job, so there is nothing to follow. Every
@@ -195,6 +202,12 @@ public final class SelfUpdateService: ObservableObject {
     /// Sends one throwaway request to the relay on the LAN, and ignores
     /// everything about the answer.
     ///
+    /// TONIGHT'S ACTUAL CAUSE, from Bottle, and it is worth recording because
+    /// it is not something any amount of app code would have found: the relay
+    /// hardware is 2.4 GHz only and the phone was on Wi-Fi 6E, which the
+    /// access point would not bridge. Disabling 6E on the phone fixed it. This
+    /// touch defends against the rest of that class rather than that instance.
+    ///
     /// WHY THIS IS HERE, from the Bottle agent who root-caused it:
     ///
     ///   Asking for an update and receiving one travel different paths. This
@@ -228,13 +241,58 @@ public final class SelfUpdateService: ObservableObject {
     /// The gap to the POST matters: the window is under ten minutes and an
     /// install takes about twenty seconds, so this is awaited immediately
     /// before the request rather than at launch or on a timer.
-    private static func touchRelay() async {
-        guard let url = URL(string: "http://bottle-relay.local/") else { return }
+    private static func touchRelay(config: BrandConfig.SelfUpdateEndpoint) async {
+        var target = URL(string: "http://bottle-relay.local/")
+
+        // The broker knows the relay's address; ask it rather than trusting
+        // mDNS. `relay_lan_ip` is absent on an older broker and null when it
+        // has no relay, and those are deliberately different so neither has to
+        // be guessed at.
+        if let address = await relayAddress(config: config) {
+            // ONLY A PRIVATE ADDRESS, and this goes beyond what the contract
+            // asks for. The app is being handed an address by a server and
+            // then firing a request at it; if that address were ever public,
+            // whether through a bug, a bad deploy or something worse, this
+            // function becomes a request generator pointed wherever the
+            // response says. `isPrivateIPv4` is the same check already applied
+            // to the phone's own `lan_ip` below, and a public address here
+            // simply falls through to the mDNS name.
+            if isPrivateIPv4(address), let url = URL(string: "http://\(address)/") {
+                target = url
+            } else {
+                staticLog.error("Relay address from the broker was not a private IPv4; ignored.")
+            }
+        }
+
+        guard let url = target else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 2
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         _ = try? await URLSession.shared.data(for: request)
+    }
+
+    /// `relay_lan_ip` from the broker's status route, or nil for any reason at
+    /// all: an older broker without the key, no relay known, a request that
+    /// failed, a body that would not parse.
+    ///
+    /// Three seconds and no error handling on purpose. Nothing downstream may
+    /// depend on this succeeding, and an update must go out whether or not it
+    /// did.
+    private static func relayAddress(
+        config: BrandConfig.SelfUpdateEndpoint
+    ) async -> String? {
+        let status = config.url.appendingPathComponent("status")
+        var request = URLRequest(url: status)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 3
+        request.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let address = object["relay_lan_ip"] as? String,
+              !address.isEmpty
+        else { return nil }
+        return address
     }
 
     private func post(

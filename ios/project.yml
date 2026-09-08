@@ -325,6 +325,14 @@ targets:
           Used to find your PC on your own Wi-Fi so it can help finish a large
           scan, and in development builds to reach the update relay on the same
           network. Your scans stay on your local network.
+        # DEVELOPMENT ONLY, and it goes when SelfUpdateService does.
+        # Cleartext HTTP to a private address, because the update relay on the
+        # owner's own Wi-Fi speaks plain HTTP and has no certificate anyone
+        # could validate. This key allows local addresses ONLY; it does not
+        # weaken transport security for anything on the internet, which is
+        # what a blanket NSAllowsArbitraryLoads would have done.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
         NSBonjourServices:
           - $(NIMBUS_BOOSTER_SERVICE_TYPE)
           # DEVELOPMENT ONLY, and it goes when SelfUpdateService does. The
