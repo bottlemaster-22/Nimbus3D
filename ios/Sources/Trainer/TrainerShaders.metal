@@ -1699,19 +1699,24 @@ kernel void trainer_rasterize_backward(
     // nothing and leaves the per-lane `continue` below as the only skip:
     // exactly the behaviour before this optimisation existed.
     const uint groupDeepest = kTrainerSimdReduce ? simd_max(lastContributor) : total;
-    const uint deepest = groupDeepest;
 
-    // A Gaussian at list position g sits in batch (g - 1) / TRAINER_TILE_AREA,
-    // because globalIndex is one-based below. Batches above the one holding
-    // `deepest` cannot contain a contributor for any pixel in this tile.
-    int lastUsefulBatch = int(batches) - 1;
-    if (deepest == 0u) {
-        // No pixel in this tile had any contributor at all.
-        lastUsefulBatch = -1;
-    } else {
-        lastUsefulBatch = min(lastUsefulBatch,
-                              int((deepest - 1u) / TRAINER_TILE_AREA));
-    }
+    // THE BATCH LOOP BOUND STAYS THREADGROUP-UNIFORM. It must.
+    //
+    // It was briefly derived from `groupDeepest`, and that was a real bug that
+    // shipped in builds 132 to 138. The loop below contains a
+    // threadgroup_barrier AND the cooperative staging that fills tgXY,
+    // tgConicOpacity and tgColorDepth with all 256 threads. A per-SIMD-group
+    // bound made different groups run different numbers of batches, so the
+    // barriers diverged and, worse, groups that had finished stopped taking
+    // part in the staging while groups still running read what was left. The
+    // model came out visibly wrong: held-out PSNR 14.2 against 16.3, and
+    // 219,000 splats against 152,000.
+    //
+    // `groupDeepest` is still used, but ONLY on the per-group gate inside the
+    // loop, where every thread of the threadgroup still reaches both barriers
+    // and still stages its entry. That is where the skipping was supposed to
+    // happen and it is the only place it can safely happen.
+    const int lastUsefulBatch = int(batches) - 1;
 
     float T = TFinal;
     float3 accumColor = float3(0.0f);
