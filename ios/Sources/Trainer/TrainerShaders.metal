@@ -425,6 +425,13 @@ static_assert(sizeof(TrainerSplat) == 48, "TrainerSplat must be 48 bytes");
 static_assert(sizeof(TrainerSplatGrad) == 48, "TrainerSplatGrad must be 48 bytes");
 static_assert(sizeof(TrainerSplatStats) == 32, "TrainerSplatStats must be 32 bytes");
 static_assert(sizeof(TrainerSplatDraw) == 64, "TrainerSplatDraw must be 64 bytes");
+// These two were in NEITHER this block nor TrainerGPULayouts.verify(), and
+// there is no Swift mirror of either: the buffer is sized by a bare `n * 64`
+// literal in TrainerResources. So the one record the backward rasteriser
+// hammers twelve times per contributing pair was the only one in the file
+// whose size nothing checked.
+static_assert(sizeof(TrainerSplatGrad2D) == 64, "TrainerSplatGrad2D must be 64 bytes");
+static_assert(sizeof(TrainerSplatGrad2DAtomic) == 64, "TrainerSplatGrad2DAtomic must be 64 bytes");
 static_assert(sizeof(TrainerSamplingTopK) == 16, "TrainerSamplingTopK must be 16 bytes");
 static_assert(sizeof(TrainerDepthSample) == 32, "TrainerDepthSample must be 32 bytes");
 static_assert(sizeof(TrainerCameraUniforms) == 144, "TrainerCameraUniforms must be 144 bytes");
@@ -2579,8 +2586,28 @@ kernel void trainer_regularizer(
         const float residual = rank - target;
         trainer_atomicAdd(lossAccum, u.discWeight * 0.5f * residual * residual);
 
-        // dL/dlogScale_j = -4 w (rank - target) rank p_j (log p_j + H)
-        const float k = -4.0f * u.discWeight * residual * rank;
+        // WAS -4.0f, AND THE COMMENT SAID -4 TOO. BOTH WERE WRONG.
+        //
+        // The loss this kernel accumulates two lines above is
+        // w * 0.5 * (rank - target)^2 with rank = exp(H). With
+        // p_j = lambda_j / sum(lambda) and lambda_j = exp(2 * logScale_j),
+        //     dp_k/dlogScale_j = 2 p_k (delta_kj - p_j)
+        //     dH/dlogScale_j   = -2 p_j (log p_j + H)
+        // so the derivative is -2 w residual rank p_j (log p_j + H). Two, not
+        // four. The gradient was exactly twice the derivative of the loss it
+        // reported, so the effective disc weight was 0.002 while the constant
+        // said 0.001, and the reported loss and the applied gradient disagreed.
+        //
+        // Confirmed two ways by two agents that did not share code: analytic
+        // differentiation, and central differences on 9,000 components from
+        // 3,000 real splats, which gave an analytic/numeric ratio of exactly
+        // 2.000000 at h = 1e-6, 1e-5 and 1e-4, and 1.000000 after the fix.
+        //
+        // NOTE FOR ATTRIBUTION: the 0.01 -> 0.001 decision was made against
+        // the 4x behaviour, so the effective weight has now moved 20x from
+        // where it started, not 10x.
+        // dL/dlogScale_j = -2 w (rank - target) rank p_j (log p_j + H)
+        const float k = -2.0f * u.discWeight * residual * rank;
         grad[gid].scale0 += k * p.x * (logP.x + H);
         grad[gid].scale1 += k * p.y * (logP.y + H);
         grad[gid].scale2 += k * p.z * (logP.z + H);

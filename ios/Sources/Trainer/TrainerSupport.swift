@@ -656,7 +656,42 @@ struct TrainerTuning: Sendable {
     /// 2.40 scene units against 0.09 / 0.15 / 0.10 for clone-dominated ones.
     /// Split diffuses, clone refines. We had almost none of the first, and
     /// then briefly almost none of the second.
-    var splitShareOfGrowth: Float = 0.2
+    /// 0.8, NOT 0.2, AND THE SIMULATION IS WHY.
+    ///
+    /// A CLONE COPIES THE PARENT'S SCALE EXACTLY (TrainerDensifier, the clone
+    /// branch leaves logScale untouched), so every clone is a Gaussian that
+    /// cannot move the size distribution. At 0.2, four fifths of every growth
+    /// pass was doing nothing about the one thing that is wrong with this
+    /// model.
+    ///
+    /// A simulation of the population's size distribution under the real
+    /// schedule, at identical population (298,619) and identical total created
+    /// (154,608), sweeping this constant:
+    ///
+    ///     0.0 -> 1.877x spread     0.6 -> 2.974x
+    ///     0.2 -> 2.132x            0.8 -> 3.820x
+    ///     0.4 -> 2.399x            1.0 -> 5.183x
+    ///
+    /// against a target of 8.9x, which is what the Scaniverse capture of the
+    /// same room measures. This is the largest lever tested and it costs
+    /// nothing: same passes, same allowance, same work.
+    ///
+    /// WHY NOT 1.0. Coverage. A split replaces one Gaussian with two at 1/1.6
+    /// on all three axes, so covered volume goes to 48.8 per cent each time; a
+    /// clone ADDS coverage. Measured total disc face area against the 150k
+    /// seed set: 4.21x at share 0.2, 2.27x at share 1.0. Still ample either
+    /// way, but the margin shrinks, and filling the holes between thinned
+    /// seeds is exactly what clones are for. 0.8 keeps a fifth of growth doing
+    /// that.
+    ///
+    /// AND AN HONEST NOTE ON WHERE 0.2 CAME FROM. It matched arXiv:2507.20239's
+    /// reported 80/20 clone/split for stock 3DGS. That reference is for a
+    /// population whose INITIALISATION already has a size distribution. Ours
+    /// does not: every seed in this scan is 7.397 mm, at every percentile from
+    /// p1 to p99, because the spacing floor wins for every sample. Copying a
+    /// ratio tuned for a varied starting population onto a perfectly uniform
+    /// one was the wrong reference class.
+    var splitShareOfGrowth: Float = 0.8
 
     /// SPLIT ON SCREEN SIZE. WITHDRAWN, MEASURED WRONG, LEFT AT 0.
     ///
