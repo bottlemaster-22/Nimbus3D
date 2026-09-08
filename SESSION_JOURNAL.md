@@ -589,3 +589,71 @@ Owner tests build 198. Read in this order:
 5. `gpuStep` and the pre-pass total.
 
 If the model comes back dim or dissolving, `relocationDonorOpacity` back to 0.02 first: 5% of the population churned per pass with fresh Adam state is the largest single behavioural change in the stack.
+
+---
+
+## 2026-09-08 (night, part two) : Twenty measured agents, 29 survivors, and the seeder was handing out one size
+
+**Since the last entry:** the owner pointed out that "no workflows" was my own inference, not his instruction, and that usage was at 7 per cent with four hours to reset. So a second workflow ran, with one change from the first: every agent was told that FOUR of the last six findings were wrong when finally measured, two of them shipped, and that any claim about a magnitude had to name a command it actually ran. **29 findings survived, 45 were killed.** The first round was 99 of 106.
+
+He then, correctly, got angry that I reported three of the 29 and sat on the rest. Everything below is the rest.
+
+### THE ROOT CAUSE, AND IT IS IN THE SEEDER
+
+**Every seed in this scan was 7.397 mm.** Not approximately: the same number at p1, p50 and p99, for 100 per cent of 888,951 seeds. sd(log10) exactly 0.0000 decades. `radius = 0.5 * max(spacing, sensorSpacing)` has `spacing` as one global constant and `sensorSpacing` only overtakes it beyond 2.726 m, while the p99 distance from any point to its nearest camera here is 1.32 m.
+
+Nothing downstream can repair that: clone copies the parent's scale, split divides by 1.6. Densification was being asked to manufacture the reference model's 0.64 decades of spread out of zero.
+
+**And the fix is the LATTICE, not the radius.** I shipped the radius-only version first and it is the wrong half. Measured: optimising every seed's radius against its own detail bucket, at the shipped 300,000 cap, reaches 16.90 dB against the as-built 16.97. Size has to follow SPACING, and on a uniform lattice spacing is a constant. The reference model's log-size on log-spacing slope is 0.94 (correlation 0.79); ours was 0.18 (0.17).
+
+So the seeder has TWO lattices now. Flat interiors (usable normal, no edge flag) go on one `flatInteriorCoarsening` times coarser; edges and normal-less samples keep the fine one. Radius is already cut from cell size, so size follows spacing by construction. They share one hash safely: a Morton key uses 21 bits per axis and `spread(z) << 2` tops out at bit 62, so bit 63 tags the lattice.
+
+### THE OTHER LEVER THAT BINDS
+
+**A clone copies the parent's scale exactly, and 80 per cent of growth was clones.** Simulated at identical population and identical total created: `splitShareOfGrowth` 0.2 gives 2.132x spread, 0.8 gives 3.820x, 1.0 gives 5.183x, against the reference's 8.9x. Now 0.8. Not 1.0 because a split shrinks covered volume to 48.8 per cent while a clone adds coverage.
+
+Where 0.2 came from: a published 80/20 ratio for stock 3DGS, whose initialisation already HAS a size distribution. Wrong reference class.
+
+### A REAL BUG
+
+`trainer_regularizer` accumulated the loss `w * 0.5 * (rank - target)^2` and applied a gradient of `-4 w residual rank p_j (log p_j + H)`. The derivative is **-2**. Two agents confirmed without sharing code: analytically, and by central differences over 9,000 components of 3,000 real splats giving a ratio of exactly 2.000000 at three step sizes, 1.000000 after. The effective disc weight has moved 20x from where it started, not the 10x I thought.
+
+### THE HOT LOOP TOUCHED TWO CACHE LINES
+
+Every contributing pair issued nine atomics into `splatGrad2D` and three into `stats`, a different buffer, roughly 69 million times an iteration, while the gradient record was nine floats plus `float pad[7]`.
+
+The naive merge is a silent correctness break and this is the crux worth remembering: `clearPerIteration` blit-fills ALL SIXTEEN floats of that record every iteration, while `stats` is zeroed once per densify pass. The three accumulators must survive a whole interval. So they accumulate in the gradient line for one iteration and are folded into `stats` by `trainer_preprocess_backward`, which owns the row and already loads both. Same atomics, same values, half the lines. `stats` is no longer bound to the backward rasteriser; index 14 is a documented hole rather than renumbered.
+
+### MEASUREMENT HONESTY
+
+Held-out frames were scored at **identity exposure and identity pose** while trained frames got both fitted, because `exposures` and `cameraDeltas` are only written for `slice.keyframes`. Part of build 182's 6.96 dB gap was protocol. `heldOutPSNRExposureFitted` now sits beside the raw number: closed-form least-squares gain and bias against the frame's own render, clamped to the trainer's own range. It corrects exposure, not pose, and says so.
+
+### CORRECTIONS I OWE
+
+- **Scaniverse's 7,389 mm p99 is a background dome, not a size tail.** Exactly 10,242 splats at contiguous indices 0 to 10241, on a 240.00001 m sphere, isotropic at log-scale exactly 2.0, alpha 253/255, all 45 higher SH coefficients zero. 10,242 is a 5-times-subdivided icosphere's vertex count. Their real p99 is 82 mm. We already have `DirectionalBackgroundModel`. I told him they had metre-scale splats covering walls; they do not.
+- The `pad0` cutoff comment quoted 60.76 per cent of exp() calls wasted. That was pre-cutoff. Post-cutoff it is **0.58 per cent**: 75,529,323 pairs reach exp and 75,089,548 clear alpha. That work is finished.
+- The radix comment described a 24-bit six-pass design the code has never implemented, above a constant reading 32. Only pass 7 is actually dead; pass 6 carries tile bits for most of a 1,530-tile grid.
+
+### WHAT THE WORKFLOW TALKED ME OUT OF
+
+- **Halving `densifyIntervalIterations`.** Growth is DELETION-limited, not fraction-limited: after the cap fills, the allowance equals the previous pass's total deletions to the unit on all 20 growth passes. 45,000 authorised, 208 to 625 granted. Halving gives 154,872 created against 154,408, and spread 2.150x against 2.132x, for double the CPU.
+- **Reasoning about the disc prior from gradient magnitudes.** Adam's `mhat / (sqrt(vhat) + epsilon)` at epsilon 1e-15 is scale-invariant, so a term 1000x larger produces a step of the learning rate, not a 1000x step. The decisive number is that the prior flips the SIGN on ~48 per cent of components. And it must not be changed yet: with headroom at zero it is the only thing setting shape, so it is confounded.
+- **Treating SH degree 3 as a config change.** The training kernels implement degree 2 forward and backward and nothing higher. Degree 3 needs new Metal in `trainer_evalSH` and the SH-gradient kernel before it can even be timed.
+
+### VERIFIED
+
+Builds 202 through 212 all green and published. `trapconv` and `deadwire` pass. The Gini and blob/disc/needle numbers were reproduced locally rather than taken on trust: 27.8 per cent and 0.434 against the reference's 61.2 and 0.753.
+
+### ASSUMED / UNVERIFIED
+
+Every behavioural change since build 182. Nothing has run on the device.
+
+### NEXT ACTION
+
+Owner tests. `cd tools/offline && python census.py` prints the verdict: the clone/split ratio, `relocated`, the size distribution with its p90/p10 spread, the aspect ratio, and the adaptivity pair. The spread is the line that matters, 1.76x today.
+
+### GOTCHAS ADDED
+
+- A Morton key here leaves bit 63 free (21 bits x 3 axes, top at bit 62), which is what makes a second lattice safe in one hash.
+- `clearPerIteration` wipes all 16 floats of `splatGrad2D` every iteration; `stats` survives a densify interval. Never move an interval-scoped accumulator into that record without a fold.
+- Growth allowance after the cap equals the previous pass's TOTAL deletions, including `carvedFromEmptySpace`, not just `prunedLowOpacity`.

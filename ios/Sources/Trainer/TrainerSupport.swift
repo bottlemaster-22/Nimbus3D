@@ -467,6 +467,22 @@ struct TrainerTuning: Sendable {
     /// The reference ratio: higher-order SH learns twenty times slower than DC.
     var shRestLRDivisor: Float = 20
 
+    /// SCOPING NOTE ON SPHERICAL HARMONIC DEGREE, so the next person does not
+    /// price the wrong thing.
+    ///
+    /// The reference capture ships degree 3 and we ship degree 1, and that
+    /// looks like a config change. It is not. `TrainerShaders.metal` implements
+    /// SH evaluation AND its backward gradient only up to DEGREE 2. There is no
+    /// degree-3 path in the training kernels in either direction; the degree-3
+    /// code in the repo lives in the VIEWER's render shader, for displaying
+    /// assets that were trained elsewhere.
+    ///
+    /// So degree 2 is config plus allocation and costs 72.0 MB at the 300,000
+    /// cap. Degree 3 costs 172.8 MB AND requires writing and validating new
+    /// Metal for `trainer_evalSH` and the SH-gradient kernel first. Any earlier
+    /// wall-clock estimate for degree 3 cannot have come from a timed run on
+    /// this codebase, because there is nothing to time.
+
     // --- Losses -------------------------------------------------------------
 
     var lambdaSSIM: Float = 0.2

@@ -200,6 +200,28 @@ public struct SmartLossSettings: Codable, Hashable, Sendable {
         // anisotropic sliver a fine texture edge needs. That is exactly what
         // a 13.2 mm median splat is failing to become.
         //
+        // AND A WARNING ABOUT HOW TO REASON ABOUT THIS CONSTANT AT ALL.
+        //
+        // The prior's dL/dlogScale still exceeds the photometric one by a
+        // median 442x to 1138x even at 0.001, and it is the larger term on 95
+        // to 98 per cent of scale components. That sounds decisive and is not:
+        // trainer_adam_splat uses mhat / (sqrt(vhat) + epsilon) with epsilon
+        // 1e-15, which is SCALE-INVARIANT. A term a thousand times larger does
+        // not produce a step a thousand times larger; it produces a step of
+        // the learning rate, in whatever direction it points.
+        //
+        // So the magnitude ratio is the wrong statistic. The decisive one is
+        // that the prior flips the SIGN of the combined gradient on about 48
+        // per cent of components, which is what actually stops the photographs
+        // setting shape. Getting the images to win on magnitude would need
+        // roughly 1e-6, three orders below this, not one.
+        //
+        // Do not make that change yet. Our splats are 88.7 per cent flat discs
+        // against the reference model's 56.4 per cent near-isotropic blobs,
+        // but with growth headroom at zero the prior is currently the ONLY
+        // thing setting shape, so the two are confounded. Re-measure the
+        // aspect ratio once densification has a real budget again.
+        //
         // THE COST: surface-normal quality and mesh extraction quality both
         // lean on this prior, and both matter for the export format. If the
         // meshes come out worse, this is the constant that did it.
