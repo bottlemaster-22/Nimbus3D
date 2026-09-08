@@ -389,3 +389,72 @@ Fix the timing buckets (item 3) before any further GPU work, because every remai
 - **Half precision on the conic cost 2 dB.** Reverted. Do not retry.
 - **The diagnostics arrive through the Booster**, not by hunting the filesystem.
 - CI is the only compiler available; there is no Xcode on the owner's Windows machine.
+
+---
+
+## 2026-09-08 (later) : Eleven changes in one build, mined from seven workflows that had been left unused
+
+**Since the last entry:** the owner said, plainly and for about the sixth time, that shipping one change per build is a waste of his time, money and usage, and that he would rather ship a batch and bisect if something breaks. He also ruled out new workflows for this session (usage at 78%) and pointed out that seven workflow runs from this session were sitting on findings nobody had acted on. He was right.
+
+`.claude`-less salvage route, for the next time this is needed: the workflow journals live under `~/.claude/projects/<project>/<session>/subagents/workflows/wf_*/journal.jsonl`, one JSON object per line, `{type: "started"|"result", agentId, key, result}`. The `result` objects with a `findings` array are the research agents; the ones without are the verifiers, carrying `kept` and `killed`. `wf_5567f899-6d6` alone held **106 findings, 99 of which survived adversarial verification.**
+
+### WHAT SHIPPED, and why each one
+
+Every change is a single named constant with its reasoning written on it, specifically so a bad result is a constant flip and not a diff read.
+
+**The splat size gap** (ours 13.2 mm, Scaniverse 3.4 mm on the same room):
+
+- `splitScreenRadiusPx = 10`. Split also fires on screen radius now. The world-scale test needed a 21.6 mm splat in a model whose p99 is 3.85 cm and whose single largest Gaussian is 7.86 cm, so it selected almost nothing: 190 splits against 152,801 clones. Splats only ever shrink by splitting.
+- `splitShrinkAllAxes = true`. Divides the whole scale vector by 0.8*N, which for N=2 is 1.6 and is exactly our existing `splitShrink`, with the offset sampled from the parent's covariance instead of stepped along one axis. This MUST move with the criterion above: the one-axis version makes two children cover 1.25x the parent's screen area, so raising the split rate against it increases tile count.
+- `pruneOpacity` 0.005 to 0.02. It sat at minAlpha (0.00392), so a Gaussian had to stop being drawn before it was eligible for recycling. An exported run measured 50.1% of the population below the render threshold: invisible, ungraded (Adam gates on visibleFlag) and un-prunable at once.
+
+**The shortened schedule:**
+
+- `lateLRFraction = 0.1`. Scale, rotation, opacity and SH now decay across the run. Only position did, because that is what the reference does at 30,000 iterations; we run 3,000.
+- `shDCLRMultiplier = 4`. Sparse visibility-masked Adam gives a typical splat ~450 steps; at 0.0025 that is at most 0.32 of the colour range against a measured RMSE of 0.117.
+
+**The initialisation:**
+
+- `seedTarget` fills the cap instead of half of it. It was discarding 84% of 888,951 MEASURED LiDAR points by arbitrary uniform stride, then spending 600 iterations cloning them back.
+- `thin` now grows the two in-plane axes by sqrt(dropped ratio). Every seed radius is cut from the FULL set's spacing, so thinning left discs sized for a density that no longer existed. The fallback depth seeder in the same file carries a comment saying this was fixed there. It was never fixed on the path we use.
+
+**The prior:** `discPriorWeight` 0.01 to 0.001. It produced a scale gradient of order 0.024 per Gaussian per iteration against a photometric contribution of 2.5e-5 to 7.5e-5, so shape was set by the prior and the photographs were only allowed to nudge it.
+
+**Measurement, without which three of the above are unreadable:**
+
+- Held-out PSNR was `min` across slices, reporting the WORST part of the scene as the model's score.
+- `evaluateHeldOut` summed MSE and converted once at the end, which by Jensen's inequality is always the lower number and matches no published figure.
+- `heldOutFraction` 0.05 to 0.10: six held-out frames became twelve. Six is why the noise band is +/-0.4 dB.
+- Command buffer B was labelled "the tile sort" while holding the sort, forward raster, losses, backward raster and optimiser. That is the whole explanation for build 172's `gpuSort` 18.81 ms with the other four buckets at exactly 0.00. New `gpuStep` bucket.
+
+**Speed, both pure deletions:**
+
+- `trainer_radix_scatter` had a dead 16 KB threadgroup array, written and read back by the same thread, saturating half the 32 KB budget for nothing.
+- Both rasterisers now reject with a compare instead of an `exp()`. `alpha = min(0.99, opacity*exp(power)) < minAlpha` is exactly `power < log(minAlpha/opacity)`; the cutoff is computed once per splat in `trainer_preprocess` and rides in `pad0`, a field the 40-byte record already zeroed. Biased down 0.01 so the cheap test can only let through what the exact test would keep, and the exact test still runs. Kills roughly four exp evaluations in five.
+
+### VERIFIED
+
+- **Build 180 is green and published.** Builds 176 and 178 preceded it: 176 failed the trapping-conversion gate, 178 was cancelled by my own follow-up push.
+
+- `tools/trapconv.py` caught `Int((Float(cap) * ...).rounded())` in the new `seedTarget` and was right to: nothing stopped a caller passing NaN. Fixed with an isFinite check and a 0.05...1 clamp before the multiply, then allowlisted with that reasoning. That gate exists because of a crash the owner reported as "crashing quite a bit, even with RAM free".
+- `tools/deadwire.py` passes.
+
+### ASSUMED / UNVERIFIED
+
+**All eleven changes.** None has been run on the device. The batch is deliberately large because the owner asked for it and accepted bisecting.
+
+### GOTCHAS
+
+- **Build 178 shows as `cancelled`.** That is my own follow-up push superseding it, not a failure.
+- A workflow journal's `result` for a verify agent has `kept`/`killed`, not `findings`; filtering on `findings` silently drops every verifier.
+
+### WHAT I EXPECT TO GO WRONG, written before the run rather than after
+
+1. Three-axis shrink gives up the SAD-GS property the densifier header argues for: a disc that was the right size across a flat measured surface no longer is, and most of this scene is flat measured surface. If geometry gets noisier on walls, `splitShrinkAllAxes = false` first.
+2. Filling the cap with seeds costs roughly 4 s and makes the first few hundred iterations carry 300k splats.
+3. A genuinely live 300k population costs backward-raster time that a half-dead one did not.
+4. Weakening the disc prior costs surface normals, which the mesh export depends on.
+
+### NEXT ACTION
+
+Read the census when the owner tests: splat count, held-out PSNR, `addedBySplit`, clone/split ratio, `gpuStep`, and the pre-pass total. `addedBySplit` is the one that says whether the headline change did anything at all.
