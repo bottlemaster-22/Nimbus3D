@@ -164,7 +164,35 @@ public enum CaptureTuning {
     /// Hot, `thermalKeyframeIntervalMultiplier` doubles this to 0.60, which
     /// lands on the tenth step at 0.667 for about 1.5 a second; the same
     /// looseness applies there and neither is worth a second constant.
-    public static let keyframeMinIntervalSeconds: Double = 0.30
+    ///
+    /// RAISED FROM 0.30 TO 0.45, because nothing downstream reads what the
+    /// extra frames cost. Counted for the owner's 276-second room scan:
+    ///
+    ///   written by capture                        868 frames
+    ///   read by the pre-pass seeder (stride 5)    174
+    ///   read by the pre-pass survey                48
+    ///   read by the glass detector                 40
+    ///   read by the trainer (Contracts:1823)      120, or 240 for a large scene
+    ///
+    /// So the largest consumer in the pipeline takes 240 and capture wrote
+    /// 868. Every one of those is a JPEG encode at 10 to 15 ms plus roughly
+    /// 800 KB of image and 147 KB of depth and confidence, so about 630 MB
+    /// written of which some 450 MB is never opened, and 9 to 13 seconds of
+    /// encode with the heat and battery that go with it. The owner's complaint
+    /// about the reference app was specifically that it did not kill his
+    /// battery or heat his phone.
+    ///
+    /// 0.45 still writes about 610 frames on the same scan, 2.5x the largest
+    /// consumer, so every selector keeps real headroom to pick from. It also
+    /// stays clear of the evaluation grid's 0.433 landing point for the same
+    /// reason 0.30 avoided 0.333: see the paragraph above.
+    ///
+    /// THE HONEST CAVEAT: this is the one change in this batch whose trade I
+    /// could not measure offline. Fewer written frames means a thinner pool
+    /// for `keyframeMinQCWeight` to reject from, so a scan with a lot of
+    /// motion blur has fewer good alternatives. If coverage or sharpness
+    /// regresses, this is the constant to put back.
+    public static let keyframeMinIntervalSeconds: Double = 0.45
 
     /// If nothing has been written for this long, take one anyway. A user who
     /// stands perfectly still while thinking should not leave a hole in the
@@ -186,6 +214,20 @@ public enum CaptureTuning {
     /// stream the app requests; it is deliberately NOT recomputed from
     /// per-device intrinsics, because the amber/red thresholds below and the
     /// QC card downstream are calibrated against this exact number.
+    ///
+    /// CHECKED AGAINST THE DEVICE, 2026-09-08, because a research pass claimed
+    /// this divisor under-reports smear by 17 per cent. It does not. That claim
+    /// derived a pitch of 0.0365 from Apple's 24 mm-equivalent MARKETING figure
+    /// for the iPhone 17 Pro Max. The device publishes its own intrinsics and
+    /// this app already writes them to disk: fx = 1381.8971 at width 1920,
+    /// giving a horizontal field of view of 69.575 degrees and an on-axis pitch
+    /// of 2*atan(0.5/fx) = 0.04146 deg/px.
+    ///
+    /// So the constant is 2.7 per cent high, not 17, and the amber and red
+    /// thresholds are calibrated against it. Leave it alone: a 2.7 per cent
+    /// shift in a threshold that exists to say "you are moving too fast" is far
+    /// below the spread of a hand-held scan, and moving it would decalibrate
+    /// the QC card for nothing.
     public static let angularPixelPitchDegrees: Float = 0.0426
 
     /// Smear in pixels at which the HUD goes amber.
