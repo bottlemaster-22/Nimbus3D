@@ -318,6 +318,24 @@ struct TrainerSplatDraw {
 /// percentile of observed sampling rate" the Mip-Splatting 3D filter is sized
 /// from, rather than the maximum, which a single close-up frame would
 /// otherwise dominate.
+/// Mirrors `TrainerBackgroundUniforms` in TrainerShaders.metal.
+///
+/// The far field used to be rasterised in Swift, once per pixel per iteration
+/// on the prefetch worker, and then memcpy'd 4.67 MB onto the main thread. It
+/// is a GPU kernel now; this is everything it needs that is not the cubemap.
+struct TrainerBackgroundUniforms {
+    /// The frame pose's INVERSE rotation, as (x, y, z, w).
+    var rotationInverse: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 1)
+    var fx: Float = 1
+    var fy: Float = 1
+    var cx: Float = 0
+    var cy: Float = 0
+    var width: UInt32 = 0
+    var height: UInt32 = 0
+    var faceSize: UInt32 = 0
+    var pad: UInt32 = 0
+}
+
 struct TrainerSamplingTopK {
     var r0: Float = 0   // offset  0
     var r1: Float = 0   // offset  4

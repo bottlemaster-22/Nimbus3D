@@ -48,10 +48,17 @@ struct TrainerFrameSupervision {
     var frame: FrameID
     /// Ground-truth RGB at the render resolution, three floats per pixel.
     var groundTruth: [Float]
-    /// Background radiance at the render resolution, three floats per pixel.
-    /// Empty when no background model is available, and `hasBackground` is
-    /// then false rather than a black image being passed off as a far field.
-    var background: [Float]
+    /// The background CUBEMAP, flattened to three floats per texel, face-major
+    /// then row-major. Empty when no background model is available, and
+    /// `hasBackground` is then false rather than a black image being passed
+    /// off as a far field.
+    ///
+    /// WAS the rasterised image, three floats per PIXEL. Rasterising it cost 6
+    /// to 10 ms of Swift per iteration on the prefetch worker and then 4.67 MB
+    /// of memcpy on the main thread; `trainer_background` does it on the GPU
+    /// from these 72 KB instead.
+    var backgroundTexels: [Float]
+    var backgroundFaceSize: Int
     var hasBackground: Bool
     var depthSamples: [TrainerDepthSample]
     var renderSize: TrainerRenderSize
@@ -424,12 +431,25 @@ final class TrainerSupervisionBuilder {
 
         let framePose = pose(for: frame)
 
-        var backgroundPixels: [Float] = []
+        var backgroundTexels: [Float] = []
+        var backgroundFaceSize = 0
         var hasBackground = false
         if let background {
-            backgroundPixels = backgroundImage(
-                background: background, pose: framePose, intrinsics: k, size: fixedSize
-            )
+            // Just the cubemap, flattened. The per-pixel rasterisation this
+            // used to do is `trainer_background` now.
+            let map = background.cubemapSnapshot
+            backgroundFaceSize = map.faceSize
+            backgroundTexels = [Float](
+                unsafeUninitializedCapacity: map.texels.count * 3
+            ) { buffer, initialized in
+                for i in 0..<map.texels.count {
+                    let t = map.texels[i]
+                    buffer[i * 3 + 0] = t.x
+                    buffer[i * 3 + 1] = t.y
+                    buffer[i * 3 + 2] = t.z
+                }
+                initialized = map.texels.count * 3
+            }
             hasBackground = true
         }
 
@@ -448,7 +468,8 @@ final class TrainerSupervisionBuilder {
         return TrainerFrameSupervision(
             frame: frame.index,
             groundTruth: groundTruth,
-            background: backgroundPixels,
+            backgroundTexels: backgroundTexels,
+            backgroundFaceSize: backgroundFaceSize,
             hasBackground: hasBackground,
             depthSamples: samples,
             renderSize: fixedSize,
@@ -688,6 +709,24 @@ final class TrainerSupervisionBuilder {
     ///
     /// One cubemap lookup per pixel at 480-720 px is a few hundred thousand
     /// trilinear fetches, which is milliseconds; it is not worth a shader.
+    /// The far field for one pose, rasterised on the CPU.
+    ///
+    /// The TRAINING path does not use this any more: `trainer_background`
+    /// builds bgColor on the GPU from the 72 KB cubemap, because this loop
+    /// cost 6 to 10 ms per iteration on the prefetch worker. It survives for
+    /// the held-out evaluation, which composites on the CPU to compute PSNR
+    /// and runs 24 frames once per slice rather than every iteration, so the
+    /// Swift loop costs nothing there and a second GPU readback would be more
+    /// machinery than the job is worth.
+    func backgroundImage(
+        pose: Pose, intrinsics: CameraIntrinsics, size: TrainerRenderSize
+    ) -> [Float]? {
+        guard let background else { return nil }
+        return backgroundImage(
+            background: background, pose: pose, intrinsics: intrinsics, size: size
+        )
+    }
+
     private func backgroundImage(
         background: DirectionalBackgroundModel,
         pose: Pose,

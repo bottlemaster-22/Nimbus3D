@@ -1693,8 +1693,11 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // --- Upload this frame's supervision -------------------------------------
         let uploadFrom = CFAbsoluteTimeGetCurrent()
         resources.gtColor.writeArray(supervision.groundTruth)
-        if supervision.hasBackground, !supervision.background.isEmpty {
-            resources.bgColor.writeArray(supervision.background)
+        // The far field is 72 KB of cubemap now, not a 4.67 MB rasterised
+        // image. `trainer_background` turns it into bgColor on the GPU in
+        // command buffer A below.
+        if supervision.hasBackground, !supervision.backgroundTexels.isEmpty {
+            resources.bgCubemap.writeArray(supervision.backgroundTexels)
         }
         let sampleCount = Swift.min(
             supervision.depthSamples.count, resources.depthSampleCapacity
@@ -1797,6 +1800,24 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             else { throw TrainerError.noMetalDevice }
             encoderA.label = "trainer.preprocess"
             gpu.resetVisibilityForIteration(encoderA, splatCount: splatCount)
+
+            // The far field, rasterised here instead of on the CPU. Runs
+            // before anything reads bgColor, which is the loss in buffer B.
+            if supervision.hasBackground, supervision.backgroundFaceSize > 0 {
+                let q = supervision.pose.rotation.simd.inverse
+                var bg = TrainerBackgroundUniforms(
+                    rotationInverse: SIMD4<Float>(q.imag.x, q.imag.y, q.imag.z, q.real),
+                    fx: supervision.intrinsics.fx,
+                    fy: supervision.intrinsics.fy,
+                    cx: supervision.intrinsics.cx,
+                    cy: supervision.intrinsics.cy,
+                    width: UInt32(size.width),
+                    height: UInt32(size.height),
+                    faceSize: UInt32(supervision.backgroundFaceSize),
+                    pad: 0
+                )
+                gpu.background(encoderA, uniforms: &bg)
+            }
             gpu.preprocess(encoderA, camera: &camera, splatCount: splatCount)
             gpu.exclusiveScan(
                 encoderA,
@@ -2546,8 +2567,18 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             guard frameSupervision.renderSize == renderSize else { continue }
 
             resources.gtColor.writeArray(frameSupervision.groundTruth)
-            if frameSupervision.hasBackground, !frameSupervision.background.isEmpty {
-                resources.bgColor.writeArray(frameSupervision.background)
+            // Rasterised on the CPU here, unlike the training path: this
+            // composites on the CPU below to get PSNR, and it runs 24 frames
+            // once per slice rather than every iteration.
+            let heldOutBackground: [Float]? = frameSupervision.hasBackground
+                ? supervision.backgroundImage(
+                    pose: frameSupervision.pose,
+                    intrinsics: frameSupervision.intrinsics,
+                    size: renderSize
+                )
+                : nil
+            if let heldOutBackground {
+                resources.bgColor.writeArray(heldOutBackground)
             }
 
             var camera = cameraUniforms(
@@ -2605,8 +2636,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             for i in 0..<pixelCount {
                 for c in 0..<3 {
                     var value = rendered[i * 3 + c]
-                    if frameSupervision.hasBackground, !frameSupervision.background.isEmpty {
-                        value += transmittance[i] * frameSupervision.background[i * 3 + c]
+                    if let heldOutBackground {
+                        value += transmittance[i] * heldOutBackground[i * 3 + c]
                     }
                     value = exposure.x * value + exposure.y
                     let truth = frameSupervision.groundTruth[i * 3 + c]

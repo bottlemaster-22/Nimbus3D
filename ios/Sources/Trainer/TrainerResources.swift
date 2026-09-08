@@ -81,6 +81,9 @@ final class TrainerResources {
     /// contribution to one Gaussian touched four cache lines in four
     /// allocations. See TrainerSplatGrad2DAtomic in TrainerShaders.metal.
     private(set) var splatGrad2D: MTLBuffer
+    /// The background cubemap, 6 faces of faceSize^2 linear-RGB texels, for
+    /// `trainer_background`. 72 KB at the default face size of 32.
+    private(set) var bgCubemap: MTLBuffer
 
     private(set) var centers: MTLBuffer
 
@@ -208,6 +211,9 @@ final class TrainerResources {
         // Costs 28 bytes per splat over the four buffers it replaces, about
         // 8 MB at the 300,000 cap.
         splatGrad2D = try make("splatGrad2D", n * 64)
+        // 6 faces, 32x32, three floats each. Fixed size: it does not scale
+        // with splats or pixels, so it is allocated once and never resized.
+        bgCubemap = try make("bgCubemap", 6 * 32 * 32 * 3 * 4)
         centers = try make("centers", n * 3 * 4)
 
         keysA = try make("keysA", inst * 4)
@@ -291,7 +297,7 @@ final class TrainerResources {
         var list: [MTLBuffer] = [
             splats, sh, stats, draws, samplingTopK, tilesTouched, offsets,
             splatGrad, shGrad, adamM, adamV, shAdamM, shAdamV,
-            splatGrad2D, centers,
+            splatGrad2D, bgCubemap, centers,
             keysA, keysB, valuesA, valuesB, tileRanges,
             radixHistogram, radixHistogramScan,
             renderColor, renderAlpha, renderDepth, renderTFinal, renderNContrib,

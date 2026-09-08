@@ -52,6 +52,7 @@ final class TrainerPipelines {
     let duplicateKeys: MTLComputePipelineState
     let tileRanges: MTLComputePipelineState
     let rasterizeForward: MTLComputePipelineState
+    let background: MTLComputePipelineState
     let lossPhotometric: MTLComputePipelineState
     let ssimPrepare: MTLComputePipelineState
     let blurH: MTLComputePipelineState
@@ -123,6 +124,7 @@ final class TrainerPipelines {
         duplicateKeys = try build(TrainerKernel.duplicateKeys)
         tileRanges = try build(TrainerKernel.tileRanges)
         rasterizeForward = try build(TrainerKernel.rasterizeForward)
+        background = try build(TrainerKernel.background)
         lossPhotometric = try build(TrainerKernel.lossPhotometric)
         ssimPrepare = try build(TrainerKernel.ssimPrepare)
         blurH = try build(TrainerKernel.blurH)
@@ -961,6 +963,33 @@ struct TrainerGPU {
         zero(resources.exposureGrad, floats: 2)
         zero(resources.cameraGrad, floats: 6)
 
+    }
+
+    /// Rasterises the far field straight into `bgColor` on the GPU.
+    ///
+    /// Replaces a Swift loop over every pixel on the prefetch worker plus a
+    /// 4.67 MB memcpy on the main thread. The cubemap is 72 KB and is uploaded
+    /// whole each time rather than versioned: at that size the copy is noise
+    /// and a version counter is one more thing to get wrong.
+    func background(
+        _ encoder: MTLComputeCommandEncoder,
+        uniforms: inout TrainerBackgroundUniforms
+    ) {
+        let px = resources.renderSize.pixelCount
+        guard px > 0 else { return }
+        encoder.setComputePipelineState(pipelines.background)
+        encoder.setBuffer(
+            resources.bgCubemap, offset: 0, index: TrainerBind.Background.texels
+        )
+        encoder.setBuffer(
+            resources.bgColor, offset: 0, index: TrainerBind.Background.bgColor
+        )
+        encoder.setBytes(
+            &uniforms,
+            length: MemoryLayout<TrainerBackgroundUniforms>.stride,
+            index: TrainerBind.Background.uniforms
+        )
+        dispatch1D(encoder, pipelines.background, count: px)
     }
 
     /// The one part of the per-iteration reset that is not a zero fill.

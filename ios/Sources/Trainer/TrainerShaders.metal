@@ -255,6 +255,14 @@ struct TrainerSplatDraw {
     uint          clampedMask;// 60..63
 };                            // 64 bytes
 
+struct TrainerBackgroundUniforms {
+    float4 rotationInverse;   //  0..15   (x, y, z, w)
+    float  fx, fy, cx, cy;    // 16..31
+    uint   width, height;     // 32..39
+    uint   faceSize;          // 40..43
+    uint   pad;               // 44..47
+};
+
 struct TrainerSamplingTopK {
     float r0, r1, r2, r3;     // 16 bytes, descending
 };
@@ -968,6 +976,101 @@ kernel void trainer_duplicate_keys(
             cursor += 1u;
         }
     }
+}
+
+/// THE FAR FIELD, RASTERISED ON THE GPU INSTEAD OF THE CPU.
+///
+/// This was a Swift loop over all 388,800 pixels, run once per iteration on
+/// the prefetch worker: a ray build, a quaternion rotate, a cube-face select
+/// that re-normalised an already-unit vector, and a bilinear cubemap fetch,
+/// call it 60 to 90 cycles a pixel. 6 to 10 ms, the largest single item on a
+/// 19 ms worker, and then 4.67 MB of it was memcpy'd into `bgColor` on the
+/// MAIN thread with the GPU idle behind that too.
+///
+/// Every input is already on the GPU or fits in a uniform. The cubemap is
+/// 6 * 32 * 32 texels, 72 KB, so it is uploaded whole every iteration rather
+/// than versioned: at that size the copy is noise and a version counter is one
+/// more thing to get wrong.
+///
+/// The arithmetic below is transcribed from SmartCamera.ray,
+/// simd_quatf.act and SmartBackgroundCubemap.faceAndUV / radiance. It must
+/// stay transcribed: the background is what the photometric loss composites
+/// behind the Gaussians, so a divergence here is not a visual artefact, it is
+/// a wrong gradient.
+kernel void trainer_background(
+    const device float*                   texels [[buffer(0)]],  // 3 per texel
+    device float*                         bgColor[[buffer(1)]],  // 3 per pixel
+    constant TrainerBackgroundUniforms&   u      [[buffer(2)]],
+    uint                                  gid    [[thread_position_in_grid]]
+) {
+    const uint n = u.width * u.height;
+    if (gid >= n) { return; }
+
+    const uint px = gid % u.width;
+    const uint py = gid / u.width;
+
+    // SmartCamera.ray: normalize((x - cx)/fx, (y - cy)/fy, 1)
+    const float3 ray = normalize(float3(
+        (float(px) + 0.5f - u.cx) / u.fx,
+        (float(py) + 0.5f - u.cy) / u.fy,
+        1.0f
+    ));
+
+    // simd_quatf.act for a unit quaternion:
+    //   v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)
+    const float3 qv = u.rotationInverse.xyz;
+    const float  qw = u.rotationInverse.w;
+    const float3 d = ray + 2.0f * cross(qv, cross(qv, ray) + qw * ray);
+
+    // SmartBackgroundCubemap.faceAndUV, branch for branch.
+    const float3 a = abs(d);
+    int face = 0;
+    float sc = 0.0f, tc = 0.0f, ma = 1.0f;
+    if (a.x >= a.y && a.x >= a.z) {
+        ma = a.x;
+        if (d.x > 0.0f) { face = 0; sc = -d.z; tc = -d.y; }
+        else            { face = 1; sc =  d.z; tc = -d.y; }
+    } else if (a.y >= a.z) {
+        ma = a.y;
+        if (d.y > 0.0f) { face = 2; sc = d.x; tc =  d.z; }
+        else            { face = 3; sc = d.x; tc = -d.z; }
+    } else {
+        ma = a.z;
+        if (d.z > 0.0f) { face = 4; sc =  d.x; tc = -d.y; }
+        else            { face = 5; sc = -d.x; tc = -d.y; }
+    }
+    const float m = max(ma, 1e-8f);
+    const float uu = (sc / m + 1.0f) * 0.5f;
+    const float vv = (tc / m + 1.0f) * 0.5f;
+
+    // bilinearFootprint: clamp at the face edges, never wrap the seam.
+    const int nf = max(2, int(u.faceSize));
+    const float fx = clamp(uu * float(nf) - 0.5f, 0.0f, float(nf - 1));
+    const float fy = clamp(vv * float(nf) - 0.5f, 0.0f, float(nf - 1));
+    const int x0 = int(fx), y0 = int(fy);
+    const int x1 = min(x0 + 1, nf - 1), y1 = min(y0 + 1, nf - 1);
+    const float ax = fx - float(x0), ay = fy - float(y0);
+    const int base = face * nf * nf;
+
+    const int i00 = base + y0 * nf + x0;
+    const int i01 = base + y0 * nf + x1;
+    const int i10 = base + y1 * nf + x0;
+    const int i11 = base + y1 * nf + x1;
+
+    // Same order the CPU accumulated in, so the same rounding.
+    float3 out = float3(0.0f);
+    out += float3(texels[i00 * 3 + 0], texels[i00 * 3 + 1], texels[i00 * 3 + 2])
+         * ((1.0f - ax) * (1.0f - ay));
+    out += float3(texels[i01 * 3 + 0], texels[i01 * 3 + 1], texels[i01 * 3 + 2])
+         * (ax * (1.0f - ay));
+    out += float3(texels[i10 * 3 + 0], texels[i10 * 3 + 1], texels[i10 * 3 + 2])
+         * ((1.0f - ax) * ay);
+    out += float3(texels[i11 * 3 + 0], texels[i11 * 3 + 1], texels[i11 * 3 + 2])
+         * (ax * ay);
+
+    bgColor[gid * 3u + 0u] = out.x;
+    bgColor[gid * 3u + 1u] = out.y;
+    bgColor[gid * 3u + 2u] = out.z;
 }
 
 kernel void trainer_tile_ranges(

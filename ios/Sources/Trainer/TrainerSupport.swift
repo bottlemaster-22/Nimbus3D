@@ -134,6 +134,7 @@ enum TrainerKernel {
     static let duplicateKeys = "trainer_duplicate_keys"
     static let tileRanges = "trainer_tile_ranges"
     static let rasterizeForward = "trainer_rasterize_forward"
+    static let background = "trainer_background"
     static let lossPhotometric = "trainer_loss_photometric"
     static let ssimPrepare = "trainer_ssim_prepare"
     static let blurH = "trainer_blur_h"
@@ -244,6 +245,12 @@ enum TrainerBind {
         static let keys = 0
         static let tileRanges = 1
         static let count = 2         // constant uint&
+    }
+
+    enum Background {
+        static let texels = 0
+        static let bgColor = 1
+        static let uniforms = 2
     }
 
     enum RasterizeForward {
