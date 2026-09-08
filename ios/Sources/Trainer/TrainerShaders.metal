@@ -1239,7 +1239,11 @@ kernel void trainer_rasterize_forward(
     uint                            tid         [[thread_index_in_threadgroup]]
 ) {
     threadgroup float2 tgXY[TRAINER_TILE_AREA];
-    threadgroup float4 tgConicOpacity[TRAINER_TILE_AREA];
+    // HALF, not float. The values now arrive from TrainerSplatRaster's half
+    // fields, so widening them here preserved nothing and cost 2 KB of
+    // threadgroup memory per threadgroup, on a GPU where threadgroup memory is
+    // one of the two things limiting how many run at once.
+    threadgroup half4 tgConicOpacity[TRAINER_TILE_AREA];
     threadgroup float4 tgColorDepth[TRAINER_TILE_AREA];
 
     const uint tileID = tgPos.y * cam.tileCountX + tgPos.x;
@@ -1271,15 +1275,14 @@ kernel void trainer_rasterize_forward(
             // threadgroups run at once. The backward rasteriser keeps
             // its own tgIndex because it genuinely reads it.
             tgXY[tid] = float2(d.mean2D);
-            tgConicOpacity[tid] = float4(
-                float(d.conic0), float(d.conic1), float(d.conic2),
-                float(d.opacity)
+            tgConicOpacity[tid] = half4(
+                d.conic0, d.conic1, d.conic2, d.opacity
             );
             tgColorDepth[tid] = float4(
                 float(d.color0), float(d.color1), float(d.color2), d.depth
             );
         } else {
-            tgConicOpacity[tid] = float4(0.0f);
+            tgConicOpacity[tid] = half4(0.0h);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1287,7 +1290,7 @@ kernel void trainer_rasterize_forward(
             const uint here = min(TRAINER_TILE_AREA, total - b * TRAINER_TILE_AREA);
             for (uint j = 0; j < here; ++j) {
                 const float2 delta = tgXY[j] - pixelCenter;
-                const float4 co = tgConicOpacity[j];
+                const float4 co = float4(tgConicOpacity[j]);
                 const float power = -0.5f * (co.x * delta.x * delta.x
                                              + co.z * delta.y * delta.y)
                                     - co.y * delta.x * delta.y;
@@ -1839,7 +1842,11 @@ kernel void trainer_rasterize_backward(
 ) {
     threadgroup uint   tgIndex[TRAINER_TILE_AREA];
     threadgroup float2 tgXY[TRAINER_TILE_AREA];
-    threadgroup float4 tgConicOpacity[TRAINER_TILE_AREA];
+    // HALF, not float. The values now arrive from TrainerSplatRaster's half
+    // fields, so widening them here preserved nothing and cost 2 KB of
+    // threadgroup memory per threadgroup, on a GPU where threadgroup memory is
+    // one of the two things limiting how many run at once.
+    threadgroup half4 tgConicOpacity[TRAINER_TILE_AREA];
     threadgroup float4 tgColorDepth[TRAINER_TILE_AREA];
 
 
@@ -1962,15 +1969,14 @@ kernel void trainer_rasterize_backward(
             const TrainerSplatRaster d = raster[splatIndex];
             tgIndex[tid] = splatIndex;
             tgXY[tid] = float2(d.mean2D);
-            tgConicOpacity[tid] = float4(
-                float(d.conic0), float(d.conic1), float(d.conic2),
-                float(d.opacity)
+            tgConicOpacity[tid] = half4(
+                d.conic0, d.conic1, d.conic2, d.opacity
             );
             tgColorDepth[tid] = float4(
                 float(d.color0), float(d.color1), float(d.color2), d.depth
             );
         } else {
-            tgConicOpacity[tid] = float4(0.0f);
+            tgConicOpacity[tid] = half4(0.0h);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1989,7 +1995,7 @@ kernel void trainer_rasterize_backward(
                 if (globalIndex > lastContributor) { continue; }
 
                 const float2 delta = tgXY[j] - pixelCenter;
-                const float4 co = tgConicOpacity[j];
+                const float4 co = float4(tgConicOpacity[j]);
                 const float power = -0.5f * (co.x * delta.x * delta.x
                                              + co.z * delta.y * delta.y)
                                     - co.y * delta.x * delta.y;
