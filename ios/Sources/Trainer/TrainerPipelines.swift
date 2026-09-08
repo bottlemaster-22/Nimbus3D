@@ -746,7 +746,6 @@ struct TrainerGPU {
         encoder.setBuffer(
             resources.splatGrad2D, offset: 0, index: TrainerBind.RasterizeBackward.splatGrad2D
         )
-        encoder.setBuffer(resources.stats, offset: 0, index: TrainerBind.RasterizeBackward.stats)
         encoder.setBytes(
             &camera,
             length: MemoryLayout<TrainerCameraUniforms>.stride,

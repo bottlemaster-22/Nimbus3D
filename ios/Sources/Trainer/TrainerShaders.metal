@@ -203,7 +203,29 @@ struct TrainerSplatGrad2DAtomic {
     atomic_float conic0;
     atomic_float conic1;
     atomic_float conic2;
-    float        pad[7];
+    // THE SAME CACHE LINE THE OTHER NINE LIVE IN.
+    //
+    // These three used to be written into `stats[splatIndex]`, a DIFFERENT
+    // buffer, so every contributing (pixel, Gaussian) pair touched two
+    // 64-byte lines instead of one. At roughly 69 million contributing pairs
+    // an iteration that is the hottest memory pattern in the trainer, and
+    // this record already had seven unused float slots sitting in the line.
+    //
+    // WHY THEY ARE PER-ITERATION HERE AND PERMANENT IN `stats`. The two
+    // buffers have different lifetimes and that is the whole reason a naive
+    // move would have been a silent correctness break: `clearPerIteration`
+    // blit-fills all sixteen floats of this record EVERY iteration, while
+    // `stats` is zeroed only by `trainer_reset_densify_stats`, once per
+    // densify pass. AbsGS and the visibility accumulators must survive the
+    // whole interval, so they cannot simply live here.
+    //
+    // So they accumulate here for one iteration and are FOLDED into `stats`
+    // by trainer_preprocess_backward, which runs one thread per splat, owns
+    // the row, and already loads both records.
+    atomic_float absGrad2D;
+    atomic_float visAccum;
+    atomic_float unknownAccum;
+    float        pad[4];
 };
 
 struct TrainerSplatGrad2D {
@@ -216,7 +238,12 @@ struct TrainerSplatGrad2D {
     float conic0;
     float conic1;
     float conic2;
-    float pad[7];
+    /// Per-ITERATION accumulators, folded into the matching `stats` fields by
+    /// trainer_preprocess_backward. See TrainerSplatGrad2DAtomic.
+    float absGrad2D;
+    float visAccum;
+    float unknownAccum;
+    float pad[4];
 };
 
 /// WHAT THE HOT LOOPS ACTUALLY READ, AND NOTHING ELSE. 32 bytes.
@@ -1913,7 +1940,11 @@ kernel void trainer_rasterize_backward(
     // One 64-byte record per splat, replacing four separate buffers. See
     // TrainerSplatGrad2DAtomic.
     device TrainerSplatGrad2DAtomic* splatGrad2D [[buffer(10)]],
-    device TrainerSplatStatsAtomic* stats       [[buffer(14)]],
+    // `stats` USED TO BE BOUND HERE at buffer(14) and is gone: the only three
+    // things this kernel wrote into it now accumulate in splatGrad2D's own
+    // cache line and are folded into stats by trainer_preprocess_backward.
+    // The binding goes with them, because a bound buffer nothing reads is the
+    // exact shape of the dead wiring this project has been bitten by before.
     constant TrainerCameraUniforms& cam         [[buffer(15)]],
     constant TrainerLossUniforms&   lu          [[buffer(16)]],
     uint2                           tgPos       [[threadgroup_position_in_grid]],
@@ -2178,10 +2209,13 @@ kernel void trainer_rasterize_backward(
                 // The MAGNITUDE, accumulated per pixel before any summation.
                 // The signed sum cancels for a Gaussian straddling an edge,
                 // which is exactly the Gaussian that has to split.
-                trainer_atomicAdd(&stats[splatIndex].absGrad2D, length(dLdMean2D));
-                trainer_atomicAdd(&stats[splatIndex].visAccum, weight);
+                // INTO `g`, THE SAME CACHE LINE as the nine above, not into
+                // the separate `stats` buffer. trainer_preprocess_backward
+                // folds these into the persistent per-interval accumulators.
+                trainer_atomicAdd(&g->absGrad2D, length(dLdMean2D));
+                trainer_atomicAdd(&g->visAccum, weight);
                 if (isUnknown > 0.0f) {
-                    trainer_atomicAdd(&stats[splatIndex].unknownAccum, weight);
+                    trainer_atomicAdd(&g->unknownAccum, weight);
                 }
             }
         }
@@ -2209,7 +2243,10 @@ kernel void trainer_preprocess_backward(
     device TrainerSplatGrad*          splatGrad  [[buffer(7)]],
     device float*                     shGrad     [[buffer(8)]],
     device atomic_float*              cameraGrad [[buffer(9)]],   // omega[3], nu[3]
-    const device TrainerSplatStats*   stats      [[buffer(10)]],
+    // WRITABLE now, and plain rather than atomic: this kernel runs one
+    // thread per splat and is the only writer of stats[gid] here, so the fold
+    // below contends with nothing. See trainer_ownedAdd.
+    device TrainerSplatStats*         stats      [[buffer(10)]],
     constant TrainerCameraUniforms&   cam        [[buffer(11)]],
     const device uint*                tilesTouched [[buffer(12)]],
     uint                              gid        [[thread_position_in_grid]]
@@ -2226,6 +2263,24 @@ kernel void trainer_preprocess_backward(
     // path that writes `draws[gid]` writes tilesTouched[gid] = touched two
     // lines later with touched > 0 guaranteed by the maxX <= minX check.
     if (tilesTouched[gid] == 0u) { return; }
+
+    // FOLD THIS ITERATION'S RASTER STATISTICS INTO THE PER-INTERVAL ONES.
+    //
+    // The backward rasteriser accumulates them in its own cache line to avoid
+    // touching a second one per contributing pair; they live for one
+    // iteration there, because `clearPerIteration` wipes that record, and
+    // must live for a whole densify interval in `stats`. This is the one
+    // place that knows both, and it already loads both.
+    //
+    // Splats with tilesTouched 0 are skipped by the return above and lose
+    // nothing: a splat that reached no tile also received no contribution, so
+    // all three of its per-iteration values are the zero the clear wrote.
+    {
+        const TrainerSplatGrad2D acc = splatGrad2D[gid];
+        stats[gid].absGrad2D += acc.absGrad2D;
+        stats[gid].visAccum += acc.visAccum;
+        stats[gid].unknownAccum += acc.unknownAccum;
+    }
 
     const TrainerSplat s = splats[gid];
     const TrainerSplatDraw d = draws[gid];

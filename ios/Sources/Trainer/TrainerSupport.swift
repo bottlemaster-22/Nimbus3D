@@ -340,7 +340,12 @@ enum TrainerBind {
         static let bgColor = 8
         static let unknownMask = 9
         static let splatGrad2D = 10
-        static let stats = 14
+        // 14 WAS `stats`, and is deliberately left as a hole rather than
+        // renumbered. The backward rasteriser stopped touching that buffer
+        // when its three accumulators moved into splatGrad2D's own cache
+        // line; renumbering `camera` and `lossUniforms` down to close the gap
+        // would be a silent, invisible way to break every binding in this
+        // kernel for nothing.
         static let camera = 15
         static let lossUniforms = 16
     }
