@@ -524,6 +524,21 @@ struct TrainerTimings: Codable {
     var gpuSort: Double = 0
     var gpuOther: Double = 0
 
+    /// Command buffer B, opened up. It measured 23.21 ms of a 25.29 ms GPU
+    /// iteration, 92% of all GPU time and 76% of the whole run, as ONE number,
+    /// which is not something anything can be done about.
+    ///
+    /// DIAGNOSTIC, AND IT COSTS SOMETHING. Getting these five numbers means
+    /// five command buffers where there was one, and the measured overhead of
+    /// a commit-and-wait on this device is about 0.29 ms, so roughly 1.2 ms
+    /// per iteration of the thing being measured. That is a deliberate trade
+    /// for one run, and the split comes back out once it has told us which
+    /// kernel to go after.
+    var gpuForward: Double = 0
+    var gpuLosses: Double = 0
+    var gpuBackward: Double = 0
+    var gpuOptimiser: Double = 0
+
     /// How many command buffers were waited on. gpuWait divided by this is
     /// the average round-trip cost, which is the number that says whether
     /// merging command buffers would be worth anything.

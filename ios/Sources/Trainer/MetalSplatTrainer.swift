@@ -1832,29 +1832,61 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // The pool closes after `Self.finish`, so every readback below is
         // reading finished results out of `resources` rather than anything the
         // pool owned.
-        try autoreleasepool { () throws -> Void in
-            guard let bufferB = queue.makeCommandBuffer(),
-                  let encoderB = bufferB.makeComputeCommandEncoder()
-            else { throw TrainerError.noMetalDevice }
-            encoderB.label = "trainer.step"
+        // WAS ONE COMMAND BUFFER. It measured 23.21 ms of a 25.29 ms GPU
+        // iteration, which is 92% of all GPU time and 76% of the entire run,
+        // as a single number that nothing can be done about.
+        //
+        // Five now, one per stage, so the census can say which kernel owns it.
+        // Command buffers committed in order on one queue execute in order, so
+        // every dependency between these stages holds exactly as it did inside
+        // the single encoder.
+        //
+        // THIS IS A MEASUREMENT AND IT IS NOT FREE: four extra
+        // commit-and-waits at about 0.29 ms each, so roughly 1.2 ms per
+        // iteration added to the very thing being measured. It comes back out
+        // once it has pointed at a target.
+        func stage(
+            _ label: String, _ body: (MTLComputeCommandEncoder) -> Void
+        ) throws {
+            try autoreleasepool { () throws -> Void in
+                guard let buffer = queue.makeCommandBuffer(),
+                      let encoder = buffer.makeComputeCommandEncoder()
+                else { throw TrainerError.noMetalDevice }
+                encoder.label = "trainer." + label
+                body(encoder)
+                encoder.endEncoding()
+                buffer.commit()
+                try finish(buffer, label)
+            }
+        }
 
-            gpu.duplicateKeys(encoderB, camera: &camera, splatCount: splatCount)
-            gpu.radixSort(encoderB, count: instanceCount)
-            gpu.tileRanges(encoderB, instanceCount: instanceCount)
-            gpu.rasterizeForward(encoderB, camera: &camera)
+        try stage("the tile sort") { encoder in
+            gpu.duplicateKeys(encoder, camera: &camera, splatCount: splatCount)
+            gpu.radixSort(encoder, count: instanceCount)
+            gpu.tileRanges(encoder, instanceCount: instanceCount)
+        }
 
-            gpu.lossPhotometric(encoderB, loss: &loss)
-            gpu.ssim(encoderB, loss: &loss)
-            gpu.lossFinalize(encoderB, loss: &loss)
-            gpu.lossDepth(encoderB, loss: &loss, sampleCount: sampleCount)
+        try stage("the forward raster") { encoder in
+            gpu.rasterizeForward(encoder, camera: &camera)
+        }
 
-            gpu.rasterizeBackward(encoderB, camera: &camera, loss: &loss)
-            gpu.preprocessBackward(encoderB, camera: &camera, splatCount: splatCount)
+        try stage("the losses") { encoder in
+            gpu.lossPhotometric(encoder, loss: &loss)
+            gpu.ssim(encoder, loss: &loss)
+            gpu.lossFinalize(encoder, loss: &loss)
+            gpu.lossDepth(encoder, loss: &loss, sampleCount: sampleCount)
+        }
 
+        try stage("the backward raster") { encoder in
+            gpu.rasterizeBackward(encoder, camera: &camera, loss: &loss)
+            gpu.preprocessBackward(encoder, camera: &camera, splatCount: splatCount)
+        }
+
+        try stage("the optimiser") { encoder in
             var reg = regularizerUniforms(
                 splatCount: splatCount, iteration: iteration, totalIterations: totalIterations
             )
-            gpu.regularizer(encoderB, reg: &reg)
+            gpu.regularizer(encoder, reg: &reg)
 
             var adam = adamUniforms(
                 splatCount: splatCount,
@@ -1863,12 +1895,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 totalIterations: totalIterations,
                 sceneExtent: sceneExtent
             )
-            gpu.adamSplat(encoderB, adam: &adam)
-            gpu.adamSH(encoderB, adam: &adam)
-
-            encoderB.endEncoding()
-            bufferB.commit()
-            try finish(bufferB, "the tile sort")
+            gpu.adamSplat(encoder, adam: &adam)
+            gpu.adamSH(encoder, adam: &adam)
         }
 
         // --- Readbacks ------------------------------------------------------------------
@@ -2233,6 +2261,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             switch stage {
             case "the tile scan": timings.gpuScan += executing
             case "the tile sort": timings.gpuSort += executing
+            case "the forward raster": timings.gpuForward += executing
+            case "the losses": timings.gpuLosses += executing
+            case "the backward raster": timings.gpuBackward += executing
+            case "the optimiser": timings.gpuOptimiser += executing
             default: timings.gpuOther += executing
             }
         }
