@@ -395,6 +395,17 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // is the second. Putting the write on the success path only would give
         // us a census for exactly the runs that did not need one.
         var census = TrainerCensus(scanID: bundle.scanID, requested: budget)
+        // ZEROED PER RUN, beside the census it will be copied into.
+        //
+        // `timings` is a stored property on this class, so a trainer instance
+        // that ran twice handed the second run a census carrying BOTH runs'
+        // totals against only the second run's startedAt and finishedAt. It
+        // surfaced as gpuWait 115.3 s inside a 68 s run, which is impossible
+        // on its face: that clock is main-thread blocking time and cannot
+        // exceed the wall clock. Every per-run field was still correct, so the
+        // conclusions drawn from splat counts and wall clock survive; only the
+        // timings table was wrong, and only on a second run.
+        timings = TrainerTimings()
         defer {
             if census.outcome == TrainerCensus.unfinishedOutcome,
                isCancelled || Task.isCancelled
