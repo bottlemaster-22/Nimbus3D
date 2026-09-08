@@ -36,7 +36,10 @@ extension Data {
     /// file is byte for byte what it was.
     mutating func appendUInt32LE(_ v: UInt32) {
         var le = v.littleEndian
-        withUnsafeBytes(of: &le) { append(contentsOf: $0) }
+        // `Swift.` is not decoration. Inside an extension on Data, the bare
+        // name resolves to Data's own withUnsafeBytes instance method, which
+        // reads the buffer rather than a value, and the compiler rejects it.
+        Swift.withUnsafeBytes(of: &le) { append(contentsOf: $0) }
     }
 
     mutating func appendInt32LE(_ v: Int32) {
