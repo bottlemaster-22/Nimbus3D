@@ -1575,6 +1575,40 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 renderSize: renderSize
             )
             census.slices[censusRow].heldOutPSNR = psnr
+
+            // The same measurement on frames the model DID see. Sampled
+            // evenly across the shuffle rather than taking the first few, and
+            // limited to the SAME COUNT as the held-out set so the two numbers
+            // cost the same and mean the same thing. Six extra renders once,
+            // at the end, against three thousand iterations.
+            let wanted = slice.heldOutKeyframes.count
+            if wanted > 0, slice.keyframes.count >= wanted {
+                let stride = Swift.max(1, slice.keyframes.count / wanted)
+                let sampled = Swift.stride(
+                    from: 0, to: slice.keyframes.count, by: stride
+                ).prefix(wanted).map { slice.keyframes[$0] }
+                let trained = try evaluateHeldOut(
+                    gpu: gpu,
+                    resources: resources,
+                    queue: queue,
+                    frames: Array(sampled),
+                    supervision: supervision,
+                    cameraDeltas: cameraDeltas,
+                    exposures: exposures,
+                    splatCount: splatCount,
+                    shCoefficientCount: shCoefficientCount,
+                    renderSize: renderSize
+                )
+                census.slices[censusRow].trainedPSNR = trained
+                if let trained, let psnr {
+                    let shown = String(format: "%.2f", trained)
+                    let gap = String(format: "%.2f", trained - psnr)
+                    TrainerLog.general.info(
+                        "Trained-view PSNR \(shown, privacy: .public) dB, \(gap, privacy: .public) dB above held-out"
+                    )
+                }
+            }
+
             if let psnr {
                 heldOutPSNR = heldOutPSNR.map { Swift.min($0, psnr) } ?? psnr
                 let formatted = String(format: "%.2f", psnr)
@@ -2191,7 +2225,17 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // completed and are zero if the device did not report them, which
         // is why this is guarded rather than trusted.
         let executing = buffer.gpuEndTime - buffer.gpuStartTime
-        if executing.isFinite, executing > 0 { timings.gpuBusy += executing }
+        if executing.isFinite, executing > 0 {
+            timings.gpuBusy += executing
+            // Bucketed by the caller's own stage name, which every command
+            // buffer already carries, so this costs a string compare per
+            // buffer and no Metal objects at all.
+            switch stage {
+            case "the tile scan": timings.gpuScan += executing
+            case "the tile sort": timings.gpuSort += executing
+            default: timings.gpuOther += executing
+            }
+        }
         if let error = buffer.error {
             TrainerLog.gpu.error(
                 """

@@ -402,6 +402,25 @@ struct TrainerCensusSlice: Codable {
     var droppedNonFiniteOnReadback: Int = 0
     var splatsHandedToMerge: Int = 0
     var heldOutPSNR: Float?
+
+    /// PSNR on frames the model DID train on, measured the same way and on
+    /// the same number of frames as `heldOutPSNR`, so the two can be compared
+    /// directly.
+    ///
+    /// Without it there is no way to tell two completely different failures
+    /// apart, and they need opposite fixes:
+    ///
+    ///   trained ~25, heldOut ~16   the model reproduces what it was shown
+    ///                              and falls apart elsewhere. A coverage or
+    ///                              camera-pose problem.
+    ///   trained ~16, heldOut ~16   it is wrong even on frames it looked at
+    ///                              three thousand times. A fitting problem.
+    ///
+    /// The owner's own observation is the reason this exists: a short scan of
+    /// one wall, viewed from the angle it was shot from, still looked bad.
+    /// That is close to a training view, which is the easy case, and it points
+    /// at the second failure. This measures it rather than inferring it.
+    var trainedPSNR: Float?
 }
 
 // MARK: - The merge
@@ -486,6 +505,24 @@ struct TrainerTimings: Codable {
     /// Writing this frame's ground truth, background and depth samples into
     /// the shared Metal buffers.
     var upload: Double = 0
+
+    /// GPU execution split by which command buffer it was in, so the 25.5 ms
+    /// the GPU now spends per iteration stops being one opaque number.
+    ///
+    /// `gpuScan` is command buffer A: clear, preprocess, the tiles-touched
+    /// exclusive scan. `gpuSort` is command buffer B, which is everything
+    /// else in an iteration: duplicate keys, the eight-pass radix sort, tile
+    /// ranges, the forward rasteriser, the losses, the backward rasteriser and
+    /// Adam. `gpuOther` is the periodic work, the filter sweep and the resets.
+    ///
+    /// Coarse on purpose. Per-kernel timing needs counter sample buffers, and
+    /// this needs no new Metal objects at all because every command buffer
+    /// already passes through `finish` with its stage name. If gpuSort is
+    /// almost all of it, which is the expectation, the next question is which
+    /// kernel inside it, and THAT is worth the counter buffers.
+    var gpuScan: Double = 0
+    var gpuSort: Double = 0
+    var gpuOther: Double = 0
 
     /// How many command buffers were waited on. gpuWait divided by this is
     /// the average round-trip cost, which is the number that says whether

@@ -60,7 +60,20 @@ public final class NativeDepthEdgeClassifier: EdgeClassifier {
     private let cacheCapacity: Int
     private let lock = NSLock()
 
-    public init(settings: SmartLossSettings = .default, cacheCapacity: Int = 6) {
+    /// SIZED TO COVER A KEYFRAME CYCLE, not to be small.
+    ///
+    /// The default was 6. The trainer shuffles its keyframes ONCE and then
+    /// walks them round-robin, so the reuse distance is the whole cycle: about
+    /// 114 frames on the owner's scan. An LRU smaller than the cycle has a 0%
+    /// hit rate, not a low one, so every iteration rebuilt a frame it had
+    /// already built about 26 times. Raising 6 to 24 would have changed
+    /// nothing for the same reason; only covering the cycle helps.
+    ///
+    /// 128 is chosen from memory, not from the cycle: an edge map is about 49 KB, so 128 of them is roughly 6 MB. That is affordable
+    /// against a 687 MB peak and a 1.59 GB ceiling, and it is bounded no
+    /// matter how large the capture is, which a "just cache everything" rule
+    /// would not be.
+    public init(settings: SmartLossSettings = .default, cacheCapacity: Int = 128) {
         self.settings = settings
         self.cacheCapacity = Swift.max(1, cacheCapacity)
     }

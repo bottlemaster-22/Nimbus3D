@@ -278,11 +278,22 @@ final class TrainerSupervisionBuilder {
             bundle.intrinsics, depthWidth: depthWidth, depthHeight: depthHeight
         )
 
-        // Three frames of cache: the current one, the one the densifier may
-        // re-render, and one spare. A house scan's frames are 2 MB decoded at
-        // 720 px, so this is single-digit megabytes, not a gamble.
+        // THE IMAGE CACHE STAYS AT THREE, and that is a memory decision
+        // rather than a good one. A SmartImage at 720x540 is 7.78 MB, because
+        // `rgb` is [SIMD3<Float>] whose stride is 16 bytes with a quarter of
+        // it padding, plus a luma plane the trainer never reads. Covering a
+        // 114 frame cycle would be 887 MB against a 687 MB peak. Fixing it
+        // properly means caching packed bytes instead of floats, which is a
+        // real change and not this one.
+        //
+        // THE DEPTH CACHE DOES NOT HAVE THAT PROBLEM. A frame's samples are
+        // depthWidth * depthHeight floats, about 196 KB at 256x192, so 128
+        // frames is roughly 25 MB and the cycle is covered. At 3 it had a 0%%
+        // hit rate: the trainer shuffles its keyframes once and then walks
+        // them round-robin, so the reuse distance is the whole cycle and
+        // nothing was ever still resident when it came round again.
         imageCache = SmartImageCache(capacity: 3, longEdge: self.requestedLongEdge)
-        depthCache = SmartDepthCache(capacity: 3, sampleCount: depthWidth * depthHeight)
+        depthCache = SmartDepthCache(capacity: 128, sampleCount: depthWidth * depthHeight)
     }
 
     /// Adopts a smaller supervision grid part way through a run.
