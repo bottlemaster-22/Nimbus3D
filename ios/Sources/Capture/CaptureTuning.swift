@@ -199,6 +199,18 @@ public enum CaptureTuning {
     /// temporal track that the pre-pass's submap builder then has to bridge.
     public static let keyframeMaxIntervalSeconds: Double = 2.0
 
+    /// How wide an arc of AZIMUTH a patch must be seen across before the
+    /// coverage field's angle channel is satisfied. See
+    /// `CaptureCoverageVoxel.azimuthSpreadDegrees`.
+    ///
+    /// 90 degrees is two of the eight 45-degree azimuth bins. It is
+    /// deliberately reachable: a patch on a wall can only be seen from the
+    /// hemisphere in front of it, and asking for more than a right angle of
+    /// travel around a single patch would fail every honest scan of a corner.
+    /// One direction alone scores 45 degrees, which is half of this, so it can
+    /// no longer satisfy a channel whose threshold is 0.7.
+    public static let coverageAzimuthSpreadTargetDegrees: Float = 90
+
     /// A frame whose QC weight is below this is not written unless
     /// `keyframeMaxIntervalSeconds` has elapsed. Not zero: a slightly blurry
     /// frame in an otherwise unseen direction is worth more than nothing.

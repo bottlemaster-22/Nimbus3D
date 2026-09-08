@@ -71,11 +71,63 @@ struct CaptureCoverageVoxel {
     /// documented target of 0.55 scored 0.55, below the 0.7 done threshold,
     /// and could never be counted as covered no matter how long the user
     /// stood there.
+    /// HOW WIDE AN ARC OF AZIMUTH THIS PATCH HAS ACTUALLY BEEN SEEN FROM,
+    /// in degrees, which is what parallax needs and what a count cannot say.
+    ///
+    /// `directionMask` packs elevation in the high bits and azimuth in the low
+    /// ones (`bucket = elevationBin * azimuthBins + azimuthBin`), so the
+    /// azimuth histogram has always been sitting in this word. Nothing ever
+    /// read it. The count-only test below is satisfied by 2.8 rounded to 3
+    /// distinct buckets OF ANY KIND, so a patch seen from ONE direction at
+    /// three different heights passed, and the owner's 50-degree azimuth dead
+    /// zone was invisible to the HUD that exists to prevent it.
+    ///
+    /// NOT "no gap wider than 90 degrees", which is what the research proposed
+    /// and which nothing could ever satisfy: a patch on a wall can only be
+    /// seen from the hemisphere in front of it, so half the azimuth circle is
+    /// unreachable by construction and the largest gap is always at least 180
+    /// degrees. The reachable question is how wide the OBSERVED arc is, which
+    /// is the circle minus the largest empty run.
+    var azimuthSpreadDegrees: Float {
+        let bins = CaptureCoverageField.azimuthBins
+        guard bins > 0 else { return 0 }
+        var occupied: UInt32 = 0
+        for bucket in 0..<32 where (directionMask & (1 << UInt32(bucket))) != 0 {
+            occupied |= 1 << UInt32(bucket % bins)
+        }
+        if occupied == 0 { return 0 }
+        let degreesPerBin = 360 / Float(bins)
+        // Largest run of empty bins, walked circularly from an occupied one so
+        // a run that straddles the wrap point is counted once and correctly.
+        var longestGap = 0
+        var run = 0
+        for step in 0..<(bins * 2) {
+            let bin = step % bins
+            if (occupied & (1 << UInt32(bin))) != 0 {
+                run = 0
+            } else {
+                run += 1
+                longestGap = Swift.max(longestGap, Swift.min(run, bins))
+            }
+        }
+        return Swift.max(0, Float(bins - longestGap) * degreesPerBin)
+    }
+
     var channels: SIMD3<Float> {
-        let angles = Swift.min(
+        let count = Swift.min(
             1,
             Float(directionCount) / Float(CaptureTuning.coverageDirectionsForFull)
         )
+        // BOTH, not either. The count says "looked at enough times", the
+        // spread says "looked at from enough different sides", and only the
+        // second is parallax. A patch fails on whichever it is worse at, which
+        // is also what makes the HUD's hint useful rather than merely red.
+        let spread = Swift.min(
+            1,
+            azimuthSpreadDegrees
+                / Swift.max(CaptureTuning.coverageAzimuthSpreadTargetDegrees, 1)
+        )
+        let angles = Swift.min(count, spread)
         let sharpnessTarget = Swift.max(CaptureTuning.coverageSharpnessTarget, 0.0001)
         let sharpness = Swift.min(1, Swift.max(0, bestSharpness / sharpnessTarget))
         return SIMD3<Float>(
