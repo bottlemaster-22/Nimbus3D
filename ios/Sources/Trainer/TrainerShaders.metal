@@ -1284,11 +1284,20 @@ kernel void trainer_ssim_stats(
     const float A  = -w * dS_dsxx;
     const float B  = -w * dS_dsxy;
 
-    partials[0u * n + gid] = Cc;
+    // THREE PLANES, NOT FIVE. The blur that follows is a linear operator,
+    // clamp-to-edge included, and three of the five blurred planes entered the
+    // gradient with no per-pixel factor at the output pixel:
+    //
+    //   dL/dX = (G*Cc) + 2X(G*A) - 2(G*(A mux)) + Y(G*B) - (G*(B muy))
+    //
+    // The first, third and fifth terms have no X or Y on them, so by linearity
+    // G*Cc - 2 G*(A mux) - G*(B muy) = G*(Cc - 2 A mux - B muy) and the fold
+    // can happen HERE, before the convolution, instead of after it. Two of the
+    // five planes stop existing: four fewer plane-passes through an 11-tap
+    // separable blur per iteration, and 12.4 MB less traffic.
+    partials[0u * n + gid] = Cc - 2.0f * A * mux - B * muy;
     partials[1u * n + gid] = A;
-    partials[2u * n + gid] = A * mux;
-    partials[3u * n + gid] = B;
-    partials[4u * n + gid] = B * muy;
+    partials[2u * n + gid] = B;
 }
 
 /// Assembles dL/dX from the blurred partials and folds it into dL/dC_final
@@ -1309,13 +1318,13 @@ kernel void trainer_ssim_backward(
     const float X = lumaPlanes[0u * n + gid];
     const float Y = lumaPlanes[1u * n + gid];
 
-    const float gCc  = blurredPartials[0u * n + gid];
-    const float gA   = blurredPartials[1u * n + gid];
-    const float gAmu = blurredPartials[2u * n + gid];
-    const float gB   = blurredPartials[3u * n + gid];
-    const float gBmu = blurredPartials[4u * n + gid];
+    // Plane 0 already carries Cc - 2 A mux - B muy, folded before the blur in
+    // trainer_ssim_stats. Same value, two fewer planes convolved.
+    const float gP = blurredPartials[0u * n + gid];
+    const float gA = blurredPartials[1u * n + gid];
+    const float gB = blurredPartials[2u * n + gid];
 
-    const float dLdX = gCc + 2.0f * X * gA - 2.0f * gAmu + Y * gB - gBmu;
+    const float dLdX = gP + 2.0f * X * gA + Y * gB;
 
     gradFinal[gid * 3u + 0u] += dLdX * TRAINER_LUMA.x;
     gradFinal[gid * 3u + 1u] += dLdX * TRAINER_LUMA.y;

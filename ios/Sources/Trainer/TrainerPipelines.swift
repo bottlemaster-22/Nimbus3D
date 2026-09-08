@@ -591,6 +591,13 @@ struct TrainerGPU {
         )
         dispatch1D(encoder, pipelines.ssimStats, count: px)
 
+        // THREE planes now, not five: trainer_ssim_stats folds the three
+        // terms that carry no per-pixel factor into plane 0 before the blur,
+        // which is legal because the blur is linear. Set AFTER ssimStats
+        // above, which does not read planeCount, and after the moments blur at
+        // the top, which genuinely needs all five. `blur` is one var passed
+        // inout to both calls, so the order of this line is load-bearing.
+        blur.planeCount = 3
         // The partials get the same separable blur, and land back in ssimTmp.
         blurBoth(encoder, from: resources.ssimTmp, through: resources.ssimMid, into: resources.ssimTmp, blur: &blur)
 
