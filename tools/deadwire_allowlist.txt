@@ -75,7 +75,6 @@ ExportService.swift:makeController  # HARMLESS: the owner CAN get files out. Sca
 # ---------------------------------------------------------------------------
 DeviceCompatibilityProbe.swift:incompatibilityError  # HARMLESS: the screen is not mute. OnboardingIncompatibleView renders report.incompatibleReason, which the probe fills on every .incompatible verdict; the two refusal sites in ARCaptureService.swift:1163/1169 compose their own sentences.
 OnboardingCopy.swift:capitalisedFirst  # ARTEFACT: used at OnboardingCopy.swift:299, inside a stripped string interpolation.
-OnboardingFormat.swift:head  # ARTEFACT: used on the very next line, inside the list-joining interpolation.
 
 # ---------------------------------------------------------------------------
 # PrePass
@@ -154,7 +153,7 @@ TrainerGPULayouts.swift:meanCamY  # ARTEFACT: Metal struct mirror, TrainerSplatD
 TrainerGPULayouts.swift:meanCamZ  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 8.
 TrainerGPULayouts.swift:mean2DX  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 16.
 TrainerGPULayouts.swift:mean2DY  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 20.
-TrainerGPULayouts.swift:radiusPx  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 24.
+TrainerGPULayouts.swift:radiusPxPackedHalf2  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 24. Two halves on the GPU side; Swift never reads it, only the stride.
 TrainerGPULayouts.swift:conicA  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 32.
 TrainerGPULayouts.swift:conicB  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 36.
 TrainerGPULayouts.swift:conicC  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 40.
