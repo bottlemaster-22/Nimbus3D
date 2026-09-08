@@ -1324,3 +1324,86 @@ final class SmartDepthCache {
         return values
     }
 }
+
+
+// MARK: - One frame's trust, taken once
+
+/// One frame's trust arrays, taken once, read without a lock.
+///
+/// `TwoScaleTrustField.weight(frame:sampleIndex:)` and `sigmaMeters` each take
+/// the field's lock and then call through to a SmartSampleFieldReader, which
+/// takes ITS lock and returns the frame's whole [Float] slice BY VALUE. Per
+/// sample that is four to six lock/unlock pairs and three or four whole-array
+/// retain/release cycles, to read two floats.
+///
+/// The pre-pass seeding stage calls both for 8,538,104 samples: roughly 34
+/// million lock acquisitions, and every call for a given frame reads the SAME
+/// two arrays.
+///
+/// The arithmetic here is copied expression for expression from those two
+/// methods, fallbacks included, so the seeds come out bit for bit the same.
+public struct SmartFrameTrust: Sendable {
+    let noise: [Float]
+    let confidence: [Float]?
+    let noiseDefault: Float
+    let confidenceDefault: Float
+    let noiseReferenceMeters: Float
+
+    @inline(__always)
+    private func noiseValue(_ i: Int) -> Float {
+        guard i >= 0, i < noise.count else { return noiseDefault }
+        let v = noise[i]
+        return v.isFinite ? v : noiseDefault
+    }
+
+    /// Same expression as `TwoScaleTrustField.weight`, without the locks.
+    public func weight(sampleIndex: Int) -> Float {
+        let sigma = noiseValue(sampleIndex)
+        guard sigma.isFinite, sigma > 0, sigma < 1e2 else { return 0 }
+
+        let ratio = sigma / Swift.max(noiseReferenceMeters, 1e-4)
+        var w = 1 / (1 + ratio * ratio)
+
+        if let confidence {
+            var raw = confidenceDefault
+            if sampleIndex >= 0, sampleIndex < confidence.count {
+                let c = confidence[sampleIndex]
+                raw = c.isFinite ? c : confidenceDefault
+            }
+            let p = SmartMath.clamp(raw, 0, 1)
+            w *= (0.25 + 0.75 * p)
+        }
+        return SmartMath.clamp(w, 0, 1)
+    }
+
+    /// Same expression as `TwoScaleTrustField.sigmaMeters`, without the locks.
+    public func sigmaMeters(sampleIndex: Int) -> Float? {
+        let s = noiseValue(sampleIndex)
+        return s.isFinite && s < 1e2 ? s : nil
+    }
+}
+
+extension TwoScaleTrustField {
+
+    /// This frame's trust arrays, taken under the lock ONCE.
+    ///
+    /// nil when there is no noise field at all, which is exactly the condition
+    /// `weight` answers 0 to and `sigmaMeters` answers nil to, so a caller
+    /// getting nil here keeps the fallbacks it already had.
+    public func frameTrust(frame: FrameID) -> SmartFrameTrust? {
+        lock.lock()
+        let reader = noiseReader
+        let confidence = confidenceReader
+        let reference = settings.noiseReferenceMeters
+        lock.unlock()
+
+        guard let reader else { return nil }
+        return SmartFrameTrust(
+            noise: reader.slice(frame: frame),
+            confidence: confidence?.slice(frame: frame),
+            noiseDefault: reader.defaultValue,
+            confidenceDefault: confidence?.defaultValue ?? 1,
+            noiseReferenceMeters: reference
+        )
+    }
+}

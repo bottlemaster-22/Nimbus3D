@@ -838,11 +838,8 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
                     bundle: refinedBundle,
                     at: ref,
                     poseFor: { $0.refinedPose ?? $0.rawPose },
-                    trustWeight: { frame, sample in
-                        trustLoaded ? trust.weight(frame: frame, sampleIndex: sample) : 0
-                    },
-                    sigmaFor: { frame, sample in
-                        trustLoaded ? trust.sigmaMeters(frame: frame, sampleIndex: sample) : nil
+                    trustFrameFor: { frame in
+                        trustLoaded ? trust.frameTrust(frame: frame) : nil
                     },
                     edgeMapFor: { frame in
                         edgesLoaded ? classifier.map(for: frame) : []

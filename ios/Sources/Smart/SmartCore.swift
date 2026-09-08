@@ -720,7 +720,10 @@ enum SmartBinary {
 final class SmartSampleFieldReader {
     private let data: Data
     private let samplesPerFrame: Int
-    private let defaultValue: Float
+    /// Internal rather than private: `TwoScaleTrustField.frameTrust` builds a
+    /// per-frame snapshot and has to reproduce `value(frame:sampleIndex:)`
+    /// exactly, fallback included.
+    let defaultValue: Float
 
     private var cachedFrame: FrameID?
     private var cachedSlice: [Float] = []

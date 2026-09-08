@@ -365,8 +365,16 @@ enum PrePassInitialSplatBuilder {
         bundle: CaptureBundle,
         at ref: CaptureBundleRef,
         poseFor: (CaptureFrame) -> Pose,
-        trustWeight: (FrameID, Int) -> Float,
-        sigmaFor: (FrameID, Int) -> Float?,
+        /// ONE snapshot per frame, not two closure calls per sample.
+        ///
+        /// This was `trustWeight: (FrameID, Int) -> Float` and
+        /// `sigmaFor: (FrameID, Int) -> Float?`, both of which reached into
+        /// TwoScaleTrustField and took four to six locks and three or four
+        /// whole-array retain/release cycles to read two floats. Seeding runs
+        /// them for 8,538,104 samples, so roughly 34 million lock
+        /// acquisitions, every one of which for a given frame read the same
+        /// two arrays.
+        trustFrameFor: (FrameID) -> SmartFrameTrust?,
         edgeMapFor: (FrameID) -> [EdgeClass],
         surfaceAreaSquareMeters: Float,
         targetSplatCount: Int,
@@ -436,7 +444,14 @@ enum PrePassInitialSplatBuilder {
         // average. Averaging across a depth edge invents a surface halfway
         // between the near thing and the far thing, which is the single most
         // recognisable artefact in a badly initialised splat field.
-        var hash = PrePassVoxelHash(expectedCount: 1 << 16)
+        // SIZED FOR THE ANSWER, not for a guess. This run produces 888,951
+        // seeds; 1 << 16 meant the hash rehashed every one of them four times
+        // over as it doubled, and every array below reallocated and copied
+        // about twenty times on its way up. `targetSplatCount` is the number
+        // the caller actually wants, and the reserve costs nothing when the
+        // real count comes in lower.
+        let expectedSeeds = Swift.max(targetSplatCount, 1 << 16)
+        var hash = PrePassVoxelHash(expectedCount: expectedSeeds)
         var position: [SIMD3<Float>] = []
         var normal: [SIMD3<Float>] = []
         var viewDirection: [SIMD3<Float>] = []
@@ -451,6 +466,17 @@ enum PrePassInitialSplatBuilder {
         var rangeMeters: [Float] = []
         var hasNormal: [Bool] = []
         var onEdge: [Bool] = []
+
+        position.reserveCapacity(expectedSeeds)
+        normal.reserveCapacity(expectedSeeds)
+        viewDirection.reserveCapacity(expectedSeeds)
+        color.reserveCapacity(expectedSeeds)
+        weight.reserveCapacity(expectedSeeds)
+        sigma.reserveCapacity(expectedSeeds)
+        sigmaMeasured.reserveCapacity(expectedSeeds)
+        rangeMeters.reserveCapacity(expectedSeeds)
+        hasNormal.reserveCapacity(expectedSeeds)
+        onEdge.reserveCapacity(expectedSeeds)
 
         // The funnel, counted. Plain Ints on the stack: the inner loop runs
         // about eight million times on a room scan and does one add per
@@ -515,6 +541,8 @@ enum PrePassInitialSplatBuilder {
             let pose = poseFor(frame)
             let cameraCentre = pose.center.simd
             let rotationInverse = pose.rotation.simd.inverse
+            // Taken ONCE for the frame. See the parameter's note.
+            let frameTrust = trustFrameFor(frame.index)
 
             for sampleIndex in 0..<(width * height) {
                 samplesInspected += 1
@@ -538,7 +566,7 @@ enum PrePassInitialSplatBuilder {
                 guard let key = voxelFrame.key(world) else { continue }
                 samplesInsideGrid += 1
 
-                let sampleWeight = clamp01(trustWeight(frame.index, sampleIndex))
+                let sampleWeight = clamp01(frameTrust?.weight(sampleIndex: sampleIndex) ?? 0)
                 if sampleWeight <= 0 { samplesWithZeroTrust += 1 }
 
                 let slot = hash.indexOrInsert(key)
@@ -563,7 +591,7 @@ enum PrePassInitialSplatBuilder {
                     rangeMeters: range, incidenceCosine: incidence
                 )
                 var sampleSigmaMeasured = false
-                if let measured = sigmaFor(frame.index, sampleIndex),
+                if let measured = frameTrust?.sigmaMeters(sampleIndex: sampleIndex),
                    measured.isFinite, measured > 0 {
                     sampleSigma = measured
                     sampleSigmaMeasured = true
