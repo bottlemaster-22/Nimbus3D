@@ -703,17 +703,9 @@ struct TrainerGPU {
             resources.unknownMask, offset: 0, index: TrainerBind.RasterizeBackward.unknownMask
         )
         encoder.setBuffer(
-            resources.gradMean2D, offset: 0, index: TrainerBind.RasterizeBackward.gradMean2D
+            resources.splatGrad2D, offset: 0, index: TrainerBind.RasterizeBackward.splatGrad2D
         )
         encoder.setBuffer(
-            resources.gradConic, offset: 0, index: TrainerBind.RasterizeBackward.gradConic
-        )
-        encoder.setBuffer(
-            resources.gradColor, offset: 0, index: TrainerBind.RasterizeBackward.gradColor
-        )
-        encoder.setBuffer(
-            resources.gradOpacity, offset: 0, index: TrainerBind.RasterizeBackward.gradOpacity
-        )
         encoder.setBuffer(resources.stats, offset: 0, index: TrainerBind.RasterizeBackward.stats)
         encoder.setBytes(
             &camera,
@@ -746,17 +738,9 @@ struct TrainerGPU {
         encoder.setBuffer(resources.sh, offset: 0, index: TrainerBind.PreprocessBackward.sh)
         encoder.setBuffer(resources.draws, offset: 0, index: TrainerBind.PreprocessBackward.draws)
         encoder.setBuffer(
-            resources.gradMean2D, offset: 0, index: TrainerBind.PreprocessBackward.gradMean2D
+            resources.splatGrad2D, offset: 0, index: TrainerBind.PreprocessBackward.splatGrad2D
         )
         encoder.setBuffer(
-            resources.gradConic, offset: 0, index: TrainerBind.PreprocessBackward.gradConic
-        )
-        encoder.setBuffer(
-            resources.gradColor, offset: 0, index: TrainerBind.PreprocessBackward.gradColor
-        )
-        encoder.setBuffer(
-            resources.gradOpacity, offset: 0, index: TrainerBind.PreprocessBackward.gradOpacity
-        )
         encoder.setBuffer(
             resources.splatGrad, offset: 0, index: TrainerBind.PreprocessBackward.splatGrad
         )
@@ -901,10 +885,10 @@ struct TrainerGPU {
         // Accumulated by the backward kernels through atomics.
         fillFloat(encoder, buffer: resources.splatGrad, count: splatCount * 12, value: 0)
         fillFloat(encoder, buffer: resources.shGrad, count: shFloats, value: 0)
-        fillFloat(encoder, buffer: resources.gradMean2D, count: splatCount * 2, value: 0)
-        fillFloat(encoder, buffer: resources.gradConic, count: splatCount * 3, value: 0)
-        fillFloat(encoder, buffer: resources.gradColor, count: splatCount * 3, value: 0)
-        fillFloat(encoder, buffer: resources.gradOpacity, count: splatCount, value: 0)
+        // ONE fill where there were four: the four gradient buffers are now
+        // one interleaved record of 16 floats per splat, so this is a quarter
+        // of the dispatches and a single contiguous write.
+        fillFloat(encoder, buffer: resources.splatGrad2D, count: splatCount * 16, value: 0)
 
         // Accumulated per pixel with `+=`.
         fillFloat(encoder, buffer: resources.gradDepthRend, count: px, value: 0)

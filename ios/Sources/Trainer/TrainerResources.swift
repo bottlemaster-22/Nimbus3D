@@ -76,10 +76,11 @@ final class TrainerResources {
     private(set) var shAdamM: MTLBuffer
     private(set) var shAdamV: MTLBuffer
 
-    private(set) var gradMean2D: MTLBuffer
-    private(set) var gradConic: MTLBuffer
-    private(set) var gradColor: MTLBuffer
-    private(set) var gradOpacity: MTLBuffer
+    /// The four screen-space gradients of every splat, interleaved into one
+    /// 64-byte record each. Was four separate buffers, which meant one pixel's
+    /// contribution to one Gaussian touched four cache lines in four
+    /// allocations. See TrainerSplatGrad2DAtomic in TrainerShaders.metal.
+    private(set) var splatGrad2D: MTLBuffer
 
     private(set) var centers: MTLBuffer
 
@@ -202,10 +203,11 @@ final class TrainerResources {
         shAdamM = try make("shAdamM", shFloats * MemoryLayout<Float>.stride)
         shAdamV = try make("shAdamV", shFloats * MemoryLayout<Float>.stride)
 
-        gradMean2D = try make("gradMean2D", n * 2 * 4)
-        gradConic = try make("gradConic", n * 3 * 4)
-        gradColor = try make("gradColor", n * 3 * 4)
-        gradOpacity = try make("gradOpacity", n * 4)
+        // 64 bytes each: nine gradient floats and seven of padding, so one
+        // splat's record is exactly one cache line and neighbours never share.
+        // Costs 28 bytes per splat over the four buffers it replaces, about
+        // 8 MB at the 300,000 cap.
+        splatGrad2D = try make("splatGrad2D", n * 64)
         centers = try make("centers", n * 3 * 4)
 
         keysA = try make("keysA", inst * 4)
@@ -289,7 +291,7 @@ final class TrainerResources {
         var list: [MTLBuffer] = [
             splats, sh, stats, draws, samplingTopK, tilesTouched, offsets,
             splatGrad, shGrad, adamM, adamV, shAdamM, shAdamV,
-            gradMean2D, gradConic, gradColor, gradOpacity, centers,
+            splatGrad2D, centers,
             keysA, keysB, valuesA, valuesB, tileRanges,
             radixHistogram, radixHistogramScan,
             renderColor, renderAlpha, renderDepth, renderTFinal, renderNContrib,
@@ -543,9 +545,8 @@ final class TrainerResources {
         // Release the ten buffers whose contents cannot outlive an iteration,
         // before a single byte is allocated.
         //
-        // Six of them, `splatGrad`, `shGrad`, `gradMean2D`, `gradConic`,
-        // `gradColor` and `gradOpacity`, are filled on the GPU by
-        // `TrainerGPU.clearPerIteration` (TrainerPipelines.swift:902-907) at
+        // Three of them, `splatGrad`, `shGrad` and `splatGrad2D`, are filled
+        // on the GPU by `TrainerGPU.clearPerIteration` at
         // the top of every step. The other four are NOT cleared there and do
         // not need to be, which is worth writing down because the obvious
         // reading of that function is that it covers everything transient:
@@ -560,10 +561,7 @@ final class TrainerResources {
         offsets = placeholder
         splatGrad = placeholder
         shGrad = placeholder
-        gradMean2D = placeholder
-        gradConic = placeholder
-        gradColor = placeholder
-        gradOpacity = placeholder
+        splatGrad2D = placeholder
         centers = placeholder
 
         // The eight that carry state across the resize, allocated into the
@@ -603,10 +601,7 @@ final class TrainerResources {
         offsets = try makeBuffer("offsets", paddedSplats * 4)
         splatGrad = try makeBuffer("splatGrad", n * gradStride)
         shGrad = try makeBuffer("shGrad", shFloats * floatStride)
-        gradMean2D = try makeBuffer("gradMean2D", n * 2 * 4)
-        gradConic = try makeBuffer("gradConic", n * 3 * 4)
-        gradColor = try makeBuffer("gradColor", n * 3 * 4)
-        gradOpacity = try makeBuffer("gradOpacity", n * 4)
+        splatGrad2D = try makeBuffer("splatGrad2D", n * 64)
         centers = try makeBuffer("centers", n * 3 * 4)
 
         // Level zero of the scan scratch is sized from the padded splat array,

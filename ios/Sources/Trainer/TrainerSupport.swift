@@ -328,10 +328,7 @@ enum TrainerBind {
         static let gradTFinal = 7
         static let bgColor = 8
         static let unknownMask = 9
-        static let gradMean2D = 10
-        static let gradConic = 11
-        static let gradColor = 12
-        static let gradOpacity = 13
+        static let splatGrad2D = 10
         static let stats = 14
         static let camera = 15
         static let lossUniforms = 16
@@ -341,10 +338,7 @@ enum TrainerBind {
         static let splats = 0
         static let sh = 1
         static let draws = 2
-        static let gradMean2D = 3
-        static let gradConic = 4
-        static let gradColor = 5
-        static let gradOpacity = 6
+        static let splatGrad2D = 3
         static let splatGrad = 7
         static let shGrad = 8
         static let cameraGrad = 9
