@@ -200,5 +200,32 @@ if os.path.exists(ply):
         print('  build 182 was p50 19.57 mm, spread 1.8x, aspect 7.6:1')
         print('  build 172 was p50 13.2 mm')
         print('  Scaniverse, same room: p50 3.39 mm, spread 8.9x, aspect 1.9:1')
+
+        # ADAPTIVITY, the two numbers that separate "the seeder decided the
+        # model" from "training decided the model". Both are cheap and both
+        # measured Scaniverse as adaptive and us as not.
+        try:
+            from scipy.spatial import cKDTree      # noqa: F401
+        except Exception:
+            pass
+        xyz = np.stack([col['x'], -col['y'], -col['z']], axis=1).astype(np.float64)
+        cell = np.floor(xyz / 0.05).astype(np.int64)
+        _, counts = np.unique(cell, axis=0, return_counts=True)
+        cs = np.sort(counts)
+        top10 = cs[int(len(cs) * 0.9):].sum() / max(cs.sum(), 1)
+        n = len(cs)
+        gini = (2 * np.arange(1, n + 1) - n - 1).dot(cs) / (n * cs.sum()) if n else 0.0
+        aspect = sc.max(axis=1) / np.maximum(sc.min(axis=1), 1e-12)
+        blob = (aspect < 2).mean()
+        needle = (aspect > 8).mean()
+        print()
+        print('ADAPTIVITY, is the model multi-scale or one-size')
+        print('  densest 10%% of 5cm voxels hold %5.1f%% of splats' % (100 * top10))
+        print('  Gini of occupied-voxel density   %6.3f' % gini)
+        print('  blobs (aspect < 2)  %5.1f%%   discs  %5.1f%%   needles (>8) %5.1f%%'
+              % (100 * blob, 100 * (1 - blob - needle), 100 * needle))
+        print()
+        print('  Scaniverse: densest 10% hold 61.2%, Gini 0.753, 56.4% blobs')
+        print('  build 182 : densest 10% hold 27.8%, Gini 0.434, 88.7% discs')
     except Exception as exc:
         print('\n(model.ply present but not read: %s)' % exc)

@@ -402,6 +402,13 @@ struct TrainerCensusSlice: Codable {
     var droppedNonFiniteOnReadback: Int = 0
     var splatsHandedToMerge: Int = 0
     var heldOutPSNR: Float?
+    /// The same held-out frames, scored after a closed-form per-frame gain and
+    /// bias fitted to each frame's own render and clamped to the trainer's own
+    /// exposure range. Trained frames are scored WITH a fitted exposure and
+    /// held-out frames without one, so the difference between this and
+    /// `heldOutPSNR` is the part of the train/test gap that was never about
+    /// geometry.
+    var heldOutPSNRExposureFitted: Float?
 
     /// PSNR on frames the model DID train on, measured the same way and on
     /// the same number of frames as `heldOutPSNR`, so the two can be compared

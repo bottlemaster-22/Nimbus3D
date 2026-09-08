@@ -1643,6 +1643,25 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             )
             census.slices[censusRow].heldOutPSNR = psnr
 
+            // The same frames, scored after a two-scalar photometric alignment
+            // fitted to each one. Reported BESIDE the raw number, never
+            // instead of it: the raw number is what the model actually
+            // produces, and this one says how much of the gap to the trained
+            // views was ever about geometry.
+            census.slices[censusRow].heldOutPSNRExposureFitted = try evaluateHeldOut(
+                gpu: gpu,
+                resources: resources,
+                queue: queue,
+                frames: slice.heldOutKeyframes,
+                supervision: supervision,
+                cameraDeltas: cameraDeltas,
+                exposures: exposures,
+                splatCount: splatCount,
+                shCoefficientCount: shCoefficientCount,
+                renderSize: renderSize,
+                fitExposure: true
+            )
+
             // The same measurement on frames the model DID see. Sampled
             // evenly across the shuffle rather than taking the first few, and
             // limited to the SAME COUNT as the held-out set so the two numbers
@@ -2631,7 +2650,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         exposures: [FrameID: SIMD2<Float>],
         splatCount: Int,
         shCoefficientCount: Int,
-        renderSize: TrainerRenderSize
+        renderSize: TrainerRenderSize,
+        /// Fit a per-frame gain and bias to THIS frame's own render before
+        /// scoring it. See the use site: a held-out frame otherwise gets
+        /// identity exposure while a trained frame gets a fitted one, which
+        /// puts part of the reported train/test gap in the protocol rather
+        /// than in the model.
+        fitExposure: Bool = false
     ) throws -> Float? {
 
         guard splatCount > 0, !frames.isEmpty else { return nil }
@@ -2715,7 +2740,52 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             let transmittance = resources.renderTFinal.readArray(Float.self, count: pixelCount)
             guard rendered.count == pixelCount * 3, transmittance.count == pixelCount else { continue }
 
-            let exposure = exposures[frame.index] ?? SIMD2<Float>(1, 0)
+            // A HELD-OUT FRAME HAS NO FITTED EXPOSURE, AND THAT IS NOT A
+            // PROPERTY OF THE MODEL.
+            //
+            // `exposures` and `cameraDeltas` are only ever written for frames
+            // drawn from `slice.keyframes`, never from `slice.heldOutKeyframes`.
+            // So a trained view is scored with a per-frame gain and bias fitted
+            // to it, and a held-out view is scored at gain 1 bias 0. Part of the
+            // reported train/test gap is therefore the protocol, not
+            // generalisation, and it moves whenever the capture's auto-exposure
+            // drifts rather than when the model changes.
+            //
+            // The fix that does not leak training signal: solve the closed-form
+            // least-squares (gain, bias) between this render and its own ground
+            // truth, clamp it to the SAME range the trainer allows, and report
+            // the corrected number ALONGSIDE the raw one. Two scalars fitted to
+            // a frame the model never trained on is a photometric alignment, not
+            // a fit of the geometry; the raw number is still reported so nothing
+            // is hidden.
+            var exposure = exposures[frame.index] ?? SIMD2<Float>(1, 0)
+            if fitExposure {
+                var sx: Double = 0, sy: Double = 0, sxx: Double = 0
+                var sxy: Double = 0, n: Double = 0
+                for i in 0..<pixelCount {
+                    for c in 0..<3 {
+                        var v = Double(rendered[i * 3 + c])
+                        if let heldOutBackground {
+                            v += Double(transmittance[i] * heldOutBackground[i * 3 + c])
+                        }
+                        let t = Double(frameSupervision.groundTruth[i * 3 + c])
+                        sx += v; sy += t; sxx += v * v; sxy += v * t; n += 1
+                    }
+                }
+                let denom = n * sxx - sx * sx
+                if denom > 1e-9 {
+                    let gain = (n * sxy - sx * sy) / denom
+                    let bias = (sy - gain * sx) / n
+                    if gain.isFinite, bias.isFinite {
+                        exposure = SIMD2<Float>(
+                            Swift.min(Swift.max(Float(gain), tuning.exposureGainRange.lowerBound),
+                                      tuning.exposureGainRange.upperBound),
+                            Swift.min(Swift.max(Float(bias), tuning.exposureBiasRange.lowerBound),
+                                      tuning.exposureBiasRange.upperBound)
+                        )
+                    }
+                }
+            }
             var sum: Double = 0
             for i in 0..<pixelCount {
                 for c in 0..<3 {
