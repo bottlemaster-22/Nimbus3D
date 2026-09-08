@@ -276,7 +276,25 @@ enum TrainerInitializer {
     /// The cost is real and should be expected in the census - the first few
     /// hundred iterations now carry the full cap instead of half of it, which
     /// the finding priced at roughly +4 s on a 65 s run.
-    static func seedTarget(forSplatCap cap: Int, fillFraction: Float = 1.0) -> Int {
+    /// MEASURED, AND REVERTED. Build 182 ran with fillFraction 1.0 and the
+    /// census settles the argument the finding and the file header were
+    /// having: the header was right.
+    ///
+    /// Growth collapsed from 152,991 created Gaussians to 6,900. Filling the
+    /// cap at iteration 0 leaves `splatCap - splatCount` at zero, so
+    /// densification has no slots and never runs, which means the 150,000
+    /// Gaussians that USED to be placed by gradient - where the photographs
+    /// say detail is missing - were replaced by 150,000 more LiDAR points
+    /// placed by an arbitrary voxel stride. Same final count, worse
+    /// placement. Held-out PSNR fell 17.30 to 13.69 while TRAINED-view rose
+    /// 19.46 to 20.65: more raw capacity, fitted to the training views and
+    /// generalising worse. Training also rose 71 s to 92 s, because the run
+    /// now carries the full cap from iteration 0 instead of growing into it.
+    ///
+    /// PocketGS's 1.2 dB init ablation is real, but it is about the QUALITY
+    /// of the initialisation, not about spending the whole budget on it.
+    /// 0.5 restores the split the depth-map path was already sized for.
+    static func seedTarget(forSplatCap cap: Int, fillFraction: Float = 0.5) -> Int {
         guard cap > 0 else { return 0 }
         // Clamped to 0.05...1 BEFORE the conversion, and NaN takes the `else`
         // branch because every comparison against NaN is false. So the product
