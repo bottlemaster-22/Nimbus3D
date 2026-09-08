@@ -506,6 +506,16 @@ struct TrainerTimings: Codable {
     /// the shared Metal buffers.
     var upload: Double = 0
 
+    /// The one command buffer that holds the sort, the forward raster, the
+    /// losses, the backward raster and the optimiser. It used to be labelled
+    /// "the tile sort", which credited all five stages to `gpuSort` and left
+    /// `gpuForward`, `gpuLosses`, `gpuBackward` and `gpuOptimiser` reading
+    /// exactly 0.00 in every census. Those four fields still exist and still
+    /// work, but they only fill when that buffer is deliberately split into
+    /// one buffer per stage for a diagnostic run; the rest of the time this
+    /// is the number, and `gpuSort` means the sort alone.
+    var gpuStep: Double = 0
+
     /// GPU execution split by which command buffer it was in, so the 25.5 ms
     /// the GPU now spends per iteration stops being one opaque number.
     ///

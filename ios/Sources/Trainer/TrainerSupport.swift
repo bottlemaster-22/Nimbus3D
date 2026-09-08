@@ -423,6 +423,38 @@ struct TrainerTuning: Sendable {
     /// Position learning rate at the last iteration, same scaling. The decay
     /// between the two is exponential.
     var positionLRFinalScaled: Float = 0.0000016
+    /// DECAY THE OTHER LEARNING RATES, not just position. Set to 1 to make
+    /// every schedule flat again, which is the reference 30,000-iteration
+    /// behaviour we inherited.
+    ///
+    /// `MetalSplatTrainer` already decays the POSITION rate exponentially
+    /// across the run and leaves scale, rotation, opacity and SH flat,
+    /// because that is what the reference does. But the reference runs
+    /// 30,000 iterations and we run 3,000, and a rate tuned to anneal over
+    /// ten times as many steps is still near its starting value when our run
+    /// ends: the parameter jitters instead of settling. arXiv:2604.28016
+    /// measures 26.01 against 27.25 PSNR for exactly this mistake on
+    /// position alone, and says it adds "analogous schedules for the
+    /// Gaussian scale, rotation, and SH DC coefficients", which 3DGS has
+    /// none of. This is the final multiple of each starting rate.
+    var lateLRFraction: Float = 0.1
+
+    /// MULTIPLY THE SH DC RATE. 1 restores the reference value.
+    ///
+    /// Adam here is visibility-masked and sparse, so a Gaussian takes a step
+    /// only on iterations where it is drawn. With 114 trained views and
+    /// 3,000 iterations each photograph is visited about 26 times, and a
+    /// splat drawn in 15 per cent of views gets roughly 450 steps. At
+    /// shDCLR 0.0025 that is at most 1.13 in SH coefficient space, which
+    /// through colour = 0.5 + 0.282095*dc is at most 0.32 of the 0..1 colour
+    /// range, and realistically a third of that once Adam's sign averaging
+    /// is accounted for. Against a measured RMSE of 0.117 that is not
+    /// obviously enough travel. 4x is the standard remedy for a shortened
+    /// schedule. Colour is the safest rate to raise: unlike scale and
+    /// opacity it cannot produce a floater, only a wrong colour that the
+    /// next gradient corrects.
+    var shDCLRMultiplier: Float = 4
+
     var opacityLR: Float = 0.05
     var scaleLR: Float = 0.005
     var rotationLR: Float = 0.001
@@ -492,7 +524,14 @@ struct TrainerTuning: Sendable {
     /// (MetalSplatTrainer applies it only when binarizeLastFraction > 0). If
     /// PSNR improves and the population survives, the answer is to weaken or
     /// remove binarization, not to move it.
-    var binarizeLastFraction: Float = 00
+    /// 0 DISABLES late opacity binarization entirely, and it is off after
+    /// a null test measured what it was costing: at 0.2 the ramp began at
+    /// 80 per cent of the run while the growth window closed at 85, so
+    /// around 90,000 Gaussians were driven to zero opacity and pruned after
+    /// densification could no longer replace them. Turning it off took the
+    /// final model from 150,554 splats to 299,883 and held-out PSNR from
+    /// 16.00 to 17.30, against a measured noise band of +/-0.4 dB.
+    var binarizeLastFraction: Float = 0
     var binarizeWeight: Float = 0.02
     /// Free-space carving deletion sweep interval, iterations.
     var carveIntervalIterations: Int = 250
@@ -588,10 +627,68 @@ struct TrainerTuning: Sendable {
     var splitChildCount: Int = 2
     /// Children are placed at +/- this many standard deviations along the
     /// split axis, and shrunk by `splitShrink`.
+    /// SPLIT ON SCREEN SIZE, not only on world size. Set to 0 to disable
+    /// and go back to the world-scale test alone.
+    ///
+    /// Split fired 190 times against 152,801 clones in the measured run:
+    /// 0.12 per cent, where the reference implementation runs about 20 per
+    /// cent (arXiv:2507.20239 measures ~80/20 clone/split). That is not a
+    /// tuning miss, it is a criterion that cannot fire. The world-scale test
+    /// is `largest linear scale > sceneExtent * splitScaleFraction`, and the
+    /// owner's own exported model has a median splat of 1.3 cm, p99 of
+    /// 3.85 cm and a single largest Gaussian of 7.86 cm in a 5.39 m room.
+    /// There is no world-scale tail to select, so the test selects nothing,
+    /// and a population that never splits can never get finer than its seed
+    /// spacing. Ours is 13.2 mm against Scaniverse's 3.4 mm on the same room.
+    ///
+    /// Screen radius is the quantity that actually says "this Gaussian is
+    /// over-reconstructed for the view it is being fitted to", it is already
+    /// measured per splat in `stats.maxRadiusPxBits`, and it selects
+    /// near-camera blur that the world-scale test is blind to. The census
+    /// gives 763,260 tile instances over 300,000 splats, so 2.545 tiles per
+    /// splat on a 16 px grid, which solves to a median projected half-extent
+    /// of about 4.8 px. 10 px therefore cuts somewhere in the top few per
+    /// cent, which is the right order for a criterion meant to fire on the
+    /// worst offenders rather than on everything.
+    var splitScreenRadiusPx: Float = 10
+
+    /// SHRINK ALL THREE AXES ON A SPLIT, as the reference does, instead of
+    /// only the split axis. Set false to restore the one-axis behaviour.
+    ///
+    /// This MUST move together with `splitScreenRadiusPx`. Our one-axis
+    /// shrink gives two children covering about 2/1.6 = 1.25x the parent's
+    /// screen area, so every split makes the tile count WORSE. At 190 splits
+    /// that is invisible; at the rate the screen-radius criterion produces
+    /// it would add roughly 29,000 tile instances. Shrinking all three axes
+    /// by the same 1.6 removes about 25,000 instead. The reference divides
+    /// the whole scale vector by 0.8*N = 1.6 for N=2, which is exactly our
+    /// splitShrink, so this is the reference geometry and not a new guess.
+    ///
+    /// THE COST, stated plainly: the one-axis shrink was a deliberate
+    /// SAD-GS choice, and it preserves a property we care about, that a disc
+    /// which was the right size across a flat measured surface stays the
+    /// right size across it. Shrinking all three axes narrows the children
+    /// across the surface too, which is why the offset below stops being a
+    /// fixed +/- along one axis and becomes a sample from the parent's own
+    /// covariance, scattering the children through the parent's volume the
+    /// way the reference does. On a LiDAR-measured flat wall that is the
+    /// real risk in this batch.
+    var splitShrinkAllAxes: Bool = true
+
     var splitOffsetSigma: Float = 0.8
     var splitShrink: Float = 1.6
     /// Opacity below which a Gaussian is pruned, as a probability.
-    var pruneOpacity: Float = 0.005
+    /// WAS 0.005, which is 1/196, against a minAlpha of 1/255 = 0.00392.
+    /// Those are the same number to within a rounding error, so a Gaussian
+    /// had to be at or below the threshold at which it stops being DRAWN
+    /// before it became eligible to be pruned and its slot recycled. An
+    /// exported 3000-iteration run measured a median peak alpha of 0.0038
+    /// with 50.1 per cent of the population below minAlpha: half the model
+    /// was invisible, ungraded (the Adam passes gate on visibleFlag) and
+    /// un-prunable at the same time, which is a population that can only
+    /// grow. 0.02 is five times the render threshold, so a Gaussian is
+    /// recycled while it is still fading rather than after it has gone.
+    var pruneOpacity: Float = 0.02
     /// Screen radius above which a Gaussian is pruned, in pixels.
     var pruneMaxScreenRadiusPx: Float = 0.0
     /// World scale above which a Gaussian is pruned, as a fraction of extent.
@@ -650,7 +747,14 @@ struct TrainerTuning: Sendable {
 
     /// Fraction of keyframes withheld from training and used only to report
     /// PSNR. Reported whatever it says.
-    var heldOutFraction: Float = 0.05
+    /// WAS 0.05, which on this app's 120 keyframes gives a step of 20 and
+    /// so exactly SIX held-out frames. Six frames is why the PSNR noise band
+    /// is +/-0.4 dB, measured across five runs of identical code, and a
+    /// +/-0.4 dB band cannot read a change worth 0.3 dB. 0.10 gives twelve
+    /// frames and roughly halves the band. It costs six training views out
+    /// of 114, which is the deliberate trade: a diagnostic that cannot
+    /// resolve the changes being made is not worth its training data.
+    var heldOutFraction: Float = 0.10
 
     init() {}
 }

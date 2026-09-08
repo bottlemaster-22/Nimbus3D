@@ -53,6 +53,15 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// on the training thread.
     var timings = TrainerTimings()
 
+    /// Running mean of the per-slice held-out PSNR. `heldOutPSNR` used to be
+    /// `min` across slices, which reported the WORST part of the scene as the
+    /// model's score; a number that only moves when the weakest slice moves
+    /// cannot measure a change made everywhere. Reset per run, exactly like
+    /// `timings`, because a stale accumulator here would silently average two
+    /// different models together.
+    private var heldOutPSNRSum: Double = 0
+    private var heldOutPSNRCount: Int = 0
+
     /// How hot it got and when. A class property for the same reason
     /// `timings` is: the loop that sees the thermal level lives in
     /// `trainSlice`, and the census is sealed in `run`.
@@ -427,6 +436,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // conclusions drawn from splat counts and wall clock survive; only the
         // timings table was wrong, and only on a second run.
         timings = TrainerTimings()
+        heldOutPSNRSum = 0
+        heldOutPSNRCount = 0
         thermals = TrainerCensus.Thermals()
         thermalMark = Date()
         thermalLevel = ThermalLevel(ProcessInfo.processInfo.thermalState).rawValue
@@ -1666,7 +1677,14 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             }
 
             if let psnr {
-                heldOutPSNR = heldOutPSNR.map { Swift.min($0, psnr) } ?? psnr
+                // WAS `min`, which reported the WORST slice as the model's
+                // PSNR. A number that tracks the weakest part of the scene
+                // moves when that part moves and is flat otherwise, which is
+                // not a measurement of the change being tested. Mean across
+                // slices is what every 3DGS paper reports.
+                heldOutPSNRSum += Double(psnr)
+                heldOutPSNRCount += 1
+                heldOutPSNR = Float(heldOutPSNRSum / Double(heldOutPSNRCount))
                 let formatted = String(format: "%.2f", psnr)
                 TrainerLog.general.info(
                     "Held-out PSNR for this part: \(formatted, privacy: .public) dB"
@@ -1968,7 +1986,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
             encoderB.endEncoding()
             bufferB.commit()
-            try finish(bufferB, "the tile sort")
+            // NOT "the tile sort". This one command buffer holds the
+            // sort, the forward raster, the losses, the backward raster and
+            // the optimiser, so labelling it as the sort credited all five
+            // to `gpuSort` and left the other four buckets reading exactly
+            // 0.00 - which is what a build-172 census showed, and which made
+            // every remaining speed decision unreadable.
+            try finish(bufferB, "the training step")
         }
 
         // --- Readbacks ------------------------------------------------------------------
@@ -2161,11 +2185,20 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             tuning.positionLRFinalScaled * sceneExtent,
             t: t
         )
-        adam.lrScale = tuning.scaleLR
-        adam.lrRotation = tuning.rotationLR
-        adam.lrOpacity = tuning.opacityLR
-        adam.lrSHDC = tuning.shDCLR
-        adam.lrSHRest = tuning.shDCLR / Swift.max(tuning.shRestLRDivisor, 1)
+        // Position already decayed above. These four did not, because the
+        // reference does not decay them either - and the reference runs
+        // 30,000 iterations against our 3,000, so a rate that should have
+        // annealed by the end is still near its starting value when we stop.
+        // See `lateLRFraction`. Setting it to 1 restores the flat behaviour.
+        let lrDecay = TrainerMath.expLerp(
+            1, Swift.max(tuning.lateLRFraction, 1e-4), t: t
+        )
+        let shDC = tuning.shDCLR * Swift.max(tuning.shDCLRMultiplier, 0)
+        adam.lrScale = tuning.scaleLR * lrDecay
+        adam.lrRotation = tuning.rotationLR * lrDecay
+        adam.lrOpacity = tuning.opacityLR * lrDecay
+        adam.lrSHDC = shDC * lrDecay
+        adam.lrSHRest = shDC * lrDecay / Swift.max(tuning.shRestLRDivisor, 1)
         adam.sparse = 1                 // visibility-masked sparse Adam
         adam.shCoeffCount = UInt32(shCoefficientCount)
         adam.pinnedPositionLRScale = 0.1
@@ -2333,6 +2366,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             switch stage {
             case "the tile scan": timings.gpuScan += executing
             case "the tile sort": timings.gpuSort += executing
+            case "the training step": timings.gpuStep += executing
             case "the forward raster": timings.gpuForward += executing
             case "the losses": timings.gpuLosses += executing
             case "the backward raster": timings.gpuBackward += executing
@@ -2601,7 +2635,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     ) throws -> Float? {
 
         guard splatCount > 0, !frames.isEmpty else { return nil }
-        var totalMSE: Double = 0
+        // PER-IMAGE PSNR, averaged. This used to sum the MSE across frames and
+        // convert once at the end, which by Jensen's inequality is ALWAYS the
+        // lower number: one dark or badly-posed frame with a large MSE drags
+        // the mean far more than it drags the mean of the logs. Every 3DGS
+        // paper averages per-image PSNR, so the old number was not comparable
+        // with any published figure either.
+        var totalPSNR: Double = 0
         var evaluated = 0
 
         for frame in frames.prefix(24) {
@@ -2689,14 +2729,15 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     sum += diff * diff
                 }
             }
-            totalMSE += sum / Double(pixelCount * 3)
+            let frameMSE = sum / Double(pixelCount * 3)
+            // A frame that matches exactly would be infinite dB; clamp it to
+            // the same 99 the old code returned for the whole set.
+            totalPSNR += frameMSE > 1e-12 ? 10 * log10(1.0 / frameMSE) : 99
             evaluated += 1
         }
 
         guard evaluated > 0 else { return nil }
-        let mse = totalMSE / Double(evaluated)
-        guard mse > 1e-12 else { return 99 }
-        return Float(10 * log10(1.0 / mse))
+        return Float(totalPSNR / Double(evaluated))
     }
 
     // MARK: - Reading the field back

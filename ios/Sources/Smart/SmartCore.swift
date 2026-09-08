@@ -187,7 +187,23 @@ public struct SmartLossSettings: Codable, Hashable, Sendable {
         pruneEndFraction: Float = 1.0,
         pruneIntervalIterations: Int = 200,
         pruneMaxFractionPerPass: Float = 0.02,
-        discPriorWeight: Float = 0.01,
+        // WAS 0.01. In trainer_regularizer the disc term produces a scale
+        // gradient of order 0.024 per Gaussian per iteration, applied
+        // unconditionally to every visible one. The photometric contribution
+        // to the SAME accumulator, arriving through dL/dconic from the 50-150
+        // pixels a splat covers, is of order 2.5e-5 to 7.5e-5. That is a
+        // ratio between 300 and 1000, so Gaussian SHAPE is being set by the
+        // prior and the photographs are only allowed to nudge it.
+        //
+        // 0.001 keeps the prior meaningful, it still exceeds the photometric
+        // term, while leaving the images room to make a Gaussian the
+        // anisotropic sliver a fine texture edge needs. That is exactly what
+        // a 13.2 mm median splat is failing to become.
+        //
+        // THE COST: surface-normal quality and mesh extraction quality both
+        // lean on this prior, and both matter for the export format. If the
+        // meshes come out worse, this is the constant that did it.
+        discPriorWeight: Float = 0.001,
         discTargetEffectiveRank: Float = 2.0,
         edgeTargetEffectiveRank: Float = 1.0,
         trustPartnerFrames: Int = 4,

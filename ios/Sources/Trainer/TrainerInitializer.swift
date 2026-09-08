@@ -252,15 +252,34 @@ enum TrainerInitializer {
     ///    a poor start regardless of what the cap says, and that floor is
     ///    itself clamped by the three-quarter ceiling above.
     ///
-    /// Worked through for the caps this app actually produces:
-    /// 150,000 (one object, full tier) seeds 75,000 and leaves 75,000;
-    /// 300,000 (a room) seeds 150,000 and leaves 150,000;
-    /// 40,000 (limited tier) seeds 20,000 and leaves 20,000;
-    /// 5,000 (the emergency floor) seeds 3,750 and leaves 1,250.
-    static func seedTarget(forSplatCap cap: Int) -> Int {
+    /// That was the rule until the LiDAR-initialisation finding below. It is
+    /// left in place because it explains what the numbers used to mean, not
+    /// because it still describes what this function does.
+    ///
+    /// REVISED. The `cap / 2` above was the operative branch for every cap
+    /// this app produces (the `min(20_000, ...)` term is dead for any cap
+    /// above 40,000), so a room threw away 84 per cent of the LiDAR seeds -
+    /// 888,951 measured points reduced to 150,000 by a uniform stride that
+    /// is spatially arbitrary, not quality-ranked - and then spent the first
+    /// 600 iterations cloning the population back up to the cap it had just
+    /// been cut below. The header's rationale, "a seeder that fills the splat
+    /// cap leaves densification nothing to do", is true of a random or SfM
+    /// initialisation and false of a metric depth sensor: the points being
+    /// discarded were MEASURED, and what replaces them is guessed.
+    ///
+    /// PocketGS (arXiv:2601.17354, iPhone 15 / A16, 500 iterations) ablates
+    /// prior-conditioned initialisation and reports about 1.2 dB of PSNR lost
+    /// AND runtime rising from 255.2 s to 319.5 s without it. We are a
+    /// partial version of that ablation, keeping half rather than none.
+    ///
+    /// `fillFraction` is the switch: pass 0.5 to restore the old behaviour.
+    /// The cost is real and should be expected in the census - the first few
+    /// hundred iterations now carry the full cap instead of half of it, which
+    /// the finding priced at roughly +4 s on a 65 s run.
+    static func seedTarget(forSplatCap cap: Int, fillFraction: Float = 1.0) -> Int {
         guard cap > 0 else { return 0 }
-        let ceilingWithHeadroom = (cap * 3) / 4
-        return Swift.max(cap / 2, Swift.min(20_000, ceilingWithHeadroom))
+        let wanted = Int((Float(cap) * Swift.max(fillFraction, 0.05)).rounded())
+        return Swift.max(1, Swift.min(cap, wanted))
     }
 
     // MARK: - Entry point
@@ -802,9 +821,25 @@ enum TrainerInitializer {
     /// corner of the room the hash happened to bucket first, and starting a
     /// scan with one wall dense and the rest empty is a hole densification
     /// then spends its whole budget trying to fill.
+    ///
+    /// It also RESIZES what it keeps. Every seed's radius is cut from its own
+    /// local sample spacing (`PrePassInitialSplats`: `radius = 0.5 * max(
+    /// spacing, sensorSpacing)`), which is the spacing of the FULL set. Drop
+    /// one seed in N and the surviving points are sqrt(N) further apart, so
+    /// discs sized for the dense set leave holes between them that
+    /// densification then has to find and fill - and the fallback depth
+    /// seeder in this same file already carries a comment describing this
+    /// exact bug and saying it was fixed there. It was never fixed on the
+    /// preferred path.
+    ///
+    /// Only the two largest axes are grown. The third is the disc's normal,
+    /// which is set from sensor noise and has nothing to do with how far
+    /// apart the samples are; scaling it too would inflate flat surfaces into
+    /// slabs.
     private static func thin(_ seeds: [TrainerSeed], to cap: Int) -> [TrainerSeed] {
         guard cap > 0, seeds.count > cap else { return seeds }
         let keepRatio = Double(cap) / Double(seeds.count)
+        let growth = logf(sqrtf(Float(seeds.count) / Float(cap)))
         var kept: [TrainerSeed] = []
         kept.reserveCapacity(cap)
         var accumulator = 0.0
@@ -812,7 +847,16 @@ enum TrainerInitializer {
             accumulator += keepRatio
             if accumulator >= 1 {
                 accumulator -= 1
-                kept.append(seed)
+                var resized = seed
+                if growth > 0 {
+                    // Grow the two in-plane axes; leave the normal alone.
+                    let s = resized.logScale
+                    var order = [0, 1, 2]
+                    order.sort { s[$0] > s[$1] }
+                    resized.logScale[order[0]] = s[order[0]] + growth
+                    resized.logScale[order[1]] = s[order[1]] + growth
+                }
+                kept.append(resized)
                 if kept.count == cap { break }
             }
         }

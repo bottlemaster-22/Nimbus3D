@@ -483,16 +483,48 @@ final class TrainerDensifier {
                 let linear = SIMD3<Float>(expf(scale.x), expf(scale.y), expf(scale.z))
                 let largest = Swift.max(linear.x, Swift.max(linear.y, linear.z))
 
-                if largest > splitThresholdScale {
-                    // SPLIT: over-sized and under-explained. Two children,
-                    // offset along the split axis, shrunk ONLY along it.
+                // Over-sized in the WORLD, or over-sized ON SCREEN. The
+                // second test is the one that fires: see the comment on
+                // `splitScreenRadiusPx`. `maxRadiusPxBits` is the largest
+                // projected radius this Gaussian reached during the interval,
+                // already accumulated by the rasteriser and already read by
+                // the prune below, so this costs one load and one compare.
+                var oversizedOnScreen = false
+                if tuning.splitScreenRadiusPx > 0, index < stats.count {
+                    let r = Float(bitPattern: stats[index].maxRadiusPxBits)
+                    oversizedOnScreen = r.isFinite && r > tuning.splitScreenRadiusPx
+                }
+
+                if largest > splitThresholdScale || oversizedOnScreen {
+                    // SPLIT: over-reconstructed. Two children inside the
+                    // parent's own ellipsoid.
                     let axis = splitAxis(for: parent, linearScale: linear)
                     let rotation = TrainerMath.rotationMatrix(parent.rotation)
-                    let direction = rotation[axis]
-                    let offset = direction * (linear[axis] * tuning.splitOffsetSigma)
 
                     var shrunk = scale
-                    shrunk[axis] = scale[axis] - logf(tuning.splitShrink)
+                    var offset: SIMD3<Float>
+                    if tuning.splitShrinkAllAxes {
+                        // The reference geometry: divide the WHOLE scale
+                        // vector by 0.8*N, which for N=2 is 1.6 and is
+                        // exactly `splitShrink`, then scatter the children
+                        // through the parent's volume by sampling the offset
+                        // from the parent's own covariance instead of
+                        // stepping a fixed distance along one axis. Shrinking
+                        // three axes while offsetting along one would leave a
+                        // gap across the other two.
+                        let k = logf(tuning.splitShrink)
+                        shrunk = scale - SIMD3<Float>(repeating: k)
+                        let g = TrainerDensifier.splitNoise(seed: UInt32(truncatingIfNeeded: index) &+ UInt32(truncatingIfNeeded: added))
+                        let local = SIMD3<Float>(
+                            g.x * linear.x, g.y * linear.y, g.z * linear.z
+                        ) * tuning.splitOffsetSigma
+                        offset = rotation[0] * local.x
+                            + rotation[1] * local.y
+                            + rotation[2] * local.z
+                    } else {
+                        shrunk[axis] = scale[axis] - logf(tuning.splitShrink)
+                        offset = rotation[axis] * (linear[axis] * tuning.splitOffsetSigma)
+                    }
 
                     // Child A replaces the parent in place, child B is new, so
                     // one split costs one slot rather than two.
@@ -1046,6 +1078,37 @@ final class TrainerDensifier {
     /// what is wanted is a split across the edge normal, which is the second
     /// longest axis. That is the SAD-GS idea, expressed in the local frame the
     /// Gaussian already carries.
+    /// A reproducible unit-normal triple for the split offset.
+    ///
+    /// The reference samples the child offset from N(0, Sigma). A real random
+    /// number would make two runs of the same build produce different models,
+    /// which would destroy the ability to read a 0.3 dB change against a
+    /// 0.4 dB noise band, so this is a hash of the splat index put through
+    /// Box-Muller: the same everywhere, different per Gaussian, and with the
+    /// distribution the geometry actually wants.
+    static func splitNoise(seed: UInt32) -> SIMD3<Float> {
+        func bits(_ x: UInt32) -> UInt32 {
+            var h = x &* 0x9E37_79B9
+            h ^= h >> 16
+            h = h &* 0x85EB_CA6B
+            h ^= h >> 13
+            h = h &* 0xC2B2_AE35
+            h ^= h >> 16
+            return h
+        }
+        // Two uniforms in (0, 1]; the 1e-7 floor keeps log() finite.
+        let u1 = Swift.max(Float(bits(seed)) / Float(UInt32.max), 1e-7)
+        let u2 = Float(bits(seed &+ 0x1234_5678)) / Float(UInt32.max)
+        let u3 = Swift.max(Float(bits(seed &+ 0x9ABC_DEF0)) / Float(UInt32.max), 1e-7)
+        let r = sqrtf(-2 * logf(u1))
+        let r2 = sqrtf(-2 * logf(u3))
+        return SIMD3<Float>(
+            r * cosf(2 * Float.pi * u2),
+            r * sinf(2 * Float.pi * u2),
+            r2 * cosf(2 * Float.pi * u2)
+        )
+    }
+
     private func splitAxis(for splat: TrainerSplat, linearScale: SIMD3<Float>) -> Int {
         var order = [0, 1, 2]
         order.sort { linearScale[$0] > linearScale[$1] }
