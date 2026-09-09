@@ -215,15 +215,27 @@ if os.path.exists(ply):
         top10 = cs[int(len(cs) * 0.9):].sum() / max(cs.sum(), 1)
         n = len(cs)
         gini = (2 * np.arange(1, n + 1) - n - 1).dot(cs) / (n * cs.sum()) if n else 0.0
-        aspect = sc.max(axis=1) / np.maximum(sc.min(axis=1), 1e-12)
-        blob = (aspect < 2).mean()
-        needle = (aspect > 8).mean()
+        # SHAPE, CLASSIFIED PROPERLY. `max/min` was the first version of this
+        # and it is wrong: it cannot tell a NEEDLE (one long axis, two short)
+        # from a DISC (two long, one short), and the disc prior in this trainer
+        # deliberately produces discs. It reported 56 per cent "needles" on a
+        # model that is 77.5 per cent discs and 16.2 per cent needles, and it
+        # sent me looking for a bug in relocation that was not there.
+        srt = np.sort(sc, axis=1)[:, ::-1]
+        r21 = srt[:, 1] / np.maximum(srt[:, 0], 1e-12)
+        r32 = srt[:, 2] / np.maximum(srt[:, 1], 1e-12)
+        needle_m = r21 < 0.4
+        disc_m = (~needle_m) & (r32 < 0.4)
+        blob = float((~(needle_m | disc_m)).mean())
+        needle = float(needle_m.mean())
+        disc_frac = float(disc_m.mean())
         print()
         print('ADAPTIVITY, is the model multi-scale or one-size')
         print('  densest 10%% of 5cm voxels hold %5.1f%% of splats' % (100 * top10))
         print('  Gini of occupied-voxel density   %6.3f' % gini)
-        print('  blobs (aspect < 2)  %5.1f%%   discs  %5.1f%%   needles (>8) %5.1f%%'
-              % (100 * blob, 100 * (1 - blob - needle), 100 * needle))
+        print('  needles %5.1f%%   discs %5.1f%%   blobs %5.1f%%   (s2/s1 %.2f, s3/s2 %.2f)'
+              % (100 * needle, 100 * disc_frac, 100 * blob,
+                 float(np.median(r21)), float(np.median(r32))))
         print()
         print('  Scaniverse: densest 10% hold 61.2%, Gini 0.753, 56.4% blobs')
         print('  build 182 : densest 10% hold 27.8%, Gini 0.434, 88.7% discs')
