@@ -507,6 +507,29 @@ struct TrainerTuning: Sendable {
     var warmupFraction: Float = 0.15
     /// Densification runs between these two fractions of the run.
     var densifyStartFraction: Float = 0.10
+
+    /// A CEILING ON WHEN GROWTH MAY START, in iterations, whatever the
+    /// fraction above works out to. 0 removes the ceiling.
+    ///
+    /// `densifyStartFraction` is a FRACTION, and that is fine at 3,000
+    /// iterations where it means "start at 300". At 30,000 it means "start at
+    /// 3,000", and the first held-out curve this trainer ever recorded shows
+    /// exactly what that costs:
+    ///
+    ///     iter 2000  PSNR 15.14  splats 148,934
+    ///     iter 2500  PSNR 14.71  splats 148,727
+    ///     iter 3000  PSNR 14.68  splats 148,565
+    ///     iter 3500  PSNR 16.19  splats 300,000   <- growth finally happened
+    ///
+    /// The run spent its first 3,000 iterations optimising a HALF-SIZE
+    /// population, because the seeder hands over about 148,000 and nothing was
+    /// allowed to add to it yet. Every one of those iterations was training a
+    /// model that was never going to be the final one.
+    ///
+    /// A warm-up before growth is right; scaling that warm-up with the total
+    /// budget is not. 300 iterations is enough for the gradients to mean
+    /// something, and it is what a 3,000-iteration run was already doing.
+    var densifyStartMaxIterations: Int = 300
     /// Raised from 0.70 after a measured run showed the budget being freed
     /// and never spent.
     ///

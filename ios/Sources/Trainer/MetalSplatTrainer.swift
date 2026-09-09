@@ -1389,11 +1389,28 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                             splatCount: splatCount
                         )
                     )
+                    // A DIP WHILE THE MODEL IS STILL BEING BUILT IS NOT
+                    // OVERFITTING, and counting it as one is what stopped the
+                    // first run of this feature at 5,500 iterations, two
+                    // thousand after densification had finally been allowed to
+                    // start. Its curve is the evidence: PSNR went 15.14, 14.71,
+                    // 14.68 while the population sat at 148,000, then 16.19 the
+                    // moment growth reached the cap. Every one of those
+                    // "declines" was a model that had not been built yet.
+                    //
+                    // So patience only accrues once the population has settled.
+                    // Growth changing the splat count by more than a per cent
+                    // between two evaluations means the thing being scored is
+                    // not the thing that will be shipped.
+                    let previous = census.heldOutCurve.dropLast().last?.splatCount
+                    let settled = previous.map { prior in
+                        abs(splatCount - prior) <= Swift.max(prior / 100, 1)
+                    } ?? false
                     if score > bestHeldOut + tuning.earlyStopMinImprovementDB {
                         bestHeldOut = score
                         bestHeldOutIteration = iteration
                         sinceBest = 0
-                    } else {
+                    } else if settled {
                         sinceBest += 1
                         if sinceBest >= Swift.max(tuning.earlyStopPatienceEvals, 1) {
                             stoppedEarly = true
@@ -1407,7 +1424,23 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 }
             }
 
-            let inDensifyWindow = progressFraction >= tuning.densifyStartFraction
+            // The fraction OR the absolute ceiling, whichever comes first.
+            // See `densifyStartMaxIterations`: a fraction that is right at
+            // 3,000 iterations delays growth to iteration 3,000 at 30,000, and
+            // the held-out curve showed the run optimising a half-size
+            // population until it did.
+            // Integer arithmetic, so there is no float-to-int conversion to
+            // trap on. The fraction is clamped to 0...1 first, and NaN takes
+            // the else branch because every comparison against NaN is false,
+            // so the product can never exceed `effectiveTotal`.
+            let startPerMille: Int = tuning.densifyStartFraction.isFinite
+                ? Int(Swift.min(Swift.max(tuning.densifyStartFraction, 0), 1) * 1000)
+                : 100
+            let fractionStart = effectiveTotal * startPerMille / 1000
+            let densifyStartsAt = tuning.densifyStartMaxIterations > 0
+                ? Swift.min(fractionStart, tuning.densifyStartMaxIterations)
+                : fractionStart
+            let inDensifyWindow = iteration >= densifyStartsAt
                 && progressFraction <= tuning.densifyEndFraction
             // `SmartLossSettings.pruneStartFraction` and `pruneEndFraction`
             // existed, were defaulted and were assigned, and were then read
