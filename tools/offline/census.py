@@ -34,8 +34,16 @@ print('TRAIN wall : %.0f s (%dm%02ds)   %.4f s/iter'
 print('  ^^ TRAINING ONLY. The pre-pass printed below is a SEPARATE stage with'
       ' its own census.')
 print('     TOTAL PROCESSING = this + pre-pass. Nothing else prints the sum.')
-print('splats     : %d   held-out PSNR %.2f'
-      % (m['splatCount'], m['heldOutPSNR']))
+_sl0 = d['slices'][0]
+_ssim = _sl0.get('heldOutSSIM')
+print('splats     : %d   held-out PSNR %.2f   SSIM %s'
+      % (m['splatCount'], m['heldOutPSNR'],
+         ('%.4f' % _ssim) if _ssim is not None else 'n/a'))
+print('  ^^ SSIM is the STRUCTURAL score, 0 to 1, higher is better.')
+print('     PSNR can RISE while the picture gets visibly worse: build 240')
+print('     gained 3 dB over 226 and lost detail in cluttered regions.')
+print('     When the two disagree, believe SSIM.')
+
 sl = d.get('slices') or [{}]
 tr = sl[0].get('trainedPSNR')
 if tr is not None:
