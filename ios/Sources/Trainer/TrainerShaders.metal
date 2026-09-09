@@ -884,10 +884,36 @@ kernel void trainer_preprocess(
 
     const float invZ = 1.0f / meanCam.z;
     const float invZ2 = invZ * invZ;
+
+    // THE TANGENT CLAMP. Every reference 3DGS implementation has one and this
+    // did not, and its absence is measurable in our own output: 258 splats per
+    // view claim a third of all tile instances, and a 720 px screen-radius cut
+    // selects 1,060 splats that carry 13.44 per cent of them. The 99th
+    // percentile of projected 3-sigma radius over drawn splats is 79 px, so
+    // those are not big Gaussians. They are ordinary ones seen far off-axis.
+    //
+    // The EWA Jacobian's j2 column is -f * x/z^2, so it grows without bound as
+    // a splat moves off-axis while staying in front of the camera. A Gaussian
+    // out at three times the frame width projects to an ellipse hundreds of
+    // pixels across, gets clamped to the tile grid, and is then rasterised
+    // across a large part of the screen where it contributes almost nothing.
+    // The projection is a first-order approximation of a perspective divide,
+    // and it stops being a reasonable one long before that.
+    //
+    // The standard fix, from the original 3DGS CUDA rasteriser onward, is to
+    // evaluate the Jacobian at a clamped tangent: limit x/z and y/z to a
+    // little beyond the frame's own half-angle. 1.3 is the reference's value.
+    // Inside the frustum nothing changes at all, because the clamp does not
+    // bind; outside it, the footprint stops growing.
+    const float limX = 1.3f * (0.5f * float(cam.imageWidth) / cam.fx);
+    const float limY = 1.3f * (0.5f * float(cam.imageHeight) / cam.fy);
+    const float txc = clamp(meanCam.x * invZ, -limX, limX) * meanCam.z;
+    const float tyc = clamp(meanCam.y * invZ, -limY, limY) * meanCam.z;
+
     // J is 2x3; MSL matrices are column-major, so this is 3 columns of 2.
     const float2 j0 = float2(cam.fx * invZ, 0.0f);
     const float2 j1 = float2(0.0f, cam.fy * invZ);
-    const float2 j2 = float2(-cam.fx * meanCam.x * invZ2, -cam.fy * meanCam.y * invZ2);
+    const float2 j2 = float2(-cam.fx * txc * invZ2, -cam.fy * tyc * invZ2);
 
     // Sigma2D = J * sigmaCam * J^T, written out because a 2x3 matrix is not a
     // Metal type.
@@ -2234,7 +2260,9 @@ kernel void trainer_preprocess_backward(
     const device TrainerSplat*        splats     [[buffer(0)]],
     const device float*               sh         [[buffer(1)]],
     const device TrainerSplatDraw*    draws      [[buffer(2)]],
-    const device TrainerSplatGrad2D*  splatGrad2D [[buffer(3)]],
+    // MUTABLE, because this kernel now CLEARS the row it consumes. See the
+    // read below.
+    device TrainerSplatGrad2D*        splatGrad2D [[buffer(3)]],
     // PLAIN, not atomic. This kernel runs one thread per splat and is the
     // only writer of splatGrad[gid] for the whole dispatch, so its eleven
     // accumulations were eleven device read-modify-writes contending with
@@ -2288,6 +2316,26 @@ kernel void trainer_preprocess_backward(
     // One contiguous read of this splat's own row, which by now nothing
     // else is writing: the rasteriser finished in an earlier command buffer.
     const TrainerSplatGrad2D g = splatGrad2D[gid];
+    // CLEAR THE ROW WE JUST CONSUMED, so the per-iteration blit does not have
+    // to. `clearPerIteration` was blit-filling splatCount * 16 floats every
+    // iteration, 19.13 MB of the ~52.5 MB it writes, purely so this record
+    // starts at zero. This kernel already has the row in registers and is the
+    // last reader of it, so zeroing here costs one store per splat against a
+    // full-buffer fill.
+    //
+    // THE INVARIANT THAT MAKES THIS SAFE, and it is exact rather than
+    // probable. The only writer of splatGrad2D is trainer_rasterize_backward,
+    // which writes a row only for a splat with tile instances. This kernel
+    // returns early at `tilesTouched[gid] == 0` above, on the SAME predicate.
+    // So for every splat, in every iteration, either both ran (the row was
+    // written and is cleared here) or neither did (the row was already zero
+    // and stays zero). There is no path that writes a row and skips the clear.
+    //
+    // All SIXTEEN floats, not the nine gradients: the folded absGrad2D,
+    // visAccum and unknownAccum accumulators live in the same record and are
+    // consumed by the fold a few lines above, so they must be cleared by the
+    // same stores.
+    splatGrad2D[gid] = TrainerSplatGrad2D{};
     const float2 dLdMean2D = float2(g.mean2D0, g.mean2D1);
     const float3 dLdConic = float3(g.conic0, g.conic1, g.conic2);
     const float3 dLdColor0 = float3(g.color0, g.color1, g.color2);

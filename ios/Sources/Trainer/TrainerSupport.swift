@@ -605,7 +605,23 @@ struct TrainerTuning: Sendable {
     /// means the pass's own `trainer_reset_densify_stats` wipes the pollution
     /// on the very next line. Anywhere else and the AbsGS score quietly
     /// includes frames the model is not training on.
-    var earlyStopEvalIntervalIterations: Int = 200
+    /// 400, NOT 200, BECAUSE THIS FEATURE HAS NEVER FIRED AND IT IS NOT FREE.
+    ///
+    /// Build 244: `earlyStopEval` cost 5.67 s of an 80 s training run, 7.1 per
+    /// cent, across 16 evaluations of 12 held-out frames at 355 ms each. And
+    /// `stoppedEarly` is false with the reason "ran out its iterations": the
+    /// held-out curve rises monotonically from 18.95 at iteration 800 to 20.48
+    /// at 3,800, so the model is UNDER-trained, not over-trained, and the stop
+    /// has never triggered once.
+    ///
+    /// It still earns its place, because it also chooses which model to
+    /// export, and that was worth 0.79 dB on build 234. But it can do that on
+    /// a coarser grid. Simulating both grids on builds 244 and 246: the
+    /// shipped 200 grid picks 3,400 at 20.432 dB and a 400 grid picks 3,600 at
+    /// 20.463 on 244; on 246 the signs reverse, 3,800 at 20.662 against 3,600
+    /// at 20.632. Both differences are inside the +/-0.4 dB noise band and the
+    /// sign flips between builds, which is the definition of noise.
+    var earlyStopEvalIntervalIterations: Int = 400
 
     /// Stop after this many consecutive evaluations fail to beat the best
     /// held-out score by `earlyStopMinImprovementDB`.
@@ -914,7 +930,24 @@ struct TrainerTuning: Sendable {
     /// recycled while it is still fading rather than after it has gone.
     var pruneOpacity: Float = 0.02
     /// Screen radius above which a Gaussian is pruned, in pixels.
-    var pruneMaxScreenRadiusPx: Float = 0.0
+    /// 720, NOT 0. This prune has been fully wired and completely dead.
+    ///
+    /// `TrainerDensifier` already reads `stats[i].maxRadiusPxBits` and already
+    /// deletes anything above this, and 0 disables the test entirely, so the
+    /// code has never once run. Measured on the current model: a 720 px
+    /// threshold selects 1,060 splats of 298,000, and those 1,060 carry
+    /// **13.44 per cent of every tile instance in the scene**.
+    ///
+    /// The margin is not close. The 99th percentile of projected 3-sigma
+    /// radius over drawn splats is 79.1 px, so 720 sits nine times above the
+    /// p99 and cannot touch anything a person would call a normal Gaussian.
+    /// It is the whole render's long edge: a splat claiming more than the
+    /// frame is not detail, it is a projection artefact.
+    ///
+    /// Belt and braces with the tangent clamp in trainer_preprocess, which
+    /// stops most of these being created. This catches whatever still gets
+    /// through.
+    var pruneMaxScreenRadiusPx: Float = 720.0
     /// World scale above which a Gaussian is pruned, as a fraction of extent.
     var pruneMaxWorldScaleFraction: Float = 0.1
     /// Fraction of the cap that may be added in one densification pass.

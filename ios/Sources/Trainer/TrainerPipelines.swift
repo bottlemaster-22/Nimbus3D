@@ -951,7 +951,11 @@ struct TrainerGPU {
         // Accumulated by the backward kernels through atomics.
         zero(resources.splatGrad, floats: splatCount * 12)
         zero(resources.shGrad, floats: shFloats)
-        zero(resources.splatGrad2D, floats: splatCount * 16)
+        // splatGrad2D IS NOT CLEARED HERE ANY MORE. trainer_preprocess_backward
+        // zeroes each row as it consumes it, which it can do exactly because it
+        // early-returns on the same `tilesTouched == 0` predicate that decides
+        // whether the backward rasteriser wrote that row at all. This was
+        // 19.13 MB of the ~52.5 MB this function fills every iteration.
 
         // Accumulated per pixel with `+=`.
         zero(resources.gradDepthRend, floats: px)
