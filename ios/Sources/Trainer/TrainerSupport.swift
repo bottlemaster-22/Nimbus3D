@@ -529,7 +529,19 @@ struct TrainerTuning: Sendable {
     /// on a measured surface with a measured normal, so it starts in
     /// roughly the right place and refines locally rather than searching
     /// for geometry from scratch the way a photo-only clone must.
-    var densifyEndFraction: Float = 0.85
+    /// 0.5 NOW, NOT 0.85, AND THE ITERATION COUNT IS WHY.
+    ///
+    /// 0.85 was correct for a 3,000-iteration run: with so little time, every
+    /// iteration you do not densify in is one you cannot grow in, and the
+    /// 450 remaining were enough to settle a population that had barely
+    /// changed. At 30,000 it would run densification to iteration 25,500 and
+    /// leave 4,500 to converge, when the reference stops at 15,000 and leaves
+    /// 15,000. Half the run to place geometry and half to fit it is what every
+    /// published 3DGS number is measured with.
+    ///
+    /// This moves WITH the iteration count and should move back if the budget
+    /// is ever cut back to 3,000.
+    var densifyEndFraction: Float = 0.5
     var densifyIntervalIterations: Int = 100
     /// Opacity binarization runs over the last this-much of the run (F4).
     /// ZERO, AS A NULL TEST. Was 0.2.

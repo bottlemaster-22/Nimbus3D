@@ -1817,7 +1817,25 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
         case .full:
             return TrainingBudget(
                 splatCap: Swift.max(50_000, Swift.min(scaleCap, capFromMemory(at: .one))),
-                iterations: sceneExtentMeters < 8 ? 3_000 : 2_000,
+                // 30,000 IS THE REFERENCE BUDGET, and this is deliberately
+                // the slow end of the trade so the quality CEILING can be
+                // measured before anything is optimised back down.
+                //
+                // Every published 3DGS number is at 30,000. Ours were at
+                // 3,000, so every comparison so far has been against a
+                // ten-times-shorter run, and the owner has never seen what
+                // this model does when it is allowed to converge.
+                //
+                // WHAT THIS COSTS, projected honestly from build 226's clean
+                // measured run: 56 s of training for 3,000 iterations is
+                // 18.7 ms each, so 30,000 is about 9.3 minutes, plus 19.5 s of
+                // pre-pass, plus roughly 21 s for ten times as many
+                // densification passes, plus whatever thermal throttling a
+                // nine-minute GPU-saturated run brings that a 56-second one
+                // does not. Expect 11 to 13 minutes. The owner has called that
+                // unacceptable for shipping and he is right; it is a
+                // measurement, not a destination.
+                iterations: sceneExtentMeters < 8 ? 30_000 : 20_000,
                 renderLongEdgePixels: 720,
                 shDegree: .one,
                 keyframeCount: sceneExtentMeters < 8 ? 120 : 240,
