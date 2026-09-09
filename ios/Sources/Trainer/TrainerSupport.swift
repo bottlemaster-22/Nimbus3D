@@ -552,19 +552,32 @@ struct TrainerTuning: Sendable {
     /// on a measured surface with a measured normal, so it starts in
     /// roughly the right place and refines locally rather than searching
     /// for geometry from scratch the way a photo-only clone must.
-    /// 0.5 NOW, NOT 0.85, AND THE ITERATION COUNT IS WHY.
+    /// BACK TO 0.85, AND THIS IS WHY BUILDS 244 AND 246 LOOK WORSE THAN 226.
     ///
-    /// 0.85 was correct for a 3,000-iteration run: with so little time, every
-    /// iteration you do not densify in is one you cannot grow in, and the
-    /// 450 remaining were enough to settle a population that had barely
-    /// changed. At 30,000 it would run densification to iteration 25,500 and
-    /// leave 4,500 to converge, when the reference stops at 15,000 and leaves
-    /// 15,000. Half the run to place geometry and half to fit it is what every
-    /// published 3DGS number is measured with.
+    /// 0.5 was set for a 30,000-iteration run, where it is right: half the run
+    /// to place geometry and half to fit it is what every published 3DGS
+    /// number is measured with. When the budget came back to 4,000 it was
+    /// never put back, and at 4,000 it means this:
     ///
-    /// This moves WITH the iteration count and should move back if the budget
-    /// is ever cut back to 3,000.
-    var densifyEndFraction: Float = 0.5
+    ///     growth window: iteration 300 .. 2000
+    ///     last densify pass: iteration 3900
+    ///     relocated: 0        donors available: 0
+    ///
+    /// For the last 2,000 iterations, HALF THE RUN, the model cannot split,
+    /// clone, prune or relocate. It cannot add a Gaussian, remove one, or make
+    /// one smaller. All it can do is push the existing geometry harder at the
+    /// training views, which is the exact recipe for a model that scores well
+    /// and looks wrong.
+    ///
+    /// Relocation dies with the window, because it only runs when the growth
+    /// window is open and the population is at its cap. That is why the
+    /// counter reads exactly 0 in builds 244 and 246 and read 47,775 in 234.
+    /// The one mechanism that can still SHRINK a Gaussian once the cap is
+    /// reached was switched off for half of every recent run.
+    ///
+    /// 226, the build the owner still rates highest, ran 0.85 over 3,000
+    /// iterations: growth to 2,550, only 15 per cent of the run frozen.
+    var densifyEndFraction: Float = 0.85
     var densifyIntervalIterations: Int = 100
 
     // MARK: - Early stopping, i.e. "how many rounds is actually right"
