@@ -241,9 +241,40 @@ public struct SmartLossSettings: Codable, Hashable, Sendable {
         // to the original behaviour, deliberately: the reference model's
         // median aspect is 1.9:1 against our 7.6:1, so shape does need to be
         // freer than it was, just not this free over ten times the iterations.
-        discPriorWeight: Float = 0.005,
+        // 0.005 WAS TOO STRONG AND THE SIDE-BY-SIDE PROVED IT. It went up
+        // from 0.001 because a 30,000-iteration run grew needles; that run
+        // also turned out to be mis-scheduled, and at a correct 4,000-iteration
+        // budget the same 0.005 drove discs from 77.5 to 87.0 per cent of the
+        // population and put visible artefacting into cluttered regions that
+        // the previous build rendered smoothly.
+        //
+        // 0.002 keeps the prior meaningful without letting it set the shape of
+        // seven splats in eight. Read together with the edge target above:
+        // the prior is now weaker AND it stops demanding slivers where the
+        // geometry is not a surface.
+        discPriorWeight: Float = 0.002,
         discTargetEffectiveRank: Float = 2.0,
-        edgeTargetEffectiveRank: Float = 1.0,
+        // 1.0 IS A NEEDLE, AND IT WAS BEING ASKED FOR IN EXACTLY THE PLACES
+        // THAT LOOK WORST. Effective rank 1 means one axis, rank 2 a disc,
+        // rank 3 a sphere. Every splat carrying the edge flag was being pushed
+        // toward a sliver, and the edge flag fires on cluttered geometry, not
+        // just on clean architectural creases.
+        //
+        // The owner compared two builds side by side on a real photograph of a
+        // messy desk and named it precisely: colour and brightness far better
+        // in the newer build, but visible artefacting in the cluttered regions
+        // that the older build rendered smoothly. Flat slivers at arbitrary
+        // orientations through volumetric clutter is what that looks like.
+        //
+        // The reference capture of the same room is 86.3 per cent
+        // near-isotropic BLOBS (s3/s2 = 0.78) against our 5.2 per cent
+        // (s3/s2 = 0.18). It does not model clutter with discs and slivers at
+        // all. A disc is the right prior for a measured flat surface and the
+        // wrong one for a pile of objects, and the edge flag is the closest
+        // thing this trainer has to "this is not a flat surface".
+        //
+        // 3.0 asks those for a blob instead.
+        edgeTargetEffectiveRank: Float = 3.0,
         trustPartnerFrames: Int = 4,
         trustSampleStride: Int = 2,
         planeSweepSampleBudget: Int = 20_000,

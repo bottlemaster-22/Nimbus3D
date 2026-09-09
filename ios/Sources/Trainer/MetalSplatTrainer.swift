@@ -59,6 +59,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// cannot measure a change made everywhere. Reset per run, exactly like
     /// `timings`, because a stale accumulator here would silently average two
     /// different models together.
+    /// SSIM from the most recent `evaluateHeldOut`. A second return value
+    /// would mean touching every call site for a diagnostic, so it rides here;
+    /// every caller reads it immediately after the call it belongs to.
+    private var lastHeldOutSSIM: Float?
     private var heldOutPSNRSum: Double = 0
     private var heldOutPSNRCount: Int = 0
 
@@ -1766,6 +1770,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 renderSize: renderSize
             )
             census.slices[censusRow].heldOutPSNR = psnr
+            census.slices[censusRow].heldOutSSIM = lastHeldOutSSIM
             census.slices[censusRow].stoppedEarly = stoppedEarly
             census.slices[censusRow].bestHeldOutPSNR =
                 bestHeldOut.isFinite ? bestHeldOut : nil
@@ -2813,6 +2818,20 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // paper averages per-image PSNR, so the old number was not comparable
         // with any published figure either.
         var totalPSNR: Double = 0
+        // STRUCTURE, WHICH PSNR CANNOT SEE. The owner compared two builds on a
+        // real photograph and found the one with the HIGHER PSNR visibly worse
+        // in cluttered regions: better colour and brightness, visible
+        // artefacting where the other was smooth. Both readings were correct,
+        // because mean squared error is dominated by large flat areas being
+        // approximately the right brightness and barely notices whether an
+        // edge is an edge.
+        //
+        // Global SSIM on luma is the cheap standard answer. It compares local
+        // means, variances and covariance rather than per-pixel difference, so
+        // a smeared edge costs it and a slight overall brightness shift does
+        // not. Reported BESIDE PSNR, never instead of it: the two disagree
+        // exactly when something interesting has happened, which is the point.
+        var totalSSIM: Double = 0
         var evaluated = 0
 
         for frame in frames.prefix(24) {
@@ -2945,6 +2964,56 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     sum += diff * diff
                 }
             }
+            // Luma SSIM over 8x8 blocks. Not a windowed Gaussian SSIM, which
+            // would need a separable blur and a second pass; block statistics
+            // over a 720x540 frame are 6,075 blocks and carry the same signal
+            // for this purpose, which is "did the structure survive".
+            var ssimSum = 0.0
+            var ssimBlocks = 0
+            let bw = renderSize.width, bh = renderSize.height
+            let c1 = 0.01 * 0.01, c2 = 0.03 * 0.03
+            var by = 0
+            while by + 8 <= bh {
+                var bx = 0
+                while bx + 8 <= bw {
+                    var mr = 0.0, mt = 0.0
+                    var vr = 0.0, vt = 0.0, cov = 0.0
+                    for dy in 0..<8 {
+                        for dx in 0..<8 {
+                            let i = (by + dy) * bw + (bx + dx)
+                            var rv = rendered[i * 3]
+                            var gv = rendered[i * 3 + 1]
+                            var bv = rendered[i * 3 + 2]
+                            if let heldOutBackground {
+                                let t = transmittance[i]
+                                rv += t * heldOutBackground[i * 3]
+                                gv += t * heldOutBackground[i * 3 + 1]
+                                bv += t * heldOutBackground[i * 3 + 2]
+                            }
+                            let lr = Double(exposure.x * (0.299 * rv + 0.587 * gv + 0.114 * bv) + exposure.y)
+                            let lt = Double(
+                                0.299 * frameSupervision.groundTruth[i * 3]
+                                    + 0.587 * frameSupervision.groundTruth[i * 3 + 1]
+                                    + 0.114 * frameSupervision.groundTruth[i * 3 + 2]
+                            )
+                            mr += lr; mt += lt
+                            vr += lr * lr; vt += lt * lt; cov += lr * lt
+                        }
+                    }
+                    let n = 64.0
+                    mr /= n; mt /= n
+                    vr = Swift.max(vr / n - mr * mr, 0)
+                    vt = Swift.max(vt / n - mt * mt, 0)
+                    cov = cov / n - mr * mt
+                    let num = (2 * mr * mt + c1) * (2 * cov + c2)
+                    let den = (mr * mr + mt * mt + c1) * (vr + vt + c2)
+                    if den > 1e-12 { ssimSum += num / den; ssimBlocks += 1 }
+                    bx += 8
+                }
+                by += 8
+            }
+            if ssimBlocks > 0 { totalSSIM += ssimSum / Double(ssimBlocks) }
+
             let frameMSE = sum / Double(pixelCount * 3)
             // A frame that matches exactly would be infinite dB; clamp it to
             // the same 99 the old code returned for the whole set.
@@ -2953,6 +3022,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         }
 
         guard evaluated > 0 else { return nil }
+        lastHeldOutSSIM = Float(totalSSIM / Double(evaluated))
         return Float(totalPSNR / Double(evaluated))
     }
 

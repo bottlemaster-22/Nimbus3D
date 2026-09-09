@@ -409,6 +409,11 @@ struct TrainerCensusSlice: Codable {
     /// `heldOutPSNR` is the part of the train/test gap that was never about
     /// geometry.
     var heldOutPSNRExposureFitted: Float?
+    /// STRUCTURAL similarity on the held-out frames, luma, 8x8 blocks, 0 to 1.
+    /// PSNR and this disagree exactly when something interesting has happened:
+    /// a build can gain half a decibel of PSNR by getting the room's overall
+    /// brightness right while smearing every edge, and only this notices.
+    var heldOutSSIM: Float?
     /// True when the run stopped because held-out PSNR stopped improving,
     /// rather than because it reached its iteration budget.
     var stoppedEarly: Bool = false
