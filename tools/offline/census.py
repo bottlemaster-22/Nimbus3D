@@ -229,3 +229,27 @@ if os.path.exists(ply):
         print('  build 182 : densest 10% hold 27.8%, Gini 0.434, 88.7% discs')
     except Exception as exc:
         print('\n(model.ply present but not read: %s)' % exc)
+
+
+# ---------------------------------------------------------------------------
+# THE HELD-OUT CURVE. The only thing that says how many rounds this capture
+# actually wants, as opposed to how many a paper used.
+# ---------------------------------------------------------------------------
+curve = d.get('heldOutCurve') or []
+if curve:
+    print()
+    print('HELD-OUT CURVE, scored on frames the model never trains on')
+    best = max(e['psnr'] for e in curve)
+    for e in curve:
+        mark = '  <-- best' if abs(e['psnr'] - best) < 1e-6 else ''
+        settled = ''
+        print('  iter %6d   PSNR %6.2f   splats %8d%s%s'
+              % (e['iteration'], e['psnr'], e['splatCount'], settled, mark))
+    sl0 = d['slices'][0]
+    print()
+    print('  stoppedEarly %s   best %.2f dB at iteration %s'
+          % (sl0.get('stoppedEarly'), sl0.get('bestHeldOutPSNR') or float('nan'),
+             sl0.get('bestHeldOutIteration')))
+    if sl0.get('bestHeldOutIteration'):
+        print('  ^ a fixed budget chosen from data would be about %d iterations'
+              % sl0['bestHeldOutIteration'])
