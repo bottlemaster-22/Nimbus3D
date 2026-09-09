@@ -241,40 +241,48 @@ public struct SmartLossSettings: Codable, Hashable, Sendable {
         // to the original behaviour, deliberately: the reference model's
         // median aspect is 1.9:1 against our 7.6:1, so shape does need to be
         // freer than it was, just not this free over ten times the iterations.
-        // 0.005 WAS TOO STRONG AND THE SIDE-BY-SIDE PROVED IT. It went up
-        // from 0.001 because a 30,000-iteration run grew needles; that run
-        // also turned out to be mis-scheduled, and at a correct 4,000-iteration
-        // budget the same 0.005 drove discs from 77.5 to 87.0 per cent of the
-        // population and put visible artefacting into cluttered regions that
-        // the previous build rendered smoothly.
+        // 0.001, WHICH IS WHAT BUILD 226 RAN AND 226 IS THE ONE THAT LOOKS
+        // BEST SO FAR.
         //
-        // 0.002 keeps the prior meaningful without letting it set the shape of
-        // seven splats in eight. Read together with the edge target above:
-        // the prior is now weaker AND it stops demanding slivers where the
-        // geometry is not a surface.
-        discPriorWeight: Float = 0.002,
+        // The sequence, all measured against the owner's own eye on the same
+        // photograph rather than against PSNR, which was blind to all of it:
+        //
+        //   226   weight 0.001, edge target 1.0   best structure so far
+        //   240   weight 0.005, edge target 1.0   better colour, artefacting
+        //                                          in cluttered regions
+        //   244   weight 0.002, edge target 3.0   worse than both
+        //
+        // 240 says the weight matters and 0.005 is too much. 244 says the edge
+        // target was not the problem. So this goes back to exactly what 226
+        // ran, and everything else 240 and 244 gained - the schedule fix that
+        // finally trains the spherical harmonics, sharper keyframe selection,
+        // a converged pose graph, exporting the best model rather than the
+        // last - is kept.
+        discPriorWeight: Float = 0.001,
         discTargetEffectiveRank: Float = 2.0,
-        // 1.0 IS A NEEDLE, AND IT WAS BEING ASKED FOR IN EXACTLY THE PLACES
-        // THAT LOOK WORST. Effective rank 1 means one axis, rank 2 a disc,
-        // rank 3 a sphere. Every splat carrying the edge flag was being pushed
-        // toward a sliver, and the edge flag fires on cluttered geometry, not
-        // just on clean architectural creases.
+        // BACK TO 1.0. I CHANGED THIS AND IT MADE THE PICTURE WORSE.
         //
-        // The owner compared two builds side by side on a real photograph of a
-        // messy desk and named it precisely: colour and brightness far better
-        // in the newer build, but visible artefacting in the cluttered regions
-        // that the older build rendered smoothly. Flat slivers at arbitrary
-        // orientations through volumetric clutter is what that looks like.
+        // Build 244 flipped this from 1.0 (a needle) to 3.0 (a sphere) on the
+        // theory that the edge flag fires on clutter and clutter should not be
+        // slivers. The owner compared the result against builds 226 and 240 on
+        // a real photograph and called it worse than both.
         //
-        // The reference capture of the same room is 86.3 per cent
-        // near-isotropic BLOBS (s3/s2 = 0.78) against our 5.2 per cent
-        // (s3/s2 = 0.18). It does not model clutter with discs and slivers at
-        // all. A disc is the right prior for a measured flat surface and the
-        // wrong one for a pile of objects, and the edge flag is the closest
-        // thing this trainer has to "this is not a flat surface".
+        // AND 226 VERSUS 244 IS A CLEAN CONTROLLED COMPARISON, which is why
+        // this is a revert rather than another guess. Both ran with the disc
+        // prior gradient already corrected and a similar weight; the one thing
+        // that changed between them is this constant. 226 looked better.
         //
-        // 3.0 asks those for a blob instead.
-        edgeTargetEffectiveRank: Float = 3.0,
+        // The mechanism is obvious in hindsight. This target applies to splats
+        // flagged as lying ON A 3D EDGE CURVE, and an edge genuinely IS a
+        // one-dimensional structure: a table lip, a cable, a chair leg, a
+        // skirting board. Asking those to become spheres blurs every crease in
+        // the room. The shape census made it visible and I did not read it
+        // properly: needles went from 16.2 per cent of the population to
+        // exactly 0.0. A real room does not contain zero elongated things.
+        //
+        // The artefacting in 240 was the prior being too STRONG, not this
+        // target being wrong, and the weight below is where that is fixed.
+        edgeTargetEffectiveRank: Float = 1.0,
         trustPartnerFrames: Int = 4,
         trustSampleStride: Int = 2,
         planeSweepSampleBudget: Int = 20_000,
