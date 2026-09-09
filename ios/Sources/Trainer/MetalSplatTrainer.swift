@@ -1003,6 +1003,14 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // there: it is the only honest way to choose a fixed budget later.
         var bestHeldOut: Float = -.infinity
         var bestHeldOutIteration = 0
+        /// THE BEST MODEL, KEPT. Build 234 measured 17.126 dB at iteration
+        /// 2,000, carried on to 4,000, and exported the 16.335 dB model. The
+        /// run knew which one was better and threw it away: 0.791 dB, measured
+        /// on the same frames with the same exposure fit, discarded for
+        /// nothing. Reading the cloud costs about the same as one preview
+        /// snapshot, which this loop already does every 200 iterations, and it
+        /// only happens when the score actually improves.
+        var bestCloud: SplatCloud?
         var sinceBest = 0
         var stoppedEarly = false
         // Rounded UP to a whole number of densify intervals, because the
@@ -1410,6 +1418,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         bestHeldOut = score
                         bestHeldOutIteration = iteration
                         sinceBest = 0
+                        bestCloud = readCloud(
+                            resources: resources, count: splatCount, shDegree: shDegree
+                        )
                     } else if settled {
                         sinceBest += 1
                         if sinceBest >= Swift.max(tuning.earlyStopPatienceEvals, 1) {
@@ -1829,7 +1840,24 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             }
         }
 
-        let cloud = readCloud(resources: resources, count: splatCount, shDegree: shDegree)
+        // THE BEST MODEL, NOT THE LAST ONE. If any mid-run evaluation scored
+        // better than where the run ended, that is the model to ship: it is
+        // the same measurement, on the same held-out frames, with the same
+        // exposure fit, and the run has already paid to find out.
+        //
+        // `readCloud` on the final state still runs when there is no better
+        // checkpoint, which is every run where the score improved to the end
+        // or where early stopping is switched off.
+        let cloud = bestCloud ?? readCloud(
+            resources: resources, count: splatCount, shDegree: shDegree
+        )
+        if bestCloud != nil {
+            let note = String(
+                format: "Exporting the model from iteration %d, which scored %.2f dB, rather than the one this run ended on.",
+                bestHeldOutIteration, bestHeldOut
+            )
+            TrainerLog.general.info("\(note, privacy: .public)")
+        }
 
         // `readCloud` drops a non-finite Gaussian rather than exporting a NaN,
         // and it does that silently. The difference between what went in and
@@ -3368,9 +3396,39 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 // on the spot in a doorway is producing genuinely new views.
                 if moved < spacing && turned < 0.02 { continue }
             }
-            chosen.append(frame)
-            lastCenter = center
-            lastForward = forward
+            // SHARPNESS DECIDES WHICH FRAME, NOW THAT SPACING HAS DECIDED
+            // WHERE. This selector read `qc.weight > 0.05` as a floor and then
+            // never looked at sharpness again: measured on the owner's capture,
+            // 93 of the 120 chosen keyframes carry more than one render pixel
+            // of motion blur, native p50 3.84 px and p90 6.80, render p50 1.44
+            // and p90 2.55. Every one of those is a blurred photograph the
+            // model is asked to reproduce exactly.
+            //
+            // The fix is cheap because the frames are already sorted by index
+            // and the walk is dense: rather than taking the FIRST frame that
+            // clears the spacing gate, look a short way ahead and take the
+            // sharpest of the candidates that also clear it. Spacing is
+            // unchanged, because every candidate in the window is past the
+            // same gate; only the choice within it changes.
+            var best = frame
+            if tuning.keyframeSharpnessLookahead > 0,
+               let here = pool.firstIndex(where: { $0.index == frame.index })
+            {
+                let limit = Swift.min(
+                    here + tuning.keyframeSharpnessLookahead, pool.count - 1
+                )
+                if limit > here {
+                    for candidate in pool[here...limit]
+                    where candidate.qc.weight > best.qc.weight {
+                        best = candidate
+                    }
+                }
+            }
+            chosen.append(best)
+            let bestPose = prePass.refinedPose(for: best.index)
+                ?? best.refinedPose ?? best.rawPose
+            lastCenter = bestPose.center.simd
+            lastForward = bestPose.forward.simd
             if chosen.count >= target { break }
         }
 

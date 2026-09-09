@@ -73,6 +73,7 @@ if not t:
 
 print('\n%-22s %9s %8s %11s' % ('', 'seconds', '% wall', 'ms/iter'))
 ORDER = ['gpuBusy', 'gpuScan', 'gpuStep', 'gpuSort', 'gpuForward', 'gpuLosses',
+         'earlyStopEval',
          'gpuBackward', 'gpuOptimiser', 'gpuOther', 'gpuWait',
          'supervision', 'supervisionPrefetched',
          'densify', 'previewSnapshot', 'filterSweep', 'upload']

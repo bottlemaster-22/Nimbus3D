@@ -19,3 +19,11 @@ target/
 app/Frameworks/*.xcframework
 __pycache__/
 *.pyc
+
+# Workflow agents write measurement scratch into tools/offline. The scripts are
+# worth keeping; their multi-hundred-megabyte intermediate arrays are not, and
+# one of them (a 137 MB .npy) got as far as a rejected push before this existed.
+tools/offline/*.npy
+tools/offline/*.npz
+tools/offline/*.png
+tools/offline/__pycache__/

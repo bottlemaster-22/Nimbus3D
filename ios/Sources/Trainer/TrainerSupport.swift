@@ -592,7 +592,7 @@ struct TrainerTuning: Sendable {
     /// means the pass's own `trainer_reset_densify_stats` wipes the pollution
     /// on the very next line. Anywhere else and the AbsGS score quietly
     /// includes frames the model is not training on.
-    var earlyStopEvalIntervalIterations: Int = 500
+    var earlyStopEvalIntervalIterations: Int = 200
 
     /// Stop after this many consecutive evaluations fail to beat the best
     /// held-out score by `earlyStopMinImprovementDB`.
@@ -605,7 +605,32 @@ struct TrainerTuning: Sendable {
     /// Never stop before this many iterations, whatever the score does. Early
     /// training is noisy and the densify window has not even opened at 10 per
     /// cent of the run.
-    var earlyStopMinIterations: Int = 2_000
+    /// WAS 2,000, WHICH WAS ALSO THE FIRST EVALUATION, so the recorded curve
+    /// began at its own maximum and declined monotonically from there. "The
+    /// model peaks at 2,000 iterations" was not a measurement, it was the
+    /// floor of the measuring instrument: nothing before 2,000 was ever
+    /// sampled. 700 is just after the population reaches its cap, which the
+    /// densify ledger puts at iteration 600 to 900, so the curve now starts
+    /// where the model is complete rather than a thousand iterations later.
+    var earlyStopMinIterations: Int = 700
+
+    /// How many frames ahead the keyframe selector may look for a SHARPER one
+    /// once spacing has already been satisfied. 0 restores the old behaviour
+    /// of taking the first frame that clears the gate.
+    ///
+    /// The selector used `qc.weight > 0.05` as a floor and then never read
+    /// sharpness again. Measured on the owner's capture: 93 of the 120 chosen
+    /// keyframes carry more than one RENDER pixel of motion blur (native p50
+    /// 3.84 px, p90 6.80; at the 720 px render, p50 1.44 and p90 2.55). The
+    /// model is being asked to reproduce blurred photographs exactly, and
+    /// there is no term anywhere in the loss that knows a photograph is
+    /// blurred.
+    ///
+    /// 5 is deliberately small. The walk produced 868 frames for 120
+    /// keyframes, so a window of 5 is well inside one spacing interval and
+    /// cannot turn the selection into a prefix or collapse the spread; every
+    /// candidate in the window has already passed the same spacing gate.
+    var keyframeSharpnessLookahead: Int = 5
 
     /// How much better a score has to be to count as an improvement. Below
     /// this it is noise, and waiting for noise to clear is what turns a

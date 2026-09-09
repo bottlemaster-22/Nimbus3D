@@ -218,7 +218,25 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         /// Huber threshold on the whitened 6-vector residual. Whitened, so
         /// this is in sigmas, not metres.
         public var robustDelta: Double = 2.0
-        public var maxIterations = 30
+        /// RAISED FROM 30, because 30 was not where the solver converged, it
+        /// was where it was cut off. The owner's scan reports
+        /// `converged: false`, `exitReason: "iterationLimit"`,
+        /// `iterationsRun: 30`, and a cost that fell from 4520.09 to 963.15,
+        /// a 79 per cent reduction still in progress when it stopped. It left
+        /// a median residual of 2.78 cm and 1.45 degrees.
+        ///
+        /// That residual is roughly three times the median splat this trainer
+        /// now produces (9.12 mm), so it is a hard floor on how sharp the
+        /// model can be: no amount of optimisation can align a Gaussian to a
+        /// photograph whose camera is 2.78 cm from where the solver thinks it
+        /// is.
+        ///
+        /// The whole stage took SEVEN MILLISECONDS. 0.0073 s for 30 iterations
+        /// is 0.24 ms each, against a pre-pass of 19 s and a training run of
+        /// 56 s. 300 iterations costs about 73 ms, which is a tenth of one per
+        /// cent of the run, and the solver stops on its own convergence test
+        /// long before that if it gets there.
+        public var maxIterations = 300
 
         public init() {}
     }

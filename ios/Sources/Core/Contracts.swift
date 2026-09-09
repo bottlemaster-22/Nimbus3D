@@ -1835,7 +1835,27 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 // does not. Expect 11 to 13 minutes. The owner has called that
                 // unacceptable for shipping and he is right; it is a
                 // measurement, not a destination.
-                iterations: sceneExtentMeters < 8 ? 30_000 : 20_000,
+                // 30,000 WAS A MEASUREMENT AND IT IS DONE. It answered the
+                // question it was set to answer: held-out PSNR peaks early and
+                // then falls, 16.88 at 3,000 against 14.38 at 30,000, with the
+                // trained view rising the whole way. The model memorises.
+                //
+                // Leaving the budget at 30,000 and relying on early stopping
+                // to cut it short is WORSE than a short budget, because every
+                // schedule in this trainer is a FRACTION of it. At 4,000 of
+                // 30,000 the run ends at 13.3 per cent of every schedule:
+                // position learning rate still at 54 per cent of its starting
+                // value, the others at 73.5, and the degree-1 spherical
+                // harmonic band only switching on at iteration 3,500 of a
+                // 4,000-iteration run, which is why 2.7 million of the model's
+                // parameters measured as effectively zero.
+                //
+                // 4,000 is chosen from the measured curve, not from a paper:
+                // the population reaches its cap by iteration 600 to 900 and
+                // held-out peaks at or before 2,000. Early stopping stays on
+                // as the safety net that catches a capture whose peak is
+                // somewhere else.
+                iterations: sceneExtentMeters < 8 ? 4_000 : 3_000,
                 renderLongEdgePixels: 720,
                 shDegree: .one,
                 keyframeCount: sceneExtentMeters < 8 ? 120 : 240,
