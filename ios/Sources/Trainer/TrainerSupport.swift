@@ -543,6 +543,51 @@ struct TrainerTuning: Sendable {
     /// is ever cut back to 3,000.
     var densifyEndFraction: Float = 0.5
     var densifyIntervalIterations: Int = 100
+
+    // MARK: - Early stopping, i.e. "how many rounds is actually right"
+
+    /// How often to score the HELD-OUT frames during training, in iterations.
+    /// 0 disables early stopping entirely and the run always goes the full
+    /// distance.
+    ///
+    /// WHY THIS EXISTS. A 30,000-iteration run measured trained-view PSNR
+    /// rising 21.10 to 25.67 while held-out FELL 16.88 to 14.38, a train/test
+    /// gap of 11.29 dB, with 44.4 per cent of the population ending as needles
+    /// against 23.4 per cent at 3,000. The optimiser was working perfectly and
+    /// the model was memorising 108 training views. Ten minutes of phone
+    /// battery bought a worse scan.
+    ///
+    /// The right number of rounds is not a constant anyone can pick in
+    /// advance, because it depends on how many views the capture has and how
+    /// much parallax they carry. It IS measurable while training, and the
+    /// trainer already holds out frames and already knows how to score them.
+    ///
+    /// MUST BE A MULTIPLE OF `densifyIntervalIterations`, and the code rounds
+    /// it up to one. Scoring runs the preprocess kernel over the held-out
+    /// frames, which increments `stats.denom` and sets `visibleFlag`, and
+    /// those feed densification. Doing it immediately before a densify pass
+    /// means the pass's own `trainer_reset_densify_stats` wipes the pollution
+    /// on the very next line. Anywhere else and the AbsGS score quietly
+    /// includes frames the model is not training on.
+    var earlyStopEvalIntervalIterations: Int = 500
+
+    /// Stop after this many consecutive evaluations fail to beat the best
+    /// held-out score by `earlyStopMinImprovementDB`.
+    ///
+    /// Four evaluations at 500 iterations is 2,000 iterations of patience,
+    /// which is enough to ride out a dip caused by a densification pass
+    /// injecting new geometry that has not settled yet.
+    var earlyStopPatienceEvals: Int = 4
+
+    /// Never stop before this many iterations, whatever the score does. Early
+    /// training is noisy and the densify window has not even opened at 10 per
+    /// cent of the run.
+    var earlyStopMinIterations: Int = 2_000
+
+    /// How much better a score has to be to count as an improvement. Below
+    /// this it is noise, and waiting for noise to clear is what turns a
+    /// stopping rule into a run that never stops.
+    var earlyStopMinImprovementDB: Float = 0.05
     /// Opacity binarization runs over the last this-much of the run (F4).
     /// ZERO, AS A NULL TEST. Was 0.2.
     ///

@@ -225,7 +225,23 @@ public struct SmartLossSettings: Codable, Hashable, Sendable {
         // THE COST: surface-normal quality and mesh extraction quality both
         // lean on this prior, and both matter for the export format. If the
         // meshes come out worse, this is the constant that did it.
-        discPriorWeight: Float = 0.001,
+        // BACK UP TO 0.005, BECAUSE 30,000 ITERATIONS MEASURED WHAT 3,000
+        // COULD NOT. At 3,000 the weakening looked free; at 30,000 the share
+        // of the population that are NEEDLES (largest axis over eight times
+        // the smallest) went from 23.4 per cent to 44.4, the median aspect
+        // from 5.8:1 to 7.6:1, and p90 splat size from 14.02 mm to 26.09 mm.
+        // A long thin Gaussian stretched to fit a handful of viewpoints is the
+        // classic 3DGS overfitting artifact, and this prior is the only thing
+        // in the trainer that opposes it.
+        //
+        // Note the effective change is smaller than the number looks. The
+        // gradient used to be exactly twice the derivative of the loss it
+        // reported, so the original 0.01 behaved like 0.02 and 0.001 behaved
+        // like 0.001 once that was fixed. 0.005 sits a quarter of the way back
+        // to the original behaviour, deliberately: the reference model's
+        // median aspect is 1.9:1 against our 7.6:1, so shape does need to be
+        // freer than it was, just not this free over ten times the iterations.
+        discPriorWeight: Float = 0.005,
         discTargetEffectiveRank: Float = 2.0,
         edgeTargetEffectiveRank: Float = 1.0,
         trustPartnerFrames: Int = 4,

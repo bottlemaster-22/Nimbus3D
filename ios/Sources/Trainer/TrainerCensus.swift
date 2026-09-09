@@ -409,6 +409,12 @@ struct TrainerCensusSlice: Codable {
     /// `heldOutPSNR` is the part of the train/test gap that was never about
     /// geometry.
     var heldOutPSNRExposureFitted: Float?
+    /// True when the run stopped because held-out PSNR stopped improving,
+    /// rather than because it reached its iteration budget.
+    var stoppedEarly: Bool = false
+    /// The best held-out score any mid-run evaluation saw, and where.
+    var bestHeldOutPSNR: Float?
+    var bestHeldOutIteration: Int?
 
     /// PSNR on frames the model DID train on, measured the same way and on
     /// the same number of frames as `heldOutPSNR`, so the two can be compared
@@ -487,6 +493,16 @@ struct TrainerCensusAlert: Codable {
 /// blocks; what is left over after both is everything else the CPU does,
 /// which is itself a useful number. Only fields that are actually measured
 /// appear here, so a zero means zero rather than "not instrumented".
+/// One mid-run measurement of how well the model does on frames it is NOT
+/// training on. The sequence of these is the answer to "how many rounds is
+/// right", which no constant can know in advance because it depends on how
+/// many views the capture has and how much parallax they carry.
+struct TrainerHeldOutSample: Codable {
+    var iteration: Int
+    var psnr: Float
+    var splatCount: Int
+}
+
 struct TrainerTimings: Codable {
     /// Building one frame of supervision on the CPU: photo decode, ground
     /// truth, background image, depth samples.
@@ -522,6 +538,10 @@ struct TrainerTimings: Codable {
     /// one buffer per stage for a diagnostic run; the rest of the time this
     /// is the number, and `gpuSort` means the sort alone.
     var gpuStep: Double = 0
+    /// Scoring the held-out frames DURING training, to decide when to stop.
+    /// Separate from everything else because it is the one cost the run pays
+    /// purely to find out whether it should still be running.
+    var earlyStopEval: Double = 0
 
     /// GPU execution split by which command buffer it was in, so the 25.5 ms
     /// the GPU now spends per iteration stops being one opaque number.
@@ -585,6 +605,11 @@ struct TrainerCensus: Codable {
 
     /// Where the time went. See `TrainerTimings`.
     var timings = TrainerTimings()
+    /// Held-out PSNR measured DURING the run, in order. This is the curve that
+    /// says where the model stopped improving, and it is recorded whether or
+    /// not early stopping is switched on, because choosing a fixed iteration
+    /// budget without it is guesswork.
+    var heldOutCurve: [TrainerHeldOutSample] = []
 
     /// HOW HOT IT GOT, AND WHEN.
     ///

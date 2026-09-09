@@ -994,6 +994,27 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             )
         }
 
+        // EARLY STOPPING STATE. See `earlyStopEvalIntervalIterations`.
+        //
+        // `bestHeldOut` is the best score any evaluation has seen, and
+        // `sinceBest` counts consecutive evaluations that failed to beat it.
+        // The whole curve goes into the census either way, because knowing
+        // WHERE the model stopped improving is worth as much as stopping
+        // there: it is the only honest way to choose a fixed budget later.
+        var bestHeldOut: Float = -.infinity
+        var bestHeldOutIteration = 0
+        var sinceBest = 0
+        var stoppedEarly = false
+        // Rounded UP to a whole number of densify intervals, because the
+        // evaluation has to sit immediately before a densify pass so that
+        // pass's stats reset wipes what the extra preprocess wrote.
+        let evalEvery: Int = {
+            let want = tuning.earlyStopEvalIntervalIterations
+            guard want > 0 else { return 0 }
+            let step = Swift.max(tuning.densifyIntervalIterations, 1)
+            return Swift.max(step, ((want + step - 1) / step) * step)
+        }()
+
         iterationLoop: while true {
             let effectiveTotal = Swift.max(
                 Swift.min(
@@ -1327,6 +1348,65 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 )
             }
 
+            // --- IS THIS RUN STILL GETTING BETTER? -----------------------------
+            //
+            // Immediately before the densify pass, so that pass's own
+            // `trainer_reset_densify_stats` clears the `denom` and
+            // `visibleFlag` writes this evaluation's preprocess just made.
+            // Anywhere else and the AbsGS densification score silently
+            // includes frames the model never trains on.
+            //
+            // Scored WITH the per-frame exposure fit, because a held-out frame
+            // has no fitted exposure of its own and the raw number therefore
+            // moves when the capture's auto-exposure drifted. The stopping
+            // decision must not turn on that.
+            if evalEvery > 0,
+               iteration > 0,
+               iteration >= tuning.earlyStopMinIterations,
+               iteration % evalEvery == 0,
+               !slice.heldOutKeyframes.isEmpty
+            {
+                let evalFrom = CFAbsoluteTimeGetCurrent()
+                let score = try evaluateHeldOut(
+                    gpu: gpu,
+                    resources: resources,
+                    queue: queue,
+                    frames: slice.heldOutKeyframes,
+                    supervision: supervision,
+                    cameraDeltas: cameraDeltas,
+                    exposures: exposures,
+                    splatCount: splatCount,
+                    shCoefficientCount: shCoefficientCount,
+                    renderSize: renderSize,
+                    fitExposure: true
+                )
+                timings.earlyStopEval += CFAbsoluteTimeGetCurrent() - evalFrom
+                if let score, score.isFinite {
+                    census.heldOutCurve.append(
+                        TrainerHeldOutSample(
+                            iteration: iterationsRunSoFar + iteration,
+                            psnr: score,
+                            splatCount: splatCount
+                        )
+                    )
+                    if score > bestHeldOut + tuning.earlyStopMinImprovementDB {
+                        bestHeldOut = score
+                        bestHeldOutIteration = iteration
+                        sinceBest = 0
+                    } else {
+                        sinceBest += 1
+                        if sinceBest >= Swift.max(tuning.earlyStopPatienceEvals, 1) {
+                            stoppedEarly = true
+                            let best = String(format: "%.2f", bestHeldOut)
+                            let now = String(format: "%.2f", score)
+                            let note = "Stopping at iteration \(iteration): held-out PSNR peaked at \(best) dB near iteration \(bestHeldOutIteration), is \(now) dB now, and has not improved in \(sinceBest) checks."
+                            TrainerLog.general.info("\(note, privacy: .public)")
+                            break iterationLoop
+                        }
+                    }
+                }
+            }
+
             let inDensifyWindow = progressFraction >= tuning.densifyStartFraction
                 && progressFraction <= tuning.densifyEndFraction
             // `SmartLossSettings.pruneStartFraction` and `pruneEndFraction`
@@ -1642,6 +1722,11 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 renderSize: renderSize
             )
             census.slices[censusRow].heldOutPSNR = psnr
+            census.slices[censusRow].stoppedEarly = stoppedEarly
+            census.slices[censusRow].bestHeldOutPSNR =
+                bestHeldOut.isFinite ? bestHeldOut : nil
+            census.slices[censusRow].bestHeldOutIteration =
+                bestHeldOut.isFinite ? bestHeldOutIteration : nil
 
             // The same frames, scored after a two-scalar photometric alignment
             // fitted to each one. Reported BESIDE the raw number, never
