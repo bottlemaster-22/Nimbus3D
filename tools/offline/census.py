@@ -237,8 +237,14 @@ if os.path.exists(ply):
               % (100 * needle, 100 * disc_frac, 100 * blob,
                  float(np.median(r21)), float(np.median(r32))))
         print()
-        print('  Scaniverse: densest 10% hold 61.2%, Gini 0.753, 56.4% blobs')
-        print('  build 182 : densest 10% hold 27.8%, Gini 0.434, 88.7% discs')
+    
+        print('  Scaniverse, same room, foreground only (dome excluded):')
+        print('    needles  8.9%   discs  4.9%   blobs 86.3%   (s2/s1 0.73, s3/s2 0.78)')
+        print('    densest 10% hold 61.2%, Gini 0.753')
+        print('  ^ THE SHAPE GAP: their third axis is 78% of the second, ours is 18%.')
+        print('    They are near-isotropic BLOBS; we are flat DISCS, which is what')
+        print('    the effective-rank prior (discTargetRank 2) is asking for.')
+
     except Exception as exc:
         print('\n(model.ply present but not read: %s)' % exc)
 
