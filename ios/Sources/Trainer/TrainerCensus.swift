@@ -530,6 +530,10 @@ struct TrainerTimings: Codable {
     var densify: Double = 0
     var previewSnapshot: Double = 0
     var filterSweep: Double = 0
+    /// runIteration only: seconds from buffer A's completion to buffer B's
+    /// commit (instance-count readback, overflow check, CPU encode of B).
+    /// The GPU is idle for all of it, so it prices merging A and B.
+    var encodeStep: Double = 0
     /// Writing this frame's ground truth, background and depth samples into
     /// the shared Metal buffers.
     var upload: Double = 0

@@ -707,3 +707,74 @@ An unseen ceiling is not in the coverage denominator. `recomputeFraction` iterat
 ### NEXT ACTION
 
 Owner tests build 224. `cd tools/offline && python census.py` prints the verdict. Read the size distribution's p90/p10 spread first: 1.76x is the disease, and seeding alone should now supply 4x before densification's contribution.
+
+---
+
+## 2026-09-10 : Build 250 measured, relocation found dead since build 182, build 252 batches everything that survived
+
+**Since the last entry:** builds 226 to 250 happened (the 30,000-iteration ceiling run, early stopping, SSIM beside PSNR, the edge-rank mistake in 244, and the `densifyEndFraction` 0.5 leftover that froze half of builds 244 to 246). Build 250 is the first clean measurement after all of that. Two workflows then re-judged the remaining refutations (123 in total, not 73) and dug into the 250 census.
+
+### BUILD 250, MEASURED
+
+| | 250 |
+|---|---|
+| pre-pass | 17.6 s (seeding 12.7) |
+| training | 77 s, 19.2 ms/iter (gpuStep 55.0, gpuScan 6.7, earlyStopEval 2.8) |
+| **total** | **94.6 s** |
+| splats | 299,888 |
+| held-out PSNR | best 20.392 at 3,600 (exported), end state 20.038 raw / 20.444 fitted |
+| SSIM | 0.6618 |
+| size | p10 3.62, p50 7.83, p90 17.22 mm, spread 4.75x |
+| shape | needles 9.1, discs 86.2, blobs 4.7 per cent |
+
+What 250's four changes did: `earlyStopEvalIntervalIterations` 400 halved earlyStopEval (5.7 to 2.8 s); the splatGrad2D self-clear took gpuScan 7.6 to 6.7 s (that drop calibrates blit fill at **83 GB/s**); the tangent clamp removed every splat above 720 px and 13.3 per cent of tile instances; and `pruneMaxScreenRadiusPx` 720 pruned **nothing**, because the clamp had already removed every splat it targeted (clamped max radius 243.7 px). The 13.44 per cent finding behind it was measured before the clamp existed.
+
+### RELOCATION HAD BEEN DEAD SINCE BUILD 182
+
+`relocated 0` in all 39 passes. The gate was `growthAllowance == 0`, i.e. headroom EXACTLY zero. After the cap fills, the low-opacity prune frees 25 to 526 slots a pass and growth refills exactly those (`added == growthAllowance == headroom` on every pass from 6 on, zero mismatches), so headroom is never zero. Build 182 seeded the cap full, so headroom WAS zero there, and relocation ran 21,000 times; lowering the fill to 0.5 silently killed it. The `allowGrowth &&` conjunct also killed it after the growth window shut. And the census field that would have exposed it, `relocationDonorsAvailable`, is only written inside the dead branch, so it read 0 meaning "never measured", not "empty pool".
+
+The pool is real: 9,799 splats below 0.05 opacity, 1.63x the median size of the rest. Build 252 relocates whenever growth is underfed (`growthAllowance < wantedGrowth`), in the same pass, behind growth's share of the ranked list, with a mask so no donor is a slot this pass used, a skip for targets too faint to survive the split, and filter3D carried with the moved splat. **Expected effect is NOT measured.** A static sim says p50 7.83 to 6.71 mm with uniform targets, but targets are ranked by AbsGS score, which grows with pixel coverage and so favours large splats, and the same sim says that case RAISES p50 to 9.1. Kill switch: `maxRelocationFractionPerPass = 0`.
+
+### BUILD 252, EVERYTHING ELSE THAT SURVIVED
+
+Speed (bit-exact or model-neutral): splatGrad and shGrad self-clear in preprocess_backward (28.8 MB of fill); the regulariser skips undrawn splats like both Adam kernels already do (77.8 per cent of its threads wrote gradients nobody read); 24-bit radix key with 12-bit LOG depth, six passes not eight (log so no room is ever too deep; 48.81 dB against exact order, within 0.003 dB of it against the photo); two finiteness tests per backward pair instead of twelve (the roots are `dLdPower` and `weight`, NOT `dLdAlpha`: Metal's `min(0.99, NaN)` is 0.99); the held-out eval uses the GPU background kernel instead of a CPU loop it ran 132 times, and the duplicate final evaluation is folded into the first. Estimated 5 to 10 s in total, none of it device-measured.
+
+Correctness: export now ships the end state when it scores at least as well as the checkpoint (250 threw away 20.444 for 20.392, and shipped a 3,600 cloud with 4,000 exposures and poses); held-out views no longer leak denom and visibleFlag into the next densify pass (the eval ran BEFORE densifier.run, and the reset runs AFTER it, so the old comment's claim was false); the backward now differentiates the forward's clamped Jacobian (latent today, 0 drawn splats bind); `carveIntervalIterations` reads 500, which is what 250 against a 100 densify interval was actually running; the seed load is timed as `prologue`, since 4.03 s of training wall sat in no bucket.
+
+Rejected with measurements: moving the disc target toward rank 3 (post-hoc isotropy costs up to 1.8 dB; rank is not the lever, and 0.001 to 0.005 of weight all act the same because the prior dominates 98.7 per cent of discs); lowering the 720 prune (90 px buys 1.27 per cent of tile instances and costs one held-out view 35 dB); raising iterations on an extrapolated curve (1,000 more cost about 19 s).
+
+### VERIFIED
+
+Every edit applied by exact-string match with an all-or-nothing script. trapconv, deadwire and brandmatch pass on the committed tree. Builds 251 and 252 green (commit 608bc36).
+
+### A LINT THAT LIED TO ME
+
+`python tools/trapconv.py | tail -3; echo $?` prints TAIL's exit code. It read 0 while trapconv had failed on the one growth line I rewrote: the allowlist matches an expression's exact text, so moving an allowlisted conversion into a new variable un-allowlists it. Build 176 went red on exactly this. Never pipe a lint before reading its exit code.
+
+### ASSUMED / UNVERIFIED
+
+Everything in 252. The relocation change is the largest behavioural change since build 182 and its sign on p50 is genuinely unknown.
+
+### OPEN
+
+- **Adam bias correction after a split or relocation.** Both zero `adamM`/`adamV` for the rewritten slot but leave `stats.stepCount`, so bias correction treats fresh moments as mature and the first steps run at about 3x the learning rate. Resetting stepCount alone would desynchronise the SH moments, which are not zeroed. Needs its own change covering both paths.
+- **SH degree 1.** `budgetAsRun.shDegree` is 1 on this scan (4 coefficients). Scaniverse ships degree 3.
+- Pending verifiers: the command-buffer merge (about 1.0 s, large surgery) and the gpuStep breakdown (50 per cent backward raster, 17 per cent loss chain, 14 per cent forward).
+
+### NEXT ACTION
+
+Owner tests build 252. Read in this order: `relocated` per pass (0 means the gate is still dead; about 10k at iteration 600 then donor-limited is expected), `relocationDonorsAvailable` (first real measurement since 182), p50 and spread, best held-out PSNR against 20.39 +/-0.4 and SSIM against 0.6618 (a drop over 0.4 dB means set `maxRelocationFractionPerPass` to 0), then gpuScan (expect about -1.4 s), gpuStep, earlyStopEval, `prologue`, and the total against 94.6 s.
+
+### ADDENDUM: build 254, the rest of the gpuStep findings, before 252 was tested
+
+The owner had not yet tested 252 when the last verifiers returned, so everything model-neutral that survived went on top of it as 254, a strict superset. Test 254, not 252.
+
+- `draws[gid].opacity = 0` in trainer_preprocess's prologue was a dead 19.2 MB scattered store: every reader of `draws` is gated on tilesTouched != 0, which implies the full `draws[gid] = d` store ran.
+- `trainer_loss_photometric` wrote `composited` (4.67 MB) that nothing reads.
+- The regulariser and both Adam kernels gate on `tilesTouched` instead of `stats.visibleFlag`: the identical predicate, read from a dense 1.2 MB array rather than a 32-byte-strided stats line. That makes `visibleFlag` dead, so `trainer_reset_visibility` (9.6 MB a step and a dispatch) and the store in preprocess are gone, with every Swift declaration that pointed at them.
+- SSIM: X*X, Y*Y and X*Y are formed per tap inside trainer_blur_h's moments pass (flagged by the spare `pad0`), so `trainer_ssim_prepare` is gone; `trainer_ssim_backward` is folded into `trainer_loss_finalize`, which writes the full gradient back into gradFinal because the CPU background accumulator reads it.
+- `timings.encodeStep` times the GPU-idle gap between buffers A and B, which is what prices the A/B merge. census.py prints it and a lower bound on untimed wall.
+
+Estimated 2 to 4.7 s, all from a bandwidth model; the verifiers had no on-device timing for any of it. Held back deliberately, each for a build of its own: the pipelined A/B merge (about 1.0 s, a large restructure with an overflow-retry path) and batching the filter sweep 8 cameras a submission (about 0.15 s, but it partly undoes the mitigation for an old iteration-500 watchdog crash).
+
+Failure signatures to read on 254 if anything went wrong: a wrong Adam binding freezes the model (PSNR collapse, sizes stop moving); a silent regulariser shows as discs falling from 86.2 per cent and s3/s2 rising from 0.20; a stuck `pad0` corrupts the SSIM gradient and SSIM collapses from 0.66.

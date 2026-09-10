@@ -1367,11 +1367,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
             // --- IS THIS RUN STILL GETTING BETTER? -----------------------------
             //
-            // Immediately before the densify pass, so that pass's own
-            // `trainer_reset_densify_stats` clears the `denom` and
-            // `visibleFlag` writes this evaluation's preprocess just made.
-            // Anywhere else and the AbsGS densification score silently
-            // includes frames the model never trains on.
+            // Immediately before a densify pass. The reset after that pass
+            // does NOT protect the score, because the pass reads stats first.
+            // What keeps held-out frames out of the AbsGS score is the
+            // snapshot and restore of the stats buffer inside evaluateHeldOut.
             //
             // Scored WITH the per-frame exposure fit, because a held-out frame
             // has no fitted exposure of its own and the raw number therefore
@@ -2039,7 +2038,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             guard let encoderA = bufferA.makeComputeCommandEncoder()
             else { throw TrainerError.noMetalDevice }
             encoderA.label = "trainer.preprocess"
-            gpu.resetVisibilityForIteration(encoderA, splatCount: splatCount)
+            // No visibility reset: nothing reads visibleFlag any more. The
+            // per-step "drawn" predicate is tilesTouched, which
+            // trainer_preprocess rewrites for every splat each iteration.
 
             // The far field, rasterised here instead of on the CPU. Runs
             // before anything reads bgColor, which is the loss in buffer B.
@@ -2070,6 +2071,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             try finish(bufferA, "the tile scan")
         }
 
+        let encodeStepFrom = CFAbsoluteTimeGetCurrent()
         // The one unavoidable readback: how many (Gaussian, tile) pairs this
         // frame produced. The exclusive scan means the total is the last
         // offset plus the last count.
@@ -2164,6 +2166,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
             encoderB.endEncoding()
             bufferB.commit()
+            timings.encodeStep += CFAbsoluteTimeGetCurrent() - encodeStepFrom
             // NOT "the tile sort". This one command buffer holds the
             // sort, the forward raster, the losses, the backward raster and
             // the optimiser, so labelling it as the sort credited all five

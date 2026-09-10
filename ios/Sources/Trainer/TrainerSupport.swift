@@ -124,7 +124,6 @@ enum TrainerError: LocalizedError {
 enum TrainerKernel {
     static let fillUInt = "trainer_fill_uint"
     static let fillFloat = "trainer_fill_float"
-    static let resetVisibility = "trainer_reset_visibility"
     static let resetDensifyStats = "trainer_reset_densify_stats"
     static let scanBlock = "trainer_scan_block"
     static let scanAdd = "trainer_scan_add"
@@ -136,11 +135,9 @@ enum TrainerKernel {
     static let rasterizeForward = "trainer_rasterize_forward"
     static let background = "trainer_background"
     static let lossPhotometric = "trainer_loss_photometric"
-    static let ssimPrepare = "trainer_ssim_prepare"
     static let blurH = "trainer_blur_h"
     static let blurV = "trainer_blur_v"
     static let ssimStats = "trainer_ssim_stats"
-    static let ssimBackward = "trainer_ssim_backward"
     static let lossDepth = "trainer_loss_depth"
     static let lossFinalize = "trainer_loss_finalize"
     static let rasterizeBackward = "trainer_rasterize_backward"
@@ -152,12 +149,12 @@ enum TrainerKernel {
     static let adamSH = "trainer_adam_sh"
     static let extractCenters = "trainer_extract_centers"
 
-    /// All 28, for the compile loop and for the "did we miss one" check.
+    /// All 25, for the compile loop and for the "did we miss one" check.
     static let all: [String] = [
-        fillUInt, fillFloat, resetVisibility, resetDensifyStats,
+        fillUInt, fillFloat, resetDensifyStats,
         scanBlock, scanAdd, radixHistogram, radixScatter,
         preprocess, duplicateKeys, tileRanges, rasterizeForward,
-        lossPhotometric, ssimPrepare, blurH, blurV, ssimStats, ssimBackward,
+        lossPhotometric, blurH, blurV, ssimStats,
         lossDepth, lossFinalize, rasterizeBackward, preprocessBackward,
         samplingRateUpdate, filter3DFinalize, regularizer,
         adamSplat, adamSH, extractCenters
@@ -182,11 +179,6 @@ enum TrainerBind {
         static let target = 0
         static let count = 1       // constant uint&
         static let value = 2       // constant float&
-    }
-
-    enum ResetVisibility {
-        static let stats = 0
-        static let count = 1
     }
 
     enum ResetDensifyStats {
@@ -281,11 +273,6 @@ enum TrainerBind {
         static let uniforms = 8      // TrainerLossUniforms
     }
 
-    enum SSIMPrepare {
-        static let planes = 0
-        static let uniforms = 1      // TrainerBlurUniforms
-    }
-
     enum Blur {
         static let src = 0
         static let dst = 1
@@ -296,13 +283,6 @@ enum TrainerBind {
         static let blurred = 0
         static let partials = 1
         static let lossAccum = 2
-        static let uniforms = 3      // TrainerLossUniforms
-    }
-
-    enum SSIMBackward {
-        static let blurredPartials = 0
-        static let lumaPlanes = 1
-        static let gradFinal = 2
         static let uniforms = 3      // TrainerLossUniforms
     }
 
@@ -326,6 +306,8 @@ enum TrainerBind {
         static let gradTFinal = 5
         static let exposureGrad = 6
         static let uniforms = 7      // TrainerLossUniforms
+        static let blurredPartials = 8
+        static let lumaPlanes = 9
     }
 
     enum RasterizeBackward {
@@ -383,6 +365,7 @@ enum TrainerBind {
         static let grad = 2
         static let lossAccum = 3
         static let uniforms = 4      // TrainerRegUniforms
+        static let tilesTouched = 5
     }
 
     enum AdamSplat {
@@ -392,6 +375,7 @@ enum TrainerBind {
         static let v = 3
         static let stats = 4
         static let uniforms = 5      // TrainerAdamUniforms
+        static let tilesTouched = 6
     }
 
     enum AdamSH {
@@ -401,6 +385,7 @@ enum TrainerBind {
         static let v = 3
         static let stats = 4
         static let uniforms = 5      // TrainerAdamUniforms
+        static let tilesTouched = 6
     }
 
     enum ExtractCenters {

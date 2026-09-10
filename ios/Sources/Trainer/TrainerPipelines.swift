@@ -42,7 +42,6 @@ final class TrainerPipelines {
 
     let fillUInt: MTLComputePipelineState
     let fillFloat: MTLComputePipelineState
-    let resetVisibility: MTLComputePipelineState
     let resetDensifyStats: MTLComputePipelineState
     let scanBlock: MTLComputePipelineState
     let scanAdd: MTLComputePipelineState
@@ -54,11 +53,9 @@ final class TrainerPipelines {
     let rasterizeForward: MTLComputePipelineState
     let background: MTLComputePipelineState
     let lossPhotometric: MTLComputePipelineState
-    let ssimPrepare: MTLComputePipelineState
     let blurH: MTLComputePipelineState
     let blurV: MTLComputePipelineState
     let ssimStats: MTLComputePipelineState
-    let ssimBackward: MTLComputePipelineState
     let lossDepth: MTLComputePipelineState
     let lossFinalize: MTLComputePipelineState
     let rasterizeBackward: MTLComputePipelineState
@@ -114,7 +111,6 @@ final class TrainerPipelines {
 
         fillUInt = try build(TrainerKernel.fillUInt)
         fillFloat = try build(TrainerKernel.fillFloat)
-        resetVisibility = try build(TrainerKernel.resetVisibility)
         resetDensifyStats = try build(TrainerKernel.resetDensifyStats)
         scanBlock = try build(TrainerKernel.scanBlock)
         scanAdd = try build(TrainerKernel.scanAdd)
@@ -126,11 +122,9 @@ final class TrainerPipelines {
         rasterizeForward = try build(TrainerKernel.rasterizeForward)
         background = try build(TrainerKernel.background)
         lossPhotometric = try build(TrainerKernel.lossPhotometric)
-        ssimPrepare = try build(TrainerKernel.ssimPrepare)
         blurH = try build(TrainerKernel.blurH)
         blurV = try build(TrainerKernel.blurV)
         ssimStats = try build(TrainerKernel.ssimStats)
-        ssimBackward = try build(TrainerKernel.ssimBackward)
         lossDepth = try build(TrainerKernel.lossDepth)
         lossFinalize = try build(TrainerKernel.lossFinalize)
         // Specialised: its batch bound uses simd_max, which is Apple7 (A14)
@@ -258,15 +252,6 @@ struct TrainerGPU {
         var v = value
         encoder.setBytes(&v, length: MemoryLayout<Float>.size, index: TrainerBind.FillFloat.value)
         dispatch1D(encoder, pipelines.fillFloat, count: count)
-    }
-
-    func resetVisibility(_ encoder: MTLComputeCommandEncoder, count: Int) {
-        guard count > 0 else { return }
-        encoder.setComputePipelineState(pipelines.resetVisibility)
-        encoder.setBuffer(resources.stats, offset: 0, index: TrainerBind.ResetVisibility.stats)
-        var n = UInt32(count)
-        encoder.setBytes(&n, length: MemoryLayout<UInt32>.size, index: TrainerBind.ResetVisibility.count)
-        dispatch1D(encoder, pipelines.resetVisibility, count: count)
     }
 
     func resetDensifyStats(_ encoder: MTLComputeCommandEncoder, count: Int) {
@@ -574,15 +559,13 @@ struct TrainerGPU {
             planeCount: UInt32(TrainerGPUConstants.ssimPlaneCount)
         )
 
-        // X*X, Y*Y, X*Y into planes 2, 3, 4 of ssimSrc.
-        encoder.setComputePipelineState(pipelines.ssimPrepare)
-        encoder.setBuffer(resources.ssimSrc, offset: 0, index: TrainerBind.SSIMPrepare.planes)
-        encoder.setBytes(
-            &blur, length: MemoryLayout<TrainerBlurUniforms>.stride, index: TrainerBind.SSIMPrepare.uniforms
-        )
-        dispatch1D(encoder, pipelines.ssimPrepare, count: px)
-
+        // X*X, Y*Y and X*Y are formed inside trainer_blur_h's moments pass;
+        // there is no separate prepare kernel. pad0 MUST go back to 0 before
+        // the partials blur below, or that pass squares the partials.
+        // setBytes copies at encode time, so resetting after the call is right.
+        blur.pad0 = 1
         blurBoth(encoder, from: resources.ssimSrc, through: resources.ssimTmp, into: resources.ssimMid, blur: &blur)
+        blur.pad0 = 0
 
         // Moments -> SSIM value and the five partial-derivative planes.
         encoder.setComputePipelineState(pipelines.ssimStats)
@@ -603,19 +586,8 @@ struct TrainerGPU {
         blur.planeCount = 3
         // The partials get the same separable blur, and land back in ssimTmp.
         blurBoth(encoder, from: resources.ssimTmp, through: resources.ssimMid, into: resources.ssimTmp, blur: &blur)
-
-        encoder.setComputePipelineState(pipelines.ssimBackward)
-        encoder.setBuffer(
-            resources.ssimTmp, offset: 0, index: TrainerBind.SSIMBackward.blurredPartials
-        )
-        encoder.setBuffer(resources.ssimSrc, offset: 0, index: TrainerBind.SSIMBackward.lumaPlanes)
-        encoder.setBuffer(resources.gradFinal, offset: 0, index: TrainerBind.SSIMBackward.gradFinal)
-        encoder.setBytes(
-            &loss,
-            length: MemoryLayout<TrainerLossUniforms>.stride,
-            index: TrainerBind.SSIMBackward.uniforms
-        )
-        dispatch1D(encoder, pipelines.ssimBackward, count: px)
+        // The SSIM backward is folded into trainer_loss_finalize, the next
+        // dispatch, which reads ssimTmp (blurred partials) and ssimSrc (luma).
     }
 
     /// Horizontal then vertical. `scratch` must be a third buffer, never
@@ -651,6 +623,12 @@ struct TrainerGPU {
         guard px > 0 else { return }
         encoder.setComputePipelineState(pipelines.lossFinalize)
         encoder.setBuffer(resources.gradFinal, offset: 0, index: TrainerBind.LossFinalize.gradFinal)
+        encoder.setBuffer(
+            resources.ssimTmp, offset: 0, index: TrainerBind.LossFinalize.blurredPartials
+        )
+        encoder.setBuffer(
+            resources.ssimSrc, offset: 0, index: TrainerBind.LossFinalize.lumaPlanes
+        )
         encoder.setBuffer(
             resources.renderColor, offset: 0, index: TrainerBind.LossFinalize.renderColor
         )
@@ -858,6 +836,9 @@ struct TrainerGPU {
         encoder.setBuffer(resources.stats, offset: 0, index: TrainerBind.Regularizer.stats)
         encoder.setBuffer(resources.splatGrad, offset: 0, index: TrainerBind.Regularizer.grad)
         encoder.setBuffer(resources.lossAccum, offset: 0, index: TrainerBind.Regularizer.lossAccum)
+        encoder.setBuffer(
+            resources.tilesTouched, offset: 0, index: TrainerBind.Regularizer.tilesTouched
+        )
         encoder.setBytes(
             &reg,
             length: MemoryLayout<TrainerRegUniforms>.stride,
@@ -875,6 +856,9 @@ struct TrainerGPU {
         encoder.setBuffer(resources.adamM, offset: 0, index: TrainerBind.AdamSplat.m)
         encoder.setBuffer(resources.adamV, offset: 0, index: TrainerBind.AdamSplat.v)
         encoder.setBuffer(resources.stats, offset: 0, index: TrainerBind.AdamSplat.stats)
+        encoder.setBuffer(
+            resources.tilesTouched, offset: 0, index: TrainerBind.AdamSplat.tilesTouched
+        )
         encoder.setBytes(
             &adam,
             length: MemoryLayout<TrainerAdamUniforms>.stride,
@@ -895,6 +879,9 @@ struct TrainerGPU {
         encoder.setBuffer(resources.shAdamM, offset: 0, index: TrainerBind.AdamSH.m)
         encoder.setBuffer(resources.shAdamV, offset: 0, index: TrainerBind.AdamSH.v)
         encoder.setBuffer(resources.stats, offset: 0, index: TrainerBind.AdamSH.stats)
+        encoder.setBuffer(
+            resources.tilesTouched, offset: 0, index: TrainerBind.AdamSH.tilesTouched
+        )
         encoder.setBytes(
             &adam,
             length: MemoryLayout<TrainerAdamUniforms>.stride,
@@ -951,7 +938,7 @@ struct TrainerGPU {
         // trainer_preprocess_backward zeroes a drawn splat's two rows before
         // it accumulates into them, and an undrawn splat's rows are never
         // read: both Adam kernels and trainer_regularizer skip
-        // visibleFlag == 0, with sparse = 1. 28.8 MB of fill an iteration at
+        // tilesTouched == 0, with sparse = 1. 28.8 MB of fill an iteration at
         // 300k splats.
         // splatGrad2D IS NOT CLEARED HERE ANY MORE. trainer_preprocess_backward
         // zeroes each row as it consumes it, which it can do exactly because it
@@ -996,15 +983,5 @@ struct TrainerGPU {
             index: TrainerBind.Background.uniforms
         )
         dispatch1D(encoder, pipelines.background, count: px)
-    }
-
-    /// The one part of the per-iteration reset that is not a zero fill.
-    ///
-    /// The visibility mask is per step; the densification statistics are per
-    /// interval and are deliberately NOT touched here.
-    func resetVisibilityForIteration(
-        _ encoder: MTLComputeCommandEncoder, splatCount: Int
-    ) {
-        resetVisibility(encoder, count: splatCount)
     }
 }

@@ -84,7 +84,8 @@ ORDER = ['gpuBusy', 'gpuScan', 'gpuStep', 'gpuSort', 'gpuForward', 'gpuLosses',
          'earlyStopEval',
          'gpuBackward', 'gpuOptimiser', 'gpuOther', 'gpuWait',
          'supervision', 'supervisionPrefetched',
-         'densify', 'previewSnapshot', 'filterSweep', 'upload', 'prologue']
+         'densify', 'previewSnapshot', 'filterSweep', 'upload', 'prologue',
+         'encodeStep']
 for k in ORDER:
     if k not in t:
         continue
@@ -115,6 +116,16 @@ accounted = t.get('supervision', 0) + t.get('gpuWait', 0)
 rest = wall - accounted
 print('%-22s %9.1f %7.1f%% %11.2f'
       % ('unaccounted', rest, 100 * rest / wall, 1000 * rest / iters))
+# Timed CPU buckets on the critical path but outside gpuWait's own clock.
+# earlyStopEval and densify CONTAIN some gpuWait (every finish() adds to it),
+# so subtracting them whole over-subtracts: the figure below is a LOWER bound
+# on what no clock covers. The wall is whole-second ISO dates, +/- 1 s.
+cpu = sum(t.get(k, 0) for k in ('upload', 'previewSnapshot', 'densify',
+                                'earlyStopEval', 'filterSweep', 'prologue',
+                                'encodeStep'))
+print('%-22s %9.1f %7.1f%% %11.2f   (lower bound, wall +/- 1 s)'
+      % ('  of which untimed', rest - cpu, 100 * (rest - cpu) / wall,
+         1000 * (rest - cpu) / iters))
 
 # Did the prefetch actually overlap?
 pre = t.get('supervisionPrefetched', 0)

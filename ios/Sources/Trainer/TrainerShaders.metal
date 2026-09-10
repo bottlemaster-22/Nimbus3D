@@ -627,17 +627,6 @@ kernel void trainer_fill_float(
     target[gid] = value;
 }
 
-/// Zeroes the per-step fields of the stats buffer without touching the
-/// accumulating densification statistics or the per-Gaussian Adam step count.
-kernel void trainer_reset_visibility(
-    device TrainerSplatStats* stats [[buffer(0)]],
-    constant uint&            count [[buffer(1)]],
-    uint                      gid   [[thread_position_in_grid]]
-) {
-    if (gid >= count) { return; }
-    stats[gid].visibleFlag = 0;
-}
-
 /// Zeroes the densification accumulators. Called after EVERY densification
 /// pass, including one that changed nothing, and never between iterations: the
 /// statistic is meant to average over exactly one interval.
@@ -858,7 +847,6 @@ kernel void trainer_preprocess(
     if (gid >= cam.splatCount) { return; }
 
     tilesTouched[gid] = 0u;
-    draws[gid].opacity = 0.0f;
 
     const TrainerSplat s = splats[gid];
     const float3 meanWorld = float3(s.mean);
@@ -1073,9 +1061,11 @@ kernel void trainer_preprocess(
     // rasteriser inner loops, to contribute nothing.
     //
     // The prologue at the top of this kernel already wrote tilesTouched 0,
-    // radiusPx 0 and opacity 0, which is precisely the state the rest of
-    // the pipeline reads as "not drawn". Returning here leaves that state
-    // intact rather than needing a second representation of it.
+    // which is the ONLY "not drawn" signal the rest of the pipeline reads:
+    // preprocess_backward, duplicate_keys, the regulariser and both Adam
+    // kernels all test it, and draws[gid] is read only where it is non-zero,
+    // i.e. after the full `draws[gid] = d` store below. The prologue used to
+    // store opacity 0 into draws too, a dead 19.2 MB scattered write.
     //
     // What this DOES change, deliberately: visibleFlag and denom below are
     // not written for these splats. Their raster gradient was already zero
@@ -1138,7 +1128,10 @@ kernel void trainer_preprocess(
 
     tilesTouched[gid] = touched;
 
-    atomic_store_explicit(&stats[gid].visibleFlag, 1u, memory_order_relaxed);
+    // visibleFlag is no longer written or read. The regulariser and both
+    // Adam kernels gate on tilesTouched, which is the identical predicate:
+    // this kernel writes tilesTouched[gid] = 0 in its prologue and
+    // tilesTouched[gid] = touched (> 0) just above, with no return between.
     // One observation of this Gaussian, for the AbsGS denominator. Pixel-GS
     // area weighting lives in the numerator, which grows with coverage.
     trainer_atomicAdd(&stats[gid].denom, 1.0f);
@@ -1522,10 +1515,9 @@ kernel void trainer_loss_photometric(
     gradFinal[gid * 3u + 1u] = g.y;
     gradFinal[gid * 3u + 2u] = g.z;
 
-    composited[gid * 3u + 0u] = rendered.x;
-    composited[gid * 3u + 1u] = rendered.y;
-    composited[gid * 3u + 2u] = rendered.z;
-
+    // `composited` is no longer written: nothing reads it (its only binding
+    // is this kernel's own). 4.67 MB of writes an iteration. The parameter
+    // stays so the binding table is unchanged.
     ssimPlanes[0u * u.pixelCount + gid] = dot(rendered, TRAINER_LUMA);
     ssimPlanes[1u * u.pixelCount + gid] = dot(truth, TRAINER_LUMA);
 }
@@ -1541,25 +1533,11 @@ kernel void trainer_loss_photometric(
 //
 // Plane layout in `ssimPlanes` (each `pixelCount` floats):
 //   forward in : 0 = X (rendered luma), 1 = Y (gt luma)
-//   forward mid: 0 = X, 1 = Y, 2 = X*X, 3 = Y*Y, 4 = X*Y      (pre-blur)
+//   forward mid: 2 = X*X, 3 = Y*Y, 4 = X*Y are formed per tap inside
+//                trainer_blur_h's moments pass, never stored pre-blur
 //   forward out: 0 = mu_x, 1 = mu_y, 2 = G*XX, 3 = G*YY, 4 = G*XY
 //   backward in: 0 = Cc, 1 = A, 2 = A*mu_x, 3 = B, 4 = B*mu_y (pre-blur)
 // ============================================================================
-
-/// Builds the five pre-blur planes from X and Y.
-kernel void trainer_ssim_prepare(
-    device float*                 planes [[buffer(0)]],
-    constant TrainerBlurUniforms& u      [[buffer(1)]],
-    uint                          gid    [[thread_position_in_grid]]
-) {
-    const uint n = u.width * u.height;
-    if (gid >= n) { return; }
-    const float x = planes[0u * n + gid];
-    const float y = planes[1u * n + gid];
-    planes[2u * n + gid] = x * x;
-    planes[3u * n + gid] = y * y;
-    planes[4u * n + gid] = x * y;
-}
 
 /// Separable Gaussian blur, horizontal then vertical, over `planeCount`
 /// planes. Clamp-to-edge, which is what every SSIM implementation does at the
@@ -1590,6 +1568,31 @@ kernel void trainer_blur_h(
         0.21300554f, 0.10936069f, 0.03600077f, 0.00759876f, 0.00102838f
     };
 
+    // pad0 != 0 marks the MOMENTS pass (planeCount 5). Planes 2..4, X*X, Y*Y
+    // and X*Y, are formed per tap from planes 0 and 1 here instead of being
+    // written by a separate kernel and read back: one dispatch and about
+    // 12.4 MB an iteration. The partials pass sends pad0 = 0.
+    if (u.pad0 != 0u) {
+        float s0 = 0.0f, s1 = 0.0f, sxx = 0.0f, syy = 0.0f, sxy = 0.0f;
+        for (int t = -int(TRAINER_SSIM_RADIUS); t <= int(TRAINER_SSIM_RADIUS); ++t) {
+            const int sx = clamp(int(gid.x) + t, 0, int(u.width) - 1);
+            const uint at = gid.y * u.width + uint(sx);
+            const float w = k[t + int(TRAINER_SSIM_RADIUS)];
+            const float x = src[at];
+            const float y = src[n + at];
+            s0 += w * x;
+            s1 += w * y;
+            sxx += w * (x * x);
+            syy += w * (y * y);
+            sxy += w * (x * y);
+        }
+        dst[idx] = s0;
+        dst[n + idx] = s1;
+        dst[2u * n + idx] = sxx;
+        dst[3u * n + idx] = syy;
+        dst[4u * n + idx] = sxy;
+        return;
+    }
     for (uint p = 0; p < u.planeCount; ++p) {
         float sum = 0.0f;
         for (int t = -int(TRAINER_SSIM_RADIUS); t <= int(TRAINER_SSIM_RADIUS); ++t) {
@@ -1684,36 +1687,7 @@ kernel void trainer_ssim_stats(
     partials[2u * n + gid] = B;
 }
 
-/// Assembles dL/dX from the blurred partials and folds it into dL/dC_final
-/// through the luma weights.
-///
-///   dL/dX_q = (G*Cc)_q + 2 X_q (G*A)_q - 2 (G*(A mu_x))_q
-///                      +   Y_q (G*B)_q -   (G*(B mu_y))_q
-kernel void trainer_ssim_backward(
-    const device float*           blurredPartials [[buffer(0)]],
-    const device float*           lumaPlanes      [[buffer(1)]],  // 0 = X, 1 = Y
-    device float*                 gradFinal       [[buffer(2)]],
-    constant TrainerLossUniforms& u               [[buffer(3)]],
-    uint                          gid             [[thread_position_in_grid]]
-) {
-    const uint n = u.pixelCount;
-    if (gid >= n) { return; }
-
-    const float X = lumaPlanes[0u * n + gid];
-    const float Y = lumaPlanes[1u * n + gid];
-
-    // Plane 0 already carries Cc - 2 A mux - B muy, folded before the blur in
-    // trainer_ssim_stats. Same value, two fewer planes convolved.
-    const float gP = blurredPartials[0u * n + gid];
-    const float gA = blurredPartials[1u * n + gid];
-    const float gB = blurredPartials[2u * n + gid];
-
-    const float dLdX = gP + 2.0f * X * gA + Y * gB;
-
-    gradFinal[gid * 3u + 0u] += dLdX * TRAINER_LUMA.x;
-    gradFinal[gid * 3u + 1u] += dLdX * TRAINER_LUMA.y;
-    gradFinal[gid * 3u + 2u] += dLdX * TRAINER_LUMA.z;
-}
+/// (dL/dX assembly lives in trainer_loss_finalize: see the fold there.)
 
 // ============================================================================
 // MARK: - Loss: depth, free space, alpha (F2, F3, F4, F6)
@@ -1911,7 +1885,7 @@ kernel void trainer_loss_depth(
 /// Turns dL/dC_final into dL/dC_splat and the background's share of
 /// dL/dT_final, and accumulates the per-frame exposure gradients.
 kernel void trainer_loss_finalize(
-    const device float*           gradFinal    [[buffer(0)]],
+    device float*                 gradFinal    [[buffer(0)]],   // L1 part in, full dL/dC_final out
     const device float*           renderColor  [[buffer(1)]],
     const device float*           renderTFinal [[buffer(2)]],
     const device float*           bgColor      [[buffer(3)]],
@@ -1919,13 +1893,31 @@ kernel void trainer_loss_finalize(
     device float*                 gradTFinal   [[buffer(5)]],
     device atomic_float*          exposureGrad [[buffer(6)]],   // (gain, bias)
     constant TrainerLossUniforms& u            [[buffer(7)]],
+    const device float*           blurredPartials [[buffer(8)]],  // ssimTmp planes 0..2
+    const device float*           lumaPlanes      [[buffer(9)]],  // ssimSrc planes 0 (X), 1 (Y)
     uint                          gid          [[thread_position_in_grid]]
 ) {
     if (gid >= u.pixelCount) { return; }
 
-    const float3 g = float3(gradFinal[gid * 3u + 0u],
-                            gradFinal[gid * 3u + 1u],
-                            gradFinal[gid * 3u + 2u]);
+    // THE SSIM BACKWARD, FOLDED IN. It was its own kernel, which read
+    // gradFinal, added dL/dX through the luma weights and wrote it back, one
+    // dispatch before this one read it again. Same expression:
+    //   dL/dX = (G*P) + 2 X (G*A) + Y (G*B), with P already folded by
+    //   trainer_ssim_stats before the blur.
+    const uint n = u.pixelCount;
+    const float X = lumaPlanes[0u * n + gid];
+    const float Y = lumaPlanes[1u * n + gid];
+    const float dLdX = blurredPartials[0u * n + gid]
+                     + 2.0f * X * blurredPartials[1u * n + gid]
+                     + Y * blurredPartials[2u * n + gid];
+    const float3 g = float3(gradFinal[gid * 3u + 0u] + dLdX * TRAINER_LUMA.x,
+                            gradFinal[gid * 3u + 1u] + dLdX * TRAINER_LUMA.y,
+                            gradFinal[gid * 3u + 2u] + dLdX * TRAINER_LUMA.z);
+    // Written back so gradFinal still holds the FULL dL/dC_final:
+    // MetalSplatTrainer.accumulateBackgroundGradient reads it on the CPU.
+    gradFinal[gid * 3u + 0u] = g.x;
+    gradFinal[gid * 3u + 1u] = g.y;
+    gradFinal[gid * 3u + 2u] = g.z;
 
     // C_final = gain * (C_splat + T * bg) + bias
     const float3 gSplat = u.exposureGain * g;
@@ -2349,9 +2341,8 @@ kernel void trainer_preprocess_backward(
     // clearPerIteration no longer blit-fills them (28.8 MB an iteration at
     // 300k splats). Same invariant as the splatGrad2D clear below: both Adam
     // kernels and trainer_regularizer read or write a row only where
-    // visibleFlag == 1, trainer_preprocess sets visibleFlag on exactly the
-    // path that writes tilesTouched > 0, and this kernel is the FIRST writer
-    // of both rows in the step. Zero first, then accumulate exactly as
+    // tilesTouched != 0, the very predicate this kernel returns on above,
+    // and this kernel is the FIRST writer of both rows in the step. Zero first, then accumulate exactly as
     // before, so it is bit-exact with the blit: the conicDet return below
     // still leaves scale, rotation and mean at zero, trainer_ownedAdd may
     // still skip a zero or non-finite value, and `pad` is zero because the
@@ -2751,6 +2742,7 @@ kernel void trainer_regularizer(
     device TrainerSplatGrad*        grad   [[buffer(2)]],
     device atomic_float*            lossAccum [[buffer(3)]],
     constant TrainerRegUniforms&    u      [[buffer(4)]],
+    const device uint*              tilesTouched [[buffer(5)]],
     uint                            gid    [[thread_position_in_grid]]
 ) {
     if (gid >= u.count) { return; }
@@ -2761,7 +2753,7 @@ kernel void trainer_regularizer(
     // atomic. It is also what lets splatGrad go uncleared for undrawn rows.
     // Model-neutral. lossEMA reads lower (prior terms over drawn splats
     // only); it feeds progress reports only, early stopping reads PSNR.
-    if (u.sparse != 0u && stats[gid].visibleFlag == 0u) { return; }
+    if (u.sparse != 0u && tilesTouched[gid] == 0u) { return; }
     const TrainerSplat s = splats[gid];
     const TrainerSplatStats st = stats[gid];
 
@@ -2856,10 +2848,11 @@ kernel void trainer_adam_splat(
     device TrainerSplatGrad*     vBuf   [[buffer(3)]],
     device TrainerSplatStats*    stats  [[buffer(4)]],
     constant TrainerAdamUniforms& u     [[buffer(5)]],
+    const device uint*           tilesTouched [[buffer(6)]],
     uint                         gid    [[thread_position_in_grid]]
 ) {
     if (gid >= u.count) { return; }
-    if (u.sparse != 0u && stats[gid].visibleFlag == 0u) { return; }
+    if (u.sparse != 0u && tilesTouched[gid] == 0u) { return; }
 
     // Per-Gaussian step count. A Gaussian seen in 3 of 3000 steps has to be
     // bias-corrected as if it were on step 3; using the global step here is
@@ -2939,12 +2932,13 @@ kernel void trainer_adam_sh(
     device float*                 vBuf  [[buffer(3)]],
     const device TrainerSplatStats* stats [[buffer(4)]],
     constant TrainerAdamUniforms& u     [[buffer(5)]],
+    const device uint*            tilesTouched [[buffer(6)]],
     uint                          gid   [[thread_position_in_grid]]
 ) {
     // One thread per Gaussian; each walks its own coefficient run, so the
     // visibility mask is a single load rather than one per float.
     if (gid >= u.count) { return; }
-    if (u.sparse != 0u && stats[gid].visibleFlag == 0u) { return; }
+    if (u.sparse != 0u && tilesTouched[gid] == 0u) { return; }
 
     const uint step = max(stats[gid].stepCount, 1u);
     const float bc1 = 1.0f - pow(u.beta1, float(step));
