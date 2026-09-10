@@ -942,7 +942,7 @@ enum SmartImageLoader {
     // Closing the pool around the return value is safe: each of these
     // returns a Swift value type owning its own byte storage, so no
     // CoreFoundation object outlives the pool.
-    static func load(url: URL, longEdge: Int) -> SmartImage? {
+    static func load(url: URL, longEdge: Int, includeLuma: Bool = true) -> SmartImage? {
         #if canImport(CoreGraphics)
         return autoreleasepool { () -> SmartImage? in
             guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
@@ -959,18 +959,19 @@ enum SmartImageLoader {
             ]
             guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
             else { return nil }
-            return decode(cg)
+            return decode(cg, includeLuma: includeLuma)
         }
 
         #else
         _ = url
         _ = longEdge
+        _ = includeLuma
         return nil
         #endif
     }
 
     #if canImport(CoreGraphics)
-    static func decode(_ cg: CGImage) -> SmartImage? {
+    static func decode(_ cg: CGImage, includeLuma: Bool = true) -> SmartImage? {
         let w = cg.width, h = cg.height
         guard w > 0, h > 0 else { return nil }
         var pixels = [UInt8](repeating: 0, count: w * h * 4)
@@ -999,15 +1000,23 @@ enum SmartImageLoader {
         // zeroing was 7.78 MB of memset per decode that the very next
         // instruction overwrote.
         let count = w * h
-        let luma = [Float](unsafeUninitializedCapacity: count) { buffer, n in
-            n = count
-            for i in 0..<count {
-                let r = Float(pixels[i * 4 + 0]) / 255
-                let g = Float(pixels[i * 4 + 1]) / 255
-                let b = Float(pixels[i * 4 + 2]) / 255
-                // Kept in sRGB space deliberately: saturation is a property of
-                // the encoded pixel, not of scene radiance.
-                buffer[i] = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        // Luma only when the caller reads it. Training supervision decodes a
+        // photo every iteration (a 3-entry cache over ~120 round-robin
+        // keyframes hits 0 per cent) and reads only `rgb`, so for it this was
+        // a full per-pixel pass and a 1.5 MB array per decode, thrown away,
+        // on the worker the loop waits for.
+        var luma: [Float] = []
+        if includeLuma {
+            luma = [Float](unsafeUninitializedCapacity: count) { buffer, n in
+                n = count
+                for i in 0..<count {
+                    let r = Float(pixels[i * 4 + 0]) / 255
+                    let g = Float(pixels[i * 4 + 1]) / 255
+                    let b = Float(pixels[i * 4 + 2]) / 255
+                    // Kept in sRGB space deliberately: saturation is a property of
+                    // the encoded pixel, not of scene radiance.
+                    buffer[i] = 0.2126 * r + 0.7152 * g + 0.0722 * b
+                }
             }
         }
         let rgb = [SIMD3<Float>](
@@ -1036,9 +1045,14 @@ final class SmartImageCache {
     private let longEdge: Int
     private let lock = NSLock()
 
-    init(capacity: Int = 8, longEdge: Int = 256) {
+    /// False for a caller that never reads `SmartImage.luma` (training
+    /// supervision): its images carry an EMPTY luma array.
+    private let includeLuma: Bool
+
+    init(capacity: Int = 8, longEdge: Int = 256, includeLuma: Bool = true) {
         self.capacity = Swift.max(1, capacity)
         self.longEdge = Swift.max(16, longEdge)
+        self.includeLuma = includeLuma
     }
 
     func image(for frame: CaptureFrame, at ref: CaptureBundleRef) -> SmartImage? {
@@ -1050,7 +1064,9 @@ final class SmartImageCache {
         lock.unlock()
 
         let url = ref.url(forRelativePath: frame.imagePath)
-        guard let loaded = SmartImageLoader.load(url: url, longEdge: longEdge) else { return nil }
+        guard let loaded = SmartImageLoader.load(
+            url: url, longEdge: longEdge, includeLuma: includeLuma
+        ) else { return nil }
 
         lock.lock()
         storage[frame.index] = loaded

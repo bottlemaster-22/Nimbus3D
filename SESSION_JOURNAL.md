@@ -922,3 +922,36 @@ Builds 263 and 264 green (commit 0dd3787). 264 is the build to test.
 The speed work all landed. The picture did not survive the one quality change: picking the look-ahead candidate by `motionBlurPixels` instead of `qc.weight`. held_out_frames.json moved from [18 ... 421] to [23 ... 515], so the test set itself changed, but SSIM and trained-view PSNR fell too. Mechanism, read from the selector and refutation [40]: the walk goes in frame order and stops at 120; the least blurred candidate sits further ahead in the window, lastCenter jumps further, and the same 120 keyframes spread over more of a capture whose second half is a REVISIT of the first (every late camera within 1 m of an early one). [40]'s offline measurement priced exactly that spread as a loss: 13.9 views per splat to 11.6 to 12.1. Reverted in 266, which also records the keyframe span in the census. If 266 returns to about 20.47 it also confirms the parallel trust build is exact.
 
 **Standing rule from the owner, 2026-09-11:** no finding is refuted or dropped without my own check against the code or the data. All 223 refutation records are being re-read by hand.
+
+---
+
+## 2026-09-11 (later) : Every refutation re-read by hand, and what came back
+
+Owner's rule: nothing refuted without my own check. All 223 records read (73 refuted findings, 50 missed ones, 100 patch-review notes). Verdicts, and what I checked for each, are in `tools/offline/REFUTATION_LEDGER.md`.
+
+**Refutations that were wrong, with the measurement that shows it:** A03 (CPU parallelism called "rearrangement"; carving, trust and time-offset since paid 2.0, 1.0 and 0.7 s), M16 (memcpy called 0.5%; it was 126 s to 101 s of training), M19 (clear-folding called free of byte savings; gpuScan went 6.7 to 3.8 s), A26 (exposure called constant from frames 0-15 only; the capture's shutter spans 0.74 stops).
+
+**Reopened:**
+- **Near-camera veil.** Found inside the A26/A27 refutations and never followed up: deleting every splat within 0.5 m of the camera raised PSNR on the 16 photographed frames by a mean +2.2 dB (up to +5.5) on 264's model. Those splats are wrong, not real geometry, or removing them would lower the score. The offline tools had NO tangent clamp in any of their three Jacobian copies (project.py, raster.py, detail.py), so that number is being re-measured with the device's clamp before anything is believed.
+- **Registration** (A11, A27, M36, M45): pose error up to 8.5 render px against a 3.7 px median splat; the ICP cap tries 600 of 24,916 candidates.
+- **Supervision worker** (M00, M02): the loop now waits 4.2 s for it because the GPU caught up. Per-sample trust lookups took ~5 locks each; every decode built a luma array supervision never reads. Both fixed locally (see below).
+- **Experiments that cost no speed:** disc prior off (A25, A69), SH rest learning rate (A59: our band 1 is 4.8x weaker than Scaniverse's), split share 1.0 with shrink 2.0 (A54), image-detail seed sizing (A62, A64), the backward's p/q reformulation (A45).
+- **Keyframes** (A13, M47): rotation admits 104 of 120 keyframes, which is what ends the walk at frame ~515 of 868; sharper supervision needs MORE keyframes (264 proved a thinner spread costs 0.7 dB).
+
+**Applied locally, NOT pushed** (holding until the owner tests 266): supervision fetches each frame's trust slices once (SmartFrameTrust, identical values, the nil-trust 0.5 vs no-noise-reader 0 distinction kept); supervision's image cache decodes rgb only. trapconv, deadwire and brandmatch pass.
+
+**The veil is not real.** Re-measured with the device's tangent clamp in all four offline Jacobian copies: deleting splats within 0.5 m of the camera changes PSNR by 0.000 dB on all 16 frames. The +2.2 dB was the offline renderer drawing unclamped off-axis near-plane splats that the phone has clamped since 250. The same fix exposes a wider problem: every offline render since 250 understated the model by about 2 dB, so offline render-based conclusions from 250 to now must be re-run (A27's pose-shift gain is one). `project.TANGENT_CLAMP` now governs all of them.
+
+---
+
+## 2026-09-11 : Build 266 measured, quality restored, and a speed conclusion withdrawn
+
+Best held-out PSNR **20.47**, SSIM **0.6654**, 299,976 splats: back to 260 exactly. 264's 0.7 dB loss was the keyframe selector, and the parallel trust build is confirmed exact. Total 81.6 s (pre-pass 8.6, training 73).
+
+**Withdrawn:** "tgIndex removal made gpuStep 6.5 per cent slower." 266 restored tgIndex and measured gpuStep 52.4 s, the same as 260 without it (52.2). gpuStep on identical GPU code moves about +/-3 s between runs, and the keyframe SET moves it about 6 s (264's frames rendered cheaper: 46.4). A 3 s difference between two single runs is not evidence. tgIndex stays restored (the original code) and the question is open.
+
+**Keyframe span, first measurement:** frames 0 to 439 of 868, 51 per cent of the capture; 428 frames after the last keyframe never train.
+
+### BUILD 268
+
+The two supervision fixes held back for 266: per-frame trust slices instead of ~5 locks per sample, and rgb-only decoding for supervision's image cache. The loop waited 3.7 s for supervision on 266.

@@ -80,8 +80,16 @@ def geometry_full(col, count, R, t, fx, fy, cx, cy):
     sigma_cam = R @ (M @ np.transpose(M, (0, 2, 1))) @ R.T
     j00 = fx * inv_z
     j11 = fy * inv_z
-    j02 = -fx * cam[:, 0] * inv_z * inv_z
-    j12 = -fy * cam[:, 1] * inv_z * inv_z
+    # Device tangent clamp (build 250+): 1.3x the frame half-angle.
+    if P.TANGENT_CLAMP:
+        _lx, _ly = 1.3 * cx / fx, 1.3 * cy / fy
+        _zz = cam[:, 2]
+        _txc = np.clip(cam[:, 0] / np.where(np.abs(_zz) > 1e-9, _zz, 1e-9), -_lx, _lx) * _zz
+        _tyc = np.clip(cam[:, 1] / np.where(np.abs(_zz) > 1e-9, _zz, 1e-9), -_ly, _ly) * _zz
+    else:
+        _txc, _tyc = cam[:, 0], cam[:, 1]
+    j02 = -fx * _txc * inv_z * inv_z
+    j12 = -fy * _tyc * inv_z * inv_z
     s00, s01, s02 = sigma_cam[:, 0, 0], sigma_cam[:, 0, 1], sigma_cam[:, 0, 2]
     s11, s12, s22 = sigma_cam[:, 1, 1], sigma_cam[:, 1, 2], sigma_cam[:, 2, 2]
     a0 = j00 * s00 + j02 * s02

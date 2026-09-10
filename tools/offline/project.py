@@ -83,6 +83,10 @@ def load_intrinsics(render_w, render_h):
 
 
 # ------------------------------------------------------- the projection itself
+# Match the device (build 250+). Set False to reproduce pre-250 censuses.
+TANGENT_CLAMP = True
+
+
 def project(col, count, R, t, fx, fy, cx, cy, tiles_x, tiles_y):
     """Returns (visible, radius3sigma_px, tiles_touched, extent_x, extent_y).
 
@@ -127,8 +131,17 @@ def project(col, count, R, t, fx, fy, cx, cy, tiles_x, tiles_y):
     inv_z2 = inv_z * inv_z
     j00 = fx * inv_z
     j11 = fy * inv_z
-    j02 = -fx * cam[:, 0] * inv_z2
-    j12 = -fy * cam[:, 1] * inv_z2
+    # Build 250+ tangent clamp, as trainer_preprocess: the Jacobian is evaluated at
+    # x/z clamped to 1.3x the frame half-angle (cx/fx stands in for 0.5*W/fx).
+    # Without it these tools overstate every off-axis near-plane footprint.
+    if TANGENT_CLAMP:
+        limx, limy = 1.3 * cx / fx, 1.3 * cy / fy
+        txc = np.clip(cam[:, 0] * inv_z, -limx, limx) * z
+        tyc = np.clip(cam[:, 1] * inv_z, -limy, limy) * z
+    else:
+        txc, tyc = cam[:, 0], cam[:, 1]
+    j02 = -fx * txc * inv_z2
+    j12 = -fy * tyc * inv_z2
 
     s00 = sigma_cam[:, 0, 0]
     s01 = sigma_cam[:, 0, 1]

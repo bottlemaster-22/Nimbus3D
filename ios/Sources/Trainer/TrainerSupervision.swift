@@ -299,7 +299,10 @@ final class TrainerSupervisionBuilder {
         // hit rate: the trainer shuffles its keyframes once and then walks
         // them round-robin, so the reuse distance is the whole cycle and
         // nothing was ever still resident when it came round again.
-        imageCache = SmartImageCache(capacity: 3, longEdge: self.requestedLongEdge)
+        // includeLuma false: this builder reads only image.rgb.
+        imageCache = SmartImageCache(
+            capacity: 3, longEdge: self.requestedLongEdge, includeLuma: false
+        )
         depthCache = SmartDepthCache(capacity: 128, sampleCount: depthWidth * depthHeight)
     }
 
@@ -325,7 +328,7 @@ final class TrainerSupervisionBuilder {
         let target = Swift.max(pixels, 64)
         guard target < requestedLongEdge else { return false }
         requestedLongEdge = target
-        imageCache = SmartImageCache(capacity: 3, longEdge: target)
+        imageCache = SmartImageCache(capacity: 3, longEdge: target, includeLuma: false)
         // Cleared, not recomputed: the next decodable frame fixes the new grid
         // and rescales the intrinsics to it, by the same path the first frame
         // of the run took.
@@ -520,6 +523,17 @@ final class TrainerSupervisionBuilder {
         let noEntryRegime: SmartDepthRegime = (authority == nil) ? .near : .far
         let noEntryAuthority: Float = (authority == nil) ? 0.5 : 0
         let affine = trust?.depthAffine(frame: frame.index) ?? .identity
+        // The frame's trust slices, fetched ONCE. The per-sample calls below
+        // went through TwoScaleTrustField.weight and .sigmaMeters, each of
+        // which takes the field's lock and then the reader's lock to reach
+        // the same cached slice: about 5 lock round trips and a dozen
+        // refcount operations per sample, 49,152 samples a frame, on the
+        // prefetch worker that the loop waited 4.2 s for on build 264.
+        // SmartFrameTrust computes from the same slices with the same
+        // defaults for out-of-range and non-finite samples, so every weight
+        // and sigma is identical. The two "no trust" cases stay distinct: no
+        // trust field at all means 0.5, a field without its noise reader 0.
+        let frameTrust = trust?.frameTrust(frame: frame.index)
         let qcWeight = TrainerMath.clamp(frame.qc.weight, 0, 1)
         let modeRadius = Swift.max(settings.modeWindowRadius, 1)
         let freeSpaceMargin = settings.freeSpaceBoundMarginMeters
@@ -589,7 +603,9 @@ final class TrainerSupervisionBuilder {
                 // construction; the authority is the per-pixel right to be
                 // believed; the QC weight is how good the photo was. All three
                 // multiply, which is what the depth-sample contract asks for.
-                let trustWeight = trust?.weight(frame: frame.index, sampleIndex: index) ?? 0.5
+                let trustWeight: Float = trust == nil
+                    ? 0.5
+                    : (frameTrust?.weight(sampleIndex: index) ?? 0)
                 var weight = trustWeight * authorityValue * qcWeight
                 if rawEdge == .geometric {
                     // The sharpen half of the WHERE/WHAT split: a real depth
@@ -600,7 +616,7 @@ final class TrainerSupervisionBuilder {
 
                 // Huber transition grows with range: 2 cm at 40 cm and 2 cm at
                 // 5 m are not the same event.
-                let sigma = trust?.sigmaMeters(frame: frame.index, sampleIndex: index)
+                let sigma = frameTrust?.sigmaMeters(sampleIndex: index)
                 sample.huberDelta = Swift.max(
                     sigma ?? (settings.huberDeltaMeters * Swift.max(z / 2, 1)),
                     0.004
