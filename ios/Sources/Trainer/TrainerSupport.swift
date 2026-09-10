@@ -689,7 +689,15 @@ struct TrainerTuning: Sendable {
     var binarizeLastFraction: Float = 0
     var binarizeWeight: Float = 0.02
     /// Free-space carving deletion sweep interval, iterations.
-    var carveIntervalIterations: Int = 250
+    /// MUST BE A MULTIPLE OF `densifyIntervalIterations`. The carver only runs
+    /// inside a densification pass: MetalSplatTrainer tests
+    /// `iteration % carveIntervalIterations == 0` inside a block already gated
+    /// on `iteration % densifyIntervalIterations == 0`, so it fires on the
+    /// least common multiple of the two. This read 250 against 100, and build
+    /// 250's census shows it ran at 500, 1000, ... 3500: seven sweeps. 500 is
+    /// what has actually been running and the number now says so. Changing
+    /// the real rate (200 would give 19 sweeps) is a separate, measured change.
+    var carveIntervalIterations: Int = 500
     /// How often a preview snapshot is read back off the GPU.
     /// WAS 50. Raised on the owner's own observation that the preview was
     /// updating far more often than he needed while the trainer waited.
@@ -934,9 +942,15 @@ struct TrainerTuning: Sendable {
     ///
     /// `TrainerDensifier` already reads `stats[i].maxRadiusPxBits` and already
     /// deletes anything above this, and 0 disables the test entirely, so the
-    /// code has never once run. Measured on the current model: a 720 px
-    /// threshold selects 1,060 splats of 298,000, and those 1,060 carry
-    /// **13.44 per cent of every tile instance in the scene**.
+    /// code has never once run. Measured BEFORE the build-250 tangent clamp: a
+    /// 720 px threshold selected 1,060 splats of 298,000, carrying 13.44 per
+    /// cent of every tile instance. The clamp removed every one of them. On
+    /// build 250's model the clamped max-over-views radius peaks at 243.7 px
+    /// over the 108 trained keyframes and 519.7 px over all 868 poses, so this
+    /// prune removes nothing (prunedOversized 0) and is kept only as a guard.
+    /// Lower cutoffs buy nothing: 120 px is 0.30 per cent of tile instances,
+    /// 90 px is 1.27 and costs one held-out view 35 dB against the unpruned
+    /// model.
     ///
     /// The margin is not close. The 99th percentile of projected 3-sigma
     /// radius over drawn splats is 79.1 px, so 720 sits nine times above the

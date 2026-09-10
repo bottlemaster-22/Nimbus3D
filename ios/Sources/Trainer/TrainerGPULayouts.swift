@@ -41,7 +41,7 @@
 //      TrainerCameraUniforms  144 bytes, align 16
 //      TrainerLossUniforms     68 bytes, align 4
 //      TrainerAdamUniforms     64 bytes, align 4
-//      TrainerRegUniforms      32 bytes, align 4
+//      TrainerRegUniforms      36 bytes, align 4
 //      TrainerScanUniforms     16 bytes, align 4
 //      TrainerRadixUniforms    16 bytes, align 4
 //      TrainerBlurUniforms     16 bytes, align 4
@@ -74,39 +74,32 @@ enum TrainerGPUConstants {
     /// Radix digit width. 4 bits keeps the per-thread histogram
     /// (16 bins x 256 threads x 4 bytes = 16 KB) inside the 32 KB threadgroup
     /// allocation every Apple GPU guarantees. 8-bit digits would need 256 KB
-    /// and do not fit, which is why the sort is 8 passes and not 4.
+    /// and do not fit, which is why the sort is 6 passes and not 3.
     static let radixBits = 4
     static var radixBins: Int { 1 << radixBits }
-    /// THIS COMMENT USED TO DESCRIBE A DESIGN THE CODE HAS NEVER IMPLEMENTED,
-    /// which is worse than no comment, so here is what actually ships.
+    /// Sort keys are 24 bits: `(tileID << 12) | logDepth12`, built in
+    /// `trainer_duplicate_keys` as `uint(norm * 4095.0f)`, norm being log2 of
+    /// depth over the [nearPlane, farPlane] cull range, and read back by
+    /// `trainer_tile_ranges` as `key >> 12`. Six 4-bit passes.
     ///
-    /// Sort keys are 32 bits: `(tileID << 16) | quantisedDepth16`, built in
-    /// `trainer_duplicate_keys` as `uint(norm * 65535.0f)` with the tile
-    /// shifted by 16. Eight 4-bit passes.
+    /// ONE CONTRACT IN FIVE PLACES: this 24, the `<< 12` and the `4095.0f` in
+    /// trainer_duplicate_keys, and both `>> 12` in trainer_tile_ranges. They
+    /// change in one commit or the sort silently drops real key bits. The
+    /// pass count must stay EVEN: the sort swaps buffers every pass, so an
+    /// odd count lands the result where no reader looks.
     ///
-    /// The old text claimed 24 bits, a 13-bit depth, a `tileID << 13` and six
-    /// passes, and claimed "two of the eight passes sort bits that are always
-    /// zero". None of it was true of the code beneath it, and the constant
-    /// below has read 32 throughout. Measured against the real encoding and
-    /// the real 45 x 34 tile grid, only pass 7 (key bits 28 to 31) is
-    /// unconditionally zero. Pass 6 (bits 24 to 27) carries tile-id bits 8 to
-    /// 10, which are populated for every tile index at or above 256, and that
-    /// is the large majority of a 1,530-tile grid.
-    ///
-    /// SO: dropping to six passes is NOT a free removal of dead work. It
-    /// requires the coupled change the old text described - `uint(norm *
-    /// 8191.0f)` and `(tile << 13)` in TrainerShaders.metal together with a 24
-    /// here - landed as ONE commit. Changing this constant alone silently
-    /// drops real tile bits from every pass and corrupts the sort. The even
-    /// count still matters if it is ever done: the sort swaps buffers every
-    /// pass, so an odd count lands the result where no reader looks.
-    static let radixKeyBits = 32
+    /// It was 32 bits and eight passes. Pass 3 (depth bits 12 to 15, always
+    /// zero for a room under a 100 m linear span) and pass 7 (tile bits 12 to
+    /// 15, zero for any grid under 4,096 tiles) sorted nothing.
+    static let radixKeyBits = 24
     static var radixPasses: Int { radixKeyBits / radixBits }
 
-    /// Hard ceiling on tile count, because the sort key gives the tile id 16
-    /// bits. 65535 tiles is 4096x4096 pixels at 16 px tiles; the trainer
-    /// renders at 384-720 px on its long edge, so this is never close.
-    static let maxTileCount = 65_535
+    /// Hard ceiling on tile count, because the sort key gives the tile id 12
+    /// bits: ids 0 to 4,095. That is 1,024 x 1,024 px at 16 px tiles. The
+    /// trainer's ladder tops out at 720 px, and `verify()` checks the
+    /// squarest render of the top rung (45 x 45 = 2,025 tiles) against this,
+    /// so outgrowing it fails loudly instead of corrupting the sort.
+    static let maxTileCount = 4_096
 
     /// SSIM window: 11 taps, sigma 1.5, the constants the SSIM paper and every
     /// 3DGS implementation use.
@@ -560,7 +553,10 @@ struct TrainerRegUniforms {
     /// swallowing a room.
     var maxScaleMeters: Float = 0.5       // offset 24
     var maxScaleWeight: Float = 0.05      // offset 28
-    // stride 32
+    /// Mirrors TrainerAdamUniforms.sparse. Always set together: with it off,
+    /// Adam reads undrawn rows and the regulariser must write them.
+    var sparse: UInt32 = 0                // offset 32
+    // stride 36
 }
 
 /// Generic exclusive-scan arguments.
@@ -726,7 +722,7 @@ enum TrainerGPULayouts {
         check("TrainerCameraUniforms", MemoryLayout<TrainerCameraUniforms>.stride, 144)
         check("TrainerLossUniforms", MemoryLayout<TrainerLossUniforms>.stride, 68)
         check("TrainerAdamUniforms", MemoryLayout<TrainerAdamUniforms>.stride, 64)
-        check("TrainerRegUniforms", MemoryLayout<TrainerRegUniforms>.stride, 32)
+        check("TrainerRegUniforms", MemoryLayout<TrainerRegUniforms>.stride, 36)
         check("TrainerScanUniforms", MemoryLayout<TrainerScanUniforms>.stride, 16)
         check("TrainerRadixUniforms", MemoryLayout<TrainerRadixUniforms>.stride, 16)
         check("TrainerBlurUniforms", MemoryLayout<TrainerBlurUniforms>.stride, 16)
@@ -791,10 +787,10 @@ enum TrainerGPULayouts {
             }
         }
 
-        // --- The tile id is 16 bits wide ------------------------------------
+        // --- The tile id is 12 bits wide ------------------------------------
         //
         // `maxTileCount` is the ceiling that fact imposes, and it was written
-        // down and never enforced. Above it the sort key `(tileID << 16) |
+        // down and never enforced. Above it the sort key `(tileID << 12) |
         // depth` wraps and tiles trade fragments with each other, which does
         // not crash and does not warn. The trainer's own resolution ladder is
         // the only thing that sets the render size, so the honest place to
@@ -806,7 +802,7 @@ enum TrainerGPULayouts {
             problems.append(
                 "the resolution ladder tops out at \(tallestRung) px, which is "
                     + "\(rungTiles) tiles, above the "
-                    + "\(TrainerGPUConstants.maxTileCount) a 16-bit tile id can address"
+                    + "\(TrainerGPUConstants.maxTileCount) a 12-bit tile id can address"
             )
         }
 

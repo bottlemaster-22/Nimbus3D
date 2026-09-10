@@ -416,7 +416,8 @@ struct TrainerRegUniforms {
     float binarizeUnknownCutoff;  // 20
     float maxScaleMeters;         // 24
     float maxScaleWeight;         // 28
-};                                // 32 bytes
+    uint  sparse;                 // 32  mirrors TrainerAdamUniforms.sparse
+};                                // 36 bytes
 
 struct TrainerScanUniforms {
     uint count;       //  0
@@ -464,7 +465,7 @@ static_assert(sizeof(TrainerDepthSample) == 32, "TrainerDepthSample must be 32 b
 static_assert(sizeof(TrainerCameraUniforms) == 144, "TrainerCameraUniforms must be 144 bytes");
 static_assert(sizeof(TrainerLossUniforms) == 68, "TrainerLossUniforms must be 68 bytes");
 static_assert(sizeof(TrainerAdamUniforms) == 64, "TrainerAdamUniforms must be 64 bytes");
-static_assert(sizeof(TrainerRegUniforms) == 32, "TrainerRegUniforms must be 32 bytes");
+static_assert(sizeof(TrainerRegUniforms) == 36, "TrainerRegUniforms must be 36 bytes");
 static_assert(sizeof(TrainerScanUniforms) == 16, "TrainerScanUniforms must be 16 bytes");
 static_assert(sizeof(TrainerRadixUniforms) == 16, "TrainerRadixUniforms must be 16 bytes");
 static_assert(sizeof(TrainerBlurUniforms) == 16, "TrainerBlurUniforms must be 16 bytes");
@@ -586,6 +587,20 @@ static inline void trainer_ownedAdd(device float* target, float value) {
 /// the same everywhere.
 static inline void trainer_atomicAdd(device atomic_float* target, float value) {
     if (trainer_finiteOrZero(value) == 0.0f) { return; }
+    atomic_fetch_add_explicit(target, value, memory_order_relaxed);
+}
+
+/// Inf or NaN, by the exponent field, for the same fast-math reason as
+/// trainer_finiteOrZero.
+static inline bool trainer_isNonFinite(float value) {
+    return (as_type<uint>(value) & 0x7F800000u) == 0x7F800000u;
+}
+
+/// trainer_atomicAdd WITHOUT its finiteness and zero tests. ONLY for a caller
+/// that has already proved the value finite: trainer_rasterize_backward,
+/// which tests its two roots once per pair instead of every add twelve times.
+/// Every other call site keeps trainer_atomicAdd.
+static inline void trainer_atomicAddUnchecked(device atomic_float* target, float value) {
     atomic_fetch_add_explicit(target, value, memory_order_relaxed);
 }
 
@@ -715,7 +730,7 @@ kernel void trainer_scan_add(
 // ============================================================================
 // MARK: - Radix sort (LSD, 4-bit digits, stable)
 //
-// Keys are 32 bits: `(tileID << 16) | quantisedDepth16`. Eight passes.
+// Keys are 24 bits: `(tileID << 12) | logDepth12`. Six passes.
 //
 // 4 bits and not 8: the scatter needs a per-thread histogram in threadgroup
 // memory, which is `bins * threads * 4` bytes. 16 bins x 256 threads = 16 KB,
@@ -1167,37 +1182,41 @@ kernel void trainer_duplicate_keys(
     const int maxY = min(int(cam.tileCountY),
                          int(ceil((mean2D.y + radiusY) / float(TRAINER_TILE_H))));
 
-    // Depth quantised to 16 bits over the working range. At a 30 m far plane
-    // that is 0.5 mm, far finer than any ordering ambiguity that matters, and
-    // it halves both the key width and the number of sort passes.
-    const float span = max(cam.farPlane - cam.nearPlane, 1e-3f);
-    // THIRTEEN BITS OF DEPTH, NOT SIXTEEN, so the whole key fits in 24 and
-    // the radix sort runs SIX four-bit passes instead of eight.
+    // TWELVE BITS OF LOG DEPTH UNDER TWELVE BITS OF TILE: a 24-bit key, so
+    // the radix sort runs SIX four-bit passes instead of eight. Six is even,
+    // so the result still lands in keysA, where every reader looks.
     //
-    // The sort moves roughly 98 MB an iteration: 763,260 instances times eight
-    // bytes of key and value, read and written, once per pass. Two of those
-    // eight passes were sorting bits that are always zero, because the key
-    // only ever used 27 of its 32 bits. Dropping depth to 13 takes it to 24,
-    // which divides by four exactly, so the pass count stays EVEN and the
-    // result still lands in the buffer every reader already expects. An odd
-    // pass count would leave it in the other one and corrupt the sort
-    // silently.
+    // The old key was (tile << 16) | uint(linear * 65535) over 0.05 to 100 m.
+    // In a room its top five depth bits were always zero (the owner's scan
+    // peaks at 2.99 m, depth field 1,928), and a 45 x 34 = 1,530 tile grid
+    // never sets tile bits 12 to 15, so passes 3 and 7 were full read-and-
+    // scatter passes over every instance that moved nothing.
     //
-    // What it costs: 8192 depth levels over the working range instead of
-    // 65536, so about 3.7 mm at a 30 m far plane instead of 0.5 mm. Two
-    // instances in the same tile closer together than that now tie and fall
-    // back to splat-index order. Alpha compositing is order-dependent, so this
-    // is a real if small quality trade, taken deliberately for a quarter of
-    // the sort's energy.
-    const float norm = clamp((d.depth - cam.nearPlane) / span, 0.0f, 1.0f);
-    const uint depthKey = uint(norm * 65535.0f);
+    // LOG, NOT LINEAR, so no room is ever too deep. 4,096 levels cover the
+    // whole 0.05 to 100 m cull range at a constant 0.19 per cent of depth
+    // (1.9 mm at 1 m, 5.6 mm at 3 m) and nothing ever clamps. A linear 12-bit
+    // key needs a hand-picked far bound, and depth here is measured from the
+    // TRAINING camera, not the one that saw the point, so a seed well inside
+    // LiDAR range of one pose can be far outside it from another.
+    //
+    // Measured offline (tools/offline/check_depthkey_span.py, frames 0, 4,
+    // 8, 12, 15): against the exact float-order render this key scores
+    // 48.81 dB mean, 48.40 worst, where the shipped 16-bit key scored 49.76
+    // and a linear 12-bit key over 10 m 47.56. Against the real photograph
+    // this key is within 0.003 dB of the exact order in every frame (the
+    // shipped key was within 0.018). Ties still fall back to splat-index
+    // order, as before.
+    const float logSpan = max(log2(cam.farPlane / cam.nearPlane), 1e-3f);
+    const float norm = clamp(log2(max(d.depth, cam.nearPlane) / cam.nearPlane) / logSpan,
+                             0.0f, 1.0f);
+    const uint depthKey = uint(norm * 4095.0f);
 
     uint cursor = offsets[gid];
     for (int ty = minY; ty < maxY; ++ty) {
         for (int tx = minX; tx < maxX; ++tx) {
             if (cursor >= instanceCap) { return; }
             const uint tile = uint(ty) * cam.tileCountX + uint(tx);
-            keys[cursor] = (tile << 16) | depthKey;
+            keys[cursor] = (tile << 12) | depthKey;
             values[cursor] = gid;
             cursor += 1u;
         }
@@ -1306,11 +1325,11 @@ kernel void trainer_tile_ranges(
     uint                 gid         [[thread_position_in_grid]]
 ) {
     if (gid >= count) { return; }
-    const uint tile = keys[gid] >> 16;
+    const uint tile = keys[gid] >> 12;
     if (gid == 0u) {
         tileRanges[2u * tile] = 0u;
     } else {
-        const uint prev = keys[gid - 1u] >> 16;
+        const uint prev = keys[gid - 1u] >> 12;
         if (prev != tile) {
             tileRanges[2u * prev + 1u] = gid;
             tileRanges[2u * tile] = gid;
@@ -2025,6 +2044,9 @@ kernel void trainer_rasterize_backward(
     // Everything that reaches an alpha only through the FINAL transmittance:
     // the background composite and the depth normalisation.
     const float dLdTTotal = dLdTExtra + dot(bg, dLdC);
+    // Loop-invariant, so the per-add zero test the colour atomics used to pay
+    // on every pair is one test per pixel.
+    const bool pixelHasColorGrad = any(dLdC != float3(0.0f));
 
     // HOW FAR BACK ANY PIXEL IN THIS TILE ACTUALLY LOOKED.
     //
@@ -2199,49 +2221,80 @@ kernel void trainer_rasterize_backward(
 
                 const uint splatIndex = tgIndex[j];
 
+                // alpha = opacity * gaussian, so:
+                const float dLdG = co.w * dLdAlpha;
+                // dG/d(power) = G; d(power)/d(delta) and d(power)/d(conic).
+                const float dGdPower = gaussian;
+                const float dLdPower = dLdG * dGdPower;
+
+                // TWO FINITENESS TESTS PER PAIR, NOT TWELVE.
+                //
+                // Every add below is `weight` times dLdC, or a multiple of
+                // dLdPower (= opacity * gaussian * dLdAlpha) by finite
+                // geometry, or gaussian * dLdAlpha. A non-finite dLdC reaches
+                // dLdAlpha through the colour dot product; a non-finite
+                // conic, delta or mean makes power, and so gaussian, NaN; a
+                // non-finite opacity is a factor of dLdPower directly; and a
+                // non-finite alpha or T reaches weight. So these two tests
+                // cover all twelve values.
+                //
+                // dLdAlpha alone would NOT: Metal's min(0.99, NaN) returns
+                // 0.99, so a NaN gaussian or opacity leaves alpha, weight and
+                // dLdAlpha finite and poisons only the products.
+                //
+                // The twelve per-add guards were 48 to 60 of a 112 to 125
+                // instruction pair (tools/offline/bwdops.py). `continue` is
+                // exact: T, the running colour and depth and lastAlpha were
+                // all updated above, and these adds end the loop body.
+                if (trainer_isNonFinite(dLdPower) || trainer_isNonFinite(weight)) { continue; }
+
                 // ONE RECORD, ONE CACHE LINE. Every add below lands in the
                 // same 64 bytes rather than in four different allocations.
                 device TrainerSplatGrad2DAtomic* g = &splatGrad2D[splatIndex];
 
-                // Colour gradient.
-                trainer_atomicAdd(&g->color0, weight * dLdC.x);
-                trainer_atomicAdd(&g->color1, weight * dLdC.y);
-                trainer_atomicAdd(&g->color2, weight * dLdC.z);
+                // Colour gradient. Skipped as a group where the pixel carries
+                // no colour gradient, which is what the per-add zero test did.
+                if (pixelHasColorGrad) {
+                    trainer_atomicAddUnchecked(&g->color0, weight * dLdC.x);
+                    trainer_atomicAddUnchecked(&g->color1, weight * dLdC.y);
+                    trainer_atomicAddUnchecked(&g->color2, weight * dLdC.z);
+                }
 
-                // alpha = opacity * gaussian, so:
-                const float dLdG = co.w * dLdAlpha;
-                trainer_atomicAdd(&g->opacity, gaussian * dLdAlpha);
+                // Every add in this block is a multiple of dLdPower or of
+                // gaussian * dLdAlpha, both zero exactly when dLdAlpha is, so
+                // one compare stands in for seven per-add zero tests.
+                if (dLdPower != 0.0f) {
+                    trainer_atomicAddUnchecked(&g->opacity, gaussian * dLdAlpha);
 
-                // dG/d(power) = G; d(power)/d(delta) and d(power)/d(conic).
-                const float dGdPower = gaussian;
-                const float gdx = -(co.x * delta.x + co.y * delta.y);
-                const float gdy = -(co.z * delta.y + co.y * delta.x);
-                // delta = mean2D - pixel, so d/d(mean2D) == d/d(delta).
-                const float2 dLdMean2D = float2(dLdG * dGdPower * gdx,
-                                                dLdG * dGdPower * gdy);
+                    const float gdx = -(co.x * delta.x + co.y * delta.y);
+                    const float gdy = -(co.z * delta.y + co.y * delta.x);
+                    // delta = mean2D - pixel, so d/d(mean2D) == d/d(delta).
+                    const float2 dLdMean2D = float2(dLdG * dGdPower * gdx,
+                                                    dLdG * dGdPower * gdy);
 
-                trainer_atomicAdd(&g->mean2D0, dLdMean2D.x);
-                trainer_atomicAdd(&g->mean2D1, dLdMean2D.y);
+                    trainer_atomicAddUnchecked(&g->mean2D0, dLdMean2D.x);
+                    trainer_atomicAddUnchecked(&g->mean2D1, dLdMean2D.y);
 
-                const float dLdPower = dLdG * dGdPower;
-                trainer_atomicAdd(&g->conic0,
-                                  dLdPower * (-0.5f * delta.x * delta.x));
-                trainer_atomicAdd(&g->conic1,
-                                  dLdPower * (-delta.x * delta.y));
-                trainer_atomicAdd(&g->conic2,
-                                  dLdPower * (-0.5f * delta.y * delta.y));
+                    trainer_atomicAddUnchecked(&g->conic0,
+                                               dLdPower * (-0.5f * delta.x * delta.x));
+                    trainer_atomicAddUnchecked(&g->conic1,
+                                               dLdPower * (-delta.x * delta.y));
+                    trainer_atomicAddUnchecked(&g->conic2,
+                                               dLdPower * (-0.5f * delta.y * delta.y));
 
-                // --- AbsGS -------------------------------------------------
-                // The MAGNITUDE, accumulated per pixel before any summation.
-                // The signed sum cancels for a Gaussian straddling an edge,
-                // which is exactly the Gaussian that has to split.
-                // INTO `g`, THE SAME CACHE LINE as the nine above, not into
-                // the separate `stats` buffer. trainer_preprocess_backward
-                // folds these into the persistent per-interval accumulators.
-                trainer_atomicAdd(&g->absGrad2D, length(dLdMean2D));
-                trainer_atomicAdd(&g->visAccum, weight);
+                    // --- AbsGS ---------------------------------------------
+                    // The MAGNITUDE, accumulated per pixel before any
+                    // summation. The signed sum cancels for a Gaussian
+                    // straddling an edge, which is exactly the Gaussian that
+                    // has to split. INTO `g`, THE SAME CACHE LINE as the nine
+                    // above; trainer_preprocess_backward folds these into the
+                    // persistent per-interval accumulators.
+                    trainer_atomicAddUnchecked(&g->absGrad2D, length(dLdMean2D));
+                }
+                // weight = alpha * T > 0 for every pair that reaches here.
+                trainer_atomicAddUnchecked(&g->visAccum, weight);
                 if (isUnknown > 0.0f) {
-                    trainer_atomicAdd(&g->unknownAccum, weight);
+                    trainer_atomicAddUnchecked(&g->unknownAccum, weight);
                 }
             }
         }
@@ -2292,6 +2345,25 @@ kernel void trainer_preprocess_backward(
     // lines later with touched > 0 guaranteed by the maxX <= minX check.
     if (tilesTouched[gid] == 0u) { return; }
 
+    // THIS KERNEL NOW CLEARS ITS OWN splatGrad AND shGrad ROWS, so
+    // clearPerIteration no longer blit-fills them (28.8 MB an iteration at
+    // 300k splats). Same invariant as the splatGrad2D clear below: both Adam
+    // kernels and trainer_regularizer read or write a row only where
+    // visibleFlag == 1, trainer_preprocess sets visibleFlag on exactly the
+    // path that writes tilesTouched > 0, and this kernel is the FIRST writer
+    // of both rows in the step. Zero first, then accumulate exactly as
+    // before, so it is bit-exact with the blit: the conicDet return below
+    // still leaves scale, rotation and mean at zero, trainer_ownedAdd may
+    // still skip a zero or non-finite value, and `pad` is zero because the
+    // whole record is. Bounded by cam.shCoeffCount, the same stride every SH
+    // reader uses, so a smaller SH budget never touches the next row.
+    splatGrad[gid] = TrainerSplatGrad{};
+    {
+        const uint shRow = cam.shCoeffCount * 3u;
+        const uint shRowBase = gid * shRow;
+        for (uint k = 0u; k < shRow; ++k) { shGrad[shRowBase + k] = 0.0f; }
+    }
+
     // FOLD THIS ITERATION'S RASTER STATISTICS INTO THE PER-INTERVAL ONES.
     //
     // The backward rasteriser accumulates them in its own cache line to avoid
@@ -2314,7 +2386,9 @@ kernel void trainer_preprocess_backward(
     const TrainerSplatDraw d = draws[gid];
 
     // One contiguous read of this splat's own row, which by now nothing
-    // else is writing: the rasteriser finished in an earlier command buffer.
+    // else is writing: trainer_rasterize_backward is the previous dispatch in
+    // the same serial compute encoder (trainer.step), which orders it before
+    // this one and makes its writes visible.
     const TrainerSplatGrad2D g = splatGrad2D[gid];
     // CLEAR THE ROW WE JUST CONSUMED, so the per-iteration blit does not have
     // to. `clearPerIteration` was blit-filling splatCount * 16 floats every
@@ -2457,8 +2531,19 @@ kernel void trainer_preprocess_backward(
     const float invZ2 = invZ * invZ;
     const float invZ3 = invZ2 * invZ;
 
-    const float3 jr0 = float3(cam.fx * invZ, 0.0f, -cam.fx * meanCam.x * invZ2);
-    const float3 jr1 = float3(0.0f, cam.fy * invZ, -cam.fy * meanCam.y * invZ2);
+    // MUST match trainer_preprocess's tangent clamp, or the backward
+    // differentiates a covariance the forward never rendered. Build 250
+    // clamped the forward only. Same 1.3x half-angle, same formula.
+    const float jcLimX = 1.3f * (0.5f * float(cam.imageWidth) / cam.fx);
+    const float jcLimY = 1.3f * (0.5f * float(cam.imageHeight) / cam.fy);
+    const float jcTanX = meanCam.x * invZ;
+    const float jcTanY = meanCam.y * invZ;
+    const bool jcBindX = (jcTanX < -jcLimX) || (jcTanX > jcLimX);
+    const bool jcBindY = (jcTanY < -jcLimY) || (jcTanY > jcLimY);
+    const float jcTx = clamp(jcTanX, -jcLimX, jcLimX) * meanCam.z;
+    const float jcTy = clamp(jcTanY, -jcLimY, jcLimY) * meanCam.z;
+    const float3 jr0 = float3(cam.fx * invZ, 0.0f, -cam.fx * jcTx * invZ2);
+    const float3 jr1 = float3(0.0f, cam.fy * invZ, -cam.fy * jcTy * invZ2);
 
     const float3 scale = exp(clamp(float3(s.logScale), -12.0f, 3.0f));
     const float4 q = normalize(float4(s.rotation));
@@ -2560,12 +2645,14 @@ kernel void trainer_preprocess_backward(
         const float3 dLdJ0 = 2.0f * (Gm[0][0] * jsc0 + Gm[1][0] * jsc1);
         const float3 dLdJ1 = 2.0f * (Gm[0][1] * jsc0 + Gm[1][1] * jsc1);
 
-        dLdMeanCam.x += dLdJ0.z * (-cam.fx * invZ2);
-        dLdMeanCam.y += dLdJ1.z * (-cam.fy * invZ2);
+        // Clamped, j02 = -fx * c / z with c the clamp limit: no x-dependence,
+        // and d/dz = fx * c / z^2 = fx * jcTx / z^3, factor 1 rather than 2.
+        dLdMeanCam.x += jcBindX ? 0.0f : dLdJ0.z * (-cam.fx * invZ2);
+        dLdMeanCam.y += jcBindY ? 0.0f : dLdJ1.z * (-cam.fy * invZ2);
         dLdMeanCam.z += dLdJ0.x * (-cam.fx * invZ2)
                       + dLdJ1.y * (-cam.fy * invZ2)
-                      + dLdJ0.z * (2.0f * cam.fx * meanCam.x * invZ3)
-                      + dLdJ1.z * (2.0f * cam.fy * meanCam.y * invZ3);
+                      + dLdJ0.z * ((jcBindX ? 1.0f : 2.0f) * cam.fx * jcTx * invZ3)
+                      + dLdJ1.z * ((jcBindY ? 1.0f : 2.0f) * cam.fy * jcTy * invZ3);
     }
 
     // World-space mean gradient: through the view rotation, plus the SH view
@@ -2667,6 +2754,14 @@ kernel void trainer_regularizer(
     uint                            gid    [[thread_position_in_grid]]
 ) {
     if (gid >= u.count) { return; }
+    // THE SAME GATE BOTH ADAM KERNELS APPLY. With sparse Adam, a splat this
+    // view did not draw is skipped by the optimiser, so any prior gradient
+    // written here for it was never read: 77.8 per cent of this kernel's
+    // threads on build 248's model, each with a single-address lossAccum
+    // atomic. It is also what lets splatGrad go uncleared for undrawn rows.
+    // Model-neutral. lossEMA reads lower (prior terms over drawn splats
+    // only); it feeds progress reports only, early stopping reads PSNR.
+    if (u.sparse != 0u && stats[gid].visibleFlag == 0u) { return; }
     const TrainerSplat s = splats[gid];
     const TrainerSplatStats st = stats[gid];
 

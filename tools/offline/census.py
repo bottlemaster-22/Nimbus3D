@@ -84,7 +84,7 @@ ORDER = ['gpuBusy', 'gpuScan', 'gpuStep', 'gpuSort', 'gpuForward', 'gpuLosses',
          'earlyStopEval',
          'gpuBackward', 'gpuOptimiser', 'gpuOther', 'gpuWait',
          'supervision', 'supervisionPrefetched',
-         'densify', 'previewSnapshot', 'filterSweep', 'upload']
+         'densify', 'previewSnapshot', 'filterSweep', 'upload', 'prologue']
 for k in ORDER:
     if k not in t:
         continue

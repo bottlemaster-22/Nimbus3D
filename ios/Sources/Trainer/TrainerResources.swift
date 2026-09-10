@@ -555,9 +555,9 @@ final class TrainerResources {
         // Release the ten buffers whose contents cannot outlive an iteration,
         // before a single byte is allocated.
         //
-        // Three of them, `splatGrad`, `shGrad` and `splatGrad2D`, are filled
-        // on the GPU by `TrainerGPU.clearPerIteration` at
-        // the top of every step. The other four are NOT cleared there and do
+        // Three of them, `splatGrad`, `shGrad` and `splatGrad2D`, start every
+        // step at zero, cleared by trainer_preprocess_backward for exactly the
+        // rows anything later reads (a fresh buffer from makeBuffer is zero). The other four are NOT cleared there and do
         // not need to be, which is worth writing down because the obvious
         // reading of that function is that it covers everything transient:
         // `draws` and `tilesTouched` are written for every Gaussian by

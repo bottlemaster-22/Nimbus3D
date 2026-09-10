@@ -1,0 +1,51 @@
+model 299888 splats, discs 86.2%, render 720x540, frames [0, 4, 8, 12, 15]
+f 0 base (build 250, clamp on)                 PSNR 17.228 fit 17.979 SSIM8 0.5438 SSIMg 0.5795  inst  399385   16s  clamp binds on 0 drawn splats, 0.00% of tile instances
+f 0 clamp OFF (build 246 fwd)                  PSNR 17.799 fit 17.860 SSIM8 0.5359 SSIMg 0.5715  inst  421919   19s  (unclamped: 19 bind-splats hold 5.34% of instances)
+f 0 discs -> iso t=0.25 (vol kept)             PSNR 16.902 fit 17.833 SSIM8 0.5217 SSIMg 0.5601  inst  348338   13s
+f 0 discs -> iso t=0.50 (vol kept)             PSNR 16.346 fit 17.510 SSIM8 0.4759 SSIMg 0.5187  inst  310197   12s
+f 0 discs -> iso t=1.00 (vol kept)             PSNR 15.059 fit 16.644 SSIM8 0.3965 SSIMg 0.4409  inst  267099   12s
+f 0 discs -> MORE aniso t=-0.25 (mirror)       PSNR 17.320 fit 17.947 SSIM8 0.5362 SSIMg 0.5742  inst  467636   19s
+f 0 discs NULL random dir, |d| of t=0.25       PSNR 17.239 fit 17.977 SSIM8 0.5363 SSIMg 0.5728  inst  408988   17s
+f 0 discs thicken s3 -> 0.78*s2 (vol grows)    PSNR 17.223 fit 17.870 SSIM8 0.5298 SSIMg 0.5687  inst  424293   17s
+f 4 base (build 250, clamp on)                 PSNR 18.327 fit 19.406 SSIM8 0.5829 SSIMg 0.6057  inst  363044   20s  clamp binds on 0 drawn splats, 0.00% of tile instances
+f 4 clamp OFF (build 246 fwd)                  PSNR 18.624 fit 19.225 SSIM8 0.5742 SSIMg 0.5964  inst  380484   19s  (unclamped: 14 bind-splats hold 4.58% of instances)
+f 4 discs -> iso t=0.25 (vol kept)             PSNR 17.644 fit 18.988 SSIM8 0.5428 SSIMg 0.5735  inst  316009   19s
+f 4 discs -> iso t=0.50 (vol kept)             PSNR 16.544 fit 18.212 SSIM8 0.4662 SSIMg 0.5055  inst  279996   23s
+f 4 discs -> iso t=1.00 (vol kept)             PSNR 14.144 fit 16.322 SSIM8 0.3476 SSIMg 0.3855  inst  238132   18s
+f 4 discs -> MORE aniso t=-0.25 (mirror)       PSNR 18.530 fit 19.428 SSIM8 0.5801 SSIMg 0.6032  inst  425631   37s
+f 4 discs NULL random dir, |d| of t=0.25       PSNR 18.334 fit 19.397 SSIM8 0.5753 SSIMg 0.5990  inst  371589   27s
+f 4 discs thicken s3 -> 0.78*s2 (vol grows)    PSNR 18.280 fit 19.266 SSIM8 0.5732 SSIMg 0.5973  inst  384505   37s
+f 8 base (build 250, clamp on)                 PSNR 18.113 fit 18.948 SSIM8 0.5588 SSIMg 0.5869  inst  351037   24s  clamp binds on 0 drawn splats, 0.00% of tile instances
+f 8 clamp OFF (build 246 fwd)                  PSNR 17.209 fit 18.410 SSIM8 0.5510 SSIMg 0.5779  inst  389843   20s  (unclamped: 33 bind-splats hold 9.95% of instances)
+f 8 discs -> iso t=0.25 (vol kept)             PSNR 17.571 fit 18.620 SSIM8 0.5231 SSIMg 0.5562  inst  305836   13s
+f 8 discs -> iso t=0.50 (vol kept)             PSNR 16.754 fit 18.052 SSIM8 0.4664 SSIMg 0.5070  inst  272371   11s
+f 8 discs -> iso t=1.00 (vol kept)             PSNR 15.169 fit 16.850 SSIM8 0.3797 SSIMg 0.4241  inst  234409   11s
+f 8 discs -> MORE aniso t=-0.25 (mirror)       PSNR 18.263 fit 18.940 SSIM8 0.5657 SSIMg 0.5944  inst  411914   19s
+f 8 discs NULL random dir, |d| of t=0.25       PSNR 18.117 fit 18.932 SSIM8 0.5534 SSIMg 0.5825  inst  360202   13s
+f 8 discs thicken s3 -> 0.78*s2 (vol grows)    PSNR 18.132 fit 18.843 SSIM8 0.5578 SSIMg 0.5877  inst  374940   15s
+f12 base (build 250, clamp on)                 PSNR 17.627 fit 17.996 SSIM8 0.5572 SSIMg 0.5783  inst  295741   23s  clamp binds on 0 drawn splats, 0.00% of tile instances
+f12 clamp OFF (build 246 fwd)                  PSNR 16.209 fit 17.174 SSIM8 0.5358 SSIMg 0.5557  inst  323487   24s  (unclamped: 24 bind-splats hold 8.58% of instances)
+f12 discs -> iso t=0.25 (vol kept)             PSNR 17.204 fit 17.753 SSIM8 0.5262 SSIMg 0.5494  inst  258676   17s
+f12 discs -> iso t=0.50 (vol kept)             PSNR 16.491 fit 17.278 SSIM8 0.4781 SSIMg 0.5052  inst  231384   14s
+f12 discs -> iso t=1.00 (vol kept)             PSNR 15.069 fit 16.272 SSIM8 0.4061 SSIMg 0.4360  inst  201669   12s
+f12 discs -> MORE aniso t=-0.25 (mirror)       PSNR 17.640 fit 17.901 SSIM8 0.5569 SSIMg 0.5819  inst  345616   22s
+f12 discs NULL random dir, |d| of t=0.25       PSNR 17.564 fit 17.920 SSIM8 0.5477 SSIMg 0.5700  inst  303706   16s
+f12 discs thicken s3 -> 0.78*s2 (vol grows)    PSNR 17.477 fit 17.780 SSIM8 0.5477 SSIMg 0.5741  inst  315588   16s
+f15 base (build 250, clamp on)                 PSNR 14.429 fit 14.824 SSIM8 0.3600 SSIMg 0.3979  inst  302763   17s  clamp binds on 0 drawn splats, 0.00% of tile instances
+f15 clamp OFF (build 246 fwd)                  PSNR 13.600 fit 14.411 SSIM8 0.3485 SSIMg 0.3871  inst  339903   18s  (unclamped: 26 bind-splats hold 10.93% of instances)
+f15 discs -> iso t=0.25 (vol kept)             PSNR 14.189 fit 14.683 SSIM8 0.3382 SSIMg 0.3771  inst  265608   12s
+f15 discs -> iso t=0.50 (vol kept)             PSNR 13.802 fit 14.447 SSIM8 0.3097 SSIMg 0.3502  inst  239028   10s
+f15 discs -> iso t=1.00 (vol kept)             PSNR 12.977 fit 13.962 SSIM8 0.2700 SSIMg 0.3124  inst  210043    9s
+f15 discs -> MORE aniso t=-0.25 (mirror)       PSNR 14.491 fit 14.833 SSIM8 0.3667 SSIMg 0.4060  inst  352215   12s
+f15 discs NULL random dir, |d| of t=0.25       PSNR 14.422 fit 14.807 SSIM8 0.3552 SSIMg 0.3936  inst  311111   10s
+f15 discs thicken s3 -> 0.78*s2 (vol grows)    PSNR 14.372 fit 14.748 SSIM8 0.3603 SSIMg 0.3994  inst  323134   11s
+
+MEAN over frames [0, 4, 8, 12, 15] (delta vs base)
+  base (build 250, clamp on)                 PSNR 17.145 (+0.000) fit 17.831 (+0.000) SSIM8 0.5205 (+0.0000) SSIMg 0.5497 (+0.0000)
+  clamp OFF (build 246 fwd)                  PSNR 16.688 (-0.457) fit 17.416 (-0.415) SSIM8 0.5091 (-0.0115) SSIMg 0.5377 (-0.0119)
+  discs -> iso t=0.25 (vol kept)             PSNR 16.702 (-0.443) fit 17.575 (-0.255) SSIM8 0.4904 (-0.0301) SSIMg 0.5233 (-0.0264)
+  discs -> iso t=0.50 (vol kept)             PSNR 15.987 (-1.157) fit 17.100 (-0.731) SSIM8 0.4393 (-0.0813) SSIMg 0.4773 (-0.0723)
+  discs -> iso t=1.00 (vol kept)             PSNR 14.484 (-2.661) fit 16.010 (-1.821) SSIM8 0.3600 (-0.1606) SSIMg 0.3998 (-0.1499)
+  discs -> MORE aniso t=-0.25 (mirror)       PSNR 17.249 (+0.104) fit 17.810 (-0.021) SSIM8 0.5211 (+0.0006) SSIMg 0.5519 (+0.0023)
+  discs NULL random dir, |d| of t=0.25       PSNR 17.135 (-0.010) fit 17.807 (-0.024) SSIM8 0.5136 (-0.0070) SSIMg 0.5436 (-0.0061)
+  discs thicken s3 -> 0.78*s2 (vol grows)    PSNR 17.097 (-0.048) fit 17.701 (-0.129) SSIM8 0.5138 (-0.0068) SSIMg 0.5454 (-0.0042)

@@ -407,19 +407,25 @@ final class TrainerDensifier {
         // particular unit is what broke this in the first place and no amount
         // of saved heat is worth reintroducing one.
         let headroom = Swift.max(splatCap - splatCount, 0)
-        let growthAllowance = allowGrowth
-            ? Swift.min(headroom, Int(Float(splatCap) * tuning.maxGrowthFractionPerPass))
-            : 0
+        let wantedGrowth = Swift.max(
+            Int(Float(splatCap) * tuning.maxGrowthFractionPerPass), 0
+        )
+        let growthAllowance = allowGrowth ? Swift.min(headroom, wantedGrowth) : 0
         outcome.growthAllowance = growthAllowance
-        // How many candidates the RELOCATION path could possibly consume, if
-        // it is the path that runs. It runs only at the cap, which is exactly
-        // when `growthAllowance` is zero, so the two limits are never both
-        // non-zero and the maximum of them is the true bound on how much of
-        // this list is ever looked at.
-        let relocationLimit = (allowGrowth && growthAllowance == 0)
+        // RELOCATION RUNS WHENEVER GROWTH IS UNDERFED, not when headroom is
+        // exactly zero. The low-opacity prune frees a few dozen slots a pass
+        // and the next pass's growth refills exactly those, so on build 250
+        // headroom ran 25 to 526 and was never 0 in 39 passes, and this path
+        // ran ZERO times; it had been dead since build 182 stopped seeding the
+        // cap full. It stays inside the growth window, as designed. Both paths
+        // now share a pass: growth takes the front of the ranked list and
+        // relocation the entries immediately behind it, so the list has to be
+        // long enough for both. maxRelocationFractionPerPass = 0 switches it
+        // off again exactly.
+        let relocationLimit = (allowGrowth && growthAllowance < wantedGrowth)
             ? Swift.max(Int(Float(splatCount) * tuning.maxRelocationFractionPerPass), 0)
             : 0
-        let selectionLimit = Swift.max(growthAllowance, relocationLimit)
+        let selectionLimit = growthAllowance + relocationLimit
         // Collecting is a separate question from RANKING. The relocation
         // branch below also counts how many donors were available, for the
         // census, and it is only entered when the candidate list is non-empty.
@@ -591,7 +597,9 @@ final class TrainerDensifier {
                     outcome.cloned += 1
                 }
             }
-        } else if allowGrowth, !candidates.isEmpty {
+        }
+
+        if relocationLimit > 0, candidates.count > added {
             // --- 3. AT THE CAP: MCMC-style relocation -------------------------
             // Nothing is created and nothing is destroyed. A Gaussian that is
             // contributing nothing is picked up and put down on top of one that
@@ -640,11 +648,19 @@ final class TrainerDensifier {
             // selected opacities are identical every time, and only that
             // self-pair coincidence count moves. It is a coincidence, not a
             // quality property.
+            // Every index growth just used, and every index this pass may
+            // relocate ONTO, is barred from being a donor. Overwriting a split
+            // child undoes the split; overwriting a later target makes that
+            // target's relocation split a Gaussian that is already gone.
+            let targetEnd = Swift.min(candidates.count, added + relocationLimit)
+            var claimed = [Bool](repeating: false, count: splatCount)
+            for k in 0..<targetEnd { claimed[candidates[k]] = true }
             var donorKey = [Float](repeating: 0, count: splatCount)
             var donors: [Int] = []
             for i in 0..<splatCount {
                 let opacity = TrainerMath.sigmoid(splats[i].opacityLogit)
                 donorKey[i] = -opacity
+                if claimed[i] { continue }
                 if opacity < tuning.relocationDonorOpacity || stats[i].visAccum <= 0 {
                     donors.append(i)
                 }
@@ -653,7 +669,7 @@ final class TrainerDensifier {
 
             let allowance = Swift.min(
                 donors.count,
-                Swift.min(candidates.count, relocationLimit)
+                Swift.min(targetEnd - added, relocationLimit)
             )
             if allowance > 0 {
                 if donors.count > allowance {
@@ -664,7 +680,7 @@ final class TrainerDensifier {
             }
             for k in 0..<Swift.max(allowance, 0) {
                 let donor = donors[k]
-                let target = candidates[k]
+                let target = candidates[added + k]
                 if donor == target { continue }
 
                 let parent = splats[target]
@@ -686,6 +702,12 @@ final class TrainerDensifier {
                 let oldOpacity = TrainerMath.sigmoid(parent.opacityLogit)
                 let corrected = 1 - sqrtf(Swift.max(1 - oldOpacity, 0))
                 let correctedLogit = TrainerMath.logit(corrected)
+                // A target this faint comes out as two DONORS (or two prune
+                // victims, once comp3D is applied) and would be moved again
+                // next pass. That is churn, not refinement. Nothing has been
+                // written yet, so skipping here changes nothing. COUPLED to
+                // relocationDonorOpacity: raising that raises this floor too.
+                if corrected < tuning.relocationDonorOpacity { continue }
 
                 var moved = parent
                 moved.mean = parent.mean - offset
@@ -713,6 +735,11 @@ final class TrainerDensifier {
                 adamM[target] = TrainerSplatGrad()
                 adamV[target] = TrainerSplatGrad()
                 stats[donor].stepCount = 0
+                // filter3D is a property of WHERE a Gaussian sits (the camera
+                // sampling rate there). The moved copy now sits at the target,
+                // the sweep only refreshes this every filter3DIntervalIterations,
+                // and the prune below reads it on this very pass.
+                stats[donor].filter3D = stats[target].filter3D
 
                 outcome.relocated += 1
             }

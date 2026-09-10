@@ -342,11 +342,11 @@ struct TrainerGPU {
 
     // MARK: Radix sort
     //
-    // Eight LSD passes of four bits over the 32-bit key
-    // `(tileID << 16) | quantisedDepth16`. Four bits and not eight because the
+    // Six LSD passes of four bits over the 24-bit key
+    // `(tileID << 12) | logDepth12`. Four bits and not eight because the
     // scatter's per-thread histogram is `bins * threads * 4` bytes of
     // threadgroup memory: 16 KB at 16 bins, 256 KB at 256 bins, and only the
-    // first fits. Eight passes is even, so the sorted result lands back in the
+    // first fits. Six passes is even, so the sorted result lands back in the
     // buffer it started in and the caller does not have to track parity.
 
     func radixSort(_ encoder: MTLComputeCommandEncoder, count: Int) {
@@ -940,7 +940,6 @@ struct TrainerGPU {
     /// float, and it is one dispatch.
     func clearPerIteration(_ blit: MTLBlitCommandEncoder, splatCount: Int) {
         let px = resources.renderSize.pixelCount
-        let shFloats = splatCount * resources.shFloatsPerSplat
 
         func zero(_ buffer: MTLBuffer, floats: Int) {
             let bytes = Swift.min(floats * 4, buffer.length)
@@ -948,9 +947,12 @@ struct TrainerGPU {
             blit.fill(buffer: buffer, range: 0..<bytes, value: 0)
         }
 
-        // Accumulated by the backward kernels through atomics.
-        zero(resources.splatGrad, floats: splatCount * 12)
-        zero(resources.shGrad, floats: shFloats)
+        // splatGrad AND shGrad ARE NOT CLEARED HERE ANY MORE either.
+        // trainer_preprocess_backward zeroes a drawn splat's two rows before
+        // it accumulates into them, and an undrawn splat's rows are never
+        // read: both Adam kernels and trainer_regularizer skip
+        // visibleFlag == 0, with sparse = 1. 28.8 MB of fill an iteration at
+        // 300k splats.
         // splatGrad2D IS NOT CLEARED HERE ANY MORE. trainer_preprocess_backward
         // zeroes each row as it consumes it, which it can do exactly because it
         // early-returns on the same `tilesTouched == 0` predicate that decides

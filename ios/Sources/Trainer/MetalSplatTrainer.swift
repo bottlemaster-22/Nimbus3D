@@ -63,6 +63,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// would mean touching every call site for a diagnostic, so it rides here;
     /// every caller reads it immediately after the call it belongs to.
     private var lastHeldOutSSIM: Float?
+    /// Set by evaluateHeldOut(alsoScoreExposureFitted: true); nil otherwise.
+    private var lastHeldOutPSNRExposureFitted: Float?
     private var heldOutPSNRSum: Double = 0
     private var heldOutPSNRCount: Int = 0
 
@@ -811,6 +813,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // --- Seed ----------------------------------------------------------------
         var sliceBudget = governor.current
         sliceBudget.splatCap = effectiveCap
+        // TIMED: see TrainerTimings.prologue.
+        let seedClock = CFAbsoluteTimeGetCurrent()
         let seedResult = try TrainerInitializer.seed(
             bundle: bundle,
             prePass: prePass,
@@ -822,6 +826,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             edges: smart.edges,
             settings: settings
         )
+        timings.prologue += CFAbsoluteTimeGetCurrent() - seedClock
         TrainerLog.general.info("\(seedResult.summary, privacy: .public)")
 
         // What the seeder actually produced, including the disc-versus-blob
@@ -1767,7 +1772,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 exposures: exposures,
                 splatCount: splatCount,
                 shCoefficientCount: shCoefficientCount,
-                renderSize: renderSize
+                renderSize: renderSize,
+                alsoScoreExposureFitted: true
             )
             census.slices[censusRow].heldOutPSNR = psnr
             census.slices[censusRow].heldOutSSIM = lastHeldOutSSIM
@@ -1782,19 +1788,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // instead of it: the raw number is what the model actually
             // produces, and this one says how much of the gap to the trained
             // views was ever about geometry.
-            census.slices[censusRow].heldOutPSNRExposureFitted = try evaluateHeldOut(
-                gpu: gpu,
-                resources: resources,
-                queue: queue,
-                frames: slice.heldOutKeyframes,
-                supervision: supervision,
-                cameraDeltas: cameraDeltas,
-                exposures: exposures,
-                splatCount: splatCount,
-                shCoefficientCount: shCoefficientCount,
-                renderSize: renderSize,
-                fitExposure: true
-            )
+            // Scored inside the call above from the SAME renders; a second
+            // evaluation re-rendered twelve identical frames for two scalars.
+            census.slices[censusRow].heldOutPSNRExposureFitted = lastHeldOutPSNRExposureFitted
 
             // The same measurement on frames the model DID see. Sampled
             // evenly across the shuffle rather than taking the first few, and
@@ -1853,10 +1849,22 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // `readCloud` on the final state still runs when there is no better
         // checkpoint, which is every run where the score improved to the end
         // or where early stopping is switched off.
-        let cloud = bestCloud ?? readCloud(
+        // ...AND ONLY WHEN IT ACTUALLY BEAT WHERE THE RUN ENDED. Build 250
+        // shipped its iteration-3,600 checkpoint (20.392 dB) over an end state
+        // that scored 20.444 dB on the same frames with the same exposure fit,
+        // because nothing compared the two. Both scores are exposure-fitted
+        // held-out PSNR from evaluateHeldOut. The end state is also what
+        // exposure.bin, the refined poses and heldOutSSIM describe, so
+        // shipping it keeps the bundle consistent.
+        let endScore = census.slices[censusRow].heldOutPSNRExposureFitted
+        var shipBest = bestCloud != nil
+        if shipBest, let endScore, endScore.isFinite, endScore >= bestHeldOut {
+            shipBest = false
+        }
+        let cloud = (shipBest ? bestCloud : nil) ?? readCloud(
             resources: resources, count: splatCount, shDegree: shDegree
         )
-        if bestCloud != nil {
+        if shipBest {
             let note = String(
                 format: "Exporting the model from iteration %d, which scored %.2f dB, rather than the one this run ended on.",
                 bestHeldOutIteration, bestHeldOut
@@ -2333,6 +2341,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         reg.binarizeUnknownCutoff = 0.5
         reg.maxScaleMeters = 0.5
         reg.maxScaleWeight = 0.05
+        reg.sparse = 1                  // MUST match adam.sparse in adamUniforms
         return reg
     }
 
@@ -2807,10 +2816,24 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         /// identity exposure while a trained frame gets a fitted one, which
         /// puts part of the reported train/test gap in the protocol rather
         /// than in the model.
-        fitExposure: Bool = false
+        fitExposure: Bool = false,
+        /// Also score the SAME renders after the per-frame exposure fit and
+        /// leave it in `lastHeldOutPSNRExposureFitted`.
+        alsoScoreExposureFitted: Bool = false
     ) throws -> Float? {
 
+        lastHeldOutPSNRExposureFitted = nil
         guard splatCount > 0, !frames.isEmpty else { return nil }
+        // HELD-OUT VIEWS MUST NOT REACH A DENSIFY PASS. The eval's preprocess
+        // writes denom, visibleFlag and maxRadiusPxBits into the live stats
+        // buffer, and the loop runs eval, THEN densifier.run (which reads
+        // them), THEN resetDensifyStats. So every early-stop evaluation was
+        // adding up to 12 observations with no gradient to the AbsGS
+        // denominators of the pass right after it. Restored on every exit.
+        // Shared storage, and every eval buffer is waited on, so the GPU is
+        // idle when this runs.
+        let statsBeforeEval = resources.stats.readArray(TrainerSplatStats.self, count: splatCount)
+        defer { resources.stats.writeArray(statsBeforeEval) }
         // PER-IMAGE PSNR, averaged. This used to sum the MSE across frames and
         // convert once at the end, which by Jensen's inequality is ALWAYS the
         // lower number: one dark or badly-posed frame with a large MSE drags
@@ -2832,6 +2855,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // not. Reported BESIDE PSNR, never instead of it: the two disagree
         // exactly when something interesting has happened, which is the point.
         var totalSSIM: Double = 0
+        var totalPSNRFitted: Double = 0
         var evaluated = 0
 
         for frame in frames.prefix(24) {
@@ -2841,18 +2865,17 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             guard frameSupervision.renderSize == renderSize else { continue }
 
             resources.gtColor.writeArray(frameSupervision.groundTruth)
-            // Rasterised on the CPU here, unlike the training path: this
-            // composites on the CPU below to get PSNR, and it runs 24 frames
-            // once per slice rather than every iteration.
-            let heldOutBackground: [Float]? = frameSupervision.hasBackground
-                ? supervision.backgroundImage(
-                    pose: frameSupervision.pose,
-                    intrinsics: frameSupervision.intrinsics,
-                    size: renderSize
-                )
-                : nil
-            if let heldOutBackground {
-                resources.bgColor.writeArray(heldOutBackground)
+            // The far field comes from the SAME trainer_background kernel the
+            // training path uses, encoded into buffer A below and read back
+            // after buffer B. It was the CPU loop backgroundImage, 6 to 10 ms a
+            // frame on the critical path, 132 frames a run (8 early-stop
+            // evaluations of 12 plus the final ones), not the 24 once per
+            // slice this comment used to claim.
+            let useGPUBackground = frameSupervision.hasBackground
+                && frameSupervision.backgroundFaceSize > 0
+                && !frameSupervision.backgroundTexels.isEmpty
+            if useGPUBackground {
+                resources.bgCubemap.writeArray(frameSupervision.backgroundTexels)
             }
 
             var camera = cameraUniforms(
@@ -2869,6 +2892,21 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                   let encoderA = bufferA.makeComputeCommandEncoder()
             else { return nil }
             encoderA.label = "trainer.eval.preprocess"
+            if useGPUBackground {
+                let q = frameSupervision.pose.rotation.simd.inverse
+                var bg = TrainerBackgroundUniforms(
+                    rotationInverse: SIMD4<Float>(q.imag.x, q.imag.y, q.imag.z, q.real),
+                    fx: frameSupervision.intrinsics.fx,
+                    fy: frameSupervision.intrinsics.fy,
+                    cx: frameSupervision.intrinsics.cx,
+                    cy: frameSupervision.intrinsics.cy,
+                    width: UInt32(renderSize.width),
+                    height: UInt32(renderSize.height),
+                    faceSize: UInt32(frameSupervision.backgroundFaceSize),
+                    pad: 0
+                )
+                gpu.background(encoderA, uniforms: &bg)
+            }
             gpu.fillUInt(encoderA, buffer: resources.tilesTouched, count: splatCount, value: 0)
             gpu.preprocess(encoderA, camera: &camera, splatCount: splatCount)
             gpu.exclusiveScan(
@@ -2879,7 +2917,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             )
             encoderA.endEncoding()
             bufferA.commit()
-            try finish(bufferA, "the filter sweep")
+            try finish(bufferA, "the held-out preprocess")
 
             let lastOffset = resources.offsets.readElement(UInt32.self, at: splatCount - 1) ?? 0
             let lastTouched = resources.tilesTouched.readElement(UInt32.self, at: splatCount - 1) ?? 0
@@ -2896,7 +2934,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             gpu.rasterizeForward(encoderB, camera: &camera)
             encoderB.endEncoding()
             bufferB.commit()
-            try finish(bufferB, "the filter finalise")
+            try finish(bufferB, "the held-out render")
 
             // Composite and exposure are applied here rather than by a kernel,
             // because the evaluation must not touch the gradient buffers.
@@ -2904,6 +2942,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             let rendered = resources.renderColor.readArray(Float.self, count: pixelCount * 3)
             let transmittance = resources.renderTFinal.readArray(Float.self, count: pixelCount)
             guard rendered.count == pixelCount * 3, transmittance.count == pixelCount else { continue }
+            let heldOutBackground: [Float]? = useGPUBackground
+                ? resources.bgColor.readArray(Float.self, count: pixelCount * 3)
+                : nil
+            if let heldOutBackground, heldOutBackground.count != pixelCount * 3 { continue }
 
             // A HELD-OUT FRAME HAS NO FITTED EXPOSURE, AND THAT IS NOT A
             // PROPERTY OF THE MODEL.
@@ -2924,7 +2966,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // a fit of the geometry; the raw number is still reported so nothing
             // is hidden.
             var exposure = exposures[frame.index] ?? SIMD2<Float>(1, 0)
-            if fitExposure {
+            var fittedExposure = exposure
+            if fitExposure || alsoScoreExposureFitted {
                 var sx: Double = 0, sy: Double = 0, sxx: Double = 0
                 var sxy: Double = 0, n: Double = 0
                 for i in 0..<pixelCount {
@@ -2942,7 +2985,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     let gain = (n * sxy - sx * sy) / denom
                     let bias = (sy - gain * sx) / n
                     if gain.isFinite, bias.isFinite {
-                        exposure = SIMD2<Float>(
+                        fittedExposure = SIMD2<Float>(
                             Swift.min(Swift.max(Float(gain), tuning.exposureGainRange.lowerBound),
                                       tuning.exposureGainRange.upperBound),
                             Swift.min(Swift.max(Float(bias), tuning.exposureBiasRange.lowerBound),
@@ -2951,17 +2994,24 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     }
                 }
             }
+            if fitExposure { exposure = fittedExposure }
             var sum: Double = 0
+            var sumFitted: Double = 0
             for i in 0..<pixelCount {
                 for c in 0..<3 {
-                    var value = rendered[i * 3 + c]
+                    var composited = rendered[i * 3 + c]
                     if let heldOutBackground {
-                        value += transmittance[i] * heldOutBackground[i * 3 + c]
+                        composited += transmittance[i] * heldOutBackground[i * 3 + c]
                     }
-                    value = exposure.x * value + exposure.y
                     let truth = frameSupervision.groundTruth[i * 3 + c]
+                    let value = exposure.x * composited + exposure.y
                     let diff = Double(value - truth)
                     sum += diff * diff
+                    if alsoScoreExposureFitted {
+                        let fittedValue = fittedExposure.x * composited + fittedExposure.y
+                        let fittedDiff = Double(fittedValue - truth)
+                        sumFitted += fittedDiff * fittedDiff
+                    }
                 }
             }
             // Luma SSIM over 8x8 blocks. Not a windowed Gaussian SSIM, which
@@ -3018,11 +3068,18 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // A frame that matches exactly would be infinite dB; clamp it to
             // the same 99 the old code returned for the whole set.
             totalPSNR += frameMSE > 1e-12 ? 10 * log10(1.0 / frameMSE) : 99
+            if alsoScoreExposureFitted {
+                let fittedMSE = sumFitted / Double(pixelCount * 3)
+                totalPSNRFitted += fittedMSE > 1e-12 ? 10 * log10(1.0 / fittedMSE) : 99
+            }
             evaluated += 1
         }
 
         guard evaluated > 0 else { return nil }
         lastHeldOutSSIM = Float(totalSSIM / Double(evaluated))
+        if alsoScoreExposureFitted {
+            lastHeldOutPSNRExposureFitted = Float(totalPSNRFitted / Double(evaluated))
+        }
         return Float(totalPSNR / Double(evaluated))
     }
 

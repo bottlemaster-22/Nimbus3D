@@ -533,6 +533,10 @@ struct TrainerTimings: Codable {
     /// Writing this frame's ground truth, background and depth samples into
     /// the shared Metal buffers.
     var upload: Double = 0
+    /// The seed load: PLY parse, record build, thinning. It was in NO
+    /// bucket. On scan_20260906_164840 (build 250) 4.03 s of a 77 s training
+    /// wall sat in no bucket at all, and this is the largest suspect.
+    var prologue: Double = 0
 
     /// The one command buffer that holds the sort, the forward raster, the
     /// losses, the backward raster and the optimiser. It used to be labelled
