@@ -465,6 +465,16 @@ enum PrePassInitialSplatBuilder {
             index += step
         }
 
+        // WARM THIS PASS'S EDGE MAPS ON EVERY CORE. Since build 256 an edge
+        // map is built the first time anyone asks for it, and the loop below
+        // asks one keyframe at a time, so the seeder built its 174 maps
+        // serially inside its own critical path. Built concurrently here
+        // first, the loop then reads each back instead (from the cache, or
+        // from the file it was written to). Same maps, same order of use.
+        DispatchQueue.concurrentPerform(iterations: keyframes.count) { k in
+            _ = edgeMapFor(keyframes[k].index)
+        }
+
         // Grid origin from the camera path grown by the sensor's reach, the
         // same envelope the carver and the survey use.
         var pathMin = SIMD3<Float>(repeating: .greatestFiniteMagnitude)

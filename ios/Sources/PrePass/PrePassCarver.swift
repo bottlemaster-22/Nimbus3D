@@ -337,105 +337,82 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
         let boundedSteps: Float = stepsNeeded.isFinite ? Swift.min(stepsNeeded, 100_000) : 100
         let maxSteps = Int(boundedSteps) + 4
 
-        for frame in keyframes {
-            try Task.checkCancellation()
-            // `loadOutcome` rather than `load`: `load` answers nil for both
-            // "this frame never recorded depth" and "this frame's depth file
-            // will not open", and only the second is data loss. Skipped in
-            // silence before the census existed, and indistinguishable from
-            // each other before this split.
-            let depthFrame: PrePassDepthFrame
-            switch try PrePassDepthFrame.loadOutcome(
-                frame: frame, settings: bundle.settings, at: ref
-            ) {
-            case .loaded(let opened):
-                depthFrame = opened
-            case .unreadable(let path):
-                keyframesDepthUnreadable += 1
-                keyframesMissing += 1
-                if firstUnreadableDepthPath == nil { firstUnreadableDepthPath = path }
-                continue
-            case .noDepthRecorded:
-                // `keyframes(from:)` only ever selects frames whose
-                // `depthPath` is non-nil, so this should be unreachable.
-                // Counted anyway, and reported below, so that if that filter
-                // ever changes the fact shows up as a number instead of
-                // quietly inflating the unreadable count.
-                keyframesNoDepthRecorded += 1
-                keyframesMissing += 1
-                continue
-            }
-            keyframesLoaded += 1
-
-            let pose = frame.refinedPose ?? frame.rawPose
-            let sensorOrigin = pose.center.simd
-            let width = geometry.width
-            let height = geometry.height
-
-            var y = 0
-            while y < height {
-                var x = 0
-                while x < width {
-                    let index = y * width + x
-                    let directionWorld = PrePassRigid.worldDirection(
-                        cameraDirection: geometry.rayDirections[index], pose: pose
+        // CARVED ON EVERY CORE, THEN MERGED TO THE IDENTICAL GRID.
+        //
+        // This walked 868 keyframes one after another on one core: 10.7
+        // million rays and hundreds of millions of cell visits, 3.09 s of a
+        // 13.6 s pre-pass on build 256. The result does not depend on the
+        // order the rays are cast in. A cell is SURFACE if any ray ever ended
+        // in it and EMPTY otherwise, its hit count is the number of rays that
+        // ended in it (saturating at UInt16.max), and the file is sorted by
+        // key. So each core carves every Nth keyframe into a table of its own
+        // and the tables are merged by exactly those rules: same cells, same
+        // states, same counts, same bytes on disk.
+        //
+        // The one difference is only reachable at the cell cap: each shard is
+        // capped at maxCells on its own, so a scan big enough to hit the cap
+        // can keep a few more free cells than the serial walk did. The cap is
+        // still reported. The owner's room uses 152,180 cells.
+        let workerCount = Swift.max(
+            1, Swift.min(ProcessInfo.processInfo.activeProcessorCount, keyframes.count, 8)
+        )
+        var shards = [CarveShard](repeating: CarveShard(), count: workerCount)
+        shards.withUnsafeMutableBufferPointer { out in
+            DispatchQueue.concurrentPerform(iterations: workerCount) { w in
+                var shard = CarveShard()
+                var k = w
+                while k < keyframes.count {
+                    if Task.isCancelled || shard.error != nil { break }
+                    carveFrame(
+                        keyframes[k], order: k, bundle: bundle, ref: ref,
+                        geometry: geometry, voxelFrame: voxelFrame, maxRange: maxRange,
+                        stride: stride, maxSteps: maxSteps, shard: &shard
                     )
-                    raysCast += 1
-
-                    if depthFrame.hasReturn(at: index) {
-                        let z = depthFrame.depthMeters(at: index)
-                        let range = geometry.range(index: index, depthMeters: z)
-                        if range > maxRange {
-                            raysBeyondMaxRange += 1
-                        } else if range <= 0.05 {
-                            raysTooClose += 1
-                        }
-                        if range > 0.05, range <= maxRange {
-                            raysWithReturnInRange += 1
-                            // Free space up to just short of the surface, then
-                            // the surface cell itself.
-                            let free = Swift.max(range - tuning.surfaceMarginMeters, 0)
-                            carveFree(
-                                origin: sensorOrigin, direction: directionWorld, distance: free,
-                                voxelFrame: voxelFrame, maxSteps: maxSteps,
-                                hash: &hash, states: &states, hits: &hits
-                            )
-                            let endpoint = sensorOrigin + directionWorld * range
-                            markSurface(
-                                at: endpoint, voxelFrame: voxelFrame,
-                                hash: &hash, states: &states, hits: &hits
-                            )
-                        }
-                        // range > maxRange: the beam came back from beyond the
-                        // sensor's specified reach. Neither the surface nor the
-                        // space in front of it is trustworthy, so nothing is
-                        // written. UNKNOWN.
-                    } else {
-                        // No return. NOT empty. The only thing this ray proves
-                        // is that it reached at least as far as its neighbours
-                        // did before something stopped them - which for a
-                        // window pane in a wall is the wall's own distance.
-                        raysNoReturn += 1
-                        if let bound = noReturnFreeBound(
-                            depthFrame: depthFrame, geometry: geometry,
-                            x: x, y: y, maxRange: maxRange
-                        ) {
-                            raysNoReturnBounded += 1
-                            carveFree(
-                                origin: sensorOrigin, direction: directionWorld, distance: bound,
-                                voxelFrame: voxelFrame, maxSteps: maxSteps,
-                                hash: &hash, states: &states, hits: &hits
-                            )
-                        }
-                    }
-                    x += stride
+                    k += workerCount
                 }
-                y += stride
+                out[w] = shard
             }
         }
+        try Task.checkCancellation()
+        for shard in shards {
+            if let error = shard.error { throw error }
+        }
 
-        // Sort by key: the file is a sorted run so a reader can binary-search
-        // it and two grids can be merged with a linear scan.
+        var firstUnreadableOrder = Int.max
+        for shard in shards {
+            raysCast += shard.raysCast
+            raysWithReturnInRange += shard.raysWithReturnInRange
+            raysBeyondMaxRange += shard.raysBeyondMaxRange
+            raysTooClose += shard.raysTooClose
+            raysNoReturn += shard.raysNoReturn
+            raysNoReturnBounded += shard.raysNoReturnBounded
+            keyframesLoaded += shard.keyframesLoaded
+            keyframesMissing += shard.keyframesMissing
+            keyframesDepthUnreadable += shard.keyframesDepthUnreadable
+            keyframesNoDepthRecorded += shard.keyframesNoDepthRecorded
+            if let first = shard.firstUnreadable, first.order < firstUnreadableOrder {
+                firstUnreadableOrder = first.order
+                firstUnreadableDepthPath = first.path
+            }
+            if shard.capped { hitCellCap = true }
+            for entry in shard.hash.entries() {
+                let state = shard.states[entry.slot]
+                let count = shard.hits[entry.slot]
+                let slot = hash.indexOrInsert(entry.key)
+                if slot.inserted {
+                    states.append(state)
+                    hits.append(count)
+                } else {
+                    if state == OccupancyState.surface.rawValue {
+                        states[slot.index] = state
+                    }
+                    let total = Int(hits[slot.index]) + Int(count)
+                    hits[slot.index] = UInt16(Swift.min(total, Int(UInt16.max)))
+                }
+            }
+        }
+        if hash.count > tuning.maxCells { hitCellCap = true }
+
         let entries = hash.entries().sorted { $0.key < $1.key }
         var keys = [UInt64](repeating: 0, count: entries.count)
         var sortedStates = [UInt8](repeating: 0, count: entries.count)
@@ -620,15 +597,141 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
 
     // MARK: Internals
 
-    private func carveFree(
+    /// One core's share of a carve: its own cell table and its own counters.
+    /// Merged by `carve` once every core has finished.
+    private struct CarveShard {
+        var hash = PrePassVoxelHash(expectedCount: 1 << 15)
+        var states: [UInt8] = []
+        var hits: [UInt16] = []
+        var capped = false
+        var error: Error?
+        var raysCast = 0
+        var raysWithReturnInRange = 0
+        var raysBeyondMaxRange = 0
+        var raysTooClose = 0
+        var raysNoReturn = 0
+        var raysNoReturnBounded = 0
+        var keyframesLoaded = 0
+        var keyframesMissing = 0
+        var keyframesDepthUnreadable = 0
+        var keyframesNoDepthRecorded = 0
+        var firstUnreadable: (order: Int, path: String)?
+    }
+
+    /// One keyframe's rays into one shard. Reads `tuning` and nothing else on
+    /// `self`, and writes only the shard, so several run at once safely.
+    private func carveFrame(
+        _ frame: CaptureFrame,
+        order: Int,
+        bundle: CaptureBundle,
+        ref: CaptureBundleRef,
+        geometry: PrePassDepthGeometry,
+        voxelFrame: PrePassVoxelFrame,
+        maxRange: Float,
+        stride: Int,
+        maxSteps: Int,
+        shard: inout CarveShard
+    ) {
+        // `loadOutcome` rather than `load`: `load` answers nil for both
+        // "this frame never recorded depth" and "this frame's depth file
+        // will not open", and only the second is data loss.
+        let depthFrame: PrePassDepthFrame
+        do {
+            switch try PrePassDepthFrame.loadOutcome(
+                frame: frame, settings: bundle.settings, at: ref
+            ) {
+            case .loaded(let opened):
+                depthFrame = opened
+            case .unreadable(let path):
+                shard.keyframesDepthUnreadable += 1
+                shard.keyframesMissing += 1
+                if shard.firstUnreadable == nil { shard.firstUnreadable = (order: order, path: path) }
+                return
+            case .noDepthRecorded:
+                // `keyframes(from:)` only selects frames with a depthPath, so
+                // this should be unreachable; counted so it shows if not.
+                shard.keyframesNoDepthRecorded += 1
+                shard.keyframesMissing += 1
+                return
+            }
+        } catch {
+            shard.error = error
+            return
+        }
+        shard.keyframesLoaded += 1
+
+        let pose = frame.refinedPose ?? frame.rawPose
+        let sensorOrigin = pose.center.simd
+        let width = geometry.width
+        let height = geometry.height
+        let margin = tuning.surfaceMarginMeters
+        let maxCells = tuning.maxCells
+
+        var y = 0
+        while y < height {
+            var x = 0
+            while x < width {
+                let index = y * width + x
+                let directionWorld = PrePassRigid.worldDirection(
+                    cameraDirection: geometry.rayDirections[index], pose: pose
+                )
+                shard.raysCast += 1
+
+                if depthFrame.hasReturn(at: index) {
+                    let z = depthFrame.depthMeters(at: index)
+                    let range = geometry.range(index: index, depthMeters: z)
+                    if range > maxRange {
+                        shard.raysBeyondMaxRange += 1
+                    } else if range <= 0.05 {
+                        shard.raysTooClose += 1
+                    }
+                    if range > 0.05, range <= maxRange {
+                        shard.raysWithReturnInRange += 1
+                        // Free space up to just short of the surface, then
+                        // the surface cell itself.
+                        let free = Swift.max(range - margin, 0)
+                        Self.carveFree(
+                            origin: sensorOrigin, direction: directionWorld, distance: free,
+                            voxelFrame: voxelFrame, maxSteps: maxSteps, maxCells: maxCells,
+                            shard: &shard
+                        )
+                        let endpoint = sensorOrigin + directionWorld * range
+                        Self.markSurface(at: endpoint, voxelFrame: voxelFrame, shard: &shard)
+                    }
+                    // range > maxRange: the beam came back from beyond the
+                    // sensor's specified reach. Nothing is written. UNKNOWN.
+                } else {
+                    // No return. NOT empty. The only thing this ray proves is
+                    // that it reached at least as far as its neighbours did.
+                    shard.raysNoReturn += 1
+                    if let bound = noReturnFreeBound(
+                        depthFrame: depthFrame, geometry: geometry,
+                        x: x, y: y, maxRange: maxRange
+                    ) {
+                        shard.raysNoReturnBounded += 1
+                        Self.carveFree(
+                            origin: sensorOrigin, direction: directionWorld, distance: bound,
+                            voxelFrame: voxelFrame, maxSteps: maxSteps, maxCells: maxCells,
+                            shard: &shard
+                        )
+                    }
+                }
+                x += stride
+            }
+            y += stride
+        }
+    }
+
+    /// Marks every cell a ray crosses as EMPTY, unless the cell already
+    /// exists (a surface stays a surface). Stops inserting at `maxCells`.
+    private static func carveFree(
         origin: SIMD3<Float>,
         direction: SIMD3<Float>,
         distance: Float,
         voxelFrame: PrePassVoxelFrame,
         maxSteps: Int,
-        hash: inout PrePassVoxelHash,
-        states: inout [UInt8],
-        hits: inout [UInt16]
+        maxCells: Int,
+        shard: inout CarveShard
     ) {
         guard distance > voxelFrame.voxelSize else { return }
         var capped = false
@@ -637,43 +740,32 @@ public final class VoxelFreeSpaceCarver: FreeSpaceCarver, @unchecked Sendable {
             frame: voxelFrame, maxSteps: maxSteps
         ) { cell in
             guard let key = PrePassMorton.key(cell: cell) else { return false }
-            if let existing = hash.index(of: key) {
-                // Already known. A SURFACE cell is NEVER downgraded to empty -
-                // one stray beam clipping a corner must not erase a wall that
-                // thousands of beams landed on - and an EMPTY cell is already
-                // what this beam would make it. Either way, nothing to write.
-                _ = existing
-                return true
-            }
-            guard hash.count < self.tuning.maxCells else { capped = true; return false }
-            let inserted = hash.indexOrInsert(key)
+            if shard.hash.index(of: key) != nil { return true }
+            guard shard.hash.count < maxCells else { capped = true; return false }
+            let inserted = shard.hash.indexOrInsert(key)
             if inserted.inserted {
-                states.append(OccupancyState.empty.rawValue)
-                hits.append(0)
+                shard.states.append(OccupancyState.empty.rawValue)
+                shard.hits.append(0)
             }
             return true
         }
-        if capped { hitCellCap = true }
+        if capped { shard.capped = true }
     }
 
-    private func markSurface(
+    /// The cell a ray ended in: SURFACE, and one more hit.
+    private static func markSurface(
         at point: SIMD3<Float>,
         voxelFrame: PrePassVoxelFrame,
-        hash: inout PrePassVoxelHash,
-        states: inout [UInt8],
-        hits: inout [UInt16]
+        shard: inout CarveShard
     ) {
         guard let key = voxelFrame.key(point) else { return }
-        let slot = hash.indexOrInsert(key)
+        let slot = shard.hash.indexOrInsert(key)
         if slot.inserted {
-            states.append(OccupancyState.surface.rawValue)
-            hits.append(1)
+            shard.states.append(OccupancyState.surface.rawValue)
+            shard.hits.append(1)
         } else {
-            states[slot.index] = OccupancyState.surface.rawValue
-            // Saturating: a wall seen 70000 times is not usefully different
-            // from one seen 65535 times, and wrapping to zero would say the
-            // opposite of the truth.
-            if hits[slot.index] < UInt16.max { hits[slot.index] += 1 }
+            shard.states[slot.index] = OccupancyState.surface.rawValue
+            if shard.hits[slot.index] < UInt16.max { shard.hits[slot.index] += 1 }
         }
     }
 

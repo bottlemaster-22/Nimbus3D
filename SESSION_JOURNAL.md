@@ -843,3 +843,19 @@ Builds 255 and 256 green. 256 is the build to test: it contains every change sin
 ### NEXT
 
 If trust is still large after this, the per-frame loop parallelises across cores: the depth and image caches are already locked, and the only order-dependent state is the global 20,000-sample plane-sweep budget.
+
+Builds 257 and 258 green. 258 is the build to test.
+
+---
+
+## 2026-09-10 (late night) : Build 260, carving on every core, and what was deliberately NOT done
+
+The owner asked for more before the next test, so 258 was not tested and 260 stacks on it.
+
+- **Free-space carving on every core, same bytes on disk.** 868 keyframes, 10.7 M rays, one core, 3.09 s on 256. The grid does not depend on ray order: a cell is SURFACE if any ray ended in it, its hit count is the number that did (saturating), and the file is sorted by key. So each core carves every Nth keyframe into its own table and the tables merge by exactly those rules. The helpers became static and take the shard, so nothing on the carver is written from two threads; the cap flag they used to set on `self` is now a field of the shard. Only difference, and only at the cell cap: each shard is capped on its own. The room uses 152,180 cells.
+- **The seeder's edge maps warmed on every core** before its loop, the same trick as the trainer's in 258. Since 256 the seeder built its 174 maps one at a time on its critical path.
+- **tgIndex dropped from trainer_rasterize_backward.** An experiment, bit-identical output: the loop re-reads `values` (an L1 broadcast, every lane the same address) instead of a 1 KB threadgroup copy, taking the footprint from 11,776 to the forward rasteriser's 10,752 bytes. One verifier said that buys a third resident threadgroup; another said the occupancy argument does not hold and the device read could be slower. gpuStep on 256 was 49.0 s and nothing else in 258 or 260 touches the GPU, so the next census reads it directly. If gpuStep rises, revert this one commit.
+
+**Deliberately not done: the trust build across cores.** 258 removed its per-sample allocations and locks and that result is not measured yet. Parallelising it means a 250-line restructure whose failure mode is silent: `trust_noise.bin` is frame-major with no header, so any ordering slip shears every later frame's trust into another frame's samples. The design, if the next census still shows trust large: run the plane-sweep frames serially until the 20,000-sample budget is spent (a few frames), then compute the rest on every core in chunks and apply the four order-sensitive outputs (noise append, bias accumulator, residuals by confidence level, affines) in slot order.
+
+Next test: 260. It carries every change since 250.
