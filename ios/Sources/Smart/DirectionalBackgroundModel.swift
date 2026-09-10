@@ -456,13 +456,22 @@ public final class DirectionalBackgroundModel: BackgroundModel {
             let qcWeight = SmartMath.clamp(frame.qc.weight, 0, 1)
             guard qcWeight > 0.05 else { continue }
 
+            // Once per frame, not once per sample. `authority(frame:sampleIndex:)`
+            // is `map(for:)` then an index, and `map(for:)` takes the map's lock
+            // and does a dictionary lookup: about 5.9 million round trips for
+            // ~120 frames of 49,152 samples, for one object per frame. Same
+            // object, same values. The rotation inverse was likewise rebuilt
+            // per sample from a pose that is constant within the frame.
+            let frameAuthority = map?.map(for: frame.index)
+            let rotationInverse = pose.rotation.simd.inverse
+
             for v in 0..<height {
                 for u in 0..<width {
                     let i = v * width + u
 
                     // A pixel belongs to the far field exactly when nothing
                     // nearer has authority over it.
-                    let authority = map?.authority(frame: frame.index, sampleIndex: i) ?? 0
+                    let authority = frameAuthority?.value(sampleIndex: i) ?? 0
                     let farness = 1 - SmartMath.clamp(authority, 0, 1)
                     guard farness > 0.5 else { continue }
 
@@ -473,7 +482,7 @@ public final class DirectionalBackgroundModel: BackgroundModel {
 
                     let pixel = SIMD2<Float>(Float(u) + 0.5, Float(v) + 0.5)
                     let rayCamera = SmartCamera.ray(pixel, nativeK)
-                    let direction = pose.rotation.simd.inverse.act(rayCamera)
+                    let direction = rotationInverse.act(rayCamera)
 
                     let w = farness * qcWeight
                     let colour = rgb[i]

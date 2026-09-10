@@ -462,23 +462,25 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         var prepared: [PreparedPair] = []
         prepared.reserveCapacity(pairs.count)
 
-        for pair in pairs {
-            try Task.checkCancellation()
+        // PAIRS PREPARED ON EVERY CORE. Each pair is independent: a depth
+        // load, two grey images, a corner response and a feature pick. Results
+        // land in pair order and are compacted in pair order, and a depth load
+        // that throws still surfaces as the first such error in pair order,
+        // so `prepared` is exactly what the serial loop built.
+        func preparePair(a: CaptureFrame, b: CaptureFrame) throws -> PreparedPair? {
             guard let depthFrame = try PrePassDepthFrame.load(
-                frame: pair.a, settings: bundle.settings, at: ref
-            ) else { continue }
+                frame: a, settings: bundle.settings, at: ref
+            ) else { return nil }
             guard let imageA = PrePassImageLoader.loadGray(
-                url: ref.url(forRelativePath: pair.a.imagePath),
+                url: ref.url(forRelativePath: a.imagePath),
                 width: workingWidth, height: workingHeight
-            ) else { continue }
+            ) else { return nil }
             guard let imageB = PrePassImageLoader.loadGray(
-                url: ref.url(forRelativePath: pair.b.imagePath),
+                url: ref.url(forRelativePath: b.imagePath),
                 width: workingWidth, height: workingHeight
-            ) else { continue }
+            ) else { return nil }
 
             let corners = PrePassImageOps.shiTomasiResponse(imageA, radius: 2)
-            // Pick the strongest corners that also have a LiDAR return, spaced
-            // out so they are not all on one high-contrast object.
             var candidates: [(response: Float, x: Int, y: Int)] = []
             let scaleToNativeX = Float(geometry.width) / Float(workingWidth)
             let scaleToNativeY = Float(geometry.height) / Float(workingHeight)
@@ -500,10 +502,10 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
             var used = Set<Int>()
             for candidate in candidates {
                 if samples.count >= tuning.timeOffsetFeaturesPerPair { break }
-                // Coarse spatial spread: at most one feature per 16x16 cell.
+                // At most one feature per 16x16 cell, so one busy corner of
+                // the frame cannot supply every sample.
                 let cell = (candidate.y / 16) * (workingWidth / 16 + 1) + (candidate.x / 16)
                 if used.contains(cell) { continue }
-
                 let nx = Int(Float(candidate.x) * scaleToNativeX)
                 let ny = Int(Float(candidate.y) * scaleToNativeY)
                 guard nx >= 0, ny >= 0, nx < geometry.width, ny < geometry.height else { continue }
@@ -511,9 +513,6 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
                 guard depthFrame.hasReturn(at: nativeIndex) else { continue }
                 let z = depthFrame.depthMeters(at: nativeIndex)
                 guard z > 0.2, z < bundle.settings.lidarMaxRangeMeters else { continue }
-
-                // Unproject with the WORKING intrinsics so the pixel the ZNCC
-                // patch is centred on and the ray are the same thing.
                 let cameraPoint = SIMD3<Float>(
                     (Float(candidate.x) + 0.5 - workingIntrinsics.cx) / workingIntrinsics.fx * z,
                     (Float(candidate.y) + 0.5 - workingIntrinsics.cy) / workingIntrinsics.fy * z,
@@ -528,13 +527,33 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
                 )
             }
 
-            guard samples.count >= 12 else { continue }
-            prepared.append(
-                PreparedPair(
-                    frameA: pair.a, frameB: pair.b,
-                    imageA: imageA, imageB: imageB, samples: samples
-                )
+            guard samples.count >= 12 else { return nil }
+            return PreparedPair(
+                frameA: a, frameB: b,
+                imageA: imageA, imageB: imageB, samples: samples
             )
+        }
+
+        try Task.checkCancellation()
+        var preparedSlots = [PreparedPair?](repeating: nil, count: pairs.count)
+        var prepareErrors = [Error?](repeating: nil, count: pairs.count)
+        preparedSlots.withUnsafeMutableBufferPointer { out in
+            prepareErrors.withUnsafeMutableBufferPointer { errors in
+                DispatchQueue.concurrentPerform(iterations: pairs.count) { p in
+                    do {
+                        out[p] = try preparePair(a: pairs[p].a, b: pairs[p].b)
+                    } catch {
+                        errors[p] = error
+                    }
+                }
+            }
+        }
+        try Task.checkCancellation()
+        for error in prepareErrors {
+            if let error { throw error }
+        }
+        for slot in preparedSlots {
+            if let slot { prepared.append(slot) }
         }
 
         guard prepared.count >= 4 else {
@@ -545,50 +564,49 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         census.pairsPrepared = prepared.count
         census.samplesPerSweepPoint = prepared.reduce(0) { $0 + $1.samples.count }
 
-        var scratchA: [Float] = []
-        var scratchB: [Float] = []
+        // THE SWEEP ON EVERY CORE. Each candidate timing is scored on its own:
+        // the same pairs, the same samples, summed in the same order, so each
+        // cost is the one the serial loop computed. The offsets are generated
+        // by the same accumulation as before, so they match to the last bit.
         var offsets: [Double] = []
-        var costs: [Double] = []
-
         var offset = tuning.timeOffsetMinSeconds
         while offset <= tuning.timeOffsetMaxSeconds + 1e-9 {
-            try Task.checkCancellation()
-            var total: Double = 0
-            var count = 0
-
-            for pair in prepared {
-                let poseA = track.pose(at: pair.frameA.timestampSeconds + offset)
-                let poseB = track.pose(at: pair.frameB.timestampSeconds + offset)
-                let aToB = PrePassRigid.relative(from: poseA, to: poseB)
-
-                for sample in pair.samples {
-                    // aToB maps camera-A coordinates to camera-B coordinates,
-                    // so the "world point" argument here is A's camera frame.
-                    let inB = PrePassRigid.cameraPoint(worldPoint: sample.cameraPointA, pose: aToB)
-                    guard inB.z > 0.05 else { continue }
-                    let u = workingIntrinsics.fx * (inB.x / inB.z) + workingIntrinsics.cx
-                    let v = workingIntrinsics.fy * (inB.y / inB.z) + workingIntrinsics.cy
-                    guard u >= 5, v >= 5,
-                          u < Float(workingWidth - 5), v < Float(workingHeight - 5) else { continue }
-
-                    let score = PrePassImageOps.zncc(
-                        pair.imageA, centerA: sample.pixelA,
-                        pair.imageB, centerB: SIMD2<Float>(u, v),
-                        radius: 4,
-                        scratchA: &scratchA, scratchB: &scratchB
-                    )
-                    total += Double(1 - score)
-                    count += 1
-                }
-            }
-
             offsets.append(offset)
-            // Infinity, not a huge finite number: a candidate offset that
-            // reprojected nothing has no cost, and must never be able to win
-            // the sweep by being numerically smallest.
-            costs.append(count > 0 ? total / Double(count) : Double.infinity)
             offset += tuning.timeOffsetStepSeconds
         }
+        var costs = [Double](repeating: Double.infinity, count: offsets.count)
+        costs.withUnsafeMutableBufferPointer { out in
+            DispatchQueue.concurrentPerform(iterations: offsets.count) { k in
+                var scratchA: [Float] = []
+                var scratchB: [Float] = []
+                let offset = offsets[k]
+                var total: Double = 0
+                var count = 0
+                for pair in prepared {
+                    let poseA = track.pose(at: pair.frameA.timestampSeconds + offset)
+                    let poseB = track.pose(at: pair.frameB.timestampSeconds + offset)
+                    let aToB = PrePassRigid.relative(from: poseA, to: poseB)
+                    for sample in pair.samples {
+                        let inB = PrePassRigid.cameraPoint(worldPoint: sample.cameraPointA, pose: aToB)
+                        guard inB.z > 0.05 else { continue }
+                        let u = workingIntrinsics.fx * (inB.x / inB.z) + workingIntrinsics.cx
+                        let v = workingIntrinsics.fy * (inB.y / inB.z) + workingIntrinsics.cy
+                        guard u >= 5, v >= 5,
+                              u < Float(workingWidth - 5), v < Float(workingHeight - 5) else { continue }
+                        let score = PrePassImageOps.zncc(
+                            pair.imageA, centerA: sample.pixelA,
+                            pair.imageB, centerB: SIMD2<Float>(u, v),
+                            radius: 4,
+                            scratchA: &scratchA, scratchB: &scratchB
+                        )
+                        total += Double(1 - score)
+                        count += 1
+                    }
+                }
+                out[k] = count > 0 ? total / Double(count) : Double.infinity
+            }
+        }
+        try Task.checkCancellation()
 
         var sweep: [(offsetSeconds: Double, cost: Double)] = []
         sweep.reserveCapacity(offsets.count)
