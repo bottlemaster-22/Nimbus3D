@@ -65,7 +65,8 @@ if pre:
     st = pre.get('stages')
     if st:
         named = 0.0
-        for k in ('timeOffset', 'revisits', 'poseGraph', 'carving', 'seeding'):
+        for k in ('timeOffset', 'revisits', 'poseGraph', 'carving',
+                  'trust', 'edges', 'glass', 'seeding'):
             v = st.get(k, 0)
             named += v
             print('  %-12s %6.2f s  %5.1f%%' % (k, v, 100 * v / max(total, 1e-9)))

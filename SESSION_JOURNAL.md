@@ -778,3 +778,31 @@ The owner had not yet tested 252 when the last verifiers returned, so everything
 Estimated 2 to 4.7 s, all from a bandwidth model; the verifiers had no on-device timing for any of it. Held back deliberately, each for a build of its own: the pipelined A/B merge (about 1.0 s, a large restructure with an overflow-retry path) and batching the filter sweep 8 cameras a submission (about 0.15 s, but it partly undoes the mitigation for an old iteration-500 watchdog crash).
 
 Failure signatures to read on 254 if anything went wrong: a wrong Adam binding freezes the model (PSNR collapse, sizes stop moving); a silent regulariser shows as discs falling from 86.2 per cent and s3/s2 rising from 0.20; a stuck `pad0` corrupts the SSIM gradient and SSIM collapses from 0.66.
+
+Builds 253 and 254 green (commit c8d3738). Owner to test 254.
+
+---
+
+## 2026-09-10 (later) : "Seeding 12.7 s" was four stages, and the edge maps were built for 868 frames to serve about 300
+
+**Owner, verbatim:** "Not gonna test that one ngl, just keep building." Workflows are off (usage 55 per cent), so this is solo work.
+
+### THE PRE-PASS CLOCK WAS BILLING FOUR STAGES AS ONE
+
+`markStage` records the time since the previous mark. After `markStage(\.carving)` the pipeline runs the trust fields, the edge classifier and glass detection, and only then builds the seeds and marks `\.seeding`. So the 12.69 s "seeding" on build 250 was trust + edges + glass + seeds, and nothing has ever said which. Three clocks added: `trust`, `edges`, `glass`. census.py prints them in pipeline order.
+
+### EDGE MAPS: 868 BUILT, ABOUT 300 READ
+
+`NativeDepthEdgeClassifier.classify` walked every frame in the capture: decode a JPEG thumbnail, read the depth and confidence sidecars, classify, write a 49 KB map. Readers: the seeder's 174 keyframes, the trainer's own keyframes (about 120, chosen later by its own selector, so the pre-pass cannot know them) and the held-out frames. Now `classify` only registers the frames and clears the directory, and `map(for:)` builds a missing map on first use, writes it where it always went, and caches it. The seeder pays for its 174; the trainer pays for its own on the supervision prefetch worker, off the critical path. Same maps, byte for byte, for every frame anyone reads. Clearing the directory is what rewriting every file used to amount to, and it stops `load` registering a stale map from an older run of the same scan. The PC Booster is unaffected: it ships its own `classify_edges`.
+
+**Not measured.** The saving is whatever share of the 12.7 s the edge stage was, times about two thirds. The new clocks will say.
+
+### LOOKED AT AND LEFT ALONE
+
+- **Adam after a split.** A split child's moments are zeroed while `stepCount` is not, so its first steps run 3 to 6x the learning rate. That is exactly what reference 3DGS does: PyTorch Adam keeps one `step` per parameter tensor, so new points get fresh moments under a mature step count. Changing it would be a departure from the reference with an unknown sign, not a fix.
+- **Trust fields over every frame.** Also built for all frames, but the trainer reads them for keyframes the pre-pass cannot know in advance, and each frame's trust is verified against partner frames, so it is not separable per frame the way edges are. It gets a clock first.
+- **The 4.03 s training prologue.** The PLY parse is 46 MB copied once and about 14 M float reads, and the nearest-spacing pass is a hash grid over 2,000 samples: neither is seconds. The likelier owner is building about 28 compute pipelines at trainer start, which no clock covers. `prologue` (since 252) times only the seed load, so it will say whether that part matters.
+
+### NEXT ACTION
+
+Keep building. The next census to arrive, from any build since 256, shows `trust`, `edges`, `glass` and `seeding` separately; whichever is largest is the next target.

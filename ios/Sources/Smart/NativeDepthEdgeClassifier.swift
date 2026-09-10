@@ -54,6 +54,9 @@ public final class NativeDepthEdgeClassifier: EdgeClassifier {
     private var bundleRef: CaptureBundleRef?
     /// Relative `prepass/edges/frame_*.edge8` path per frame.
     private var pathsByFrame: [FrameID: String] = [:]
+    /// Every frame with depth, so a map nobody has built yet can be built
+    /// on first use. Set by `classify` and by `load`.
+    private var framesByID: [FrameID: CaptureFrame] = [:]
 
     private var cacheOrder: [FrameID] = []
     private var cache: [FrameID: [EdgeClass]] = [:]
@@ -94,86 +97,34 @@ public final class NativeDepthEdgeClassifier: EdgeClassifier {
             )
         }
 
+        // BUILT ON FIRST USE, NOT ALL UP FRONT.
+        //
+        // This used to walk EVERY frame in the capture, 868 on the owner's
+        // scan, decoding a JPEG, reading two sidecars and writing a map for
+        // each, on the pre-pass critical path. The readers are the seeder
+        // (174 keyframes) and the trainer (its own ~120 keyframes plus the
+        // held-out frames), so roughly two thirds of that work was written
+        // and never opened. `map(for:)` now builds a missing map the first
+        // time anyone asks for it, writes it where this used to, and caches
+        // it: the seeder pays for its frames, the trainer pays for its frames
+        // on its supervision prefetch worker, off the critical path.
+        //
+        // The directory is CLEARED first, which is what rewriting every file
+        // used to amount to, so `load` in the trainer can never register a
+        // stale map left by an older run of the same scan.
         let directory = "\(BrandConfig.Folder.prePass)/edges"
         let directoryURL = ref.url(forRelativePath: directory)
+        try? FileManager.default.removeItem(at: directoryURL)
         try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-
-        let sampleCount = width * height
-        let imageCache = SmartImageCache(capacity: 2, longEdge: Swift.max(width, height))
-
-        var written = 0
-        var localPaths: [FrameID: String] = [:]
-
-        // One pool per frame. This loop walks EVERY frame in the capture,
-        // not just the keyframes, and each pass decodes a JPEG, reads two
-        // sidecars and writes an edge map. Draining per frame keeps one
-        // frame resident instead of all of them.
-        //
-        // The body hands back the path it wrote instead of using
-        // `continue`, which cannot cross a closure boundary. A nil means
-        // the frame was skipped, which is what both `continue`s meant.
-        for frame in bundle.frames {
-            if Task.isCancelled { throw NimbusError.cancelled }
-            let relativePath = try autoreleasepool { () throws -> String? in
-                guard let depthPath = frame.depthPath else { return nil }
-
-                let depth: [Float]
-                do {
-                    depth = try SmartBinary.readDepth16(
-                        ref.url(forRelativePath: depthPath), count: sampleCount
-                    )
-                } catch {
-                    // A frame with an unreadable depth sidecar is skipped, loudly.
-                    // It is not fatal: `map(for:)` returns an empty map and the
-                    // loss simply has no depth opinion about that frame.
-                    SmartLog.edges.error(
-                        "Frame \(frame.index) depth unreadable, skipped: \(String(describing: error), privacy: .public)"
-                    )
-                    return nil
-                }
-
-                let confidence: [UInt8]
-                if let confidencePath = frame.confidencePath,
-                   let read = try? SmartBinary.readConfidence8(
-                       ref.url(forRelativePath: confidencePath), count: sampleCount
-                   ) {
-                    confidence = read
-                } else {
-                    // No confidence sidecar: treat everything as medium. Losing
-                    // the ranking costs precision in the `unknown` class, nothing
-                    // else, and ARKit's confidence is a weak signal anyway.
-                    confidence = [UInt8](repeating: 1, count: sampleCount)
-                }
-
-                let luma = nativeLuma(
-                    frame: frame, ref: ref, cache: imageCache, width: width, height: height
-                )
-
-                let classes = classifyFrame(
-                    depth: depth,
-                    confidence: confidence,
-                    luma: luma,
-                    width: width,
-                    height: height
-                )
-
-                let relative = "\(directory)/\(Self.stem(forImagePath: frame.imagePath)).edge8"
-                var bytes = Data(capacity: sampleCount)
-                for c in classes { bytes.append(c.rawValue) }
-                try SmartBinary.write(bytes, to: ref.url(forRelativePath: relative))
-                return relative
-            }
-
-            if let relativePath {
-                localPaths[frame.index] = relativePath
-                written += 1
-            }
-        }
 
         let produced = EdgeClassificationRefs(
             directory: directory,
             bandRadiusNativePixels: settings.edgeBandRadiusNativePixels
         )
+        var frames: [FrameID: CaptureFrame] = [:]
+        for frame in bundle.frames where frame.depthPath != nil {
+            frames[frame.index] = frame
+        }
 
         lock.lock()
         depthWidth = width
@@ -181,12 +132,13 @@ public final class NativeDepthEdgeClassifier: EdgeClassifier {
         lidarMaxRange = bundle.settings.lidarMaxRangeMeters
         refs = produced
         bundleRef = ref
-        pathsByFrame = localPaths
+        framesByID = frames
+        pathsByFrame = [:]
         cache.removeAll()
         cacheOrder.removeAll()
         lock.unlock()
 
-        SmartLog.edges.info("Classified edges for \(written) of \(bundle.frames.count) frames")
+        SmartLog.edges.info("Edge maps for \(frames.count) frames will be built on first use")
         return produced
     }
 
@@ -206,24 +158,37 @@ public final class NativeDepthEdgeClassifier: EdgeClassifier {
         let path = pathsByFrame[frame]
         let ref = bundleRef
         let expected = depthWidth * depthHeight
+        let captureFrame = framesByID[frame]
+        let directory = refs?.directory
         lock.unlock()
 
-        guard let path, let ref, expected > 0 else { return [] }
-
-        guard let data = try? SmartBinary.map(ref.url(forRelativePath: path)),
-              data.count >= expected
-        else {
-            SmartLog.edges.error("Edge map for frame \(frame) missing or short at \(path, privacy: .public)")
-            return []
-        }
+        guard let ref, expected > 0 else { return [] }
 
         var classes = [EdgeClass](repeating: .none, count: expected)
-        // The closure parameter is annotated on purpose: without it the
-        // compiler cannot choose between Data's two withUnsafeBytes overloads.
-        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            for i in 0..<expected {
-                classes[i] = EdgeClass(rawValue: raw[i]) ?? .none
+        if let path {
+            guard let data = try? SmartBinary.map(ref.url(forRelativePath: path)),
+                  data.count >= expected
+            else {
+                SmartLog.edges.error("Edge map for frame \(frame) missing or short at \(path, privacy: .public)")
+                return []
             }
+            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                for i in 0..<expected {
+                    classes[i] = EdgeClass(rawValue: raw[i]) ?? .none
+                }
+            }
+        } else {
+            // Not built yet: build it now. Computed OUTSIDE the lock, so the
+            // trainer's main thread and its prefetch worker never wait on
+            // each other; if both ask for the same frame at once they both
+            // build identical bytes, which is wasted work and nothing worse.
+            guard let captureFrame, let directory,
+                  let built = buildMap(frame: captureFrame, ref: ref, directory: directory)
+            else { return [] }
+            classes = built.classes
+            lock.lock()
+            pathsByFrame[frame] = built.path
+            lock.unlock()
         }
 
         lock.lock()
@@ -235,6 +200,62 @@ public final class NativeDepthEdgeClassifier: EdgeClassifier {
         }
         lock.unlock()
         return classes
+    }
+
+    /// One frame's map: exactly what `classify` used to do per frame, now
+    /// run on first use. Returns the classes and, when the write succeeded,
+    /// the relative path, so later calls read the file instead of rebuilding.
+    private func buildMap(
+        frame: CaptureFrame, ref: CaptureBundleRef, directory: String
+    ) -> (classes: [EdgeClass], path: String?)? {
+        return autoreleasepool { () -> (classes: [EdgeClass], path: String?)? in
+            lock.lock()
+            let width = depthWidth
+            let height = depthHeight
+            lock.unlock()
+            let sampleCount = width * height
+            guard sampleCount > 0, let depthPath = frame.depthPath else { return nil }
+
+            let depth: [Float]
+            do {
+                depth = try SmartBinary.readDepth16(
+                    ref.url(forRelativePath: depthPath), count: sampleCount
+                )
+            } catch {
+                SmartLog.edges.error(
+                    "Frame \(frame.index) depth unreadable, skipped: \(String(describing: error), privacy: .public)"
+                )
+                return nil
+            }
+
+            let confidence: [UInt8]
+            if let confidencePath = frame.confidencePath,
+               let read = try? SmartBinary.readConfidence8(
+                   ref.url(forRelativePath: confidencePath), count: sampleCount
+               ) {
+                confidence = read
+            } else {
+                confidence = [UInt8](repeating: 1, count: sampleCount)
+            }
+
+            let imageCache = SmartImageCache(capacity: 1, longEdge: Swift.max(width, height))
+            let luma = nativeLuma(
+                frame: frame, ref: ref, cache: imageCache, width: width, height: height
+            )
+            let classes = classifyFrame(
+                depth: depth,
+                confidence: confidence,
+                luma: luma,
+                width: width,
+                height: height
+            )
+
+            let relative = "\(directory)/\(Self.stem(forImagePath: frame.imagePath)).edge8"
+            var bytes = Data(capacity: sampleCount)
+            for c in classes { bytes.append(c.rawValue) }
+            let written = (try? SmartBinary.write(bytes, to: ref.url(forRelativePath: relative))) != nil
+            return (classes: classes, path: written ? relative : nil)
+        }
     }
 
     // MARK: - Loading maps somebody else wrote
@@ -251,7 +272,9 @@ public final class NativeDepthEdgeClassifier: EdgeClassifier {
         at ref: CaptureBundleRef
     ) {
         var localPaths: [FrameID: String] = [:]
+        var frames: [FrameID: CaptureFrame] = [:]
         for frame in bundle.frames where frame.depthPath != nil {
+            frames[frame.index] = frame
             let relative = "\(refs.directory)/\(Self.stem(forImagePath: frame.imagePath)).edge8"
             if FileManager.default.fileExists(atPath: ref.url(forRelativePath: relative).path) {
                 localPaths[frame.index] = relative
@@ -265,6 +288,7 @@ public final class NativeDepthEdgeClassifier: EdgeClassifier {
         self.refs = refs
         bundleRef = ref
         pathsByFrame = localPaths
+        framesByID = frames
         cache.removeAll()
         cacheOrder.removeAll()
         lock.unlock()
@@ -276,7 +300,9 @@ public final class NativeDepthEdgeClassifier: EdgeClassifier {
     public var isLoaded: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return !pathsByFrame.isEmpty
+        // Loaded means "can answer", and a map not built yet is built on
+        // first use, so this no longer needs a single file on disk.
+        return bundleRef != nil && !framesByID.isEmpty
     }
 
     // MARK: - The classifier itself

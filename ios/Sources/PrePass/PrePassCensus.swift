@@ -152,7 +152,7 @@ public struct PrePassCensus: Codable, Sendable {
     ///
     /// Seconds, cumulative over the pass. They do not have to sum to
     /// `durationSeconds`: bundle loading and the writes at the end are outside
-    /// all five, and what is left over after subtracting them is itself the
+    /// all of them, and what is left over after subtracting them is itself the
     /// answer to "is the I/O the problem".
     public struct Stages: Codable, Sendable, Equatable {
         /// Sweeping the camera-to-IMU time offset.
@@ -164,6 +164,15 @@ public struct PrePassCensus: Codable, Sendable {
         /// Free-space carving. 10.7 million rays over 868 keyframes on the
         /// owner's scan, every one of which needs a depth map loaded.
         public var carving: Double = 0
+        /// The depth trust fields. Until these three clocks existed, trust,
+        /// edges and glass all ran between the carving mark and the seeding
+        /// mark, so all three were billed as "seeding" (12.7 s on build 250).
+        public var trust: Double = 0
+        /// Edge classification. Lazy since this build, so it should read near
+        /// zero; each map's cost now lands wherever it is first asked for.
+        public var edges: Double = 0
+        /// Glass and window detection.
+        public var glass: Double = 0
         /// Building the seed Gaussians from 174 keyframes.
         public var seeding: Double = 0
 

@@ -748,6 +748,7 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
         }
 
         // --- 7. F3 edge classification.
+        markStage(\.trust)
         var edgesLoaded = false
         if tuning.classifyEdges {
             try Task.checkCancellation()
@@ -795,6 +796,7 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
         }
 
         // --- 8. F5 glass and windows.
+        markStage(\.edges)
         var glassFraction = survey.apertureSampleFraction
         if tuning.detectGlass {
             try Task.checkCancellation()
@@ -822,6 +824,7 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
         }
 
         // --- 9. The initial Gaussian set, the point cloud, and the budget.
+        markStage(\.glass)
         let extent = (survey.surfaceBounds ?? bundle.sceneBounds)?.longestEdgeMeters ?? 5
         let budget = suggestedBudget(sceneExtentMeters: extent)
         result.suggestedBudget = budget
