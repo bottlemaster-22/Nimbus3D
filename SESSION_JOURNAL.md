@@ -904,3 +904,21 @@ Builds 261 and 262 green (commit d2a3439).
 ### THE REFUTATION LEDGER, ANSWERED FOR THE OWNER
 
 Asked whether every recovered refutation has now been added: no, and deliberately. Of the 42 recovered in the first pass and the survivors of the second: shipped as listed across 250 to 264; measured and dropped (tgIndex, 6.5 per cent slower; the A/B merge, worth about 1 s by the encodeStep clock); refused because they cut the seed count (three findings, the owner's floor is 800k); already adopted before this session (schedules re-indexed to 4,000 iterations in 244); held as quality experiments that cost time (SH degree 2, supervision resolution); left alone because the proposed fix makes it worse (the SH band gate would open view dependence at 35 per cent instead of 12). Open and actionable: seeding across cores (1.70 s, needs an order-exact merge because PLY order drives the trainer's thinning), filter-sweep batching (0.15 s, an old watchdog crash lives there), and the exposure model.
+
+Builds 263 and 264 green (commit 0dd3787). 264 is the build to test.
+
+---
+
+## 2026-09-11 : Build 264 measured: fastest yet, and the keyframe selector change cost 0.7 dB
+
+| | 260 | 264 |
+|---|---|---|
+| pre-pass | 9.5 s | **7.8 s** (trust 3.38, timeOffset 0.38, carving 1.11) |
+| training | 73 s | **67 s** (gpuStep 46.4: tgIndex revert plus) |
+| **total** | 82.5 s | **74.8 s** |
+| best held-out PSNR | 20.47 | 19.73 |
+| SSIM | 0.6668 | 0.6414 |
+
+The speed work all landed. The picture did not survive the one quality change: picking the look-ahead candidate by `motionBlurPixels` instead of `qc.weight`. held_out_frames.json moved from [18 ... 421] to [23 ... 515], so the test set itself changed, but SSIM and trained-view PSNR fell too. Mechanism, read from the selector and refutation [40]: the walk goes in frame order and stops at 120; the least blurred candidate sits further ahead in the window, lastCenter jumps further, and the same 120 keyframes spread over more of a capture whose second half is a REVISIT of the first (every late camera within 1 m of an early one). [40]'s offline measurement priced exactly that spread as a loss: 13.9 views per splat to 11.6 to 12.1. Reverted in 266, which also records the keyframe span in the census. If 266 returns to about 20.47 it also confirms the parallel trust build is exact.
+
+**Standing rule from the owner, 2026-09-11:** no finding is refuted or dropped without my own check against the code or the data. All 223 refutation records are being re-read by hand.

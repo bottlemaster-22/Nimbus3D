@@ -511,6 +511,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             "Training \(slices.count) time slice(s) from \(keyframes.count) keyframes"
         )
         census.keyframesSelected = keyframes.count
+        census.keyframeFirstIndex = keyframes.map { Int($0.index) }.min() ?? -1
+        census.keyframeLastIndex = keyframes.map { Int($0.index) }.max() ?? -1
+        census.framesInBundle = bundle.frames.count
         census.sliceCount = slices.count
 
         // --- Train each slice --------------------------------------------------
@@ -3566,16 +3569,19 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     here + tuning.keyframeSharpnessLookahead, pool.count - 1
                 )
                 if limit > here {
-                    // By MOTION BLUR, which is what "sharpest" means. It
-                    // compared `qc.weight`, the PRODUCT of blur, sharpness,
-                    // depth coverage, exposure jump and tracking, so a frame
-                    // could win on exposure while being the most smeared in
-                    // the window. Re-running this selector on the owner's
-                    // capture showed the diluted proxy leaving most of the
-                    // available sharpness on the table. The qc.weight > 0.05
-                    // floor that builds `pool` still excludes unusable frames.
+                    // By qc.weight, NOT by motion blur. Build 264 compared
+                    // motionBlurPixels here, and best held-out PSNR fell
+                    // 20.47 to 19.73 and SSIM 0.6668 to 0.6414. The least
+                    // blurred candidate tends to sit further ahead in the
+                    // window, so lastCenter jumps further, the walk reaches
+                    // further into the capture with the same 120 keyframes
+                    // (last held-out frame 421 became 515), and every region
+                    // gets fewer views. Spreading the same 120 frames was
+                    // measured as a loss offline too: 13.9 views per splat
+                    // fell to 11.6 to 12.1. Sharper supervision has to come
+                    // with MORE keyframes, not a thinner spread.
                     for candidate in pool[here...limit]
-                    where candidate.qc.motionBlurPixels < best.qc.motionBlurPixels {
+                    where candidate.qc.weight > best.qc.weight {
                         best = candidate
                     }
                 }

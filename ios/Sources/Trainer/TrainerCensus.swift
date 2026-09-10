@@ -676,6 +676,15 @@ struct TrainerCensus: Codable {
     var gates: TrainerCensusGates?
 
     var keyframesSelected: Int = 0
+    /// The frame-index span the chosen keyframes cover, against the capture's
+    /// length. The selector walks frames in order and stops at its target, so
+    /// on the owner's 868-frame scan the set ended near frame 485 and the
+    /// rest of the walk never trained. Build 264's selector change moved that
+    /// end (visible only through held_out_frames.json) and cost 0.7 dB. These
+    /// make the span a number instead of a reconstruction.
+    var keyframeFirstIndex: Int = -1
+    var keyframeLastIndex: Int = -1
+    var framesInBundle: Int = 0
     var sliceCount: Int = 0
     var slices: [TrainerCensusSlice] = []
     var densifyPasses: [TrainerCensusDensifyPass] = []

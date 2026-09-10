@@ -292,3 +292,10 @@ if curve:
     if sl0.get('bestHeldOutIteration'):
         print('  ^ a fixed budget chosen from data would be about %d iterations'
               % sl0['bestHeldOutIteration'])
+
+# Keyframe span: which part of the capture the model actually trained on.
+_first, _last, _n = d.get('keyframeFirstIndex', -1), d.get('keyframeLastIndex', -1), d.get('framesInBundle', 0)
+if _n and _last >= 0:
+    print('
+KEYFRAMES  : frames %d to %d of %d  (%.0f%% of the capture; after the last keyframe: %d frames)'
+          % (_first, _last, _n, 100.0 * (_last + 1) / _n, _n - 1 - _last))
