@@ -1391,8 +1391,8 @@ kernel void trainer_rasterize_forward(
             // tgIndex was staged here and never read back in this
             // kernel. 1 KB of threadgroup memory per threadgroup, on a
             // GPU where threadgroup memory is what limits how many
-            // threadgroups run at once. The backward rasteriser dropped
-            // its own tgIndex too (build 260), re-reading `values` instead.
+            // threadgroups run at once. The backward rasteriser keeps
+            // its own tgIndex: build 260 dropped it and ran 6.5% slower.
             tgXY[tid] = float2(d.mean2D);
             tgConicOpacity[tid] = float4(float3(d.conic), float(d.opacity));
             tgColorDepth[tid] = float4(
@@ -1988,14 +1988,14 @@ kernel void trainer_rasterize_backward(
     uint2                           tPos        [[thread_position_in_threadgroup]],
     uint                            tid         [[thread_index_in_threadgroup]]
 ) {
-    // tgIndex IS GONE, and its 1,024 bytes with it. It staged `values[load]`
-    // so the accumulation loop could read the splat index back from
-    // threadgroup memory. The loop re-reads `values` instead: at a given j
-    // every lane reads the SAME address, and a batch is 256 consecutive
-    // uints (1 KB), so it is an L1 broadcast. The footprint drops from
-    // 11,776 to 10,752 bytes, the forward rasteriser's own figure, which
-    // may let a third threadgroup fit per core. Output is bit-identical;
-    // only speed can move, and build 256 is the gpuStep baseline (49.0 s).
+    // tgIndex STAYS. Build 260 removed it and re-read `values` from device
+    // memory in the accumulation loop instead, to take the footprint from
+    // 11,776 to 10,752 bytes on the theory that a third threadgroup would
+    // then fit per core. Measured on the device: gpuStep 49.0 s to 52.2 s,
+    // 6.5 per cent SLOWER, the only GPU change in that build. Same
+    // direction as build 92's SIMD-group reduction (6 per cent slower).
+    // On this GPU, threadgroup memory is not what limits this kernel.
+    threadgroup uint   tgIndex[TRAINER_TILE_AREA];
     threadgroup float2 tgXY[TRAINER_TILE_AREA];
     // FLOAT4 again. Staging as half was exact only while the conic itself was
     // half, and the conic went back to float because half cost 2 dB there.
@@ -2126,6 +2126,7 @@ kernel void trainer_rasterize_backward(
         const uint load = rangeStart + batchBase + tid;
         if (load < rangeEnd) {
             const uint splatIndex = values[load];
+            tgIndex[tid] = splatIndex;
             const TrainerSplatRaster d = raster[splatIndex];
             tgXY[tid] = float2(d.mean2D);
             tgConicOpacity[tid] = float4(float3(d.conic), float(d.opacity));
@@ -2217,11 +2218,7 @@ kernel void trainer_rasterize_backward(
                 // scales T_final by 1/(1 - alpha).
                 dLdAlpha += (-TFinal / max(1.0f - alpha, 1e-6f)) * dLdTTotal;
 
-                // Always in bounds: `here` is min(TRAINER_TILE_AREA,
-                // total - batchBase) and j < here, so this is strictly
-                // below rangeStart + total == rangeEnd. The padding lanes
-                // staged for a short batch are never reached here.
-                const uint splatIndex = values[rangeStart + batchBase + uint(j)];
+                const uint splatIndex = tgIndex[j];
 
                 // alpha = opacity * gaussian, so:
                 const float dLdG = co.w * dLdAlpha;

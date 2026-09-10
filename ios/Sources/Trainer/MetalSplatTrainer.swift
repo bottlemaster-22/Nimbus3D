@@ -725,21 +725,19 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         guard let device, let queue, let pipelines else { throw TrainerError.noMetalDevice }
         guard !slice.keyframes.isEmpty else { return SplatCloud.empty(shDegree: .zero) }
 
-        // WARM THIS SLICE'S EDGE MAPS ON EVERY CORE, BEFORE THE LOOP ASKS.
+        // WARM THIS SLICE'S EDGE MAPS ON EVERY CORE, AND FINISH BEFORE THE LOOP.
         // Build 256 made edge maps lazy, which took about 4 s out of the
-        // pre-pass. But the maps the trainer needs were then built one at a
-        // time on the supervision prefetch worker during the first cycle, and
-        // the loop waited on that worker: supervision went from 1.5 s to
-        // 4.0 s. Building them concurrently here overlaps seed load and
-        // resource setup. A frame the worker asks for before it is warm is
-        // simply built twice, identically; the classifier computes outside
-        // its lock.
+        // pre-pass, but the trainer's own maps were then built one at a time
+        // on the supervision prefetch worker during the first cycle, and the
+        // loop waited on it: supervision 1.5 s to 4.0 s. Build 258 warmed them
+        // in the BACKGROUND, which only got that to 3.5 s: the warm-up raced
+        // the prefetch worker for the same cores and the same frames. This
+        // blocks instead, about 120 maps across every core, so the first
+        // cycle finds every map built.
         if let edges = smart.edges {
             let warm = (slice.keyframes + slice.heldOutKeyframes).map(\.index)
-            DispatchQueue.global(qos: .userInitiated).async {
-                DispatchQueue.concurrentPerform(iterations: warm.count) { i in
-                    _ = edges.map(for: warm[i])
-                }
+            DispatchQueue.concurrentPerform(iterations: warm.count) { i in
+                _ = edges.map(for: warm[i])
             }
         }
 

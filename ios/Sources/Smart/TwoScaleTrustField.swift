@@ -206,6 +206,22 @@ public final class TwoScaleTrustField: TrustField {
         return n % 2 == 1 ? buffer[n / 2] : 0.5 * (buffer[n / 2 - 1] + buffer[n / 2])
     }
 
+    /// One trust slot's outputs, computed on any core and applied by
+    /// `build` strictly in slot order.
+    private struct TrustSlotResult {
+        var sigma: [Float]
+        var bias: [TrustBiasEntry] = []
+        var levelResiduals: [(level: Int, value: Float)] = []
+        var affine: (FrameID, SmartDepthAffine)?
+    }
+
+    /// One bias-accumulator sample, recorded so it can be added in order.
+    private struct TrustBiasEntry {
+        let world: SIMD3<Float>
+        let residual: Float
+        let time: Double
+    }
+
     public func build(
         bundle: CaptureBundle,
         prePassPoses: [String: Pose],
@@ -323,52 +339,41 @@ public final class TwoScaleTrustField: TrustField {
         var planeSweepBudget = cost.planeSweepSampleBudget
         let startingSweepBudget = planeSweepBudget
 
-        for slot in 0..<slotCount {
-            if Task.isCancelled {
-                try? noiseWriter.close()
-                throw NimbusError.cancelled
-            }
+        // THE TRUST BUILD ACROSS CORES, APPLIED IN SLOT ORDER.
+        //
+        // 4.37 s of a 9.5 s pre-pass on build 260, every slot on one core.
+        // Each slot's work is independent EXCEPT for four outputs whose order
+        // matters: its row in trust_noise.bin (frame-major, no header, so one
+        // slot out of place shears every later frame), the bias accumulator
+        // (float sums), the residuals by confidence level, and the affines.
+        // `computeSlot` produces all four for one slot without touching any
+        // of them, and `apply` commits them, always in slot order.
+        //
+        // The plane-sweep budget is first-come in slot and sample order, so
+        // slots run strictly serially, exactly as before, until it is spent.
+        // Only after that, when no slot can sweep, do the rest run on every
+        // core. If the budget is never spent, everything stays serial: still
+        // correct, just not faster. Every value written is the one the serial
+        // loop wrote.
+        let frameLookup = framesByIndex
 
-            // One pool per frame slot, for the reason spelled out in
-            // SmartImageLoader.load: a Swift concurrency job drains its
-            // autorelease pool when the job ENDS, not between iterations, and
-            // this is the longest-running loop in the pre-pass. It walks EVERY
-            // slot from 0 to the highest frame index, not just the keyframes,
-            // so on the 900-frame scan this file's own comments describe it is
-            // 900 passes, and each pass opens this frame's depth and
-            // confidence sidecars, hands a 196,608-byte chunk to the noise
-            // writer, and can reach into the image cache for the plane sweep.
-            // None of that is meant to outlive the slot it was read for, so
-            // draining per slot keeps one frame resident instead of the scan.
-            //
-            // The skip path RETURNS rather than using `continue`, which cannot
-            // cross a closure boundary. It means exactly what the `continue`
-            // meant: the maximally distrusted frame HAS been written and this
-            // iteration is over. That ordering is load bearing. trust_noise.bin
-            // is frame-major with no header, so a return placed above the
-            // append would leave the file one frame short and shear every later
-            // lookup into another frame's samples.
-            //
-            // The cancellation check stays outside the pool because its throw
-            // has to leave the loop rather than the closure, and the writer has
-            // to be closed before it does.
-            try autoreleasepool { () throws -> Void in
+        func computeSlot(
+            _ slot: Int, sweepBudget: inout Int, cache: SmartDepthCache
+        ) -> TrustSlotResult {
+            return autoreleasepool { () -> TrustSlotResult in
                 guard
-                    let frame = framesByIndex[slot],
+                    let frame = frameLookup[slot],
                     let pose = poses[frame.index],
-                    let depth = depthCache.depth(for: frame, at: ref)
+                    let depth = cache.depth(for: frame, at: ref)
                 else {
-                    try noiseWriter.appendFloats(
-                        [Float](repeating: Self.hopelessSigma, count: perFrame)
+                    return TrustSlotResult(
+                        sigma: [Float](repeating: Self.hopelessSigma, count: perFrame)
                     )
-                    return
                 }
 
-                let confidence = depthCache.confidence(for: frame, at: ref)
+                let confidence = cache.confidence(for: frame, at: ref)
 
-                // --- 1. The prior, for every sample. --------------------------
-                // A few flops, so it is computed for the whole grid; only the
-                // cross-frame verification below is strided.
+                // --- 1. The prior, for every sample. ----------------------
                 var sigma = [Float](repeating: Self.hopelessSigma, count: perFrame)
                 for v in 0..<height {
                     for u in 0..<width {
@@ -382,40 +387,30 @@ public final class TwoScaleTrustField: TrustField {
                     }
                 }
 
-                // --- 2. Cross-frame verification, strided. --------------------
+                // --- 2. Cross-frame verification, strided. ----------------
                 let sampleStride = Swift.max(1, cost.trustSampleStride)
                 var partnerFrames: [CaptureFrame] = []
                 for id in partners[frame.index] ?? [] {
-                    if let partner = framesByIndex[Int(id)] { partnerFrames.append(partner) }
+                    if let partner = frameLookup[Int(id)] { partnerFrames.append(partner) }
                 }
 
                 var measuredRatios: [Float] = []
                 var affineSensor: [Float] = []
                 var affineTarget: [Float] = []
+                var bias: [TrustBiasEntry] = []
+                var levels: [(level: Int, value: Float)] = []
 
-                // PARTNER POSES AND DEPTH MAPS, FETCHED ONCE PER FRAME.
-                //
-                // They were looked up inside the per-sample loop: a dictionary
-                // read for the pose and a LOCKED cache read for the depth map,
-                // per partner, per sample. At stride 2 that is about 12,300
-                // samples a frame times 4 partners times 868 frames, some 43
-                // million lock round trips for values that never change within
-                // a frame. A partner with no pose or no depth was skipped for
-                // every sample of the frame, and still is.
+                // Partner poses and depths once per frame, not per sample.
                 var partnerPoses: [Pose] = []
                 var partnerDepths: [[Float]] = []
                 for partner in partnerFrames {
                     guard
                         let partnerPose = poses[partner.index],
-                        let partnerDepth = depthCache.depth(for: partner, at: ref)
+                        let partnerDepth = cache.depth(for: partner, at: ref)
                     else { continue }
                     partnerPoses.append(partnerPose)
                     partnerDepths.append(partnerDepth)
                 }
-                // Reused for every sample instead of allocated per sample. The
-                // old path allocated up to four small arrays per sample (the
-                // residuals, a sorted copy for the median, the deviations, and
-                // their sorted copy): about 40 million allocations a pass.
                 var residuals = [Float](repeating: 0, count: partnerPoses.count)
                 var deviations = [Float](repeating: 0, count: partnerPoses.count)
 
@@ -440,9 +435,6 @@ public final class TwoScaleTrustField: TrustField {
                                 let pc = SmartCamera.worldToCamera(partnerPoses[p], world)
                                 guard let pp = SmartCamera.project(pc, nativeK) else { continue }
                                 // Trapping conversion: guard before, not after.
-                                // `project` only rules out points behind the
-                                // camera, so a partner pose with a huge or
-                                // non-finite translation still lands here.
                                 guard
                                     let partnerPixel = SmartMath.pixelIndex(
                                         pp, width: width, height: height
@@ -457,13 +449,10 @@ public final class TwoScaleTrustField: TrustField {
                             }
                             guard residualCount >= 2 else { continue }
 
-                            // Sorts the prefix in place; nothing below reads
-                            // the residuals again except through this median.
                             let medianResidual = Self.medianOfPrefix(&residuals, count: residualCount)
-                            // Robust spread, not a standard deviation: one partner
-                            // looking through a doorway must not get to decide
-                            // this sample's noise. 1.4826 makes the median
-                            // absolute deviation comparable to a sigma.
+                            // Robust spread (median absolute deviation, scaled
+                            // to a sigma): one partner looking through a
+                            // doorway must not decide this sample's noise.
                             for r in 0..<residualCount {
                                 deviations[r] = abs(residuals[r] - medianResidual)
                             }
@@ -477,8 +466,8 @@ public final class TwoScaleTrustField: TrustField {
                             )
 
                             // Optional photometric second opinion, budgeted.
-                            if planeSweepBudget > 0,
-                               let sweep = planeSweep(
+                            if sweepBudget > 0,
+                               let sweep = self.planeSweep(
                                    frame: frame,
                                    pose: pose,
                                    partners: partnerFrames,
@@ -491,22 +480,18 @@ public final class TwoScaleTrustField: TrustField {
                                    ref: ref
                                )
                             {
-                                planeSweepBudget -= 1
-                                // A sharp, high-NCC peak that agrees with the
-                                // sensor is real evidence the sample is good; a
-                                // flat peak is a textureless patch and its
-                                // location means nothing.
+                                sweepBudget -= 1
                                 let agreement = SmartMath.smoothdrop(
                                     0.02, settings.planeSweepRangeMeters, abs(sweep.offsetMeters)
                                 )
                                 let quality = SmartMath.clamp(sweep.peakNCC, 0, 1) * sweep.sharpness
                                 let trustBoost = 0.5 + 0.5 * agreement * quality
                                 measured /= Swift.max(trustBoost, 0.25)
-                                accumulator.add(
+                                bias.append(TrustBiasEntry(
                                     world: world,
                                     residual: sweep.offsetMeters,
-                                    timeSeconds: frame.timestampSeconds
-                                )
+                                    time: frame.timestampSeconds
+                                ))
                             }
 
                             sigma[i] = measured
@@ -515,15 +500,15 @@ public final class TwoScaleTrustField: TrustField {
                             )
                             measuredRatios.append(measured / headOnPrior)
 
-                            accumulator.add(
+                            bias.append(TrustBiasEntry(
                                 world: world,
                                 residual: medianResidual,
-                                timeSeconds: frame.timestampSeconds
-                            )
+                                time: frame.timestampSeconds
+                            ))
 
                             let level = Int(i < confidence.count ? confidence[i] : 1)
                             if level >= 0, level < 3 {
-                                residualsByLevel[level].append(abs(medianResidual))
+                                levels.append((level: level, value: abs(medianResidual)))
                             }
 
                             affineSensor.append(z)
@@ -533,12 +518,9 @@ public final class TwoScaleTrustField: TrustField {
                     }
                 }
 
-                // --- 3. Frame-level inflation for unverified samples. ----------
-                // NOT spatial averaging: one scalar per frame, applied uniformly,
-                // which cannot move an outlier into its neighbours. It says "on
-                // this frame the sensor turned out to be 1.6x worse than the
-                // physics prior expected", which is a frame property (motion blur,
-                // a warm sensor, a dark room), not a place property.
+                // --- 3. Frame-level inflation for unverified samples. -----
+                // One scalar per frame, applied uniformly: "on this frame the
+                // sensor was worse than the physics prior expected".
                 let inflation = measuredRatios.isEmpty
                     ? 1
                     : Swift.max(1, SmartMath.percentile(measuredRatios, 0.5))
@@ -553,7 +535,8 @@ public final class TwoScaleTrustField: TrustField {
                     }
                 }
 
-                // --- 4. Per-frame sensor affine. -------------------------------
+                // --- 4. Per-frame sensor affine. --------------------------
+                var slotAffine: (FrameID, SmartDepthAffine)?
                 let affine = Self.fitAffine(
                     sensor: affineSensor,
                     target: affineTarget,
@@ -561,7 +544,7 @@ public final class TwoScaleTrustField: TrustField {
                     maxShiftMeters: settings.maxDepthShiftMeters
                 )
                 if !affine.isIdentity {
-                    affines.append((frame.index, affine))
+                    slotAffine = (frame.index, affine)
                     let scaleClamped =
                         abs(affine.scale - 1) >= settings.maxDepthScaleDeviation * 0.999
                     let shiftClamped =
@@ -577,9 +560,84 @@ public final class TwoScaleTrustField: TrustField {
                     }
                 }
 
-                try noiseWriter.appendFloats(sigma)
+                return TrustSlotResult(
+                    sigma: sigma, bias: bias, levelResiduals: levels, affine: slotAffine
+                )
             }
         }
+
+        // Commits one slot's four ordered outputs. Only ever called in slot order.
+        func apply(_ result: TrustSlotResult) throws {
+            try noiseWriter.appendFloats(result.sigma)
+            for entry in result.bias {
+                accumulator.add(
+                    world: entry.world, residual: entry.residual, timeSeconds: entry.time
+                )
+            }
+            for entry in result.levelResiduals {
+                residualsByLevel[entry.level].append(entry.value)
+            }
+            if let slotAffine = result.affine { affines.append(slotAffine) }
+        }
+
+        // Phase 1: serial, exactly as before, while any slot could still sweep.
+        var slot = 0
+        while slot < slotCount, planeSweepBudget > 0 {
+            if Task.isCancelled {
+                try? noiseWriter.close()
+                throw NimbusError.cancelled
+            }
+            try apply(computeSlot(slot, sweepBudget: &planeSweepBudget, cache: depthCache))
+            slot += 1
+        }
+        let serialSlots = slot
+
+        // Phase 2: every core. Each worker walks a run of consecutive slots
+        // through its own depth cache, so neighbouring frames share their
+        // partners' loads the way the serial loop did.
+        let workerCount = Swift.max(
+            1, Swift.min(ProcessInfo.processInfo.activeProcessorCount, 8)
+        )
+        let slotsPerWorker = 8
+        let workerCaches = (0..<workerCount).map { _ in
+            SmartDepthCache(
+                capacity: Swift.max(4, cost.trustPartnerFrames + 2), sampleCount: perFrame
+            )
+        }
+        while slot < slotCount {
+            if Task.isCancelled {
+                try? noiseWriter.close()
+                throw NimbusError.cancelled
+            }
+            let base = slot
+            let chunk = Swift.min(workerCount * slotsPerWorker, slotCount - base)
+            var results = [TrustSlotResult?](repeating: nil, count: chunk)
+            results.withUnsafeMutableBufferPointer { out in
+                DispatchQueue.concurrentPerform(iterations: workerCount) { w in
+                    var k = w * slotsPerWorker
+                    let end = Swift.min(k + slotsPerWorker, chunk)
+                    while k < end {
+                        var noSweeps = 0
+                        out[k] = computeSlot(base + k, sweepBudget: &noSweeps, cache: workerCaches[w])
+                        k += 1
+                    }
+                }
+            }
+            for (k, result) in results.enumerated() {
+                // Never skip a slot: a missing row would shear every later
+                // frame's trust into another frame's samples.
+                guard let result else {
+                    try? noiseWriter.close()
+                    throw NimbusError.prePassFailed("trust slot \(base + k) produced no result")
+                }
+                try apply(result)
+            }
+            slot += chunk
+        }
+        let parallelSlots = slotCount - serialSlots
+        SmartLog.trust.info(
+            "Trust build: \(serialSlots) slots serial for the plane sweep, \(parallelSlots) on \(workerCount) cores"
+        )
 
         try noiseWriter.close()
 

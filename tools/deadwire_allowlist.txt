@@ -214,3 +214,4 @@ ViewerGPULayouts.swift:overlapNormalizer  # ARTEFACT: Metal struct mirror, Unifo
 ViewerGPULayouts.swift:baseInstance  # ARTEFACT: Metal struct mirror, part of the indirect draw argument layout the GPU fills in.
 ViewerSupport.swift:readUInt16  # HARMLESS: spare little-endian reader, kept for the same reason as Export's Int32 pair.
 ViewerSupport.swift:remainder  # ARTEFACT: local used on the next line, inside "\(minutes)m \(remainder)s".
+TwoScaleTrustField.swift:parallelSlots  # ARTEFACT: local used only in the trust build's serial/parallel split log interpolation, beside sweepsRun and presetName.

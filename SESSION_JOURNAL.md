@@ -859,3 +859,36 @@ The owner asked for more before the next test, so 258 was not tested and 260 sta
 **Deliberately not done: the trust build across cores.** 258 removed its per-sample allocations and locks and that result is not measured yet. Parallelising it means a 250-line restructure whose failure mode is silent: `trust_noise.bin` is frame-major with no header, so any ordering slip shears every later frame's trust into another frame's samples. The design, if the next census still shows trust large: run the plane-sweep frames serially until the 20,000-sample budget is spent (a few frames), then compute the rest on every core in chunks and apply the four order-sensitive outputs (noise append, bias accumulator, residuals by confidence level, affines) in slot order.
 
 Next test: 260. It carries every change since 250.
+
+Builds 259 and 260 green (commit 9ca7fa5). 260 is the build to test.
+
+---
+
+## 2026-09-11 : Build 260 measured, and build 262: trust across cores, tgIndex reverted
+
+### BUILD 260, MEASURED
+
+| | 256 | 260 |
+|---|---|---|
+| pre-pass | 13.6 s | **9.5 s** |
+| carving | 3.09 | **1.05** (every core, identical grid) |
+| trust | 6.42 | **4.37** (per-sample allocations and locks gone) |
+| seeding | 1.77 | 1.70 (the edge warm-up bought almost nothing: seeding is its sample loop, not its maps) |
+| training | 70 s | 73 s |
+| gpuStep | 49.0 | **52.2** |
+| total | 83.6 s | 82.5 s |
+| best held-out PSNR / SSIM | 20.41 / 0.6647 | **20.47 / 0.6668**, best yet |
+
+**tgIndex removal made gpuStep 6.5 per cent SLOWER.** It was the only GPU change in 258 and 260. Reverted in 262, with the measurement written on the declaration. Same direction as build 92's SIMD-group reduction: on this GPU, threadgroup memory is not what limits the backward rasteriser, and a device re-read in its innermost loop costs more than the occupancy it might buy.
+
+Supervision wait was 3.5 s (4.0 on 256, 1.5 on 250): 258's background warm-up raced the prefetch worker for the same cores and frames. 262 blocks on it instead.
+
+`smartLayer` is 1.7 s and untimed fell to 2.3 s.
+
+### BUILD 262
+
+- **tgIndex restored.**
+- **Trainer edge warm-up blocks** until every map for the slice is built.
+- **The trust build across cores, bit-exact.** Each slot's work is independent except four ordered outputs: its row in `trust_noise.bin` (frame-major, no header), the bias accumulator (float sums), the residuals by confidence level, and the affines. `computeSlot` (a local function, so it captures the build's state without new plumbing) produces all four without touching them; `apply` commits them strictly in slot order. The plane-sweep budget is first-come in slot and sample order, so slots run serially exactly as before until it is spent, then the rest run on every core in chunks, each worker walking eight consecutive slots through its own depth cache so neighbours share their partners' loads. A missing result throws rather than letting the noise file shear. If the budget is never spent everything stays serial: correct, not faster. A log line records the split.
+
+Expected: trust 4.37 s down by the parallel share of its compute; the serial `apply` (about 10.7 M accumulator adds) is the floor. Total should land near 9.5 - 2.5 + 73 - 3.2 - 2 = about 75 s if all three hold. Not measured.
