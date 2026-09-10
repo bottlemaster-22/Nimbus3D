@@ -86,7 +86,7 @@ ORDER = ['gpuBusy', 'gpuScan', 'gpuStep', 'gpuSort', 'gpuForward', 'gpuLosses',
          'gpuBackward', 'gpuOptimiser', 'gpuOther', 'gpuWait',
          'supervision', 'supervisionPrefetched',
          'densify', 'previewSnapshot', 'filterSweep', 'upload', 'prologue',
-         'encodeStep']
+         'smartLayer', 'encodeStep']
 for k in ORDER:
     if k not in t:
         continue
@@ -123,7 +123,7 @@ print('%-22s %9.1f %7.1f%% %11.2f'
 # on what no clock covers. The wall is whole-second ISO dates, +/- 1 s.
 cpu = sum(t.get(k, 0) for k in ('upload', 'previewSnapshot', 'densify',
                                 'earlyStopEval', 'filterSweep', 'prologue',
-                                'encodeStep'))
+                                'smartLayer', 'encodeStep'))
 print('%-22s %9.1f %7.1f%% %11.2f   (lower bound, wall +/- 1 s)'
       % ('  of which untimed', rest - cpu, 100 * (rest - cpu) / wall,
          1000 * (rest - cpu) / iters))

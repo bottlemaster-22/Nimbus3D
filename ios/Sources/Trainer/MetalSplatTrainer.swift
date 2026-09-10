@@ -490,7 +490,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // still trains, as plain 3DGS with LiDAR seeding, which is honest
         // degradation rather than a hard failure. What is NOT done is
         // pretending a missing sidecar is a neutral one.
+        let smartClock = CFAbsoluteTimeGetCurrent()
         let smart = try await loadSmartLayer(bundle: bundle, prePass: prePass, at: ref)
+        timings.smartLayer += CFAbsoluteTimeGetCurrent() - smartClock
 
         // --- Keyframes --------------------------------------------------------
         let keyframes = selectKeyframes(bundle: bundle, prePass: prePass, budget: governor.current)
@@ -722,6 +724,24 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
         guard let device, let queue, let pipelines else { throw TrainerError.noMetalDevice }
         guard !slice.keyframes.isEmpty else { return SplatCloud.empty(shDegree: .zero) }
+
+        // WARM THIS SLICE'S EDGE MAPS ON EVERY CORE, BEFORE THE LOOP ASKS.
+        // Build 256 made edge maps lazy, which took about 4 s out of the
+        // pre-pass. But the maps the trainer needs were then built one at a
+        // time on the supervision prefetch worker during the first cycle, and
+        // the loop waited on that worker: supervision went from 1.5 s to
+        // 4.0 s. Building them concurrently here overlaps seed load and
+        // resource setup. A frame the worker asks for before it is warm is
+        // simply built twice, identically; the classifier computes outside
+        // its lock.
+        if let edges = smart.edges {
+            let warm = (slice.keyframes + slice.heldOutKeyframes).map(\.index)
+            DispatchQueue.global(qos: .userInitiated).async {
+                DispatchQueue.concurrentPerform(iterations: warm.count) { i in
+                    _ = edges.map(for: warm[i])
+                }
+            }
+        }
 
         let sliceLabel = slice.label(of: sliceCount)
         let shDegree = governor.current.shDegree

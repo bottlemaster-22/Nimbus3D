@@ -39,7 +39,10 @@ import Foundation
 import simd
 
 /// F3. Implements `EdgeClassifier` (CONTRACTS.md §5).
-public final class NativeDepthEdgeClassifier: EdgeClassifier {
+// @unchecked Sendable: every mutable field is read and written under `lock`,
+// and a map is built outside it on local state only, so the trainer can warm
+// maps from several threads at once.
+public final class NativeDepthEdgeClassifier: EdgeClassifier, @unchecked Sendable {
 
     // MARK: Configuration
 

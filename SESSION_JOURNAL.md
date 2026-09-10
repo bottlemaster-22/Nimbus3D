@@ -806,3 +806,40 @@ Builds 253 and 254 green (commit c8d3738). Owner to test 254.
 ### NEXT ACTION
 
 Keep building. The next census to arrive, from any build since 256, shows `trust`, `edges`, `glass` and `seeding` separately; whichever is largest is the next target.
+
+Builds 255 and 256 green. 256 is the build to test: it contains every change since 250.
+
+---
+
+## 2026-09-10 (night) : Build 256 measured, 94.6 s to 83.6 s, relocation alive, and the trust loop's 40 million allocations
+
+### BUILD 256, MEASURED
+
+| | 250 | 256 |
+|---|---|---|
+| pre-pass | 17.6 s | **13.6 s** |
+| training | 77 s | **70 s** |
+| **total** | 94.6 s | **83.6 s** |
+| best held-out PSNR | 20.39 | 20.41 |
+| SSIM | 0.6618 | **0.6647** |
+| p50 / spread | 7.83 mm / 4.75x | **7.48 mm / 5.00x** |
+| needles / discs / blobs | 9.1 / 86.2 / 4.7 | 11.2 / 82.2 / 6.7 |
+| densest 10% / Gini | 45.2% / 0.579 | 47.7% / 0.598 |
+
+**Relocation ran 25,935 times** (0 on 250), donor-limited on every pass exactly as predicted, and `prunedLowOpacity` fell 2,299 to 75 because the faint splats now get moved instead of deleted. p50 fell rather than rose, so the feared large-target bias did not dominate. The export fix works: the end state (fitted 20.463) shipped over the 3,600 checkpoint (20.410).
+
+**The pre-pass, split for the first time:** trust 6.42 s (47 per cent), carving 3.09, seeding 1.77, glass 0.28, edges 0.04. Lazy edges took about 4 s out of the pre-pass, but put about 2.5 s back into training: the loop waited 4.0 s for supervision against 1.5, because the trainer's maps were then built one at a time on the prefetch worker.
+
+**Two hypotheses closed by the new clocks:** `encodeStep` is 0.1 s for the whole run, so the pipelined A/B merge is worth only its submit latency, about 1 s, for a five-file restructure. Not worth it yet. `prologue` (the seed load) is 0.5 s. 3.9 s of training wall is still untimed; the pipelines compile BEFORE the census opens, so the suspect is `loadSmartLayer`, now clocked as `smartLayer`.
+
+### BATCH FOR 258
+
+- **Edge maps warmed on every core** at the start of each slice (the slice's keyframes and held-out frames, via `concurrentPerform` on a background queue), so the first cycle stops waiting on the prefetch worker. The classifier is `@unchecked Sendable`: its state is lock-protected and a map is built outside the lock.
+- **`smartLayer` clock** around `loadSmartLayer`.
+- **The trust loop's per-sample work.** At stride 2 and 4 partners the cross-frame check visits about 10.7 million samples a pass. For each it did a dictionary read and a LOCKED depth-cache read per partner (about 43 million lock round trips for values constant within a frame) and allocated up to four small arrays (residuals, a sorted copy for the median, the deviations, their sorted copy). Partner poses and depths are now fetched once per frame, and the median runs by insertion sort over a reused buffer. Same values, same order, same result to the bit. This is the pattern that has paid every time on this project: `radiance()` returning a Swift array per call was 388,800 mallocs an iteration and 42 s of training.
+
+**Not measured.** The trust stage should fall well below 6.42 s; how far says how much of it was allocation and locking versus the plane sweep and the per-frame I/O.
+
+### NEXT
+
+If trust is still large after this, the per-frame loop parallelises across cores: the depth and image caches are already locked, and the only order-dependent state is the global 20,000-sample plane-sweep budget.

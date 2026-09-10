@@ -186,6 +186,26 @@ public final class TwoScaleTrustField: TrustField {
 
     // MARK: - TrustField: build
 
+    /// `SmartMath.median` over the first `n` entries of `buffer`, sorting them
+    /// in place: the same ordering of the same finite values, so the same
+    /// result to the bit, with no allocation. For the handful of partner
+    /// residuals per sample in the trust build's innermost loop.
+    private static func medianOfPrefix(_ buffer: inout [Float], count n: Int) -> Float {
+        guard n > 0 else { return 0 }
+        var i = 1
+        while i < n {
+            let key = buffer[i]
+            var j = i - 1
+            while j >= 0, buffer[j] > key {
+                buffer[j + 1] = buffer[j]
+                j -= 1
+            }
+            buffer[j + 1] = key
+            i += 1
+        }
+        return n % 2 == 1 ? buffer[n / 2] : 0.5 * (buffer[n / 2 - 1] + buffer[n / 2])
+    }
+
     public func build(
         bundle: CaptureBundle,
         prePassPoses: [String: Pose],
@@ -373,6 +393,32 @@ public final class TwoScaleTrustField: TrustField {
                 var affineSensor: [Float] = []
                 var affineTarget: [Float] = []
 
+                // PARTNER POSES AND DEPTH MAPS, FETCHED ONCE PER FRAME.
+                //
+                // They were looked up inside the per-sample loop: a dictionary
+                // read for the pose and a LOCKED cache read for the depth map,
+                // per partner, per sample. At stride 2 that is about 12,300
+                // samples a frame times 4 partners times 868 frames, some 43
+                // million lock round trips for values that never change within
+                // a frame. A partner with no pose or no depth was skipped for
+                // every sample of the frame, and still is.
+                var partnerPoses: [Pose] = []
+                var partnerDepths: [[Float]] = []
+                for partner in partnerFrames {
+                    guard
+                        let partnerPose = poses[partner.index],
+                        let partnerDepth = depthCache.depth(for: partner, at: ref)
+                    else { continue }
+                    partnerPoses.append(partnerPose)
+                    partnerDepths.append(partnerDepth)
+                }
+                // Reused for every sample instead of allocated per sample. The
+                // old path allocated up to four small arrays per sample (the
+                // residuals, a sorted copy for the median, the deviations, and
+                // their sorted copy): about 40 million allocations a pass.
+                var residuals = [Float](repeating: 0, count: partnerPoses.count)
+                var deviations = [Float](repeating: 0, count: partnerPoses.count)
+
                 if !partnerFrames.isEmpty {
                     var v = 0
                     while v < height {
@@ -389,14 +435,9 @@ public final class TwoScaleTrustField: TrustField {
                             let cameraPoint = SmartCamera.unproject(pixel, depthZ: z, nativeK)
                             let world = SmartCamera.cameraToWorld(pose, cameraPoint)
 
-                            var residuals: [Float] = []
-                            residuals.reserveCapacity(partnerFrames.count)
-                            for partner in partnerFrames {
-                                guard
-                                    let partnerPose = poses[partner.index],
-                                    let partnerDepth = depthCache.depth(for: partner, at: ref)
-                                else { continue }
-                                let pc = SmartCamera.worldToCamera(partnerPose, world)
+                            var residualCount = 0
+                            for p in 0..<partnerPoses.count {
+                                let pc = SmartCamera.worldToCamera(partnerPoses[p], world)
                                 guard let pp = SmartCamera.project(pc, nativeK) else { continue }
                                 // Trapping conversion: guard before, not after.
                                 // `project` only rules out points behind the
@@ -407,20 +448,26 @@ public final class TwoScaleTrustField: TrustField {
                                         pp, width: width, height: height
                                     )
                                 else { continue }
-                                let pz = partnerDepth[partnerPixel.y * width + partnerPixel.x]
+                                let pz = partnerDepths[p][partnerPixel.y * width + partnerPixel.x]
                                 guard pz > 0, SmartMath.isUsableDepth(pz) else { continue }
                                 // Positive residual: this frame's sample sits
                                 // BEYOND where the partner sees the surface.
-                                residuals.append(pc.z - pz)
+                                residuals[residualCount] = pc.z - pz
+                                residualCount += 1
                             }
-                            guard residuals.count >= 2 else { continue }
+                            guard residualCount >= 2 else { continue }
 
-                            let medianResidual = SmartMath.median(residuals)
+                            // Sorts the prefix in place; nothing below reads
+                            // the residuals again except through this median.
+                            let medianResidual = Self.medianOfPrefix(&residuals, count: residualCount)
                             // Robust spread, not a standard deviation: one partner
                             // looking through a doorway must not get to decide
                             // this sample's noise. 1.4826 makes the median
                             // absolute deviation comparable to a sigma.
-                            let spread = SmartMath.median(residuals.map { abs($0 - medianResidual) })
+                            for r in 0..<residualCount {
+                                deviations[r] = abs(residuals[r] - medianResidual)
+                            }
+                            let spread = Self.medianOfPrefix(&deviations, count: residualCount)
                                 * 1.4826
 
                             var measured = sqrt(

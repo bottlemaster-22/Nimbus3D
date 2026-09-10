@@ -541,6 +541,11 @@ struct TrainerTimings: Codable {
     /// bucket. On scan_20260906_164840 (build 250) 4.03 s of a 77 s training
     /// wall sat in no bucket at all, and this is the largest suspect.
     var prologue: Double = 0
+    /// Loading the SMART layer: trust fields, authority, edges, background,
+    /// carver. Build 256 still had 3.9 s of training wall in no bucket, and
+    /// this is the largest thing between the census opening and the loop
+    /// that no clock covered (the pipelines are compiled before it opens).
+    var smartLayer: Double = 0
 
     /// The one command buffer that holds the sort, the forward raster, the
     /// losses, the backward raster and the optimiser. It used to be labelled
