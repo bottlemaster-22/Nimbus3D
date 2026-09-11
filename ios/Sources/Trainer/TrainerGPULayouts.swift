@@ -40,7 +40,7 @@
 //      TrainerDepthSample      32 bytes, align 4
 //      TrainerCameraUniforms  144 bytes, align 16
 //      TrainerLossUniforms     68 bytes, align 4
-//      TrainerAdamUniforms     64 bytes, align 4
+//      TrainerAdamUniforms     68 bytes, align 4
 //      TrainerRegUniforms      36 bytes, align 4
 //      TrainerScanUniforms     16 bytes, align 4
 //      TrainerRadixUniforms    16 bytes, align 4
@@ -541,7 +541,13 @@ struct TrainerAdamUniforms {
     var minLogScale: Float = -11.5    // offset 52   ~10 micrometres
     var maxLogScale: Float = 0.7      // offset 56   ~2 metres
     var maxOpacityLogit: Float = 12   // offset 60
-    // stride 64
+    /// Build 332: SH coefficients the ramp has switched on so far (the same
+    /// number cameraUniforms hands the rasteriser). trainer_adam_sh walks only
+    /// these: a coefficient that has never been active has a zero gradient
+    /// and zero moments, so skipping it leaves every value exactly as the
+    /// full walk would, and the ramp only ever grows.
+    var activeSHCoeffCount: UInt32 = 0 // offset 64
+    // stride 68
 }
 
 /// Regulariser weights: the disc / effective-rank prior and late opacity
@@ -730,7 +736,7 @@ enum TrainerGPULayouts {
         check("TrainerDepthSample", MemoryLayout<TrainerDepthSample>.stride, 32)
         check("TrainerCameraUniforms", MemoryLayout<TrainerCameraUniforms>.stride, 144)
         check("TrainerLossUniforms", MemoryLayout<TrainerLossUniforms>.stride, 68)
-        check("TrainerAdamUniforms", MemoryLayout<TrainerAdamUniforms>.stride, 64)
+        check("TrainerAdamUniforms", MemoryLayout<TrainerAdamUniforms>.stride, 68)
         check("TrainerRegUniforms", MemoryLayout<TrainerRegUniforms>.stride, 36)
         check("TrainerScanUniforms", MemoryLayout<TrainerScanUniforms>.stride, 16)
         check("TrainerRadixUniforms", MemoryLayout<TrainerRadixUniforms>.stride, 16)

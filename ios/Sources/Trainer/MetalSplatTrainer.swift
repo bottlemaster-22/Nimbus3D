@@ -893,27 +893,34 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // and 24.69 ms per iteration on the owner's phone, one after the
         // other, with the other device idle each time.
         let prefetch = TrainerSupervisionPrefetch(builder: supervision)
-        // BUILD 328: A SECOND BUILDER FOR THE COARSE PHASE, decoding at the
-        // coarse long edge, with its own prefetch worker. The loop takes each
-        // iteration's frame from whichever pair that iteration belongs to, and
-        // the render buffers follow the frame's size as they always have.
+        // BUILD 328/332: ONE BUILDER PER RESOLUTION LEVEL, each decoding at
+        // its own long edge with its own prefetch worker and frame cache. The
+        // loop takes each iteration's frame from the level that iteration
+        // belongs to, and the render buffers follow the frame's size as they
+        // always have. Each level's frames are decoded in the background
+        // before its phase starts (TrainerSupervisionPreload).
         let fullLongEdge = governor.current.renderLongEdgePixels
-        // Integer arithmetic on a clamped per-mille, as the densify schedule
-        // does: a NaN scale takes the else branch and switches the phase off.
-        let coarseScalePerMille = tuning.coarseResolutionScale.isFinite
-            ? Int(Swift.min(Swift.max(tuning.coarseResolutionScale, 0), 1) * 1000) : 0
-        let coarseFractionPerMille = tuning.coarseResolutionFraction.isFinite
-            ? Int(Swift.min(Swift.max(tuning.coarseResolutionFraction, 0), 1) * 1000) : 0
-        let coarseLongEdge = fullLongEdge * coarseScalePerMille / 1000
-        let coarsePhaseOn = coarseFractionPerMille > 0
-            && coarseScalePerMille > 0 && coarseScalePerMille < 1000
-            && coarseLongEdge >= 64
-        let coarseSupervision: TrainerSupervisionBuilder? = coarsePhaseOn
-            ? TrainerSupervisionBuilder(
+        // Integer arithmetic on clamped per-milles, as the densify schedule
+        // does: a NaN entry takes the else branch and is dropped.
+        var levelScalesPerMille: [Int] = []
+        var levelFractionsPerMille: [Int] = []
+        for (fraction, scale) in zip(tuning.coarseResolutionFractions, tuning.coarseResolutionScales) {
+            guard fraction.isFinite, scale.isFinite else { continue }
+            let f = Int(Swift.min(Swift.max(fraction, 0), 1) * 1000)
+            let sc = Int(Swift.min(Swift.max(scale, 0), 1) * 1000)
+            guard f > 0, sc > 0, sc < 1000, fullLongEdge * sc / 1000 >= 64 else { continue }
+            // Levels must be in order; a fraction that does not grow ends the list.
+            if let last = levelFractionsPerMille.last, f <= last { break }
+            levelFractionsPerMille.append(f)
+            levelScalesPerMille.append(sc)
+        }
+        let coarsePhaseOn = !levelFractionsPerMille.isEmpty
+        let coarseSupervisions: [TrainerSupervisionBuilder] = levelScalesPerMille.map { sc in
+            TrainerSupervisionBuilder(
                 bundle: bundle,
                 prePass: prePass,
                 at: ref,
-                longEdgePixels: coarseLongEdge,
+                longEdgePixels: fullLongEdge * sc / 1000,
                 settings: settings,
                 tuning: tuning,
                 trust: smart.trust,
@@ -921,26 +928,37 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 edges: smart.edges,
                 background: smart.background
             )
-            : nil
-        let coarsePrefetch = coarseSupervision.map { TrainerSupervisionPrefetch(builder: $0) }
-        if coarsePhaseOn { timings.coarseLongEdgePixels = coarseLongEdge }
+        }
+        let coarsePrefetches = coarseSupervisions.map { TrainerSupervisionPrefetch(builder: $0) }
+        if let first = levelScalesPerMille.first {
+            timings.coarseLongEdgePixels = fullLongEdge * first / 1000
+        }
+        // One preload per level, plus one for the full builder; level 0's
+        // starts now (it overlaps the seed load below), each later one when
+        // the level before it becomes active.
+        let preloads: [TrainerSupervisionPreload] = (coarseSupervisions + [supervision]).map {
+            TrainerSupervisionPreload(builder: $0, frames: slice.keyframes)
+        }
         // The full builder fixes its grid and intrinsics from its first
         // decode. The 3D-filter sweep reads those intrinsics at iteration 500,
-        // inside the coarse phase, before the full builder would otherwise
-        // have decoded anything, so it decodes one frame now (no samples, not
+        // inside the levels, before the full builder would otherwise have
+        // decoded anything, so it decodes one frame now (no samples, not
         // cached: about 15 ms).
         if coarsePhaseOn, let first = slice.keyframes.first {
             _ = supervision.build(frame: first, iteration: 0, totalIterations: 1, includeDepthSamples: false)
         }
+        preloads.first?.start()
         defer {
             prefetch.drain()
-            coarsePrefetch?.drain()
+            coarsePrefetches.forEach { $0.drain() }
+            preloads.forEach { $0.cancelAndJoin() }
             // Accumulated across slices: what the worker built off the
             // critical path, which `timings.supervision` no longer sees.
             timings.supervisionPrefetched += prefetch.workerSeconds
-                + (coarsePrefetch?.workerSeconds ?? 0)
+                + coarsePrefetches.reduce(0) { $0 + $1.workerSeconds }
             timings.supervisionCacheHits += supervision.frameCacheHits
-                + (coarseSupervision?.frameCacheHits ?? 0)
+                + coarseSupervisions.reduce(0) { $0 + $1.frameCacheHits }
+            timings.supervisionPreloaded += preloads.reduce(0) { $0 + $1.built }
             timings.supervisionCacheMegabytes = Swift.max(
                 timings.supervisionCacheMegabytes, Double(supervision.frameCacheBytes) / 1_048_576
             )
@@ -955,7 +973,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // The full-size grid, for the 3D-filter sweep during the coarse phase
         // (its sampling rates are a property of the full-size camera).
         var fullRenderSize = renderSize
-        var coarseCacheDropped = false
+        // Levels whose phase has ended have had their caches dropped up to
+        // this index; preloads started up to this index.
+        var levelsDropped = 0
+        var preloadsStarted = 1
 
         // --- Census: open this slice's row now ---------------------------------
         // Opened before anything can go wrong and filled in as the slice runs,
@@ -1247,23 +1268,35 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             if iteration >= effectiveTotal { break iterationLoop }
             try checkCancellation()
 
-            // Build 328: the coarse phase is the first share of the run that
-            // will actually happen (`effectiveTotal`, like every schedule).
-            let coarseEnd = coarsePhaseOn ? effectiveTotal * coarseFractionPerMille / 1000 : 0
+            // Build 328/332: the levels are shares of the run that will
+            // actually happen (`effectiveTotal`, like every schedule). Level i
+            // covers iterations below fraction i; `levelCount` is full size.
+            let levelCount = coarseSupervisions.count
+            func levelFor(_ at: Int) -> Int {
+                for (i, perMille) in levelFractionsPerMille.enumerated()
+                where at < effectiveTotal * perMille / 1000 { return i }
+                return levelCount
+            }
             func supervisionFor(_ at: Int) -> (TrainerSupervisionBuilder, TrainerSupervisionPrefetch) {
-                if at < coarseEnd, let coarseSupervision, let coarsePrefetch {
-                    return (coarseSupervision, coarsePrefetch)
-                }
+                let level = levelFor(at)
+                if level < levelCount { return (coarseSupervisions[level], coarsePrefetches[level]) }
                 return (supervision, prefetch)
             }
+            let activeLevel = levelFor(iteration)
             let (activeSupervision, activePrefetch) = supervisionFor(iteration)
-            let activeIsCoarse = activeSupervision !== supervision
-            if !activeIsCoarse, coarsePhaseOn, !coarseCacheDropped {
-                // The coarse frames are never needed again.
-                coarseCacheDropped = true
-                coarsePrefetch?.drain()
-                timings.supervisionCacheHits += coarseSupervision?.frameCacheHits ?? 0
-                coarseSupervision?.dropFrameCache(disable: true)
+            let activeIsCoarse = activeLevel < levelCount
+            // A level that has ended is never needed again: its worker is
+            // joined and its frames released. And the level after the active
+            // one starts decoding its frames now, while this level trains.
+            while levelsDropped < activeLevel {
+                coarsePrefetches[levelsDropped].drain()
+                timings.supervisionCacheHits += coarseSupervisions[levelsDropped].frameCacheHits
+                coarseSupervisions[levelsDropped].dropFrameCache(disable: true)
+                levelsDropped += 1
+            }
+            while preloadsStarted <= activeLevel + 1, preloadsStarted < preloads.count {
+                preloads[preloadsStarted].start()
+                preloadsStarted += 1
             }
 
             // Three integer stores. The governor never reads these to make a
@@ -1360,7 +1393,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     // The governor can swap the builder's image cache out
                     // from under a worker. Nothing may be in flight.
                     prefetch.drain()
-                    coarsePrefetch?.drain()
+                    coarsePrefetches.forEach { $0.drain() }
+                    preloads.forEach { $0.cancelAndJoin() }
                     try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
                     try applyBudgetChange(
                         change,
@@ -1369,7 +1403,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         splatCount: &splatCount,
                         renderSize: &renderSize,
                         supervision: supervision,
-                        coarseSupervision: coarseSupervision,
+                        coarseSupervisions: Array(zip(coarseSupervisions, levelScalesPerMille)),
                         bundle: bundle,
                         governor: governor
                     )
@@ -1435,7 +1469,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     // The governor can swap the builder's image cache out
                     // from under a worker. Nothing may be in flight.
                     prefetch.drain()
-                    coarsePrefetch?.drain()
+                    coarsePrefetches.forEach { $0.drain() }
+                    preloads.forEach { $0.cancelAndJoin() }
                     try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
                     try applyBudgetChange(
                         change,
@@ -1444,7 +1479,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         splatCount: &splatCount,
                         renderSize: &renderSize,
                         supervision: supervision,
-                        coarseSupervision: coarseSupervision,
+                        coarseSupervisions: Array(zip(coarseSupervisions, levelScalesPerMille)),
                         bundle: bundle,
                         governor: governor
                     )
@@ -1458,6 +1493,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
             let supervisionFrom = CFAbsoluteTimeGetCurrent()
             let builtSupervision: TrainerFrameSupervision?
+            // The first iteration of the run: nothing has been prefetched, and
+            // level 0's preload must hand the builder over before the loop
+            // builds on it.
+            if iteration == 0, activeLevel < preloads.count { preloads[activeLevel].join() }
             switch activePrefetch.take(
                 frame: frame, iteration: iteration, totalIterations: effectiveTotal
             ) {
@@ -1507,7 +1546,12 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             if !order.isEmpty {
                 let nextFrame = slice.keyframes[order[orderCursor % order.count]]
                 // The pair the NEXT iteration belongs to (build 328): the last
-                // coarse iteration starts the first full-size frame.
+                // iteration of a level starts the next level's first frame.
+                // That level's preload must be done with the builder first.
+                let nextLevel = levelFor(iteration + 1)
+                if nextLevel != activeLevel, nextLevel < preloads.count {
+                    preloads[nextLevel].join()
+                }
                 supervisionFor(iteration + 1).1.start(
                     frame: nextFrame,
                     iteration: iteration + 1,
@@ -1535,7 +1579,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 gpu = TrainerGPU(pipelines: pipelines, resources: resources)
                 if !activeIsCoarse { fullRenderSize = renderSize }
             }
-            resolutionScale = activeIsCoarse ? tuning.coarseResolutionScale : 1
+            resolutionScale = activeIsCoarse
+                ? Float(levelScalesPerMille[activeLevel]) / 1000 : 1
             if activeIsCoarse { timings.coarseSteps += 1 }
 
 
@@ -2095,6 +2140,36 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // Scored inside the call above from the SAME renders; a second
             // evaluation re-rendered twelve identical frames for two scalars.
             census.slices[censusRow].heldOutPSNRExposureFitted = lastHeldOutPSNRExposureFitted
+
+            // BUILD 332: THE SAME FRAMES WITH THEIR CAMERAS ALIGNED. The
+            // trained frames' poses are refined during the run; the held-out
+            // frames keep the pre-pass pose, so part of the raw gap is
+            // registration and not the model. Each held-out camera takes a
+            // few clamped gradient steps against the finished model (the
+            // model does not move: the only thing written is the camera's
+            // own correction), and the frames are scored again. Reported
+            // beside the raw and exposure-fitted numbers, never instead.
+            do {
+                let aligned = try alignHeldOutPoses(
+                    gpu: gpu, resources: resources, queue: queue,
+                    frames: slice.heldOutKeyframes, supervision: supervision,
+                    cameraDeltas: cameraDeltas, splatCount: splatCount,
+                    shCoefficientCount: shCoefficientCount, renderSize: renderSize
+                )
+                _ = try evaluateHeldOut(
+                    gpu: gpu, resources: resources, queue: queue,
+                    frames: slice.heldOutKeyframes, supervision: supervision,
+                    cameraDeltas: aligned, exposures: exposures,
+                    splatCount: splatCount, shCoefficientCount: shCoefficientCount,
+                    renderSize: renderSize, alsoScoreExposureFitted: true
+                )
+                census.slices[censusRow].heldOutPSNRPoseAligned = lastHeldOutPSNRExposureFitted
+                census.slices[censusRow].heldOutSSIMPoseAligned = lastHeldOutSSIM
+            } catch {
+                TrainerLog.general.error(
+                    "The pose-aligned held-out score could not be taken: \(error.localizedDescription, privacy: .public)"
+                )
+            }
 
             // Camera deltas, read-only: size per frame and the common
             // (world-frame mean) component. view' = D * view, so the centre
@@ -3461,8 +3536,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 // reads them.
                 let anyCalibration = calibrating || sortCalibrating || forwardCalibrating
                     || backward2Calibrating || blurCalibrating
-                let checkPerMille = tuning.warmupFraction.isFinite && tuning.coarseResolutionFraction.isFinite
-                    ? Int(Swift.min(Swift.max(Swift.max(tuning.warmupFraction, tuning.coarseResolutionFraction), 0), 1) * 1000)
+                let checkPerMille = tuning.warmupFraction.isFinite
+                    ? Int(Swift.min(Swift.max(tuning.warmupFraction, 0), 1) * 1000)
                     : 1000
                 let checkAfter = totalIterations * checkPerMille / 1000
                 if profiling, !anyCalibration, !poseCheckDone, iteration > checkAfter {
@@ -3742,9 +3817,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
         // Coarse to fine: DC only at first, then the view-dependent terms.
         let fraction = Float(iteration) / Float(Swift.max(totalIterations, 1))
-        let shGate = TrainerMath.clamp(fraction / Swift.max(tuning.shFullyEnabledFraction, 1e-3), 0, 1)
-        let activeCoefficients = 1 + Int(Float(shCoefficientCount - 1) * shGate)
-        camera.activeSHCoeffCount = UInt32(Swift.max(Swift.min(activeCoefficients, shCoefficientCount), 1))
+        camera.activeSHCoeffCount = UInt32(activeSHCoefficients(
+            iteration: iteration, totalIterations: totalIterations,
+            shCoefficientCount: shCoefficientCount
+        ))
 
         // And low frequencies first, in screen space. This decays to exactly
         // zero, not to a small number, so late training is not permanently
@@ -3791,6 +3867,19 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         return reg
     }
 
+    /// The spherical-harmonic ramp: DC only at first, all coefficients from
+    /// `shFullyEnabledFraction` of the run. Read by cameraUniforms (what the
+    /// rasteriser evaluates) and adamUniforms (what the optimiser walks,
+    /// build 332), so the two can never disagree.
+    private func activeSHCoefficients(
+        iteration: Int, totalIterations: Int, shCoefficientCount: Int
+    ) -> Int {
+        let fraction = Float(iteration) / Float(Swift.max(totalIterations, 1))
+        let shGate = TrainerMath.clamp(fraction / Swift.max(tuning.shFullyEnabledFraction, 1e-3), 0, 1)
+        let activeCoefficients = 1 + Int(Float(shCoefficientCount - 1) * shGate)
+        return Swift.max(Swift.min(activeCoefficients, shCoefficientCount), 1)
+    }
+
     private func adamUniforms(
         splatCount: Int,
         shCoefficientCount: Int,
@@ -3800,6 +3889,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     ) -> TrainerAdamUniforms {
         var adam = TrainerAdamUniforms()
         adam.count = UInt32(splatCount)
+        adam.activeSHCoeffCount = UInt32(activeSHCoefficients(
+            iteration: iteration, totalIterations: totalIterations,
+            shCoefficientCount: shCoefficientCount
+        ))
         adam.beta1 = 0.9
         adam.beta2 = 0.999
         adam.epsilon = 1e-15
@@ -3848,7 +3941,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         splatCount: inout Int,
         renderSize: inout TrainerRenderSize,
         supervision: TrainerSupervisionBuilder,
-        coarseSupervision: TrainerSupervisionBuilder? = nil,
+        coarseSupervisions: [(TrainerSupervisionBuilder, Int)] = [],
         bundle: CaptureBundle,
         governor: TrainerBudgetGovernor
     ) throws {
@@ -3873,10 +3966,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // would grow them straight back, reallocating both ways each time
             // and leaving the phone doing the very work the governor just cut.
             supervision.lowerLongEdge(to: to)
-            // The same clamped per-mille arithmetic the slice used to size it.
-            let coarsePerMille = tuning.coarseResolutionScale.isFinite
-                ? Int(Swift.min(Swift.max(tuning.coarseResolutionScale, 0), 1) * 1000) : 0
-            coarseSupervision?.lowerLongEdge(to: to * coarsePerMille / 1000)
+            // Each level by its own clamped per-mille, as the slice sized them.
+            for (builder, perMille) in coarseSupervisions {
+                builder.lowerLongEdge(to: to * perMille / 1000)
+            }
             let size = TrainerBudgetGovernor.renderSize(
                 forLongEdge: to, intrinsics: bundle.intrinsics
             )
@@ -4563,6 +4656,196 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             lastHeldOutPSNRExposureFitted = Float(totalPSNRFitted / Double(evaluated))
         }
         return Float(totalPSNR / Double(evaluated))
+    }
+
+    // MARK: - Test-time pose alignment (build 332)
+
+    /// A few clamped gradient steps on each held-out frame's camera against
+    /// the finished model, exposure fitted first, the correction with the
+    /// lowest photometric loss kept. Returns the training deltas with the
+    /// held-out frames' entries replaced. Nothing of the model is written:
+    /// the backward runs only for the camera gradient, the per-interval
+    /// stats it folds are put back, and every other buffer it touches is
+    /// per-step scratch.
+    private func alignHeldOutPoses(
+        gpu: TrainerGPU,
+        resources: TrainerResources,
+        queue: MTLCommandQueue,
+        frames: [CaptureFrame],
+        supervision: TrainerSupervisionBuilder,
+        cameraDeltas: [FrameID: Pose],
+        splatCount: Int,
+        shCoefficientCount: Int,
+        renderSize: TrainerRenderSize
+    ) throws -> [FrameID: Pose] {
+        var aligned = cameraDeltas
+        guard splatCount > 0, !frames.isEmpty else { return aligned }
+        let px = renderSize.pixelCount
+        guard px > 0 else { return aligned }
+        let statsBefore = resources.stats.readArray(TrainerSplatStats.self, count: splatCount)
+        defer { if statsBefore.count == splatCount { _ = resources.stats.writeArray(statsBefore) } }
+        let steps = 8
+        // Steps saturate the per-step clamps (2 mm, 0.5 mrad) while the
+        // gradient is large and shrink as it settles; eight of them reach
+        // 1.6 cm, above the pose graph's own residual.
+        let rateScale: Float = 100
+
+        for frame in frames.prefix(24) {
+            let frameSupervision: TrainerFrameSupervision
+            if let cached = evalSupervisionCache[frame.index], cached.renderSize == renderSize {
+                frameSupervision = cached
+            } else {
+                guard let built = supervision.build(
+                    frame: frame, iteration: 0, totalIterations: 1, includeDepthSamples: false
+                ) else { continue }
+                evalSupervisionCache[frame.index] = built
+                frameSupervision = built
+            }
+            guard frameSupervision.renderSize == renderSize else { continue }
+            let useGPUBackground = frameSupervision.hasBackground
+                && frameSupervision.backgroundFaceSize > 0
+                && !frameSupervision.backgroundTexels.isEmpty
+            resources.inputSlot = 0
+            if useGPUBackground {
+                _ = resources.bgCubemapIn.writeArray(frameSupervision.backgroundTexels)
+            }
+            if resources.instanceCapacity < splatCount {
+                try resources.growInstanceCapacity(to: splatCount + splatCount / 4)
+            }
+
+            var loss = TrainerLossUniforms()
+            loss.pixelCount = UInt32(px)
+            loss.width = UInt32(renderSize.width)
+            loss.height = UInt32(renderSize.height)
+            loss.lambdaSSIM = tuning.lambdaSSIM
+            loss.frameWeight = 1
+            loss.exposureGain = 1
+            loss.exposureBias = 0
+            loss.depthScale = 0
+            loss.depthSampleCount = 0
+            loss.depthSupervisedCount = 0
+            loss.hasBackground = useGPUBackground ? 1 : 0
+
+            /// One render of the frame at `delta`. With `backward`, the
+            /// camera gradient is left in cameraGrad. Returns the loss.
+            func render(at delta: Pose?, backward: Bool) throws -> Float {
+                var camera = cameraUniforms(
+                    supervision: frameSupervision, cameraDelta: delta, size: renderSize,
+                    splatCount: splatCount, shCoefficientCount: shCoefficientCount,
+                    iteration: 1, totalIterations: 1
+                )
+                guard let buffer = queue.makeCommandBuffer(),
+                      let blit = buffer.makeBlitCommandEncoder()
+                else { throw TrainerError.noMetalDevice }
+                blit.label = "trainer.align.clear"
+                gpu.clearPerIteration(blit, splatCount: splatCount)
+                blit.endEncoding()
+                guard let front = buffer.makeComputeCommandEncoder()
+                else { throw TrainerError.noMetalDevice }
+                front.label = "trainer.align.preprocess"
+                if useGPUBackground {
+                    let q = frameSupervision.pose.rotation.simd.inverse
+                    var bg = TrainerBackgroundUniforms(
+                        rotationInverse: SIMD4<Float>(q.imag.x, q.imag.y, q.imag.z, q.real),
+                        fx: frameSupervision.intrinsics.fx,
+                        fy: frameSupervision.intrinsics.fy,
+                        cx: frameSupervision.intrinsics.cx,
+                        cy: frameSupervision.intrinsics.cy,
+                        width: UInt32(renderSize.width),
+                        height: UInt32(renderSize.height),
+                        faceSize: UInt32(frameSupervision.backgroundFaceSize),
+                        pad: 0
+                    )
+                    gpu.background(front, uniforms: &bg)
+                }
+                gpu.preprocess(front, camera: &camera, splatCount: splatCount)
+                if splatOrderChosen {
+                    gpu.orderSplats(
+                        front, camera: &camera, splatCount: splatCount, simdScan: sortSimdScanChosen
+                    )
+                } else {
+                    gpu.exclusiveScan(
+                        front, input: resources.tilesTouched, output: resources.offsets,
+                        count: splatCount
+                    )
+                }
+                gpu.sortSetup(front, camera: &camera, ordered: splatOrderChosen)
+                front.endEncoding()
+                guard let step = buffer.makeComputeCommandEncoder()
+                else { throw TrainerError.noMetalDevice }
+                step.label = "trainer.align.render"
+                gpu.duplicateKeys(step, camera: &camera, splatCount: splatCount, ordered: splatOrderChosen)
+                gpu.radixSortIndirect(step, simdScan: sortSimdScanChosen, tileOnly: splatOrderChosen)
+                gpu.tileRangesIndirect(step)
+                gpu.rasterizeForward(step, camera: &camera, twoPixels: forwardTwoPixelChosen)
+                gpu.lossPhotometric(step, loss: &loss)
+                let partials = gpu.ssim(step, loss: &loss, fused: blurFusedChosen)
+                if backward {
+                    gpu.lossFinalize(step, loss: &loss, blurredPartials: partials)
+                    gpu.rasterizeBackward(
+                        step, camera: &camera, loss: &loss, simdSum: backwardSimdSumChosen,
+                        twoPixels: backwardTwoPixelChosen
+                    )
+                    gpu.preprocessBackward(step, camera: &camera, splatCount: splatCount)
+                }
+                step.endEncoding()
+                buffer.commit()
+                try finish(buffer, "the pose alignment")
+                return resources.lossAccum.readElement(Float.self, at: 0) ?? .nan
+            }
+
+            // Exposure first, closed form, from a render at the starting
+            // correction: the same two-scalar fit the score applies, so the
+            // pose is aligned against the brightness it will be scored at.
+            var delta = aligned[frame.index]
+            _ = try render(at: delta, backward: false)
+            let rendered = resources.renderColor.readArray(Float.self, count: px * 3)
+            let transmittance = resources.renderTFinal.readArray(Float.self, count: px)
+            let background: [Float]? = useGPUBackground
+                ? resources.bgColor.readArray(Float.self, count: px * 3) : nil
+            if rendered.count == px * 3, transmittance.count == px,
+               background == nil || background?.count == px * 3 {
+                let truth = frameSupervision.groundTruthBytes
+                var sx: Double = 0, sy: Double = 0, sxx: Double = 0, sxy: Double = 0, n: Double = 0
+                for i in 0..<px {
+                    for c in 0..<3 {
+                        var v = Double(rendered[i * 3 + c])
+                        if let background { v += Double(transmittance[i] * background[i * 3 + c]) }
+                        let t = Double(Float(truth[i * 3 + c]) / 255)
+                        sx += v; sy += t; sxx += v * v; sxy += v * t; n += 1
+                    }
+                }
+                let denom = n * sxx - sx * sx
+                if denom > 1e-9 {
+                    let gain = (n * sxy - sx * sy) / denom
+                    let bias = (sy - gain * sx) / n
+                    if gain.isFinite, bias.isFinite {
+                        loss.exposureGain = TrainerMath.clamp(
+                            Float(gain), tuning.exposureGainRange.lowerBound, tuning.exposureGainRange.upperBound
+                        )
+                        loss.exposureBias = TrainerMath.clamp(
+                            Float(bias), tuning.exposureBiasRange.lowerBound, tuning.exposureBiasRange.upperBound
+                        )
+                    }
+                }
+            }
+
+            var best = delta
+            var bestLoss = Float.infinity
+            for k in 0...steps {
+                let value = try render(at: delta, backward: k < steps)
+                if value.isFinite, value < bestLoss {
+                    bestLoss = value
+                    best = delta
+                }
+                guard k < steps else { break }
+                let gradient = resources.cameraGrad.readArray(Float.self, count: 6)
+                guard gradient.count == 6, gradient.allSatisfy({ $0.isFinite }) else { break }
+                delta = updatedCameraDelta(current: delta, gradient: gradient, rateScale: rateScale)
+            }
+            if let best { aligned[frame.index] = best }
+        }
+        return aligned
     }
 
     // MARK: - Reading the field back

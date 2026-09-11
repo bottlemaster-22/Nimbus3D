@@ -409,6 +409,14 @@ struct TrainerCensusSlice: Codable {
     /// `heldOutPSNR` is the part of the train/test gap that was never about
     /// geometry.
     var heldOutPSNRExposureFitted: Float?
+    /// Build 332: the same frames scored after each held-out frame's CAMERA
+    /// was aligned to the model (a few clamped gradient steps on its pose,
+    /// exposure fitted first, best loss kept), beside the raw number. A
+    /// held-out frame keeps the pre-pass pose while the trained frames'
+    /// poses are refined, so part of the raw gap is registration, not the
+    /// model; this is the number with that part removed.
+    var heldOutPSNRPoseAligned: Float?
+    var heldOutSSIMPoseAligned: Float?
     /// STRUCTURAL similarity on the held-out frames, luma, 8x8 blocks, 0 to 1.
     /// PSNR and this disagree exactly when something interesting has happened:
     /// a build can gain half a decibel of PSNR by getting the room's overall
@@ -722,6 +730,8 @@ struct TrainerTimings: Codable {
     /// long edge in pixels (0 when the coarse phase was off).
     var coarseSteps: Int = 0
     var coarseLongEdgePixels: Int = 0
+    /// Build 332: frames decoded by the background preloads (off the loop).
+    var supervisionPreloaded: Int = 0
     /// Build 330: the pose check. Photometric loss (L1 + SSIM terms) of the
     /// frame at its current camera correction and after one gradient step,
     /// on the same model; 1 if the step lowered it (full-rate refinement

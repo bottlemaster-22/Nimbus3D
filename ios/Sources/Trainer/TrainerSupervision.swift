@@ -220,6 +220,72 @@ final class TrainerSupervisionPrefetch: @unchecked Sendable {
     }
 }
 
+/// BUILD 332: fills a builder's per-run frame cache in the background, one
+/// frame at a time, before the phase that will use the builder begins. A
+/// builder is not thread safe, so exactly one thread touches it at a time:
+/// this one until `join()` returns, the phase's prefetch worker after. The
+/// loop joins before the first `start` on that builder's prefetch.
+///
+/// Why: build 330 waited 1.1 s for supervision, almost all of it the first
+/// visit to each frame of each level (a decode and a 49,152-sample pass),
+/// while the CPU sat idle through the previous level's steps.
+final class TrainerSupervisionPreload: @unchecked Sendable {
+    private let builder: TrainerSupervisionBuilder
+    private let frames: [CaptureFrame]
+    private let queue = DispatchQueue(
+        label: "\(BrandConfig.bundleIdentifier).trainer.supervision-preload",
+        qos: .utility
+    )
+    private var work: DispatchWorkItem?
+    private let lock = NSLock()
+    private var cancelled = false
+    private(set) var built = 0
+
+    init(builder: TrainerSupervisionBuilder, frames: [CaptureFrame]) {
+        self.builder = builder
+        self.frames = frames
+    }
+
+    /// Starts building. Idempotent.
+    func start() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard work == nil else { return }
+        let item = DispatchWorkItem { [self] in
+            for frame in frames {
+                lock.lock()
+                let stop = cancelled
+                lock.unlock()
+                if stop { break }
+                // The iteration is not part of what is cached.
+                _ = builder.build(frame: frame, iteration: 0, totalIterations: 1)
+                lock.lock()
+                built += 1
+                lock.unlock()
+            }
+        }
+        work = item
+        queue.async(execute: item)
+    }
+
+    /// Waits for the background pass to finish, then the builder is free.
+    /// Nothing to wait for if `start` was never called.
+    func join() {
+        lock.lock()
+        let item = work
+        lock.unlock()
+        item?.wait()
+    }
+
+    /// Stops after the frame in progress and waits for it.
+    func cancelAndJoin() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+        join()
+    }
+}
+
 final class TrainerSupervisionBuilder {
 
     private let bundle: CaptureBundle

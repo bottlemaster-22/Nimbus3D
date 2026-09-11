@@ -421,7 +421,8 @@ struct TrainerAdamUniforms {
     float minLogScale;            // 52
     float maxLogScale;            // 56
     float maxOpacityLogit;        // 60
-};                                // 64 bytes
+    uint  activeSHCoeffCount;     // 64  build 332: coefficients switched on so far
+};                                // 68 bytes
 
 struct TrainerRegUniforms {
     uint  count;                  //  0
@@ -3910,8 +3911,14 @@ kernel void trainer_adam_sh(
 
     const uint floatsPerSplat = u.shCoeffCount * 3u;
     const uint base = gid * floatsPerSplat;
+    // Only the coefficients the ramp has switched on (build 332). One that
+    // has never been active carries a zero gradient and zero moments, so the
+    // walk below would store back exactly what it read; the ramp only grows,
+    // so nothing is ever skipped that was once walked. Exact, and during the
+    // ramp (the first 35 % of the run) up to nine times less traffic.
+    const uint activeFloats = min(max(u.activeSHCoeffCount, 1u), u.shCoeffCount) * 3u;
 
-    for (uint i = 0; i < floatsPerSplat; ++i) {
+    for (uint i = 0; i < activeFloats; ++i) {
         const uint k = base + i;
         float g = grad[k];
         if (!isfinite(g)) { g = 0.0f; }

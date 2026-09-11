@@ -157,8 +157,14 @@ if pre:
           'itself waited %.1f s for supervision.' % (pre, t['supervision']))
     print('ceiling if perfectly overlapped: max(worker, gpuBusy) + rest = '
           '%.1f s' % (max(pre, t['gpuBusy']) + rest))
-if t.get('poseCheckDescends', -1) >= 0:
-    print('POSE CHECK: photometric loss %.5f -> %.5f after one full-rate step  -> %s'
+_sl = (d.get('slices') or [{}])[-1] if isinstance(d.get('slices'), list) else {}
+if _sl.get('heldOutPSNRPoseAligned') is not None:
+    print('HELD-OUT, CAMERAS ALIGNED (build 332+): PSNR %.2f  SSIM %.4f   (raw fitted %.2f / %.4f): the gap that was registration, not the model'
+          % (_sl['heldOutPSNRPoseAligned'], _sl.get('heldOutSSIMPoseAligned') or 0,
+             _sl.get('heldOutPSNRExposureFitted') or 0, _sl.get('heldOutSSIM') or 0))
+if t.get('supervisionPreloaded'):
+    print('preloaded %d frames in the background before their level began' % t['supervisionPreloaded'])
+if t.get('poseCheckDescends', -1) >= 0:    print('POSE CHECK: photometric loss %.5f -> %.5f after one full-rate step  -> %s'
           % (t['poseCheckLossBefore'], t['poseCheckLossAfter'],
              'full-rate refinement ON' if t['poseCheckDescends'] else 'rate left inert'))
 if t.get('coarseSteps'):    print('coarse phase: %d steps at a %d px long edge (the rest at full size)'

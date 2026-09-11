@@ -1090,8 +1090,11 @@ struct TrainerTuning: Sendable {
     /// shown on device that one step along the gradient lowers the
     /// photometric loss; until then the trainer multiplies them by 0.1, the
     /// inert value.
-    var cameraRotationLR: Float = 1e-4
-    var cameraTranslationLR: Float = 1e-4
+    /// 3e-4 since build 332: at 1e-4 the checked refinement moved the
+    /// cameras a median 0.08 cm and at most 0.43 cm, against a pose-graph
+    /// residual near 3 cm. The per-step clamps and the ceiling are unchanged.
+    var cameraRotationLR: Float = 3e-4
+    var cameraTranslationLR: Float = 3e-4
     /// Build 330: at the first profiled step past warm-up and the coarse
     /// phase, render the frame at its current camera correction and at that
     /// correction plus one gradient step, both after the step's own Adam
@@ -1132,33 +1135,34 @@ struct TrainerTuning: Sendable {
     /// Build 288: from this iteration, for this many, run both backward
     /// rasterisers on the same inputs, compare and time them, and keep the
     /// SIMD-summed one only if it agrees (relative L1 < 1e-3) and is at least
-    /// 3 % faster. Past warm-up and the coarse phase (build 328: 700+), so the
-    /// model being compared is a real one, at the full render size.
-    var backwardCalibrationStart: Int = 700
+    /// 3 % faster. Past the resolution levels (build 332: 2,500+, full size
+    /// begins at 55 % of a 4,500-round run), so the kernels are compared at
+    /// the size they will run at for the rest of the run.
+    var backwardCalibrationStart: Int = 2500
     var backwardCalibrationSteps: Int = 6
 
     /// Build 290: the same for the radix scatter. After the backward window,
     /// so the two never share an iteration. Build 306: this window also checks
     /// the splat-order sort against the legacy one (see `splatOrderSort`).
-    var sortCalibrationStart: Int = 710
+    var sortCalibrationStart: Int = 2510
     var sortCalibrationSteps: Int = 4
 
     /// Build 302: the same for the two-pixel forward rasteriser, after the
     /// sort window.
-    var forwardCalibrationStart: Int = 716
+    var forwardCalibrationStart: Int = 2516
     var forwardCalibrationSteps: Int = 4
 
     /// Build 304: the two-pixel backward against the backward the first
     /// window chose (plain or SIMD-summed), after the forward window. Kept
     /// only if its gradients agree (relative L1 < 1e-3) and it is at least
     /// 3 % faster.
-    var backwardTwoPixelCalibrationStart: Int = 722
+    var backwardTwoPixelCalibrationStart: Int = 2522
     var backwardTwoPixelCalibrationSteps: Int = 6
 
     /// Build 318: the fused SSIM blur against the two-pass one, after the
     /// two-pixel backward window. Kept only if every blurred plane matched
     /// BIT FOR BIT on every step and it was at least 3 % faster.
-    var blurCalibrationStart: Int = 728
+    var blurCalibrationStart: Int = 2528
     var blurCalibrationSteps: Int = 2
 
     /// Build 306: allow the splat-order tile sort (depth-sort the splats, then
@@ -1198,8 +1202,17 @@ struct TrainerTuning: Sendable {
     /// unit. The far-field warm-up (warmupFraction 0.15) is the same span.
     /// Everything after it, including every held-out evaluation and every
     /// calibration window, runs at the full size. 0 switches it off.
-    var coarseResolutionFraction: Float = 0.15
-    var coarseResolutionScale: Float = 0.5
+    /// BUILD 332: LEVELS. Level i trains at `coarseResolutionScales[i]` of
+    /// the render size until `coarseResolutionFractions[i]` of the run; after
+    /// the last fraction the run is at full size. Build 330 measured a
+    /// half-size step at 3.7 ms against 12.5 at full size, and the first
+    /// full-size score after 675 half-size steps was the same as build
+    /// 320's, so more of the run goes below full size: half until 30 %,
+    /// three quarters until 55 %, full for the last 45 % (2,025 rounds of
+    /// 4,500). Empty arrays switch it off.
+    var coarseResolutionFractions: [Float] = [0.30, 0.55]
+    var coarseResolutionScales: [Float] = [0.5, 0.75]
+
 
     init() {}
 }
