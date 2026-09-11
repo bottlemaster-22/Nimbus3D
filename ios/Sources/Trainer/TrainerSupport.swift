@@ -822,7 +822,10 @@ struct TrainerTuning: Sendable {
     /// wall-clock bug as much as a quality one: the most expensive third
     /// of the run trains 300,000 splats in order to delete 148,000 of
     /// them.
-    var splitScaleFraction: Float = 0.004
+    // 0.002 (build 352; was 0.004). Our points' median long axis is 7.1 mm against
+    // 3.4 mm in the Scaniverse reference; at 0.004 of the extent only points
+    // over about 2 cm were ever split.
+    var splitScaleFraction: Float = 0.002
     /// How many children a split produces.
     ///
     /// Descriptive, not read. `TrainerDensifier` splits by shrinking the
@@ -978,7 +981,10 @@ struct TrainerTuning: Sendable {
     /// un-prunable at the same time, which is a population that can only
     /// grow. 0.02 is five times the render threshold, so a Gaussian is
     /// recycled while it is still fading rather than after it has gone.
-    var pruneOpacity: Float = 0.02
+    // 0.08 (build 352; was 0.02). The finished 348 model carried 8 % of its
+    // points below 0.1 opacity against 1 % in the Scaniverse reference of the
+    // same room; those slots are wanted for splits of the large points.
+    var pruneOpacity: Float = 0.08
     /// Screen radius above which a Gaussian is pruned, in pixels.
     /// 720, NOT 0. This prune has been fully wired and completely dead.
     ///

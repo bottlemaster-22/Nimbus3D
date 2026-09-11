@@ -5246,7 +5246,46 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         try FileManager.default.createDirectory(
             at: plyURL.deletingLastPathComponent(), withIntermediateDirectories: true
         )
-        try PLYCodec.write(cloud, to: plyURL)
+        // BUILD 352: THE FAR FIELD GOES INTO THE PLY. The trainer keeps the
+        // background as a cubemap (model/background.bin) that no PLY viewer,
+        // the app's own included, ever reads, so every export had holes where
+        // the windows and the far walls were. The Scaniverse export of the
+        // same room carries its far field as a shell of large points about
+        // fifty extents out. This writes the frozen cubemap as such a shell:
+        // 24,576 points on a sphere, opaque, coloured from the cubemap,
+        // degree-0 colour only. The model itself is untouched, and the count
+        // and bounds recorded below are the model's.
+        var exported = cloud
+        if let background {
+            let box = bounds(of: cloud)
+            let centre = (box.min + box.max) * 0.5
+            let extent = Swift.max(simd_length(box.max - box.min), 1)
+            let radius = extent * 50
+            let cubemap = background.cubemapSnapshot
+            let shellCount = 24_576
+            // Neighbour spacing on the sphere; the point's standard deviation
+            // is a little under it so neighbours overlap without a seam.
+            let spacing = radius * (4 * Float.pi / Float(shellCount)).squareRoot()
+            let logScale = SIMD3<Float>(repeating: log(spacing * 0.7))
+            let golden = Float.pi * (3 - Float(5).squareRoot())
+            let restCount = cloud.shDegree.restCoefficientCount
+            for i in 0..<shellCount {
+                let y = 1 - (Float(i) + 0.5) * 2 / Float(shellCount)
+                let ring = Swift.max(1 - y * y, 0).squareRoot()
+                let theta = golden * Float(i)
+                let direction = SIMD3<Float>(cos(theta) * ring, y, sin(theta) * ring)
+                let colour = cubemap.radiance(direction)
+                exported.positions.append(centre + direction * radius)
+                exported.rotations.append(SIMD4<Float>(0, 0, 0, 1))
+                exported.logScales.append(logScale)
+                exported.opacityLogits.append(8)
+                exported.colorDC.append((colour - 0.5) / 0.28209479)
+                if restCount > 0 {
+                    exported.shRest.append([SIMD3<Float>](repeating: .zero, count: restCount))
+                }
+            }
+        }
+        try PLYCodec.write(exported, to: plyURL)
 
         var backgroundPath: String?
         if let background {
