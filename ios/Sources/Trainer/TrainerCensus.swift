@@ -637,6 +637,16 @@ struct TrainerTimings: Codable {
     var backwardRelativeDifference: Double = 0
     var backwardSimdSumChosen: Int = 0
 
+    /// Sort calibration (build 290): the plain radix scatter (A) against the
+    /// SIMD-prefix one (B) on the same unsorted keys. GPU seconds of each
+    /// summed, how many steps' outputs differed (must be 0: it is an integer
+    /// ranking), and whether B was then used (1) or not (0).
+    var sortCalibrationSteps: Int = 0
+    var sortSecondsA: Double = 0
+    var sortSecondsB: Double = 0
+    var sortMismatchSteps: Int = 0
+    var sortSimdScanChosen: Int = 0
+
     /// How many command buffers were waited on. gpuWait divided by this is
     /// the average round-trip cost, which is the number that says whether
     /// merging command buffers would be worth anything.

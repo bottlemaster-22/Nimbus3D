@@ -88,6 +88,14 @@ constant bool kTrainerBackwardSimdSum [[function_constant(1)]];
 constant bool kBackwardSimdSum = is_function_constant_defined(kTrainerBackwardSimdSum)
     ? kTrainerBackwardSimdSum : false;
 
+/// Build 290: the radix scatter's SIMD-prefix variant (see
+/// trainer_radix_scatter). Same pattern: a second pipeline, Apple7+ with a
+/// 32-wide SIMD group only, and both pipelines are built with it set
+/// explicitly so neither depends on how an unset constant resolves.
+constant bool kTrainerRadixSimdScan [[function_constant(2)]];
+constant bool kRadixSimdScan = is_function_constant_defined(kTrainerRadixSimdScan)
+    ? kTrainerRadixSimdScan : false;
+
 // ============================================================================
 // MARK: - Constants (mirrored in TrainerGPUConstants)
 // ============================================================================
@@ -771,8 +779,14 @@ kernel void trainer_radix_scatter(
     const device uint*             histScan   [[buffer(4)]],  // exclusive scan of hist
     constant TrainerRadixUniforms& u          [[buffer(5)]],
     uint                           tid        [[thread_position_in_threadgroup]],
-    uint                           bid        [[threadgroup_position_in_grid]]
+    uint                           bid        [[threadgroup_position_in_grid]],
+    uint                           lane       [[thread_index_in_simdgroup]],
+    uint                           group      [[simdgroup_index_in_threadgroup]],
+    uint                           simdSize   [[threads_per_simdgroup]]
 ) {
+    /// Per-bin totals of each SIMD group, for the SIMD-prefix variant: 512 B
+    /// in place of the 16 KB tgScratch the Hillis-Steele scan needs.
+    threadgroup uint tgGroupTotals[TRAINER_RADIX_BINS][TRAINER_SCAN_THREADS / 32u];
     // WAS two [bin][thread] arrays, 16 KB each, exactly saturating the
     // 32 KB a threadgroup may hold on Apple 7 and later. The first was
     // written by every thread, immediately read back by the SAME thread,
@@ -800,27 +814,49 @@ kernel void trainer_radix_scatter(
             digits[i] = TRAINER_RADIX_BINS;   // sentinel: skipped below
         }
     }
-    // Hillis-Steele inclusive scan across threads, all 16 bins at once.
-    // `acc` starts from this thread's own counts. No barrier is needed to
-    // read a register the same thread just wrote; the one that used to sit
-    // here existed only for the round trip through tgCount.
-    uint acc[TRAINER_RADIX_BINS];
-    for (uint b = 0; b < TRAINER_RADIX_BINS; ++b) { acc[b] = mine[b]; }
-    for (uint offset = 1; offset < TRAINER_SCAN_THREADS; offset <<= 1) {
-        for (uint b = 0; b < TRAINER_RADIX_BINS; ++b) { tgScratch[b][tid] = acc[b]; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid >= offset) {
-            for (uint b = 0; b < TRAINER_RADIX_BINS; ++b) {
-                acc[b] += tgScratch[b][tid - offset];
-            }
+    uint cursor[TRAINER_RADIX_BINS];
+    if (kRadixSimdScan) {
+        // SIMD-PREFIX RANKING (build 290). The same exclusive per-bin prefix
+        // over the 256 threads in tid order that the Hillis-Steele scan below
+        // produces, as integers, so the output order is IDENTICAL: within a
+        // 32-lane group simd_prefix_exclusive_sum counts the lanes before this
+        // one (tid order inside a group is lane order), and across groups the
+        // totals of the groups before this one are added. One SIMD op per bin
+        // and one barrier, instead of eight rounds of 16 threadgroup stores,
+        // 16 loads and two barriers.
+        for (uint b = 0; b < TRAINER_RADIX_BINS; ++b) {
+            const uint before = simd_prefix_exclusive_sum(mine[b]);
+            if (lane == simdSize - 1u) { tgGroupTotals[b][group] = before + mine[b]; }
+            cursor[b] = before;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+        for (uint b = 0; b < TRAINER_RADIX_BINS; ++b) {
+            uint earlier = 0u;
+            for (uint g = 0; g < group; ++g) { earlier += tgGroupTotals[b][g]; }
+            cursor[b] += histScan[b * u.blockCount + bid] + earlier;
+        }
+    } else {
+        // Hillis-Steele inclusive scan across threads, all 16 bins at once.
+        // `acc` starts from this thread's own counts. No barrier is needed to
+        // read a register the same thread just wrote; the one that used to sit
+        // here existed only for the round trip through tgCount.
+        uint acc[TRAINER_RADIX_BINS];
+        for (uint b = 0; b < TRAINER_RADIX_BINS; ++b) { acc[b] = mine[b]; }
+        for (uint offset = 1; offset < TRAINER_SCAN_THREADS; offset <<= 1) {
+            for (uint b = 0; b < TRAINER_RADIX_BINS; ++b) { tgScratch[b][tid] = acc[b]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid >= offset) {
+                for (uint b = 0; b < TRAINER_RADIX_BINS; ++b) {
+                    acc[b] += tgScratch[b][tid - offset];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
 
-    // Exclusive per-(block, bin) offset for THIS thread's elements.
-    uint cursor[TRAINER_RADIX_BINS];
-    for (uint b = 0; b < TRAINER_RADIX_BINS; ++b) {
-        cursor[b] = histScan[b * u.blockCount + bid] + (acc[b] - mine[b]);
+        // Exclusive per-(block, bin) offset for THIS thread's elements.
+        for (uint b = 0; b < TRAINER_RADIX_BINS; ++b) {
+            cursor[b] = histScan[b * u.blockCount + bid] + (acc[b] - mine[b]);
+        }
     }
 
     // Written in ascending element order, so the sort is stable and two

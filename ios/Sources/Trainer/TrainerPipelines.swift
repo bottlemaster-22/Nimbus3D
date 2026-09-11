@@ -47,6 +47,10 @@ final class TrainerPipelines {
     let scanAdd: MTLComputePipelineState
     let radixHistogram: MTLComputePipelineState
     let radixScatter: MTLComputePipelineState
+    /// The SIMD-prefix scatter (build 290), nil where it cannot be built (pre-
+    /// Apple7, a SIMD group other than 32 wide) or failed to. Used only once the
+    /// trainer's on-device calibration has shown it sorts identically and faster.
+    let radixScatterSimdScan: MTLComputePipelineState?
     let preprocess: MTLComputePipelineState
     let duplicateKeys: MTLComputePipelineState
     let tileRanges: MTLComputePipelineState
@@ -82,6 +86,12 @@ final class TrainerPipelines {
             let values = MTLFunctionConstantValues()
             var flag = simdReduce
             values.setConstantValue(&flag, type: .bool, index: 0)
+            // Set EXPLICITLY off (build 290). The kernel reads constant 1
+            // through the is_function_constant_defined default pattern, so
+            // leaving it unset is legal, but this pipeline must not depend on
+            // that on a device no one has tested it on.
+            var noSimdSum = false
+            values.setConstantValue(&noSimdSum, type: .bool, index: 1)
             let function: MTLFunction
             do {
                 function = try library.makeFunction(name: name, constantValues: values)
@@ -111,6 +121,16 @@ final class TrainerPipelines {
             return try device.makeComputePipelineState(function: function)
         }
 
+        /// The radix scatter with constant 2 set explicitly either way.
+        func buildRadixScatter(_ name: String, simdScan: Bool) throws -> MTLComputePipelineState {
+            let values = MTLFunctionConstantValues()
+            var scan = simdScan
+            values.setConstantValue(&scan, type: .bool, index: 2)
+            let function = try library.makeFunction(name: name, constantValues: values)
+            function.label = simdScan ? name + ".simdScan" : name
+            return try device.makeComputePipelineState(function: function)
+        }
+
         func build(_ name: String) throws -> MTLComputePipelineState {
             guard let function = library.makeFunction(name: name) else {
                 throw TrainerError.missingKernel(name)
@@ -132,7 +152,16 @@ final class TrainerPipelines {
         scanBlock = try build(TrainerKernel.scanBlock)
         scanAdd = try build(TrainerKernel.scanAdd)
         radixHistogram = try build(TrainerKernel.radixHistogram)
-        radixScatter = try build(TrainerKernel.radixScatter)
+        do {
+            radixScatter = try buildRadixScatter(TrainerKernel.radixScatter, simdScan: false)
+        } catch {
+            throw TrainerError.pipelineFailed(
+                kernel: TrainerKernel.radixScatter, reason: error.localizedDescription
+            )
+        }
+        let scatterSimd = device.supportsFamily(.apple7)
+            ? (try? buildRadixScatter(TrainerKernel.radixScatter, simdScan: true)) : nil
+        radixScatterSimdScan = (scatterSimd?.threadExecutionWidth == 32) ? scatterSimd : nil
         preprocess = try build(TrainerKernel.preprocess)
         duplicateKeys = try build(TrainerKernel.duplicateKeys)
         tileRanges = try build(TrainerKernel.tileRanges)
@@ -355,8 +384,9 @@ struct TrainerGPU {
     // first fits. Six passes is even, so the sorted result lands back in the
     // buffer it started in and the caller does not have to track parity.
 
-    func radixSort(_ encoder: MTLComputeCommandEncoder, count: Int) {
+    func radixSort(_ encoder: MTLComputeCommandEncoder, count: Int, simdScan: Bool = false) {
         guard count > 1 else { return }
+        let scatter = (simdScan ? pipelines.radixScatterSimdScan : nil) ?? pipelines.radixScatter
         let blocks = TrainerGPU.blockCount(for: count)
         let histogramEntries = TrainerGPUConstants.radixBins * blocks
 
@@ -390,7 +420,7 @@ struct TrainerGPU {
                 count: histogramEntries
             )
 
-            encoder.setComputePipelineState(pipelines.radixScatter)
+            encoder.setComputePipelineState(scatter)
             encoder.setBuffer(keysIn, offset: 0, index: TrainerBind.RadixScatter.keysIn)
             encoder.setBuffer(valuesIn, offset: 0, index: TrainerBind.RadixScatter.valuesIn)
             encoder.setBuffer(keysOut, offset: 0, index: TrainerBind.RadixScatter.keysOut)

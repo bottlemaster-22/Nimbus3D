@@ -367,3 +367,11 @@ if t.get('backwardCalibrationSteps', 0):
              t['backwardSecondsB'] / max(t['backwardSecondsA'], 1e-12),
              t['backwardRelativeDifference'],
              'B (SIMD-summed) used' if t.get('backwardSimdSumChosen') else 'A kept'))
+
+# Sort calibration (build 290+): plain scatter (A) against SIMD-prefix (B).
+if t.get('sortCalibrationSteps', 0):
+    _k = t['sortCalibrationSteps']
+    print('SORT CALIBRATION: %d steps  A %.2f ms  B %.2f ms  (B/A %.3f)  mismatched steps %d  -> %s'
+          % (_k, 1000 * t['sortSecondsA'] / _k, 1000 * t['sortSecondsB'] / _k,
+             t['sortSecondsB'] / max(t['sortSecondsA'], 1e-12), t.get('sortMismatchSteps', 0),
+             'B (SIMD-prefix) used' if t.get('sortSimdScanChosen') else 'A kept'))

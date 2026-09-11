@@ -1070,6 +1070,11 @@ struct TrainerTuning: Sendable {
     var backwardCalibrationStart: Int = 300
     var backwardCalibrationSteps: Int = 6
 
+    /// Build 290: the same for the radix scatter. After the backward window,
+    /// so the two never share an iteration.
+    var sortCalibrationStart: Int = 310
+    var sortCalibrationSteps: Int = 4
+
     init() {}
 }
 
