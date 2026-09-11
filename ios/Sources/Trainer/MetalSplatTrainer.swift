@@ -4342,6 +4342,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // cameras is a high percentile of the same distribution for a fraction
         // of the cost.
         let stride = Swift.max(keyframes.count / 64, 1)
+        var cameras: [TrainerCameraUniforms] = []
         var index = 0
         while index < keyframes.count {
             let frame = keyframes[index]
@@ -4364,12 +4365,31 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // is its own submission. Before, a stop during the sweep had
             // to wait for all 64 passes to finish first.
             if Task.isCancelled { throw NimbusError.cancelled }
-            try submit("the 3D filter sweep") { encoder in
-                gpu.samplingRateUpdate(
-                    encoder, camera: &camera, splatCount: splatCount
-                )
-            }
+            cameras.append(camera)
             index += stride
+        }
+        // BUILD 390 (unpushed experiment): TEN CAMERAS PER COMMAND BUFFER,
+        // each batch in its own pool. Build 384's 100-iteration memory curve
+        // stepped up by about 1.4 KB per live point at every sweep and
+        // nowhere else, while 382's 48 sweeps were flat; nothing here
+        // allocates on the CPU, so the suspect is what the driver keeps per
+        // command buffer (one per camera, up to 108 a sweep). Ten dispatches
+        // in one encoder stay ordered on the shared top-K buffer (Metal's
+        // hazard tracking); ten is far below the watchdog's reach at any cap.
+        var batchStart = 0
+        while batchStart < cameras.count {
+            let batchEnd = Swift.min(batchStart + 10, cameras.count)
+            try autoreleasepool {
+                try submit("the 3D filter sweep") { encoder in
+                    for k in batchStart..<batchEnd {
+                        var camera = cameras[k]
+                        gpu.samplingRateUpdate(
+                            encoder, camera: &camera, splatCount: splatCount
+                        )
+                    }
+                }
+            }
+            batchStart = batchEnd
         }
 
         try submit("the 3D filter finalise") { encoder in
