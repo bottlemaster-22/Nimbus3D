@@ -604,6 +604,19 @@ public final class TwoScaleTrustField: TrustField {
                     }
                 }
 
+                // The collect pass (build 294) only needs the candidate list
+                // the sample loop just produced; its result is discarded, so
+                // the inflation sweep, the affine fit and the clamp notice
+                // below would run twice per slot and say "clamped" twice for
+                // one frame (build 318).
+                if collect != nil {
+                    return TrustSlotResult(
+                        sigma: sigma, bias: bias,
+                        levelCount: levelCount, levelInside: levelInside,
+                        affine: nil
+                    )
+                }
+
                 // --- 3. Frame-level inflation for unverified samples. -----
                 // One scalar per frame, applied uniformly: "on this frame the
                 // sensor was worse than the physics prior expected".
@@ -699,6 +712,19 @@ public final class TwoScaleTrustField: TrustField {
             var swept: [Int: PlaneSweepResult?] = [:]
             var budget = planeSweepBudget
             var next = 0
+            // BUILD 318: THE IMAGE CACHE IS WARMED ON THIS THREAD FIRST. Every
+            // candidate of a slot reads the same reference photo and the same
+            // partners, and all the workers used to miss on them at once: N
+            // decodes of one JPEG, and (until SmartImageCache stopped taking
+            // duplicate keys) a cache that then evicted itself into a permanent
+            // miss. Warmed serially, the workers only ever hit.
+            if let first = candidateList.first {
+                var warm: [CaptureFrame] = [first.frame]
+                warm.append(contentsOf: first.partners)
+                for f in warm.prefix(imageCache.capacity) {
+                    _ = imageCache.image(for: f, at: ref)
+                }
+            }
             while next < candidateList.count, budget > 0 {
                 let chunk = Swift.min(sweepChunk, candidateList.count - next)
                 let base = next
@@ -1608,6 +1634,12 @@ final class SmartDepthCache {
         }
 
         lock.lock()
+        // Re-checked under the lock (build 318): see SmartImageCache.image for
+        // why a second insert of the same key must not append to the order.
+        if let existing = depths[frame.index] {
+            lock.unlock()
+            return existing
+        }
         depths[frame.index] = values
         depthOrder.append(frame.index)
         while depthOrder.count > capacity {
@@ -1638,6 +1670,10 @@ final class SmartDepthCache {
         }
 
         lock.lock()
+        if let existing = confidences[frame.index] {
+            lock.unlock()
+            return existing
+        }
         confidences[frame.index] = values
         confidenceOrder.append(frame.index)
         while confidenceOrder.count > capacity {

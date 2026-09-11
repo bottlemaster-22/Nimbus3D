@@ -409,3 +409,11 @@ if t.get('backwardTwoPixelCalibrationSteps', 0):
              t['backwardTwoPixelSecondsB'] / max(t['backwardTwoPixelSecondsA'], 1e-12),
              t['backwardTwoPixelRelativeDifference'],
              'B (two-pixel) used' if t.get('backwardTwoPixelChosen') else 'A kept'))
+
+# Blur calibration (build 318+): two-pass SSIM blur (A) against the fused one (B).
+if t.get('blurCalibrationSteps', 0):
+    _k = t['blurCalibrationSteps']
+    print('BLUR CALIBRATION: %d steps  A %.2f ms  B %.2f ms  (B/A %.3f)  mismatched steps %d  -> %s'
+          % (_k, 1000 * t['blurSecondsA'] / _k, 1000 * t['blurSecondsB'] / _k,
+             t['blurSecondsB'] / max(t['blurSecondsA'], 1e-12), t.get('blurMismatchSteps', 0),
+             'B (fused) used' if t.get('blurFusedChosen') else 'A kept'))

@@ -146,6 +146,8 @@ enum TrainerKernel {
     static let lossPhotometric = "trainer_loss_photometric"
     static let blurH = "trainer_blur_h"
     static let blurV = "trainer_blur_v"
+    /// Build 318: both blur directions in one kernel. Optional, not in `all`.
+    static let blurHV = "trainer_blur_hv"
     static let ssimStats = "trainer_ssim_stats"
     static let lossDepth = "trainer_loss_depth"
     static let lossFinalize = "trainer_loss_finalize"
@@ -1123,6 +1125,12 @@ struct TrainerTuning: Sendable {
     /// 3 % faster.
     var backwardTwoPixelCalibrationStart: Int = 322
     var backwardTwoPixelCalibrationSteps: Int = 6
+
+    /// Build 318: the fused SSIM blur against the two-pass one, after the
+    /// two-pixel backward window. Kept only if every blurred plane matched
+    /// BIT FOR BIT on every step and it was at least 3 % faster.
+    var blurCalibrationStart: Int = 328
+    var blurCalibrationSteps: Int = 2
 
     /// Build 306: allow the splat-order tile sort (depth-sort the splats, then
     /// sort instances on their tile bits only). Used only after the sort

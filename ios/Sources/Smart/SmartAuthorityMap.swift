@@ -878,6 +878,18 @@ public final class SmartAuthorityMap {
         var regimes = [SmartDepthRegime](repeating: .far, count: n)
         var sum: Float = 0
 
+        // THE FRAME'S TRUST, TAKEN ONCE (build 318). `weight(frame:sampleIndex:)`
+        // reads the noise and confidence readers, and each reader caches ONE
+        // frame's slice under a lock. Serially that was a hit for every sample
+        // after the first. With twelve frames' maps built at once (the far
+        // field's warm-up, build 298) the readers' single entries flipped
+        // between frames on every call and each sample re-read a 196 KB slice
+        // under the lock: the warm-up never finished. SmartFrameTrust.weight
+        // is the same expression as TwoScaleTrustField.weight, fallbacks
+        // included (its own comment says so and the seeding stage relies on
+        // it), and a nil reader gives weight 0 both ways.
+        let frameTrust = trustField?.frameTrust(frame: frame)
+
         for i in 0..<n {
             let z = depth[i]
             let hasReturn = z > 0 && SmartMath.isUsableDepth(z)
@@ -899,9 +911,9 @@ public final class SmartAuthorityMap {
             guard hasReturn, rangeAuthority > 0 else { continue }
 
             // 2. Recalibrated confidence, via the trust field's soft weight.
-            let confidenceAuthority = trustField.map {
-                0.25 + 0.75 * SmartMath.clamp($0.weight(frame: frame, sampleIndex: i), 0, 1)
-            } ?? 1
+            let confidenceAuthority: Float = trustField == nil
+                ? 1
+                : 0.25 + 0.75 * SmartMath.clamp(frameTrust?.weight(sampleIndex: i) ?? 0, 0, 1)
 
             // 4. Glass and sky.
             let glassAuthority = glass.verdict(sampleIndex: i).authorityMultiplier

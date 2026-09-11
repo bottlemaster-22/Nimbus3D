@@ -93,6 +93,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     private var forwardTwoPixelChosen = false
     /// Set by the two-pixel backward calibration (build 304).
     private var backwardTwoPixelChosen = false
+    /// Set by the blur calibration (build 318): use the fused SSIM blur.
+    private var blurFusedChosen = false
     /// Set by the sort calibration (build 306): use the splat-order tile sort.
     private var splatOrderChosen = false
 
@@ -127,21 +129,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         let rendered: [Float]
         let transmittance: [Float]
         let background: [Float]?
-        let groundTruth: [Float]
+        /// The supervision bytes as they are (build 318); scoreHeldOut turns
+        /// each into `Float(byte) / 255`, the decoder's float, where it reads it.
+        let groundTruth: [UInt8]
         let exposure: SIMD2<Float>
-    }
-
-    /// The decoder's floats from the supervision bytes: `Float(byte) / 255`,
-    /// the expression SmartImageLoader.decode used, so the CPU score is taken
-    /// on exactly the values it was taken on before build 314.
-    private static func groundTruthFloats(_ bytes: [UInt8]) -> [Float] {
-        let count = bytes.count
-        return [Float](unsafeUninitializedCapacity: count) { buffer, initialized in
-            bytes.withUnsafeBufferPointer { source in
-                for i in 0..<count { buffer[i] = Float(source[i]) / 255 }
-            }
-            initialized = count
-        }
     }
 
     /// One frame's scores. `ssim` is nil when no 8x8 block qualified, which is
@@ -532,6 +523,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         sortSimdScanChosen = false
         forwardTwoPixelChosen = false
         backwardTwoPixelChosen = false
+        blurFusedChosen = false
         splatOrderChosen = false
         // A step left running by a run that threw cannot belong to this one.
         // Its buffer finishes on its own; its read-backs are not wanted.
@@ -1295,13 +1287,34 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             }
 
             if iteration % 50 == 0 {
-                let reading = governor.measureMemory(resources: resources)
-                if let change = governor.degradeForMemory(
+                var reading = governor.measureMemory(resources: resources)
+                var change = governor.degradeForMemory(
                     reading: reading,
                     currentSplatCount: splatCount,
                     shCoefficientCount: shCoefficientCount,
                     pixelCount: renderSize.pixelCount
-                ) {
+                )
+                // BUILD 318: THE FRAME CACHE GOES FIRST. The governor measures
+                // this run's footprint as everything the process allocated
+                // since the run began, which includes the per-run frame cache
+                // (build 310, up to 420 MB), so the cache could have been paid
+                // for in Gaussians. It is dropped, and stays off, before any
+                // cut is considered; the reading is then retaken.
+                if change != nil, supervision.frameCacheBytes > 0 {
+                    prefetch.drain()
+                    supervision.dropFrameCache(disable: true)
+                    TrainerLog.budget.notice(
+                        "Frame cache released for memory before any cut was considered"
+                    )
+                    reading = governor.measureMemory(resources: resources)
+                    change = governor.degradeForMemory(
+                        reading: reading,
+                        currentSplatCount: splatCount,
+                        shCoefficientCount: shCoefficientCount,
+                        pixelCount: renderSize.pixelCount
+                    )
+                }
+                if let change {
                     emit(
                         progressTick(
                             stage: .pausedMemory,
@@ -2126,6 +2139,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
            iteration < backward2Start + tuning.backwardTwoPixelCalibrationSteps {
             return true
         }
+        let blurStart = tuning.blurCalibrationStart
+        if gpu.pipelines.blurHV != nil,
+           tuning.blurCalibrationSteps > 0,
+           iteration >= blurStart,
+           iteration < blurStart + tuning.blurCalibrationSteps {
+            return true
+        }
         return false
     }
 
@@ -2445,8 +2465,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             gpu.rasterizeForward(step, camera: &camera, twoPixels: forwardTwoPixelChosen)
 
             gpu.lossPhotometric(step, loss: &loss)
-            gpu.ssim(step, loss: &loss)
-            gpu.lossFinalize(step, loss: &loss)
+            let partials = gpu.ssim(step, loss: &loss, fused: blurFusedChosen)
+            gpu.lossFinalize(step, loss: &loss, blurredPartials: partials)
             gpu.lossDepth(step, loss: &loss, sampleCount: sampleCount)
 
             gpu.rasterizeBackward(
@@ -2788,12 +2808,23 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 && tuning.backwardTwoPixelCalibrationSteps > 0
                 && iteration >= backward2Start
                 && iteration < backward2Start + tuning.backwardTwoPixelCalibrationSteps
+            // BLUR CALIBRATION (build 318): the SSIM stage is run with the
+            // two-pass blur (A), its blurred partials read back, then with the
+            // fused blur (B) and compared BIT FOR BIT. A mismatch re-runs A so
+            // the step goes on from A's planes. B is kept only if every step
+            // matched and it was at least 3 % faster.
+            let blurStart = tuning.blurCalibrationStart
+            let blurCalibrating = gpu.pipelines.blurHV != nil
+                && tuning.blurCalibrationSteps > 0
+                && iteration >= blurStart
+                && iteration < blurStart + tuning.blurCalibrationSteps
             if profiling || calibrating || sortCalibrating || forwardCalibrating
-                || backward2Calibrating {
+                || backward2Calibrating || blurCalibrating {
                 // Calibration iterations are timed under their own label, so
                 // they never skew the stage profile.
                 func tag(_ label: String) -> String {
-                    (calibrating || sortCalibrating || forwardCalibrating || backward2Calibrating)
+                    (calibrating || sortCalibrating || forwardCalibrating || backward2Calibrating
+                     || blurCalibrating)
                         ? "the backward calibration" : label
                 }
                 @discardableResult
@@ -2971,11 +3002,56 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         gpu.rasterizeForward(e, camera: &camera, twoPixels: forwardTwoPixelChosen)
                     }
                 }
-                try stage(tag("the losses")) { e in
-                    gpu.lossPhotometric(e, loss: &loss)
-                    gpu.ssim(e, loss: &loss)
-                    gpu.lossFinalize(e, loss: &loss)
-                    gpu.lossDepth(e, loss: &loss, sampleCount: sampleCount)
+                if blurCalibrating {
+                    let pixels = resources.renderSize.pixelCount
+                    try stage(tag("the losses")) { e in
+                        gpu.lossPhotometric(e, loss: &loss)
+                    }
+                    // ssimStats adds the SSIM loss into lossAccum, so the
+                    // total is put back between runs and the step's loss
+                    // read-back sees one contribution.
+                    let lossBefore = resources.lossAccum.readElement(Float.self, at: 0) ?? 0
+                    let secondsA = try stage(tag("the losses")) { e in
+                        gpu.ssim(e, loss: &loss, fused: false)
+                    }
+                    let planesA = resources.ssimTmp.readArray(Float.self, count: pixels * 3)
+                    _ = resources.lossAccum.writeArray([lossBefore])
+                    let secondsB = try stage(tag("the losses")) { e in
+                        gpu.ssim(e, loss: &loss, fused: true)
+                    }
+                    let planesB = resources.ssimMid.readArray(Float.self, count: pixels * 3)
+                    // Bit for bit: the bit patterns, so a NaN in the same
+                    // place counts as a match and -0 against +0 does not.
+                    let identical = planesA.count == pixels * 3 && planesB.count == pixels * 3
+                        && zip(planesA, planesB).allSatisfy { $0.bitPattern == $1.bitPattern }
+                    var partials: MTLBuffer = resources.ssimMid
+                    if !identical {
+                        _ = resources.lossAccum.writeArray([lossBefore])
+                        try stage(tag("the losses")) { e in
+                            partials = gpu.ssim(e, loss: &loss, fused: false)
+                        }
+                        timings.blurMismatchSteps += 1
+                    }
+                    timings.blurCalibrationSteps += 1
+                    timings.blurSecondsA += secondsA
+                    timings.blurSecondsB += secondsB
+                    if iteration == blurStart + tuning.blurCalibrationSteps - 1 {
+                        blurFusedChosen = timings.blurMismatchSteps == 0
+                            && timings.blurSecondsB < timings.blurSecondsA * 0.97
+                        timings.blurFusedChosen = blurFusedChosen ? 1 : 0
+                    }
+                    let chosenPartials = partials
+                    try stage(tag("the losses")) { e in
+                        gpu.lossFinalize(e, loss: &loss, blurredPartials: chosenPartials)
+                        gpu.lossDepth(e, loss: &loss, sampleCount: sampleCount)
+                    }
+                } else {
+                    try stage(tag("the losses")) { e in
+                        gpu.lossPhotometric(e, loss: &loss)
+                        let partials = gpu.ssim(e, loss: &loss, fused: blurFusedChosen)
+                        gpu.lossFinalize(e, loss: &loss, blurredPartials: partials)
+                        gpu.lossDepth(e, loss: &loss, sampleCount: sampleCount)
+                    }
                 }
                 if calibrating || backward2Calibrating {
                     let floats = splatCount * 16
@@ -3101,8 +3177,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             gpu.rasterizeForward(encoderB, camera: &camera, twoPixels: forwardTwoPixelChosen)
 
             gpu.lossPhotometric(encoderB, loss: &loss)
-            gpu.ssim(encoderB, loss: &loss)
-            gpu.lossFinalize(encoderB, loss: &loss)
+            let partials = gpu.ssim(encoderB, loss: &loss, fused: blurFusedChosen)
+            gpu.lossFinalize(encoderB, loss: &loss, blurredPartials: partials)
             gpu.lossDepth(encoderB, loss: &loss, sampleCount: sampleCount)
 
             gpu.rasterizeBackward(
@@ -3852,6 +3928,40 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         var evaluated = 0
 
         var collected: [HeldOutRender] = []
+        // SCORED ON EVERY CORE (build 300). The GPU renders the frames (the
+        // loop below); the per-frame metrics, three Double passes over ~1.2 M
+        // values each, run in parallel over what has been collected and are
+        // combined in frame order. Each frame's arithmetic is the loop's,
+        // unchanged, so every score is the same number it was.
+        let scoreTuning = tuning
+        let scorePixelCount = renderSize.pixelCount
+        let bw = renderSize.width, bh = renderSize.height
+        let scoreChunk = Swift.max(ProcessInfo.processInfo.activeProcessorCount, 1)
+        func scoreCollected() {
+            let renders = collected
+            collected.removeAll(keepingCapacity: true)
+            guard !renders.isEmpty else { return }
+            var scores = [HeldOutScore?](repeating: nil, count: renders.count)
+            scores.withUnsafeMutableBufferPointer { out in
+                DispatchQueue.concurrentPerform(iterations: renders.count) { k in
+                    out[k] = Self.scoreHeldOut(
+                        renders[k], pixelCount: scorePixelCount, width: bw, height: bh,
+                        fitExposure: fitExposure, alsoScoreExposureFitted: alsoScoreExposureFitted,
+                        tuning: scoreTuning
+                    )
+                }
+            }
+            for (k, score) in scores.enumerated() {
+                guard let score else { continue }
+                if let ssim = score.ssim { totalSSIM += ssim }
+                totalPSNR += score.psnr
+                lastHeldOutPerFrame.append(
+                    TrainerHeldOutFrameScore(frameIndex: Int(renders[k].frame.index), psnr: Float(score.psnr))
+                )
+                if alsoScoreExposureFitted { totalPSNRFitted += score.psnrFitted }
+                evaluated += 1
+            }
+        }
         for frame in frames.prefix(24) {
             // CACHED for the run (build 300): the eval visits the same frames
             // ~9 times, and every build re-decoded the photo (about half the
@@ -3993,40 +4103,17 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 rendered: rendered,
                 transmittance: transmittance,
                 background: heldOutBackground,
-                groundTruth: Self.groundTruthFloats(frameSupervision.groundTruthBytes),
+                groundTruth: frameSupervision.groundTruthBytes,
                 exposure: exposures[frame.index] ?? SIMD2<Float>(1, 0)
             ))
+            // Scored a core's worth at a time (build 318): holding every
+            // frame's read-backs until the end was up to 24 x 15 MB alive at
+            // once, on top of peak training memory, right where the governor
+            // polls. Chunks keep the peak at a few frames; the order the
+            // scores are combined in is unchanged.
+            if collected.count >= scoreChunk { scoreCollected() }
         }
-
-        // SCORED ON EVERY CORE (build 300). The GPU renders every frame first
-        // (above); the per-frame metrics, three Double passes over ~1.2 M
-        // values each, then run in parallel, and are combined below in frame
-        // order. Each frame's arithmetic is the loop's, unchanged, so every
-        // score is the same number it was.
-        let scoreTuning = tuning
-        let pixelCount = renderSize.pixelCount
-        let bw = renderSize.width, bh = renderSize.height
-        let renders = collected
-        var scores = [HeldOutScore?](repeating: nil, count: renders.count)
-        scores.withUnsafeMutableBufferPointer { out in
-            DispatchQueue.concurrentPerform(iterations: renders.count) { k in
-                out[k] = Self.scoreHeldOut(
-                    renders[k], pixelCount: pixelCount, width: bw, height: bh,
-                    fitExposure: fitExposure, alsoScoreExposureFitted: alsoScoreExposureFitted,
-                    tuning: scoreTuning
-                )
-            }
-        }
-        for (k, score) in scores.enumerated() {
-            guard let score else { continue }
-            if let ssim = score.ssim { totalSSIM += ssim }
-            totalPSNR += score.psnr
-            lastHeldOutPerFrame.append(
-                TrainerHeldOutFrameScore(frameIndex: Int(renders[k].frame.index), psnr: Float(score.psnr))
-            )
-            if alsoScoreExposureFitted { totalPSNRFitted += score.psnrFitted }
-            evaluated += 1
-        }
+        scoreCollected()
 
         guard evaluated > 0 else { return nil }
         lastHeldOutSSIM = Float(totalSSIM / Double(evaluated))
@@ -4067,7 +4154,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     if let heldOutBackground {
                         v += Double(transmittance[i] * heldOutBackground[i * 3 + c])
                     }
-                    let t = Double(groundTruth[i * 3 + c])
+                    let t = Double(Float(groundTruth[i * 3 + c]) / 255)
                     sx += v; sy += t; sxx += v * v; sxy += v * t; n += 1
                 }
             }
@@ -4094,7 +4181,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 if let heldOutBackground {
                     composited += transmittance[i] * heldOutBackground[i * 3 + c]
                 }
-                let truth = groundTruth[i * 3 + c]
+                let truth = Float(groundTruth[i * 3 + c]) / 255
                 let value = exposure.x * composited + exposure.y
                 let diff = Double(value - truth)
                 sum += diff * diff
@@ -4129,9 +4216,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         }
                         let lr = Double(exposure.x * (0.299 * rv + 0.587 * gv + 0.114 * bv) + exposure.y)
                         let lt = Double(
-                            0.299 * groundTruth[i * 3]
-                                + 0.587 * groundTruth[i * 3 + 1]
-                                + 0.114 * groundTruth[i * 3 + 2]
+                            0.299 * (Float(groundTruth[i * 3]) / 255)
+                                + 0.587 * (Float(groundTruth[i * 3 + 1]) / 255)
+                                + 0.114 * (Float(groundTruth[i * 3 + 2]) / 255)
                         )
                         mr += lr; mt += lt
                         vr += lr * lr; vt += lt * lt; cov += lr * lt

@@ -490,6 +490,8 @@ public final class DirectionalBackgroundModel: BackgroundModel {
             next += chunk
 
             for c in 0..<chunk {
+                // Per frame, as the serial loop checked it (build 318).
+                if Task.isCancelled { throw NimbusError.cancelled }
                 guard let frameData = prepared[c] else { continue }
                 visited += 1
                 let luma = frameData.luma

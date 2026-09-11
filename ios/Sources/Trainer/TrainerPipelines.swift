@@ -61,6 +61,9 @@ final class TrainerPipelines {
     let background: MTLComputePipelineState
     let lossPhotometric: MTLComputePipelineState
     let blurH: MTLComputePipelineState
+    /// Build 318: the fused blur, nil if it cannot run 256 threads or failed
+    /// to build. Used only after the blur calibration matched bit for bit.
+    let blurHV: MTLComputePipelineState?
     let blurV: MTLComputePipelineState
     let ssimStats: MTLComputePipelineState
     let lossDepth: MTLComputePipelineState
@@ -192,6 +195,8 @@ final class TrainerPipelines {
         lossPhotometric = try build(TrainerKernel.lossPhotometric, simdReduce: simdAtomics)
         blurH = try build(TrainerKernel.blurH)
         blurV = try build(TrainerKernel.blurV)
+        let fused = try? build(TrainerKernel.blurHV)
+        blurHV = (fused?.maxTotalThreadsPerThreadgroup ?? 0) >= 256 ? fused : nil
         ssimStats = try build(TrainerKernel.ssimStats, simdReduce: simdAtomics)
         lossDepth = try build(TrainerKernel.lossDepth, simdReduce: simdAtomics)
         lossFinalize = try build(TrainerKernel.lossFinalize, simdReduce: simdAtomics)
@@ -873,10 +878,20 @@ struct TrainerGPU {
     ///   ssimMid  blurred moments, then the h-blurred partials.
     ///   ssimTmp  h-blurred moments, then the raw partials, then the fully
     ///            blurred partials.
-    func ssim(_ encoder: MTLComputeCommandEncoder, loss: inout TrainerLossUniforms) {
+    /// Returns the buffer holding the blurred partials, which lossFinalize
+    /// reads: ssimTmp on the two-pass path, ssimMid on the fused path (the
+    /// fused kernel reads whole rows of its source while other tiles write,
+    /// so it can never blur a buffer into itself).
+    @discardableResult
+    func ssim(
+        _ encoder: MTLComputeCommandEncoder,
+        loss: inout TrainerLossUniforms,
+        fused: Bool = false
+    ) -> MTLBuffer {
         let size = resources.renderSize
         let px = size.pixelCount
-        guard px > 0 else { return }
+        guard px > 0 else { return resources.ssimTmp }
+        let fusedPipeline = fused ? pipelines.blurHV : nil
 
         var blur = TrainerBlurUniforms(
             width: UInt32(size.width),
@@ -884,12 +899,16 @@ struct TrainerGPU {
             planeCount: UInt32(TrainerGPUConstants.ssimPlaneCount)
         )
 
-        // X*X, Y*Y and X*Y are formed inside trainer_blur_h's moments pass;
-        // there is no separate prepare kernel. pad0 MUST go back to 0 before
-        // the partials blur below, or that pass squares the partials.
-        // setBytes copies at encode time, so resetting after the call is right.
+        // X*X, Y*Y and X*Y are formed inside the moments pass; there is no
+        // separate prepare kernel. pad0 MUST go back to 0 before the partials
+        // blur below, or that pass squares the partials. setBytes copies at
+        // encode time, so resetting after the call is right.
         blur.pad0 = 1
-        blurBoth(encoder, from: resources.ssimSrc, through: resources.ssimTmp, into: resources.ssimMid, blur: &blur)
+        if let fusedPipeline {
+            blurFused(encoder, fusedPipeline, from: resources.ssimSrc, into: resources.ssimMid, blur: &blur)
+        } else {
+            blurBoth(encoder, from: resources.ssimSrc, through: resources.ssimTmp, into: resources.ssimMid, blur: &blur)
+        }
         blur.pad0 = 0
 
         // Moments -> SSIM value and the five partial-derivative planes.
@@ -909,10 +928,39 @@ struct TrainerGPU {
         // the top, which genuinely needs all five. `blur` is one var passed
         // inout to both calls, so the order of this line is load-bearing.
         blur.planeCount = 3
+        if let fusedPipeline {
+            // The partials go ssimTmp -> ssimMid (the moments there are
+            // already consumed by ssimStats).
+            blurFused(encoder, fusedPipeline, from: resources.ssimTmp, into: resources.ssimMid, blur: &blur)
+            return resources.ssimMid
+        }
         // The partials get the same separable blur, and land back in ssimTmp.
         blurBoth(encoder, from: resources.ssimTmp, through: resources.ssimMid, into: resources.ssimTmp, blur: &blur)
         // The SSIM backward is folded into trainer_loss_finalize, the next
-        // dispatch, which reads ssimTmp (blurred partials) and ssimSrc (luma).
+        // dispatch, which reads the blurred partials and ssimSrc (luma).
+        return resources.ssimTmp
+    }
+
+    /// Build 318: one dispatch, 16 x 16 tiles. `source` and `destination`
+    /// must differ.
+    private func blurFused(
+        _ encoder: MTLComputeCommandEncoder,
+        _ pipeline: MTLComputePipelineState,
+        from source: MTLBuffer,
+        into destination: MTLBuffer,
+        blur: inout TrainerBlurUniforms
+    ) {
+        let size = resources.renderSize
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(source, offset: 0, index: TrainerBind.Blur.src)
+        encoder.setBuffer(destination, offset: 0, index: TrainerBind.Blur.dst)
+        encoder.setBytes(
+            &blur, length: MemoryLayout<TrainerBlurUniforms>.stride, index: TrainerBind.Blur.uniforms
+        )
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (size.width + 15) / 16, height: (size.height + 15) / 16, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1)
+        )
     }
 
     /// Horizontal then vertical. `scratch` must be a third buffer, never
@@ -943,13 +991,18 @@ struct TrainerGPU {
         dispatch2D(encoder, pipelines.blurV, width: size.width, height: size.height)
     }
 
-    func lossFinalize(_ encoder: MTLComputeCommandEncoder, loss: inout TrainerLossUniforms) {
+    /// `blurredPartials` is what `ssim` returned for this step.
+    func lossFinalize(
+        _ encoder: MTLComputeCommandEncoder,
+        loss: inout TrainerLossUniforms,
+        blurredPartials: MTLBuffer
+    ) {
         let px = resources.renderSize.pixelCount
         guard px > 0 else { return }
         encoder.setComputePipelineState(pipelines.lossFinalize)
         encoder.setBuffer(resources.gradFinal, offset: 0, index: TrainerBind.LossFinalize.gradFinal)
         encoder.setBuffer(
-            resources.ssimTmp, offset: 0, index: TrainerBind.LossFinalize.blurredPartials
+            blurredPartials, offset: 0, index: TrainerBind.LossFinalize.blurredPartials
         )
         encoder.setBuffer(
             resources.ssimSrc, offset: 0, index: TrainerBind.LossFinalize.lumaPlanes

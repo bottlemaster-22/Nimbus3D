@@ -1118,7 +1118,7 @@ enum SmartImageLoader {
 final class SmartImageCache {
     private var order: [FrameID] = []
     private var storage: [FrameID: SmartImage] = [:]
-    private let capacity: Int
+    let capacity: Int
     private let longEdge: Int
     private let lock = NSLock()
 
@@ -1146,6 +1146,20 @@ final class SmartImageCache {
         ) else { return nil }
 
         lock.lock()
+        // BUILD 318: RE-CHECKED UNDER THE LOCK. The decode above runs outside
+        // it, so two threads missing the same frame both decode it, and the
+        // second insert used to append a DUPLICATE key to `order` while
+        // `storage` held one entry. The eviction loop then removed the
+        // duplicate's key from `storage`, deleting a live image, and the cache
+        // settled with fewer distinct frames than its capacity: with a working
+        // set exactly the size of the capacity (the trust build: a reference
+        // and four partners in a cache of five) every lookup missed from then
+        // on, tens of thousands of JPEG decodes where a serial run did five.
+        // The first decode to land wins; a later one is dropped.
+        if let existing = storage[frame.index] {
+            lock.unlock()
+            return existing
+        }
         storage[frame.index] = loaded
         order.append(frame.index)
         while order.count > capacity {

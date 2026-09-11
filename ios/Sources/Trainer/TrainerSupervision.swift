@@ -364,9 +364,19 @@ final class TrainerSupervisionBuilder {
         renderSize = nil
         renderIntrinsics = nil
         // At the old grid, like the decodes above.
+        dropFrameCache(disable: false)
+        return true
+    }
+
+    /// Lets go of every cached frame. `disable` also stops the cache refilling
+    /// for the rest of the run: the memory governor calls it that way, since a
+    /// cache that refilled after being dropped for memory would be dropped
+    /// again at the next poll, and a decode storm every fifty iterations is
+    /// worse than no cache (build 318).
+    func dropFrameCache(disable: Bool) {
         frameCache.removeAll()
         frameCacheBytes = 0
-        return true
+        if disable { frameCacheLimitBytes = 0 }
     }
 
     /// The pose the trainer should render this frame from: the pre-pass's

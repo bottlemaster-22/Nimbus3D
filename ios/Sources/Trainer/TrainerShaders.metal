@@ -1913,6 +1913,110 @@ kernel void trainer_blur_v(
     }
 }
 
+// ============================================================================
+// MARK: - SSIM blur, both directions in one kernel (build 318)
+//
+// trainer_blur_h and trainer_blur_v as ONE dispatch: a 16 x 16 tile of
+// outputs, the horizontal blur computed for the 26 clamped rows the tile's
+// vertical taps read, kept in threadgroup memory, then the vertical blur from
+// there. The intermediate planes never touch device memory (10 to 16 MB a
+// pass, twice a step, at 720 x 540).
+//
+// The arithmetic is the two kernels', statement for statement: the same taps
+// in the same order, the same clamp-to-edge, the same per-tap expressions.
+// The horizontal blur of a clamped row is the value trainer_blur_h wrote for
+// that row, and trainer_blur_v read exactly that value at that row, so every
+// output is the number the two-pass path produced. The trainer still checks
+// this on device, bit for bit, before it uses this kernel (MetalSplatTrainer,
+// blur calibration): a compiler is free to schedule one kernel differently
+// from another, and a claim of bit-identity is worth one comparison.
+//
+// pad0 != 0 is the MOMENTS pass, as in trainer_blur_h: two input planes,
+// five output planes. Otherwise planeCount planes in, planeCount out.
+// ============================================================================
+
+constant uint kTrainerBlurTile = 16u;
+constant uint kTrainerBlurRows = kTrainerBlurTile + 2u * TRAINER_SSIM_RADIUS;   // 26
+
+kernel void trainer_blur_hv(
+    const device float*           src   [[buffer(0)]],
+    device float*                 dst   [[buffer(1)]],
+    constant TrainerBlurUniforms& u     [[buffer(2)]],
+    uint2                         tgPos [[threadgroup_position_in_grid]],
+    uint2                         tPos  [[thread_position_in_threadgroup]]
+) {
+    // [plane][row][column]: 5 x 26 x 16 floats, 8,320 bytes.
+    threadgroup float inter[5][kTrainerBlurRows][kTrainerBlurTile];
+
+    // The eleven weights, the same table trainer_blur_h and trainer_blur_v
+    // carry and TrainerGPULayouts.verify() checks.
+    const float k[11] = {
+        0.00102838f, 0.00759876f, 0.03600077f, 0.10936069f, 0.21300554f,
+        0.26601172f,
+        0.21300554f, 0.10936069f, 0.03600077f, 0.00759876f, 0.00102838f
+    };
+
+    const uint n = u.width * u.height;
+    const uint x = tgPos.x * kTrainerBlurTile + tPos.x;
+    const uint y0 = tgPos.y * kTrainerBlurTile;
+    const bool column = x < u.width;
+    const bool moments = u.pad0 != 0u;
+    const uint planes = moments ? 5u : min(u.planeCount, 5u);
+    const int radius = int(TRAINER_SSIM_RADIUS);
+
+    // Phase 1: trainer_blur_h, at the 26 clamped rows this tile reads. Every
+    // thread of a column takes rows tPos.y, tPos.y + 16.
+    if (column) {
+        for (uint r = tPos.y; r < kTrainerBlurRows; r += kTrainerBlurTile) {
+            const int yr = clamp(int(y0) + int(r) - radius, 0, int(u.height) - 1);
+            const uint rowBase = uint(yr) * u.width;
+            if (moments) {
+                float s0 = 0.0f, s1 = 0.0f, sxx = 0.0f, syy = 0.0f, sxy = 0.0f;
+                for (int t = -radius; t <= radius; ++t) {
+                    const int sx = clamp(int(x) + t, 0, int(u.width) - 1);
+                    const uint at = rowBase + uint(sx);
+                    const float w = k[t + radius];
+                    const float xv = src[at];
+                    const float yv = src[n + at];
+                    s0 += w * xv;
+                    s1 += w * yv;
+                    sxx += w * (xv * xv);
+                    syy += w * (yv * yv);
+                    sxy += w * (xv * yv);
+                }
+                inter[0][r][tPos.x] = s0;
+                inter[1][r][tPos.x] = s1;
+                inter[2][r][tPos.x] = sxx;
+                inter[3][r][tPos.x] = syy;
+                inter[4][r][tPos.x] = sxy;
+            } else {
+                for (uint p = 0; p < planes; ++p) {
+                    float sum = 0.0f;
+                    for (int t = -radius; t <= radius; ++t) {
+                        const int sx = clamp(int(x) + t, 0, int(u.width) - 1);
+                        sum += k[t + radius] * src[p * n + rowBase + uint(sx)];
+                    }
+                    inter[p][r][tPos.x] = sum;
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: trainer_blur_v, from the staged rows. Row tPos.y + radius + t
+    // holds the horizontal blur of clamp(y + t), which is what blur_v read.
+    const uint y = y0 + tPos.y;
+    if (!column || y >= u.height) { return; }
+    const uint idx = y * u.width + x;
+    for (uint p = 0; p < planes; ++p) {
+        float sum = 0.0f;
+        for (int t = -radius; t <= radius; ++t) {
+            sum += k[t + radius] * inter[p][uint(int(tPos.y) + radius + t)][tPos.x];
+        }
+        dst[p * n + idx] = sum;
+    }
+}
+
 /// Turns the five blurred moments into the SSIM value and the three partial
 /// derivative planes the backward blur needs.
 kernel void trainer_ssim_stats(
@@ -3076,18 +3180,25 @@ kernel void trainer_rasterize_backward2(
                 trainer_backwardPixel(b, globalIndex, xy, co, cutoff, colorDepth, cam,
                                       gA, gB, gC, contributes);
                 if (!contributes) { continue; }
+                // No per-value zero tests (build 318): adding +0 is exact and
+                // a contributing pair's components are almost never zero, so
+                // twelve compares and branches bought nothing. The colour
+                // group keeps the per-pixel gate the one-pixel kernel has,
+                // and unknownAccum keeps its test because it usually IS zero.
                 device TrainerSplatGrad2DAtomic* g = &splatGrad2D[tgIndex[j]];
-                if (gA.x != 0.0f) { trainer_atomicAddUnchecked(&g->color0, gA.x); }
-                if (gA.y != 0.0f) { trainer_atomicAddUnchecked(&g->color1, gA.y); }
-                if (gA.z != 0.0f) { trainer_atomicAddUnchecked(&g->color2, gA.z); }
-                if (gA.w != 0.0f) { trainer_atomicAddUnchecked(&g->opacity, gA.w); }
-                if (gB.x != 0.0f) { trainer_atomicAddUnchecked(&g->mean2D0, gB.x); }
-                if (gB.y != 0.0f) { trainer_atomicAddUnchecked(&g->mean2D1, gB.y); }
-                if (gB.z != 0.0f) { trainer_atomicAddUnchecked(&g->conic0, gB.z); }
-                if (gB.w != 0.0f) { trainer_atomicAddUnchecked(&g->conic1, gB.w); }
-                if (gC.x != 0.0f) { trainer_atomicAddUnchecked(&g->conic2, gC.x); }
-                if (gC.y != 0.0f) { trainer_atomicAddUnchecked(&g->absGrad2D, gC.y); }
-                if (gC.z != 0.0f) { trainer_atomicAddUnchecked(&g->visAccum, gC.z); }
+                if (a.hasColorGrad || b.hasColorGrad) {
+                    trainer_atomicAddUnchecked(&g->color0, gA.x);
+                    trainer_atomicAddUnchecked(&g->color1, gA.y);
+                    trainer_atomicAddUnchecked(&g->color2, gA.z);
+                }
+                trainer_atomicAddUnchecked(&g->opacity, gA.w);
+                trainer_atomicAddUnchecked(&g->mean2D0, gB.x);
+                trainer_atomicAddUnchecked(&g->mean2D1, gB.y);
+                trainer_atomicAddUnchecked(&g->conic0, gB.z);
+                trainer_atomicAddUnchecked(&g->conic1, gB.w);
+                trainer_atomicAddUnchecked(&g->conic2, gC.x);
+                trainer_atomicAddUnchecked(&g->absGrad2D, gC.y);
+                trainer_atomicAddUnchecked(&g->visAccum, gC.z);
                 if (gC.w != 0.0f) { trainer_atomicAddUnchecked(&g->unknownAccum, gC.w); }
             }
         }

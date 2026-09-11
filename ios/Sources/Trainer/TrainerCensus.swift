@@ -685,6 +685,16 @@ struct TrainerTimings: Codable {
     var backwardTwoPixelRelativeDifference: Double = 0
     var backwardTwoPixelChosen: Int = 0
 
+    /// Blur calibration (build 318): the two-pass SSIM blur (A) against the
+    /// fused one (B) on the same frame. GPU seconds of the whole SSIM stage
+    /// each way, steps whose blurred partials differed in ANY bit, and
+    /// whether B was then used (1) or not (0).
+    var blurCalibrationSteps: Int = 0
+    var blurSecondsA: Double = 0
+    var blurSecondsB: Double = 0
+    var blurMismatchSteps: Int = 0
+    var blurFusedChosen: Int = 0
+
     /// Build 292: steps whose buffer B was left running while the next
     /// iteration's CPU work and buffer A went ahead (completed later by
     /// drainPendingStep).
