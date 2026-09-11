@@ -562,6 +562,9 @@ struct TrainerTimings: Codable {
     var densifyGatherChecks: Int = 0
     var densifyGatherMismatches: Int = 0
     var previewSnapshot: Double = 0
+    /// Build 322: preview snapshots copied inside a step's command buffer
+    /// and converted off the loop (not in `previewSnapshot`).
+    var snapshotsStaged: Int = 0
     var filterSweep: Double = 0
     /// runIteration only: seconds from buffer A's completion to buffer B's
     /// commit (instance-count readback, overflow check, CPU encode of B).

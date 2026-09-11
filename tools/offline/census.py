@@ -157,8 +157,10 @@ if pre:
           'itself waited %.1f s for supervision.' % (pre, t['supervision']))
     print('ceiling if perfectly overlapped: max(worker, gpuBusy) + rest = '
           '%.1f s' % (max(pre, t['gpuBusy']) + rest))
-if t.get('densifyGatherChecks'):
-    print('densify gather: %d pass(es) checked against the CPU path, %d words differed'
+if t.get('snapshotsStaged'):
+    print('preview snapshots: %d copied inside a step and converted off the loop'
+          % t['snapshotsStaged'])
+if t.get('densifyGatherChecks'):    print('densify gather: %d pass(es) checked against the CPU path, %d words differed'
           % (t['densifyGatherChecks'], t.get('densifyGatherMismatches', 0)))
 if t.get('mergedSteps'):    print('merged steps: %d of %d overlapped ran as one command buffer; %d ran short of instance slots'
           % (t['mergedSteps'], t.get('overlappedSteps', 0), t.get('truncatedInstanceSteps', 0)))

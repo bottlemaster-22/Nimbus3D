@@ -1278,6 +1278,17 @@ extension MTLBuffer {
         return Array(UnsafeBufferPointer(start: raw, count: count))
     }
 
+    /// Reads `count` elements of `T` starting `byteOffset` bytes in (build
+    /// 322: the staging buffers hold several arrays end to end). Empty when
+    /// the range does not fit, like `readArray(_:count:)`.
+    func readArray<T>(_ type: T.Type, count: Int, byteOffset: Int) -> [T] {
+        guard count > 0, byteOffset >= 0,
+              length >= byteOffset + count * MemoryLayout<T>.stride
+        else { return [] }
+        let raw = contents().advanced(by: byteOffset).bindMemory(to: T.self, capacity: count)
+        return Array(UnsafeBufferPointer(start: raw, count: count))
+    }
+
     /// Writes `values` to the front of the buffer. Silently writes as many as
     /// fit, and returns how many that was, so an over-long write is a number
     /// the caller can check rather than a heap corruption.

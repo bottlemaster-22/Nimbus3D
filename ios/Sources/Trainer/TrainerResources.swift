@@ -164,6 +164,13 @@ final class TrainerResources {
     private(set) var densifySource: MTLBuffer
     private(set) var densifyFlags: MTLBuffer
     private(set) var densifyScratch: MTLBuffer
+    /// Build 322: a copy of splats, sh and stats (end to end) taken inside a
+    /// step's command buffer for the preview, converted off the loop.
+    private(set) var snapshotStaging: MTLBuffer
+    /// Build 322: two slots the held-out render copies its outputs into
+    /// (counts, colour, transmittance, background), so the next frame
+    /// renders while this one is read back. See evalStagingSlotBytes.
+    private(set) var evalStaging: MTLBuffer
 
     // MARK: Accounting
 
@@ -249,6 +256,7 @@ final class TrainerResources {
         densifySource = try make("densifySource", n * 4)
         densifyFlags = try make("densifyFlags", n)
         densifyScratch = try make("densifyScratch", shFloats * MemoryLayout<Float>.stride)
+        snapshotStaging = try make("snapshotStaging", Self.snapshotStagingBytes(splats: n, shFloats: shFloats))
         // 6 faces, 32x32, three floats each. Fixed size: it does not scale
         // with splats or pixels, so it is allocated once and never resized.
         bgCubemap = try make("bgCubemap", 6 * 32 * 32 * 3 * 4)
@@ -297,6 +305,7 @@ final class TrainerResources {
         renderDepth = try make("renderDepth", px * 4)
         renderTFinal = try make("renderTFinal", px * 4)
         renderNContrib = try make("renderNContrib", px * 4)
+        evalStaging = try make("evalStaging", 2 * Self.evalStagingSlotBytes(pixelCount: px))
 
         gtColor = try make("gtColor", px * 3)
         bgColor = try make("bgColor", px * 3 * 4)
@@ -348,7 +357,7 @@ final class TrainerResources {
             splats, sh, stats, draws, samplingTopK, tilesTouched, offsets,
             splatGrad, shGrad, adamM, adamV, shAdamM, shAdamV,
             splatGrad2D, bgCubemap, raster, centers,
-            densifySource, densifyFlags, densifyScratch,
+            densifySource, densifyFlags, densifyScratch, snapshotStaging, evalStaging,
             keysA, keysB, valuesA, valuesB, tileRanges,
             radixHistogram, radixHistogramScan,
             renderColor, renderAlpha, renderDepth, renderTFinal, renderNContrib,
@@ -380,6 +389,9 @@ final class TrainerResources {
             + MemoryLayout<TrainerSplatGrad>.stride * 3    // gradient + Adam m + v
             + shFloats * 4 * 4                             // sh + grad + m + v
             + shFloats * 4 + 4 + 1                         // densify scratch, source, flags
+            + MemoryLayout<TrainerSplat>.stride            // snapshot staging: splat,
+            + shFloats * 4                                 //   sh,
+            + MemoryLayout<TrainerSplatStats>.stride       //   stats
             + 4 * 2                                        // tilesTouched, offsets
             + 4 * (2 + 3 + 3 + 1)                          // mean2D, conic, colour, opacity
             + 4 * 3                                        // extracted centres
@@ -401,8 +413,22 @@ final class TrainerResources {
             + 1 // gradTFinal
             + 1 // unknownMask
         let ssimFloats = TrainerGPUConstants.ssimPlaneCount * 3   // src, mid, tmp
-        // gtColor and gtColorAlt: three BYTES per pixel each (build 314).
-        return (perPixelFloats + ssimFloats) * 4 + 3 * 2
+        // gtColor and gtColorAlt: three BYTES per pixel each (build 314), and
+        // the two held-out staging slots, 28 bytes per pixel each (build 322).
+        return (perPixelFloats + ssimFloats) * 4 + 3 * 2 + 28 * 2
+    }
+
+    /// Bytes of one held-out staging slot: 16 for the instance counts, then
+    /// colour (12 per pixel), transmittance (4) and background (12).
+    static func evalStagingSlotBytes(pixelCount: Int) -> Int {
+        16 + pixelCount * 28
+    }
+
+    /// Bytes of the preview snapshot staging: splats, sh and stats end to end.
+    static func snapshotStagingBytes(splats n: Int, shFloats: Int) -> Int {
+        n * MemoryLayout<TrainerSplat>.stride
+            + shFloats * MemoryLayout<Float>.stride
+            + n * MemoryLayout<TrainerSplatStats>.stride
     }
 
     // MARK: - Allocation
@@ -626,6 +652,7 @@ final class TrainerResources {
         densifySource = placeholder
         densifyFlags = placeholder
         densifyScratch = placeholder
+        snapshotStaging = placeholder
 
         // The eight that carry state across the resize, allocated into the
         // headroom the release above just freed. Each replacement is filled
@@ -670,6 +697,9 @@ final class TrainerResources {
         densifySource = try makeBuffer("densifySource", n * 4)
         densifyFlags = try makeBuffer("densifyFlags", n)
         densifyScratch = try makeBuffer("densifyScratch", shFloats * floatStride)
+        snapshotStaging = try makeBuffer(
+            "snapshotStaging", Self.snapshotStagingBytes(splats: n, shFloats: shFloats)
+        )
 
         // Level zero of the scan scratch is sized from the padded splat array,
         // so it moves with the capacity even though the sort capacity has not.
@@ -722,6 +752,7 @@ final class TrainerResources {
         renderDepth = placeholder
         renderTFinal = placeholder
         renderNContrib = placeholder
+        evalStaging = placeholder
         gtColor = placeholder
         gtColorAlt = placeholder
         bgColor = placeholder
@@ -742,6 +773,7 @@ final class TrainerResources {
         renderDepth = try makeBuffer("renderDepth", px * 4)
         renderTFinal = try makeBuffer("renderTFinal", px * 4)
         renderNContrib = try makeBuffer("renderNContrib", px * 4)
+        evalStaging = try makeBuffer("evalStaging", 2 * Self.evalStagingSlotBytes(pixelCount: px))
 
         gtColor = try makeBuffer("gtColor", px * 3)
         gtColorAlt = try makeBuffer("gtColorAlt", px * 3)

@@ -116,11 +116,22 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         /// Build 316: one command buffer with the sort sized on the GPU; its
         /// staging slot also carries the instance count (needed, used).
         let merged: Bool
+        /// Build 322: this step's command buffer copied that many Gaussians
+        /// (splats, sh, stats) into snapshotStaging for the preview; 0 = none.
+        let snapshotCount: Int
     }
     private var pendingStep: PendingStep?
     /// Build 316: a merged step ran short of instance slots and needs this
     /// many; the buffers grow before the next merged step is encoded.
     private var pendingInstanceGrowth: Int?
+    /// Build 322: a preview snapshot is wanted; the next merged step copies
+    /// the model into the staging inside its own command buffer and the copy
+    /// is converted off the loop, instead of draining the GPU to read the
+    /// live buffers. All four under `lock`: the conversion runs elsewhere.
+    private var snapshotRequested = false
+    private var snapshotParts: [SplatCloud] = []
+    private var snapshotDegree: SHDegree = .zero
+    private var snapshotConverting = false
 
     /// Held-out (and trained-view) supervision built by evaluateHeldOut, kept
     /// for the run (build 300). ~1.2 MB a frame (bytes since 314), 11 or 12 frames.
@@ -533,6 +544,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // Its buffer finishes on its own; its read-backs are not wanted.
         pendingStep = nil
         pendingInstanceGrowth = nil
+        lock.lock()
+        snapshotRequested = false
+        snapshotConverting = false
+        lock.unlock()
         evalSupervisionCache.removeAll()
         heldOutPSNRSum = 0
         heldOutPSNRCount = 0
@@ -1784,15 +1799,26 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             }
 
             if iteration % Swift.max(tuning.snapshotIntervalIterations, 1) == 0 {
-                try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
-                let snapshotFrom = CFAbsoluteTimeGetCurrent()
-                let cloud = readCloud(
-                    resources: resources, count: splatCount, shDegree: shDegree
-                )
-                lock.lock()
-                latestSnapshot = mergePreview(completedParts: completedParts, current: cloud)
-                lock.unlock()
-                timings.previewSnapshot += CFAbsoluteTimeGetCurrent() - snapshotFrom
+                if let running = pendingStep, running.merged {
+                    // Build 322: the next merged step copies the model in its
+                    // own command buffer and the copy is converted off the
+                    // loop (startSnapshotConversion). Nothing waits here.
+                    lock.lock()
+                    snapshotRequested = true
+                    snapshotParts = completedParts
+                    snapshotDegree = shDegree
+                    lock.unlock()
+                } else {
+                    try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
+                    let snapshotFrom = CFAbsoluteTimeGetCurrent()
+                    let cloud = readCloud(
+                        resources: resources, count: splatCount, shDegree: shDegree
+                    )
+                    lock.lock()
+                    latestSnapshot = mergePreview(completedParts: completedParts, current: cloud)
+                    lock.unlock()
+                    timings.previewSnapshot += CFAbsoluteTimeGetCurrent() - snapshotFrom
+                }
             }
 
             // --- Progress ------------------------------------------------------------
@@ -2252,6 +2278,44 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 }
             }
         }
+        if pending.snapshotCount > 0 {
+            timings.snapshotsStaged += 1
+            startSnapshotConversion(resources: resources, count: pending.snapshotCount)
+        }
+    }
+
+    /// Build 322: the staged copy becomes the preview on a background thread.
+    /// The three arrays are read out of the staging HERE, on the loop thread,
+    /// so a later step's copy can never overtake the read; only the
+    /// conversion runs elsewhere. A conversion still running when the next
+    /// snapshot lands makes that one wait for the following interval.
+    private func startSnapshotConversion(resources: TrainerResources, count: Int) {
+        lock.lock()
+        let busy = snapshotConverting
+        let parts = snapshotParts
+        let degree = snapshotDegree
+        if !busy { snapshotConverting = true }
+        lock.unlock()
+        guard !busy else { return }
+        let shPerSplat = resources.shFloatsPerSplat
+        let staging = resources.snapshotStaging
+        let splatBytes = count * MemoryLayout<TrainerSplat>.stride
+        let shBytes = count * shPerSplat * MemoryLayout<Float>.stride
+        let splats = staging.readArray(TrainerSplat.self, count: count, byteOffset: 0)
+        let sh = staging.readArray(Float.self, count: count * shPerSplat, byteOffset: splatBytes)
+        let stats = staging.readArray(
+            TrainerSplatStats.self, count: count, byteOffset: splatBytes + shBytes
+        )
+        DispatchQueue.global(qos: .utility).async { [self] in
+            let cloud = Self.buildCloud(
+                splats: splats, sh: sh, shPerSplat: shPerSplat, stats: stats, shDegree: degree
+            )
+            let merged = mergePreview(completedParts: parts, current: cloud)
+            lock.lock()
+            latestSnapshot = merged
+            snapshotConverting = false
+            lock.unlock()
+        }
     }
 
     /// This frame's supervision into the GPU's input slot, and the camera and
@@ -2421,6 +2485,23 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         var loss = inputs.loss
         let sampleCount = inputs.sampleCount
 
+        // Build 322: a requested preview snapshot rides in this step's buffer,
+        // copied BEFORE the step's Adam touches anything: the state after the
+        // previous step, which is what the synchronous snapshot read.
+        var snapshotCount = 0
+        lock.lock()
+        let snapshotWanted = snapshotRequested && !snapshotConverting
+        lock.unlock()
+        let snapshotBytes = TrainerResources.snapshotStagingBytes(
+            splats: splatCount, shFloats: splatCount * resources.shFloatsPerSplat
+        )
+        if snapshotWanted, resources.snapshotStaging.length >= snapshotBytes {
+            lock.lock()
+            snapshotRequested = false
+            lock.unlock()
+            snapshotCount = splatCount
+        }
+
         let encodeFrom = CFAbsoluteTimeGetCurrent()
         // Pooled for the reason runIteration's buffers are; the committed
         // buffer itself is kept, as build 292 kept buffer B.
@@ -2428,6 +2509,18 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             guard let buffer = queue.makeCommandBuffer(),
                   let blit = buffer.makeBlitCommandEncoder()
             else { throw TrainerError.noMetalDevice }
+            if snapshotCount > 0 {
+                let splatBytes = snapshotCount * MemoryLayout<TrainerSplat>.stride
+                let shBytes = snapshotCount * resources.shFloatsPerSplat * MemoryLayout<Float>.stride
+                let statsBytes = snapshotCount * MemoryLayout<TrainerSplatStats>.stride
+                blit.copy(from: resources.splats, sourceOffset: 0,
+                          to: resources.snapshotStaging, destinationOffset: 0, size: splatBytes)
+                blit.copy(from: resources.sh, sourceOffset: 0,
+                          to: resources.snapshotStaging, destinationOffset: splatBytes, size: shBytes)
+                blit.copy(from: resources.stats, sourceOffset: 0,
+                          to: resources.snapshotStaging, destinationOffset: splatBytes + shBytes,
+                          size: statsBytes)
+            }
             blit.label = "trainer.clear"
             gpu.clearPerIteration(blit, splatCount: splatCount)
             blit.endEncoding()
@@ -2527,7 +2620,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         pendingStep = PendingStep(
             buffer: committed, slot: slot, frame: frame,
             exposure: exposure, iteration: iteration,
-            totalIterations: totalIterations, splatCount: splatCount, merged: true
+            totalIterations: totalIterations, splatCount: splatCount, merged: true,
+            snapshotCount: snapshotCount
         )
         timings.overlappedSteps += 1
         timings.mergedSteps += 1
@@ -3239,7 +3333,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 pendingStep = PendingStep(
                     buffer: bufferB, slot: resources.inputSlot, frame: frame,
                     exposure: exposure, iteration: iteration,
-                    totalIterations: totalIterations, splatCount: splatCount, merged: false
+                    totalIterations: totalIterations, splatCount: splatCount, merged: false,
+                    snapshotCount: 0
                 )
                 timings.overlappedSteps += 1
                 return
@@ -3977,123 +4072,49 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 evaluated += 1
             }
         }
-        for frame in frames.prefix(24) {
-            // CACHED for the run (build 300): the eval visits the same frames
-            // ~9 times, and every build re-decoded the photo (about half the
-            // eval's time). Nothing in a held-out frame's supervision changes
-            // once the background is frozen (evals start after warm-up); a
-            // render-size change invalidates the entry.
-            let frameSupervision: TrainerFrameSupervision
-            if let cached = evalSupervisionCache[frame.index], cached.renderSize == renderSize {
-                frameSupervision = cached
-            } else {
-                guard let built = supervision.build(
-                    frame: frame, iteration: 0, totalIterations: 1, includeDepthSamples: false
-                ) else { continue }
-                evalSupervisionCache[frame.index] = built
-                frameSupervision = built
-            }
-            guard frameSupervision.renderSize == renderSize else { continue }
-
-            // No ground-truth upload: the held-out render runs no loss kernel,
-            // and the score is taken on the CPU from the bytes below. (This
-            // used to copy 4.67 MB a frame into a buffer nothing read.)
-            // The far field comes from the SAME trainer_background kernel the
-            // training path uses, encoded into buffer A below and read back
-            // after buffer B. It was the CPU loop backgroundImage, 6 to 10 ms a
-            // frame on the critical path, 132 frames a run (8 early-stop
-            // evaluations of 12 plus the final ones), not the 24 once per
-            // slice this comment used to claim.
-            let useGPUBackground = frameSupervision.hasBackground
-                && frameSupervision.backgroundFaceSize > 0
-                && !frameSupervision.backgroundTexels.isEmpty
-            if useGPUBackground {
-                resources.bgCubemapIn.writeArray(frameSupervision.backgroundTexels)
-            }
-
-            var camera = cameraUniforms(
-                supervision: frameSupervision,
-                cameraDelta: cameraDeltas[frame.index],
-                size: renderSize,
-                splatCount: splatCount,
-                shCoefficientCount: shCoefficientCount,
-                iteration: 1,
-                totalIterations: 1
+        // BUILD 322: THE FRAMES RENDER BACK TO BACK. Each frame is one command
+        // buffer with the sort sized on the GPU (build 316's setup kernel and
+        // indirect dispatches), ending in a copy of its outputs into one of
+        // two staging slots; the next frame is committed BEFORE this one is
+        // waited for, so its render overlaps this one's read-back and score.
+        // It was two command buffers and two waits per frame with the GPU
+        // idle through every read-back: 1.6 s a run on build 292.
+        let px = renderSize.pixelCount
+        let slotBytes = TrainerResources.evalStagingSlotBytes(pixelCount: px)
+        struct EvalPending {
+            let buffer: MTLCommandBuffer
+            let slot: Int
+            let frame: CaptureFrame
+            let supervision: TrainerFrameSupervision
+            let hasBackground: Bool
+        }
+        var pending: EvalPending?
+        // Runs before the stats restore above (later defers run first): a
+        // frame still rendering when this returns early must finish before
+        // the live stats are written over.
+        defer { pending?.buffer.waitUntilCompleted() }
+        var slot = 0
+        func collect(_ done: EvalPending) throws {
+            try finish(done.buffer, "the held-out render")
+            let base = done.slot * slotBytes
+            // The same rule the two-buffer path applied from its CPU count: a
+            // frame that produced no instances, or more than the buffers
+            // hold, is not scored.
+            let counts = resources.evalStaging.readArray(UInt32.self, count: 2, byteOffset: base)
+            guard counts.count == 2, counts[0] > 0,
+                  counts[0] <= UInt32(resources.instanceCapacity)
+            else { return }
+            let rendered = resources.evalStaging.readArray(
+                Float.self, count: px * 3, byteOffset: base + 16
             )
-
-            if resources.instanceCapacity < splatCount {
-                try resources.growInstanceCapacity(to: splatCount + splatCount / 4)
-            }
-            guard let bufferA = queue.makeCommandBuffer(),
-                  let encoderA = bufferA.makeComputeCommandEncoder()
-            else { return nil }
-            encoderA.label = "trainer.eval.preprocess"
-            if useGPUBackground {
-                let q = frameSupervision.pose.rotation.simd.inverse
-                var bg = TrainerBackgroundUniforms(
-                    rotationInverse: SIMD4<Float>(q.imag.x, q.imag.y, q.imag.z, q.real),
-                    fx: frameSupervision.intrinsics.fx,
-                    fy: frameSupervision.intrinsics.fy,
-                    cx: frameSupervision.intrinsics.cx,
-                    cy: frameSupervision.intrinsics.cy,
-                    width: UInt32(renderSize.width),
-                    height: UInt32(renderSize.height),
-                    faceSize: UInt32(frameSupervision.backgroundFaceSize),
-                    pad: 0
-                )
-                gpu.background(encoderA, uniforms: &bg)
-            }
-            gpu.fillUInt(encoderA, buffer: resources.tilesTouched, count: splatCount, value: 0)
-            gpu.preprocess(encoderA, camera: &camera, splatCount: splatCount)
-            if splatOrderChosen {
-                gpu.orderSplats(
-                    encoderA, camera: &camera, splatCount: splatCount,
-                    simdScan: sortSimdScanChosen
-                )
-            } else {
-                gpu.exclusiveScan(
-                    encoderA,
-                    input: resources.tilesTouched,
-                    output: resources.offsets,
-                    count: splatCount
-                )
-            }
-            encoderA.endEncoding()
-            bufferA.commit()
-            try finish(bufferA, "the held-out preprocess")
-
-            let lastOffset = resources.offsets.readElement(UInt32.self, at: splatCount - 1) ?? 0
-            let lastTouched = (splatOrderChosen ? resources.keysA : resources.tilesTouched).readElement(UInt32.self, at: splatCount - 1) ?? 0
-            let instanceCount = Int(lastOffset) + Int(lastTouched)
-            guard instanceCount > 0, instanceCount <= resources.instanceCapacity else { continue }
-
-            guard let bufferB = queue.makeCommandBuffer(),
-                  let encoderB = bufferB.makeComputeCommandEncoder()
-            else { return nil }
-            encoderB.label = "trainer.eval.render"
-            gpu.duplicateKeys(
-                encoderB, camera: &camera, splatCount: splatCount, ordered: splatOrderChosen
+            let transmittance = resources.evalStaging.readArray(
+                Float.self, count: px, byteOffset: base + 16 + px * 12
             )
-            gpu.radixSort(
-                encoderB, count: instanceCount, simdScan: sortSimdScanChosen,
-                tileOnly: splatOrderChosen
-            )
-            gpu.tileRanges(encoderB, instanceCount: instanceCount)
-            gpu.rasterizeForward(encoderB, camera: &camera, twoPixels: forwardTwoPixelChosen)
-            encoderB.endEncoding()
-            bufferB.commit()
-            try finish(bufferB, "the held-out render")
-
-            // Composite and exposure are applied here rather than by a kernel,
-            // because the evaluation must not touch the gradient buffers.
-            let pixelCount = renderSize.pixelCount
-            let rendered = resources.renderColor.readArray(Float.self, count: pixelCount * 3)
-            let transmittance = resources.renderTFinal.readArray(Float.self, count: pixelCount)
-            guard rendered.count == pixelCount * 3, transmittance.count == pixelCount else { continue }
-            let heldOutBackground: [Float]? = useGPUBackground
-                ? resources.bgColor.readArray(Float.self, count: pixelCount * 3)
+            guard rendered.count == px * 3, transmittance.count == px else { return }
+            let heldOutBackground: [Float]? = done.hasBackground
+                ? resources.evalStaging.readArray(Float.self, count: px * 3, byteOffset: base + 16 + px * 16)
                 : nil
-            if let heldOutBackground, heldOutBackground.count != pixelCount * 3 { continue }
+            if let heldOutBackground, heldOutBackground.count != px * 3 { return }
 
             // A HELD-OUT FRAME HAS NO FITTED EXPOSURE, AND THAT IS NOT A
             // PROPERTY OF THE MODEL.
@@ -4114,12 +4135,12 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // a fit of the geometry; the raw number is still reported so nothing
             // is hidden.
             collected.append(HeldOutRender(
-                frame: frame,
+                frame: done.frame,
                 rendered: rendered,
                 transmittance: transmittance,
                 background: heldOutBackground,
-                groundTruth: frameSupervision.groundTruthBytes,
-                exposure: exposures[frame.index] ?? SIMD2<Float>(1, 0)
+                groundTruth: done.supervision.groundTruthBytes,
+                exposure: exposures[done.frame.index] ?? SIMD2<Float>(1, 0)
             ))
             // Scored a core's worth at a time (build 318): holding every
             // frame's read-backs until the end was up to 24 x 15 MB alive at
@@ -4127,6 +4148,128 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // polls. Chunks keep the peak at a few frames; the order the
             // scores are combined in is unchanged.
             if collected.count >= scoreChunk { scoreCollected() }
+        }
+
+        for frame in frames.prefix(24) {
+            // CACHED for the run (build 300): the eval visits the same frames
+            // ~9 times, and every build re-decoded the photo (about half the
+            // eval's time). Nothing in a held-out frame's supervision changes
+            // once the background is frozen (evals start after warm-up); a
+            // render-size change invalidates the entry.
+            let frameSupervision: TrainerFrameSupervision
+            if let cached = evalSupervisionCache[frame.index], cached.renderSize == renderSize {
+                frameSupervision = cached
+            } else {
+                guard let built = supervision.build(
+                    frame: frame, iteration: 0, totalIterations: 1, includeDepthSamples: false
+                ) else { continue }
+                evalSupervisionCache[frame.index] = built
+                frameSupervision = built
+            }
+            guard frameSupervision.renderSize == renderSize else { continue }
+
+            // No ground-truth upload: the held-out render runs no loss kernel,
+            // and the score is taken on the CPU from the bytes. The far field
+            // comes from the SAME trainer_background kernel the training path
+            // uses. The cubemap goes into the input slot the frame still
+            // rendering is NOT reading (the two are double-buffered).
+            let useGPUBackground = frameSupervision.hasBackground
+                && frameSupervision.backgroundFaceSize > 0
+                && !frameSupervision.backgroundTexels.isEmpty
+            resources.inputSlot = slot
+            if useGPUBackground {
+                resources.bgCubemapIn.writeArray(frameSupervision.backgroundTexels)
+            }
+
+            var camera = cameraUniforms(
+                supervision: frameSupervision,
+                cameraDelta: cameraDeltas[frame.index],
+                size: renderSize,
+                splatCount: splatCount,
+                shCoefficientCount: shCoefficientCount,
+                iteration: 1,
+                totalIterations: 1
+            )
+
+            if resources.instanceCapacity < splatCount {
+                try resources.growInstanceCapacity(to: splatCount + splatCount / 4)
+            }
+            guard let buffer = queue.makeCommandBuffer(),
+                  let front = buffer.makeComputeCommandEncoder()
+            else { return nil }
+            front.label = "trainer.eval.preprocess"
+            if useGPUBackground {
+                let q = frameSupervision.pose.rotation.simd.inverse
+                var bg = TrainerBackgroundUniforms(
+                    rotationInverse: SIMD4<Float>(q.imag.x, q.imag.y, q.imag.z, q.real),
+                    fx: frameSupervision.intrinsics.fx,
+                    fy: frameSupervision.intrinsics.fy,
+                    cx: frameSupervision.intrinsics.cx,
+                    cy: frameSupervision.intrinsics.cy,
+                    width: UInt32(renderSize.width),
+                    height: UInt32(renderSize.height),
+                    faceSize: UInt32(frameSupervision.backgroundFaceSize),
+                    pad: 0
+                )
+                gpu.background(front, uniforms: &bg)
+            }
+            gpu.fillUInt(front, buffer: resources.tilesTouched, count: splatCount, value: 0)
+            gpu.preprocess(front, camera: &camera, splatCount: splatCount)
+            if splatOrderChosen {
+                gpu.orderSplats(
+                    front, camera: &camera, splatCount: splatCount,
+                    simdScan: sortSimdScanChosen
+                )
+            } else {
+                gpu.exclusiveScan(
+                    front,
+                    input: resources.tilesTouched,
+                    output: resources.offsets,
+                    count: splatCount
+                )
+            }
+            gpu.sortSetup(front, camera: &camera, ordered: splatOrderChosen)
+            front.endEncoding()
+
+            guard let render = buffer.makeComputeCommandEncoder() else { return nil }
+            render.label = "trainer.eval.render"
+            gpu.duplicateKeys(
+                render, camera: &camera, splatCount: splatCount, ordered: splatOrderChosen
+            )
+            gpu.radixSortIndirect(render, simdScan: sortSimdScanChosen, tileOnly: splatOrderChosen)
+            gpu.tileRangesIndirect(render)
+            gpu.rasterizeForward(render, camera: &camera, twoPixels: forwardTwoPixelChosen)
+            render.endEncoding()
+
+            guard let copy = buffer.makeBlitCommandEncoder() else { return nil }
+            let base = slot * slotBytes
+            copy.copy(from: resources.sortArgs, sourceOffset: 0,
+                      to: resources.evalStaging, destinationOffset: base, size: 8)
+            copy.copy(from: resources.renderColor, sourceOffset: 0,
+                      to: resources.evalStaging, destinationOffset: base + 16, size: px * 12)
+            copy.copy(from: resources.renderTFinal, sourceOffset: 0,
+                      to: resources.evalStaging, destinationOffset: base + 16 + px * 12, size: px * 4)
+            if useGPUBackground {
+                copy.copy(from: resources.bgColor, sourceOffset: 0,
+                          to: resources.evalStaging, destinationOffset: base + 16 + px * 16, size: px * 12)
+            }
+            copy.endEncoding()
+            buffer.commit()
+
+            let next = EvalPending(
+                buffer: buffer, slot: slot, frame: frame,
+                supervision: frameSupervision, hasBackground: useGPUBackground
+            )
+            if let previous = pending {
+                pending = nil
+                try collect(previous)
+            }
+            pending = next
+            slot = 1 - slot
+        }
+        if let last = pending {
+            pending = nil
+            try collect(last)
         }
         scoreCollected()
 
@@ -4272,9 +4415,27 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         shDegree: SHDegree
     ) -> SplatCloud {
         guard count > 0 else { return SplatCloud.empty(shDegree: shDegree) }
-        let splats = resources.splats.readArray(TrainerSplat.self, count: count)
         let shPerSplat = resources.shFloatsPerSplat
-        let sh = resources.sh.readArray(Float.self, count: count * shPerSplat)
+        return Self.buildCloud(
+            splats: resources.splats.readArray(TrainerSplat.self, count: count),
+            sh: resources.sh.readArray(Float.self, count: count * shPerSplat),
+            shPerSplat: shPerSplat,
+            stats: resources.stats.readArray(TrainerSplatStats.self, count: count),
+            shDegree: shDegree
+        )
+    }
+
+    /// The cloud from three arrays read off the GPU: the live buffers, or the
+    /// build 322 snapshot staging. Static, because the preview conversion
+    /// runs it on a background thread.
+    private static func buildCloud(
+        splats: [TrainerSplat],
+        sh: [Float],
+        shPerSplat: Int,
+        stats: [TrainerSplatStats],
+        shDegree: SHDegree
+    ) -> SplatCloud {
+        guard !splats.isEmpty else { return SplatCloud.empty(shDegree: shDegree) }
         let restCount = shDegree.restCoefficientCount
 
         // THE 3D LOW-PASS FILTER HAS TO LEAVE WITH THE MODEL, AND IT CAN ONLY
@@ -4294,7 +4455,6 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // implementation in Export (`SplatCloud.fuse3DFilter`). Do not
         // re-derive the formula: one copy is the whole point of it living
         // there.
-        let stats = resources.stats.readArray(TrainerSplatStats.self, count: count)
         // `readArray` returns an EMPTY array when the buffer is shorter than
         // asked for, so this is a real test and not a formality. Indexing a
         // short array with `i` below would be a crash, and pairing a filter
