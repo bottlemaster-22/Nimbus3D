@@ -102,6 +102,28 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         let totalIterations: Int
     }
     private var pendingStep: PendingStep?
+
+    /// Held-out (and trained-view) supervision built by evaluateHeldOut, kept
+    /// for the run (build 300). ~4.7 MB a frame, 11 or 12 frames.
+    private var evalSupervisionCache: [FrameID: TrainerFrameSupervision] = [:]
+
+    /// One frame's render, read back by evaluateHeldOut for scoring.
+    private struct HeldOutRender {
+        let frame: CaptureFrame
+        let rendered: [Float]
+        let transmittance: [Float]
+        let background: [Float]?
+        let groundTruth: [Float]
+        let exposure: SIMD2<Float>
+    }
+
+    /// One frame's scores. `ssim` is nil when no 8x8 block qualified, which is
+    /// when the loop used to add nothing to the SSIM total.
+    private struct HeldOutScore {
+        let psnr: Double
+        let psnrFitted: Double
+        let ssim: Double?
+    }
     private var heldOutPSNRSum: Double = 0
     private var heldOutPSNRCount: Int = 0
 
@@ -484,6 +506,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // A step left running by a run that threw cannot belong to this one.
         // Its buffer finishes on its own; its read-backs are not wanted.
         pendingStep = nil
+        evalSupervisionCache.removeAll()
         heldOutPSNRSum = 0
         heldOutPSNRCount = 0
         thermals = TrainerCensus.Thermals()
@@ -3325,10 +3348,23 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         var totalPSNRFitted: Double = 0
         var evaluated = 0
 
+        var collected: [HeldOutRender] = []
         for frame in frames.prefix(24) {
-            guard let frameSupervision = supervision.build(
-                frame: frame, iteration: 0, totalIterations: 1, includeDepthSamples: false
-            ) else { continue }
+            // CACHED for the run (build 300): the eval visits the same frames
+            // ~9 times, and every build re-decoded the photo (about half the
+            // eval's time). Nothing in a held-out frame's supervision changes
+            // once the background is frozen (evals start after warm-up); a
+            // render-size change invalidates the entry.
+            let frameSupervision: TrainerFrameSupervision
+            if let cached = evalSupervisionCache[frame.index], cached.renderSize == renderSize {
+                frameSupervision = cached
+            } else {
+                guard let built = supervision.build(
+                    frame: frame, iteration: 0, totalIterations: 1, includeDepthSamples: false
+                ) else { continue }
+                evalSupervisionCache[frame.index] = built
+                frameSupervision = built
+            }
             guard frameSupervision.renderSize == renderSize else { continue }
 
             resources.gtColorIn.writeArray(frameSupervision.groundTruth)
@@ -3432,117 +3468,43 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // a frame the model never trained on is a photometric alignment, not
             // a fit of the geometry; the raw number is still reported so nothing
             // is hidden.
-            var exposure = exposures[frame.index] ?? SIMD2<Float>(1, 0)
-            var fittedExposure = exposure
-            if fitExposure || alsoScoreExposureFitted {
-                var sx: Double = 0, sy: Double = 0, sxx: Double = 0
-                var sxy: Double = 0, n: Double = 0
-                for i in 0..<pixelCount {
-                    for c in 0..<3 {
-                        var v = Double(rendered[i * 3 + c])
-                        if let heldOutBackground {
-                            v += Double(transmittance[i] * heldOutBackground[i * 3 + c])
-                        }
-                        let t = Double(frameSupervision.groundTruth[i * 3 + c])
-                        sx += v; sy += t; sxx += v * v; sxy += v * t; n += 1
-                    }
-                }
-                let denom = n * sxx - sx * sx
-                if denom > 1e-9 {
-                    let gain = (n * sxy - sx * sy) / denom
-                    let bias = (sy - gain * sx) / n
-                    if gain.isFinite, bias.isFinite {
-                        fittedExposure = SIMD2<Float>(
-                            Swift.min(Swift.max(Float(gain), tuning.exposureGainRange.lowerBound),
-                                      tuning.exposureGainRange.upperBound),
-                            Swift.min(Swift.max(Float(bias), tuning.exposureBiasRange.lowerBound),
-                                      tuning.exposureBiasRange.upperBound)
-                        )
-                    }
-                }
-            }
-            if fitExposure { exposure = fittedExposure }
-            var sum: Double = 0
-            var sumFitted: Double = 0
-            for i in 0..<pixelCount {
-                for c in 0..<3 {
-                    var composited = rendered[i * 3 + c]
-                    if let heldOutBackground {
-                        composited += transmittance[i] * heldOutBackground[i * 3 + c]
-                    }
-                    let truth = frameSupervision.groundTruth[i * 3 + c]
-                    let value = exposure.x * composited + exposure.y
-                    let diff = Double(value - truth)
-                    sum += diff * diff
-                    if alsoScoreExposureFitted {
-                        let fittedValue = fittedExposure.x * composited + fittedExposure.y
-                        let fittedDiff = Double(fittedValue - truth)
-                        sumFitted += fittedDiff * fittedDiff
-                    }
-                }
-            }
-            // Luma SSIM over 8x8 blocks. Not a windowed Gaussian SSIM, which
-            // would need a separable blur and a second pass; block statistics
-            // over a 720x540 frame are 6,075 blocks and carry the same signal
-            // for this purpose, which is "did the structure survive".
-            var ssimSum = 0.0
-            var ssimBlocks = 0
-            let bw = renderSize.width, bh = renderSize.height
-            let c1 = 0.01 * 0.01, c2 = 0.03 * 0.03
-            var by = 0
-            while by + 8 <= bh {
-                var bx = 0
-                while bx + 8 <= bw {
-                    var mr = 0.0, mt = 0.0
-                    var vr = 0.0, vt = 0.0, cov = 0.0
-                    for dy in 0..<8 {
-                        for dx in 0..<8 {
-                            let i = (by + dy) * bw + (bx + dx)
-                            var rv = rendered[i * 3]
-                            var gv = rendered[i * 3 + 1]
-                            var bv = rendered[i * 3 + 2]
-                            if let heldOutBackground {
-                                let t = transmittance[i]
-                                rv += t * heldOutBackground[i * 3]
-                                gv += t * heldOutBackground[i * 3 + 1]
-                                bv += t * heldOutBackground[i * 3 + 2]
-                            }
-                            let lr = Double(exposure.x * (0.299 * rv + 0.587 * gv + 0.114 * bv) + exposure.y)
-                            let lt = Double(
-                                0.299 * frameSupervision.groundTruth[i * 3]
-                                    + 0.587 * frameSupervision.groundTruth[i * 3 + 1]
-                                    + 0.114 * frameSupervision.groundTruth[i * 3 + 2]
-                            )
-                            mr += lr; mt += lt
-                            vr += lr * lr; vt += lt * lt; cov += lr * lt
-                        }
-                    }
-                    let n = 64.0
-                    mr /= n; mt /= n
-                    vr = Swift.max(vr / n - mr * mr, 0)
-                    vt = Swift.max(vt / n - mt * mt, 0)
-                    cov = cov / n - mr * mt
-                    let num = (2 * mr * mt + c1) * (2 * cov + c2)
-                    let den = (mr * mr + mt * mt + c1) * (vr + vt + c2)
-                    if den > 1e-12 { ssimSum += num / den; ssimBlocks += 1 }
-                    bx += 8
-                }
-                by += 8
-            }
-            if ssimBlocks > 0 { totalSSIM += ssimSum / Double(ssimBlocks) }
+            collected.append(HeldOutRender(
+                frame: frame,
+                rendered: rendered,
+                transmittance: transmittance,
+                background: heldOutBackground,
+                groundTruth: frameSupervision.groundTruth,
+                exposure: exposures[frame.index] ?? SIMD2<Float>(1, 0)
+            ))
+        }
 
-            let frameMSE = sum / Double(pixelCount * 3)
-            // A frame that matches exactly would be infinite dB; clamp it to
-            // the same 99 the old code returned for the whole set.
-            let framePSNR = frameMSE > 1e-12 ? 10 * log10(1.0 / frameMSE) : 99
-            totalPSNR += framePSNR
-            lastHeldOutPerFrame.append(
-                TrainerHeldOutFrameScore(frameIndex: Int(frame.index), psnr: Float(framePSNR))
-            )
-            if alsoScoreExposureFitted {
-                let fittedMSE = sumFitted / Double(pixelCount * 3)
-                totalPSNRFitted += fittedMSE > 1e-12 ? 10 * log10(1.0 / fittedMSE) : 99
+        // SCORED ON EVERY CORE (build 300). The GPU renders every frame first
+        // (above); the per-frame metrics, three Double passes over ~1.2 M
+        // values each, then run in parallel, and are combined below in frame
+        // order. Each frame's arithmetic is the loop's, unchanged, so every
+        // score is the same number it was.
+        let scoreTuning = tuning
+        let pixelCount = renderSize.pixelCount
+        let bw = renderSize.width, bh = renderSize.height
+        let renders = collected
+        var scores = [HeldOutScore?](repeating: nil, count: renders.count)
+        scores.withUnsafeMutableBufferPointer { out in
+            DispatchQueue.concurrentPerform(iterations: renders.count) { k in
+                out[k] = Self.scoreHeldOut(
+                    renders[k], pixelCount: pixelCount, width: bw, height: bh,
+                    fitExposure: fitExposure, alsoScoreExposureFitted: alsoScoreExposureFitted,
+                    tuning: scoreTuning
+                )
             }
+        }
+        for (k, score) in scores.enumerated() {
+            guard let score else { continue }
+            if let ssim = score.ssim { totalSSIM += ssim }
+            totalPSNR += score.psnr
+            lastHeldOutPerFrame.append(
+                TrainerHeldOutFrameScore(frameIndex: Int(renders[k].frame.index), psnr: Float(score.psnr))
+            )
+            if alsoScoreExposureFitted { totalPSNRFitted += score.psnrFitted }
             evaluated += 1
         }
 
@@ -3555,6 +3517,132 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     }
 
     // MARK: - Reading the field back
+
+    /// One held-out frame's PSNR, exposure-fitted PSNR and block SSIM, exactly
+    /// as evaluateHeldOut's loop computed them before build 300 (the same
+    /// expressions, loops and Double accumulations in the same order), moved
+    /// here so the frames can be scored on every core.
+    private static func scoreHeldOut(
+        _ frameRender: HeldOutRender,
+        pixelCount: Int,
+        width bw: Int,
+        height bh: Int,
+        fitExposure: Bool,
+        alsoScoreExposureFitted: Bool,
+        tuning: TrainerTuning
+    ) -> HeldOutScore {
+        let rendered = frameRender.rendered
+        let transmittance = frameRender.transmittance
+        let heldOutBackground = frameRender.background
+        let groundTruth = frameRender.groundTruth
+
+        var exposure = frameRender.exposure
+        var fittedExposure = exposure
+        if fitExposure || alsoScoreExposureFitted {
+            var sx: Double = 0, sy: Double = 0, sxx: Double = 0
+            var sxy: Double = 0, n: Double = 0
+            for i in 0..<pixelCount {
+                for c in 0..<3 {
+                    var v = Double(rendered[i * 3 + c])
+                    if let heldOutBackground {
+                        v += Double(transmittance[i] * heldOutBackground[i * 3 + c])
+                    }
+                    let t = Double(groundTruth[i * 3 + c])
+                    sx += v; sy += t; sxx += v * v; sxy += v * t; n += 1
+                }
+            }
+            let denom = n * sxx - sx * sx
+            if denom > 1e-9 {
+                let gain = (n * sxy - sx * sy) / denom
+                let bias = (sy - gain * sx) / n
+                if gain.isFinite, bias.isFinite {
+                    fittedExposure = SIMD2<Float>(
+                        Swift.min(Swift.max(Float(gain), tuning.exposureGainRange.lowerBound),
+                                  tuning.exposureGainRange.upperBound),
+                        Swift.min(Swift.max(Float(bias), tuning.exposureBiasRange.lowerBound),
+                                  tuning.exposureBiasRange.upperBound)
+                    )
+                }
+            }
+        }
+        if fitExposure { exposure = fittedExposure }
+        var sum: Double = 0
+        var sumFitted: Double = 0
+        for i in 0..<pixelCount {
+            for c in 0..<3 {
+                var composited = rendered[i * 3 + c]
+                if let heldOutBackground {
+                    composited += transmittance[i] * heldOutBackground[i * 3 + c]
+                }
+                let truth = groundTruth[i * 3 + c]
+                let value = exposure.x * composited + exposure.y
+                let diff = Double(value - truth)
+                sum += diff * diff
+                if alsoScoreExposureFitted {
+                    let fittedValue = fittedExposure.x * composited + fittedExposure.y
+                    let fittedDiff = Double(fittedValue - truth)
+                    sumFitted += fittedDiff * fittedDiff
+                }
+            }
+        }
+        // Luma SSIM over 8x8 blocks, as before.
+        var ssimSum = 0.0
+        var ssimBlocks = 0
+        let c1 = 0.01 * 0.01, c2 = 0.03 * 0.03
+        var by = 0
+        while by + 8 <= bh {
+            var bx = 0
+            while bx + 8 <= bw {
+                var mr = 0.0, mt = 0.0
+                var vr = 0.0, vt = 0.0, cov = 0.0
+                for dy in 0..<8 {
+                    for dx in 0..<8 {
+                        let i = (by + dy) * bw + (bx + dx)
+                        var rv = rendered[i * 3]
+                        var gv = rendered[i * 3 + 1]
+                        var bv = rendered[i * 3 + 2]
+                        if let heldOutBackground {
+                            let t = transmittance[i]
+                            rv += t * heldOutBackground[i * 3]
+                            gv += t * heldOutBackground[i * 3 + 1]
+                            bv += t * heldOutBackground[i * 3 + 2]
+                        }
+                        let lr = Double(exposure.x * (0.299 * rv + 0.587 * gv + 0.114 * bv) + exposure.y)
+                        let lt = Double(
+                            0.299 * groundTruth[i * 3]
+                                + 0.587 * groundTruth[i * 3 + 1]
+                                + 0.114 * groundTruth[i * 3 + 2]
+                        )
+                        mr += lr; mt += lt
+                        vr += lr * lr; vt += lt * lt; cov += lr * lt
+                    }
+                }
+                let n = 64.0
+                mr /= n; mt /= n
+                vr = Swift.max(vr / n - mr * mr, 0)
+                vt = Swift.max(vt / n - mt * mt, 0)
+                cov = cov / n - mr * mt
+                let num = (2 * mr * mt + c1) * (2 * cov + c2)
+                let den = (mr * mr + mt * mt + c1) * (vr + vt + c2)
+                if den > 1e-12 { ssimSum += num / den; ssimBlocks += 1 }
+                bx += 8
+            }
+            by += 8
+        }
+
+        let frameMSE = sum / Double(pixelCount * 3)
+        let framePSNR = frameMSE > 1e-12 ? 10 * log10(1.0 / frameMSE) : 99
+        var fittedPSNR: Double = 0
+        if alsoScoreExposureFitted {
+            let fittedMSE = sumFitted / Double(pixelCount * 3)
+            fittedPSNR = fittedMSE > 1e-12 ? 10 * log10(1.0 / fittedMSE) : 99
+        }
+        return HeldOutScore(
+            psnr: framePSNR,
+            psnrFitted: fittedPSNR,
+            ssim: ssimBlocks > 0 ? ssimSum / Double(ssimBlocks) : nil
+        )
+    }
 
     private func readCloud(
         resources: TrainerResources,

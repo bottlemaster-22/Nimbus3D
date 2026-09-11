@@ -1208,3 +1208,9 @@ Build 293 (the push run of aa9f549, build 294's code) green; the PR run was canc
 ### BUILD 298: background warm-up preparation on every core
 
 smartLayer is 1.3 s of training's one-off time; most of it is DirectionalBackgroundModel.warmUp visiting ~120 frames one at a time: a photo decode, a luma and an RGB resample and the frame's authority map (built on a miss) per frame, then a per-pixel accumulation into the cubemap. The preparation is a pure function of the frame (the image cache and the authority map lock their own tables), so it now runs 12 frames at a time on every core, and the accumulation walks the prepared frames strictly in the old order: same frames, same pixels, same float sums in the same order, the same cubemap to the bit. The authority map is fetched only past the QC gate, as before, so its cache fills identically.
+
+Builds 295/297 (the push runs of 296 and 298) green.
+
+### BUILD 300: held-out evaluation, cached supervision and scoring on every core
+
+earlyStopEval is 1.7 s a run (~190 ms per evaluation, 11 frames). Each frame re-built its supervision (a photo decode, about half the time) and was scored on the main thread with three Double passes over ~1.2 M values. Now: the held-out supervision is cached for the run (`evalSupervisionCache`, ~4.7 MB a frame, invalidated by a render-size change; the background is frozen before evaluations start); every frame is rendered first, then scored on every core by `scoreHeldOut`, whose body is the loop's arithmetic unchanged, and the scores are combined in frame order. Every PSNR, fitted PSNR and SSIM is the same number. Expected ~190 -> ~80 ms per evaluation.
