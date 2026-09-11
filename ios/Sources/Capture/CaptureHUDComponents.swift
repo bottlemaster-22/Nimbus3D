@@ -433,7 +433,11 @@ struct CaptureBottomPanel: View {
             // because the card is only on screen while a window is in front of
             // you, and a user who wants the darker shots off wants them off
             // for the whole walk.
-            Toggle("Slip in a darker shot for windows", isOn: $model.darkShotsOn)
+            // Hidden while bracketing is parked: a switch for a feature that
+            // cannot fire would be a switch that lies.
+            if !CaptureTuning.bracketingParked {
+                Toggle("Slip in a darker shot for windows", isOn: $model.darkShotsOn)
+            }
 
             // The release for a brightness hold, in a place that stays on
             // screen after the window card has gone. The hold is made on the

@@ -955,3 +955,26 @@ Best held-out PSNR **20.47**, SSIM **0.6654**, 299,976 splats: back to 260 exact
 ### BUILD 268
 
 The two supervision fixes held back for 266: per-frame trust slices instead of ~5 locks per sample, and rgb-only decoding for supervision's image cache. The loop waited 3.7 s for supervision on 266.
+
+---
+
+## 2026-09-11 : Build 270, the scanner never had its camera, and clocks inside trust and seeding
+
+### THE SCANNER FINDING (owner asked whether the scanner could be improved)
+
+scan_20260906_164840 was captured on app build 44 (bd2f4e7), which already carried the ISO record (since 1aa3082) and the 1/60 s shutter cap (a6091b6). Yet not one of 868 frames carries an `iso` key (nil is omitted, like `refinedPose`), every frame's bracket is `normal`, and the settings record `bracketEveryNFrames 0`. `currentISO` is nil only when `device` is nil, so `configurableCaptureDeviceForPrimaryCamera` returned nil for the whole session. Apple documents nil only on phones without an ultra-wide camera; this phone has one. The code asked the base class `ARConfiguration`; Apple's examples ask `ARWorldTrackingConfiguration`. Fixed to the subclass. NOT PROVEN to be the cause: the next scan's ISO values say.
+
+What was silently off: the shutter cap, the ISO record, the brightness hold, the white-balance hold, window brackets. What the photos show: motion blur p10/p50/p90/max 1.7 / 3.9 / 7.2 / 11.6 px; 68 percent of frames over 3 px, 20 percent over 6 px; shutter 1/100 to 1/60 s (free auto-exposure, capped by the 60 fps frame time, so the 1/60 cap was a no-op even had it applied). qc.sharpness median 0.27.
+
+**Dark brackets are PARKED** (`CaptureTuning.bracketingParked`). Nothing downstream reads `bracket`: the trainer, pre-pass, seeder and keyframe selector would train a 3-stop-dark frame as an ordinary photo, and the only reader (the background model) skips them. With the device fixed, bracketing would have started firing every 12 keyframes. The HUD switch is hidden while parked.
+
+**Next on the scanner, needs the owner's call and a new scan:** a 1/120 s shutter cap would halve blur at the cost of one stop of ISO noise (which the trainer averages across views; blur it cannot). Decide after one scan records ISO so the headroom is known. A new scan also breaks comparability with every trainer A/B so far, so the old scan stays the trainer benchmark.
+
+### CLOCKS
+
+- `PrePassCensus.trustBuild`: setup, serial plane-sweep prefix (with its slot count), parallel slots (count, cores), confidence rewrite, writes. Trust is 3.85 s, the largest pre-pass stage, and nothing said which part.
+- `PrePassCensus.seeding.seconds*`: before-loop (edge warm-up split out), sample loop, shaping, write. Decides A36/A03 (an order-exact parallel seeder is only worth it if the loop is the bulk).
+- Both optional, so older census files still decode. census.py prints them.
+- tgIndex comment corrected (the 6.5 percent claim was noise).
+
+Research workflows running: keyframe coverage, registration, size gap, remaining speed (8 agents) and the exposure model (2 agents).

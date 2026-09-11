@@ -73,6 +73,21 @@ if pre:
         rest = total - named
         print('  %-12s %6.2f s  %5.1f%%  (bundle load + writes)'
               % ('unaccounted', rest, 100 * rest / max(total, 1e-9)))
+        tb = pre.get('trustBuild')
+        if tb:
+            print('  trust split : setup %.2f  serial %.2f (%d slots)  parallel %.2f'
+                  ' (%d slots, %d cores)  confidence %.2f  write %.2f'
+                  % (tb.get('setupSeconds', 0), tb.get('serialSeconds', 0),
+                     tb.get('serialSlots', 0), tb.get('parallelSeconds', 0),
+                     tb.get('parallelSlots', 0), tb.get('workerCount', 0),
+                     tb.get('confidenceSeconds', 0), tb.get('writeSeconds', 0)))
+        sd = pre.get('seeding') or {}
+        if 'secondsSampleLoop' in sd:
+            print('  seed split  : before loop %.2f (edge warm-up %.2f)  sample loop %.2f'
+                  '  shaping %.2f  write %.2f'
+                  % (sd.get('secondsBeforeLoop', 0), sd.get('secondsEdgeWarmup', 0),
+                     sd.get('secondsSampleLoop', 0), sd.get('secondsShaping', 0),
+                     sd.get('secondsWrite', 0)))
     else:
         print('  no stage clocks in this census (build 144 or older)')
 

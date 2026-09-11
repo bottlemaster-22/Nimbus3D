@@ -148,6 +148,28 @@ public struct SmartTrustBiasCell: Hashable, Sendable {
 
 // MARK: - TwoScaleTrustField
 
+/// Where the trust build's seconds went. The pre-pass clocks the stage as a
+/// whole (3.85 s on build 266, its largest), and that cannot say whether
+/// the serial plane-sweep prefix, the parallel slots or the confidence
+/// rewrite after them is the part to attack.
+public struct TrustBuildTimings: Codable, Sendable, Equatable {
+    /// Build start to the first slot: frame tables, sidecar checks.
+    public var setupSeconds: Double = 0
+    /// Slots run one at a time while the plane-sweep budget lasts.
+    public var serialSeconds: Double = 0
+    /// The remaining slots on every core, plus their in-order apply.
+    public var parallelSeconds: Double = 0
+    /// Confidence recalibration and its rewrite of every frame's sidecar.
+    public var confidenceSeconds: Double = 0
+    /// The bias field and affine writes.
+    public var writeSeconds: Double = 0
+    public var serialSlots = 0
+    public var parallelSlots = 0
+    public var workerCount = 0
+
+    public init() {}
+}
+
 /// F6. Implements `TrustField` (CONTRACTS.md section 5).
 public final class TwoScaleTrustField: TrustField {
 
@@ -175,6 +197,14 @@ public final class TwoScaleTrustField: TrustField {
     private var biasCellCount: Int = 0
     private var biasVoxelSize: Float = 0.25
     private var affineByFrame: [FrameID: SmartDepthAffine] = [:]
+    private var buildTimings: TrustBuildTimings?
+
+    /// The last completed `build`'s clocks, for the pre-pass census.
+    public var lastBuildTimings: TrustBuildTimings? {
+        lock.lock()
+        defer { lock.unlock() }
+        return buildTimings
+    }
 
     public init(
         settings: SmartLossSettings = .default,
@@ -227,6 +257,7 @@ public final class TwoScaleTrustField: TrustField {
         prePassPoses: [String: Pose],
         at ref: CaptureBundleRef
     ) async throws -> TrustFieldRefs {
+        let buildStarted = Date()
         let width = bundle.settings.depthWidth
         let height = bundle.settings.depthHeight
         let perFrame = width * height
@@ -581,6 +612,7 @@ public final class TwoScaleTrustField: TrustField {
         }
 
         // Phase 1: serial, exactly as before, while any slot could still sweep.
+        let serialStarted = Date()
         var slot = 0
         while slot < slotCount, planeSweepBudget > 0 {
             if Task.isCancelled {
@@ -591,6 +623,7 @@ public final class TwoScaleTrustField: TrustField {
             slot += 1
         }
         let serialSlots = slot
+        let parallelStarted = Date()
 
         // Phase 2: every core. Each worker walks a run of consecutive slots
         // through its own depth cache, so neighbouring frames share their
@@ -634,6 +667,7 @@ public final class TwoScaleTrustField: TrustField {
             }
             slot += chunk
         }
+        let parallelEnded = Date()
         let parallelSlots = slotCount - serialSlots
         SmartLog.trust.info(
             "Trust build: \(serialSlots) slots serial for the plane sweep, \(parallelSlots) on \(workerCount) cores"
@@ -660,6 +694,8 @@ public final class TwoScaleTrustField: TrustField {
             levelProbabilities: levelProbabilities
         )
 
+        let confidenceEnded = Date()
+
         // --- 6. Write the bias field and the affines. ---------------------
         let biasCells = accumulator.sortedCells()
         var biasBytes = Data(capacity: biasCells.count * SmartTrustBiasCell.byteSize)
@@ -680,6 +716,19 @@ public final class TwoScaleTrustField: TrustField {
             SmartBinary.append(a.shiftMeters, to: &affineBytes)
         }
         try SmartBinary.write(affineBytes, to: ref.url(forRelativePath: affinePath))
+
+        var timings = TrustBuildTimings()
+        timings.setupSeconds = serialStarted.timeIntervalSince(buildStarted)
+        timings.serialSeconds = parallelStarted.timeIntervalSince(serialStarted)
+        timings.parallelSeconds = parallelEnded.timeIntervalSince(parallelStarted)
+        timings.confidenceSeconds = confidenceEnded.timeIntervalSince(parallelEnded)
+        timings.writeSeconds = Date().timeIntervalSince(confidenceEnded)
+        timings.serialSlots = serialSlots
+        timings.parallelSlots = parallelSlots
+        timings.workerCount = workerCount
+        lock.lock()
+        buildTimings = timings
+        lock.unlock()
 
         let refs = TrustFieldRefs(
             biasFieldPath: biasPath,

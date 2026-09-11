@@ -418,6 +418,7 @@ enum PrePassInitialSplatBuilder {
     ) throws -> PrePassInitialSplatOutput {
 
         census.attempted = true
+        let seedingStarted = Date()
         census.trustedFloor = settings.trustedWeight
         census.trustedQuantile = settings.trustedQuantile
         census.targetSplatCount = targetSplatCount
@@ -471,9 +472,11 @@ enum PrePassInitialSplatBuilder {
         // serially inside its own critical path. Built concurrently here
         // first, the loop then reads each back instead (from the cache, or
         // from the file it was written to). Same maps, same order of use.
+        let warmupStarted = Date()
         DispatchQueue.concurrentPerform(iterations: keyframes.count) { k in
             _ = edgeMapFor(keyframes[k].index)
         }
+        census.secondsEdgeWarmup = Date().timeIntervalSince(warmupStarted)
 
         // Grid origin from the camera path grown by the sensor's reach, the
         // same envelope the carver and the survey use.
@@ -594,6 +597,8 @@ enum PrePassInitialSplatBuilder {
         defer { prefetch.drain() }
         if let first = keyframes.first { prefetch.start(first) }
 
+        let loopStarted = Date()
+        census.secondsBeforeLoop = loopStarted.timeIntervalSince(seedingStarted)
         for (keyframeIndex, frame) in keyframes.enumerated() {
             try Task.checkCancellation()
 
@@ -758,6 +763,7 @@ enum PrePassInitialSplatBuilder {
             }
         }
 
+        census.secondsSampleLoop = Date().timeIntervalSince(loopStarted)
         let count = position.count
 
         // Recorded BEFORE the guard below, so the run that produced nothing
@@ -783,6 +789,7 @@ enum PrePassInitialSplatBuilder {
         }
 
         // --- Shape each Gaussian.
+        let shapingStarted = Date()
         var positions = [SIMD3<Float>](repeating: .zero, count: count)
         var rotations = [SIMD4<Float>](repeating: SIMD4<Float>(0, 0, 0, 1), count: count)
         var logScales = [SIMD3<Float>](repeating: .zero, count: count)
@@ -1015,6 +1022,8 @@ enum PrePassInitialSplatBuilder {
         // mechanism depends on it.
         cloud.filter3DFused = false
 
+        let writeStarted = Date()
+        census.secondsShaping = writeStarted.timeIntervalSince(shapingStarted)
         let plyURL = ref.url(forRelativePath: PrePassPaths.initialSplats)
         try FileManager.default.createDirectory(
             at: plyURL.deletingLastPathComponent(), withIntermediateDirectories: true
@@ -1031,6 +1040,7 @@ enum PrePassInitialSplatBuilder {
         )
 
         census.splatsWritten = count
+        census.secondsWrite = Date().timeIntervalSince(writeStarted)
 
         return PrePassInitialSplatOutput(
             ref: InitialSplatSetRef(

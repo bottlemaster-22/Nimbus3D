@@ -304,6 +304,17 @@ public enum CaptureTuning {
 
     // MARK: - Exposure bracketing (F5)
 
+    /// Dark brackets are PARKED: no stage downstream reads them yet. The
+    /// trainer, the pre-pass, the seeder and the keyframe selector never look
+    /// at `bracket`, so a 3-stop-dark frame would train as an ordinary photo
+    /// of a room that is 1/8 as bright, and the one stage that does look
+    /// (the background model) skips dark frames. Until build 270 this never
+    /// mattered: the capture device lookup always returned nil, so no
+    /// bracket was ever taken. With the lookup fixed, bracketing would have
+    /// started firing every 12 keyframes. Unpark only together with a
+    /// consumer that uses the dark frames and a trainer that excludes them.
+    public static let bracketingParked = true
+
     /// Every Nth *keyframe* is captured darker so a bright window has
     /// unsaturated pixels somewhere in the dataset.
     public static let bracketEveryNKeyframes: Int = 12

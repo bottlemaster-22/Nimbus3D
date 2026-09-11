@@ -6,7 +6,8 @@
 //
 //  HOW THIS IS POSSIBLE AT ALL. ARKit owns the capture device, so the usual
 //  `AVCaptureSession` route is closed. Since iOS 16, ARKit hands the device
-//  back through `ARConfiguration.configurableCaptureDeviceForPrimaryCamera`,
+//  back through `configurableCaptureDeviceForPrimaryCamera` (asked of
+//  `ARWorldTrackingConfiguration`; see `device` below),
 //  and that is the only supported way to set manual exposure inside an ARKit
 //  session. On a device or OS where that property is nil, bracketing is
 //  reported as unavailable and `CaptureSettings.bracketEveryNFrames` is
@@ -74,8 +75,19 @@ final class CaptureExposureController: @unchecked Sendable {
     private(set) var isWhiteBalanceLocked = false
 
     /// The capture device ARKit is using, when the OS will hand it over.
+    ///
+    /// Asked of `ARWorldTrackingConfiguration`, the configuration this app
+    /// actually runs, as Apple's own examples do. It used to be asked of the
+    /// base class `ARConfiguration`. Apple documents nil only for phones
+    /// without an ultra-wide camera, and the owner's iPhone 17 Pro Max has
+    /// one, yet on scan_20260906_164840 not one of 868 frames carries an ISO
+    /// (`currentISO` is nil only when this is nil), no bracket was ever
+    /// taken, and the settings recorded bracketing off. So the shutter cap,
+    /// the ISO record, the brightness hold and the white-balance hold all
+    /// silently did nothing. The next scan's ISO values say whether this
+    /// was the cause.
     private var device: AVCaptureDevice? {
-        ARConfiguration.configurableCaptureDeviceForPrimaryCamera
+        ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera
     }
 
     // MARK: - Availability
@@ -84,6 +96,7 @@ final class CaptureExposureController: @unchecked Sendable {
     var isBracketingAvailable: Bool {
         lock.lock()
         defer { lock.unlock() }
+        guard !CaptureTuning.bracketingParked else { return false }
         guard bracketingEnabled else { return false }
         guard device != nil else { return false }
         return true
@@ -269,6 +282,7 @@ final class CaptureExposureController: @unchecked Sendable {
     ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
+        guard !CaptureTuning.bracketingParked else { return false }
         guard bracketingEnabled, everyN > 0, device != nil else { return false }
         guard case .idle = state else { return false }
         guard trackingQuality == .normal else { return false }
@@ -505,6 +519,6 @@ final class CaptureExposureController: @unchecked Sendable {
     func settingsCadence(requested: Int) -> Int {
         lock.lock()
         defer { lock.unlock() }
-        return bracketingEnabled ? requested : 0
+        return bracketingEnabled && !CaptureTuning.bracketingParked ? requested : 0
     }
 }

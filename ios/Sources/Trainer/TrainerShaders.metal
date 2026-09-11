@@ -1392,7 +1392,7 @@ kernel void trainer_rasterize_forward(
             // kernel. 1 KB of threadgroup memory per threadgroup, on a
             // GPU where threadgroup memory is what limits how many
             // threadgroups run at once. The backward rasteriser keeps
-            // its own tgIndex: build 260 dropped it and ran 6.5% slower.
+            // its own tgIndex (see trainer_rasterize_backward).
             tgXY[tid] = float2(d.mean2D);
             tgConicOpacity[tid] = float4(float3(d.conic), float(d.opacity));
             tgColorDepth[tid] = float4(
@@ -1988,13 +1988,12 @@ kernel void trainer_rasterize_backward(
     uint2                           tPos        [[thread_position_in_threadgroup]],
     uint                            tid         [[thread_index_in_threadgroup]]
 ) {
-    // tgIndex STAYS. Build 260 removed it and re-read `values` from device
-    // memory in the accumulation loop instead, to take the footprint from
-    // 11,776 to 10,752 bytes on the theory that a third threadgroup would
-    // then fit per core. Measured on the device: gpuStep 49.0 s to 52.2 s,
-    // 6.5 per cent SLOWER, the only GPU change in that build. Same
-    // direction as build 92's SIMD-group reduction (6 per cent slower).
-    // On this GPU, threadgroup memory is not what limits this kernel.
+    // tgIndex stays. Build 260 removed it (re-reading `values` from device
+    // memory in the accumulation loop, footprint 11,776 to 10,752 bytes).
+    // gpuStep went 49.0 s to 52.2 s, but build 266 restored it and measured
+    // 52.4 s: the difference was run-to-run noise (about +/-3 s), not the
+    // kernel. Neither version is proven faster; this one is kept because it
+    // reads device memory once per splat per batch instead of per pixel.
     threadgroup uint   tgIndex[TRAINER_TILE_AREA];
     threadgroup float2 tgXY[TRAINER_TILE_AREA];
     // FLOAT4 again. Staging as half was exact only while the conic itself was

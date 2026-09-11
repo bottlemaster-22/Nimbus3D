@@ -187,6 +187,10 @@ public struct PrePassCensus: Codable, Sendable {
     public var poseGraph = PoseGraph()
     public var carving = Carving()
     public var seeding = Seeding()
+    /// The trust stage split into its serial plane-sweep prefix, its
+    /// parallel slots and the confidence rewrite. Optional so a census
+    /// written before build 270 still decodes.
+    public var trustBuild: TrustBuildTimings?
 
     // MARK: The keys the Viewer's census screen reads
     //
@@ -639,6 +643,22 @@ public struct PrePassCensus: Codable, Sendable {
         public var measuredSurfaceAreaSquareMeters: Float = 0
         /// Splats written to `init_splats.ply`.
         public var splatsWritten = 0
+
+        /// WHERE SEEDING'S SECONDS GO (1.85 s on build 266). Refutation A36:
+        /// running the sample loop on every core is only worth an order-exact
+        /// merge if the loop is the bulk, and until these existed nothing
+        /// said whether it was the loop, the shaping or the 60 MB write.
+        /// Optional so an older census still decodes.
+        /// Start to the sample loop, the edge warm-up included.
+        public var secondsBeforeLoop: Double?
+        /// Of that, the edge maps built on every core.
+        public var secondsEdgeWarmup: Double?
+        /// The per-keyframe, per-sample loop into the voxel hash.
+        public var secondsSampleLoop: Double?
+        /// Weight sort, trust cut, and shaping every Gaussian.
+        public var secondsShaping: Double?
+        /// The PLY and the flags file.
+        public var secondsWrite: Double?
 
         public init() {}
     }

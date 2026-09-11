@@ -705,6 +705,7 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
                 // re-deriving what is in it.
                 try await trustField.load(refs, at: ref)
                 trustLoaded = true
+                census.trustBuild = trustField.lastBuildTimings
                 // The trust builder lives in `Sources/Smart` and spells these
                 // paths out itself. `PrePassPaths` is where this module says
                 // they are. If the two ever drift apart the pre-pass would
