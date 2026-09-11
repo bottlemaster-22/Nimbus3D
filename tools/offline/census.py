@@ -368,13 +368,22 @@ if t.get('backwardCalibrationSteps', 0):
              t['backwardRelativeDifference'],
              'B (SIMD-summed) used' if t.get('backwardSimdSumChosen') else 'A kept'))
 
-# Sort calibration (build 290+): plain scatter (A) against SIMD-prefix (B).
+# Sort calibration (build 290+; 306+ adds the legacy reference L and the splat-order sort).
 if t.get('sortCalibrationSteps', 0):
     _k = t['sortCalibrationSteps']
-    print('SORT CALIBRATION: %d steps  A %.2f ms  B %.2f ms  (B/A %.3f)  mismatched steps %d  -> %s'
-          % (_k, 1000 * t['sortSecondsA'] / _k, 1000 * t['sortSecondsB'] / _k,
-             t['sortSecondsB'] / max(t['sortSecondsA'], 1e-12), t.get('sortMismatchSteps', 0),
-             'B (SIMD-prefix) used' if t.get('sortSimdScanChosen') else 'A kept'))
+    if 'sortLegacySeconds' in t:
+        print('SORT CALIBRATION: %d steps  legacy %.2f ms  splat-order %.2f ms  +SIMD %.2f ms  '
+              'mismatched: splat-order %d, +SIMD %d  -> splat-order %s, SIMD scatter %s'
+              % (_k, 1000 * t['sortLegacySeconds'] / _k, 1000 * t['sortSecondsA'] / _k,
+                 1000 * t['sortSecondsB'] / _k, t.get('sortSplatOrderMismatchSteps', 0),
+                 t.get('sortMismatchSteps', 0),
+                 'USED' if t.get('sortSplatOrderChosen') else 'not used',
+                 'USED' if t.get('sortSimdScanChosen') else 'not used'))
+    else:
+        print('SORT CALIBRATION: %d steps  A %.2f ms  B %.2f ms  (B/A %.3f)  mismatched steps %d  -> %s'
+              % (_k, 1000 * t['sortSecondsA'] / _k, 1000 * t['sortSecondsB'] / _k,
+                 t['sortSecondsB'] / max(t['sortSecondsA'], 1e-12), t.get('sortMismatchSteps', 0),
+                 'B (SIMD-prefix) used' if t.get('sortSimdScanChosen') else 'A kept'))
 
 # Forward calibration (build 302+): one-pixel (A) against two-pixel (B).
 if t.get('forwardCalibrationSteps', 0):

@@ -93,6 +93,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     private var forwardTwoPixelChosen = false
     /// Set by the two-pixel backward calibration (build 304).
     private var backwardTwoPixelChosen = false
+    /// Set by the sort calibration (build 306): use the splat-order tile sort.
+    private var splatOrderChosen = false
 
     /// A training step whose command buffer B was committed and left running
     /// (build 292): the CPU went on to the next iteration's supervision and
@@ -510,6 +512,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         sortSimdScanChosen = false
         forwardTwoPixelChosen = false
         backwardTwoPixelChosen = false
+        splatOrderChosen = false
         // A step left running by a run that threw cannot belong to this one.
         // Its buffer finishes on its own; its read-backs are not wanted.
         pendingStep = nil
@@ -2079,8 +2082,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             return true
         }
         let sortStart = tuning.sortCalibrationStart
-        if gpu.pipelines.radixScatterSimdScan != nil,
-           tuning.sortCalibrationSteps > 0,
+        if tuning.sortCalibrationSteps > 0,
            iteration >= sortStart,
            iteration < sortStart + tuning.sortCalibrationSteps {
             return true
@@ -2305,6 +2307,11 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // the normal path. `camera` is a local of this function captured by a
         // non-escaping closure, so passing it inout in here is the same store it
         // was before.
+        // Build 306: the splat-order sort ranks the splats in the instance
+        // sort's buffers, so those must hold at least one entry per splat.
+        if resources.instanceCapacity < splatCount {
+            try resources.growInstanceCapacity(to: splatCount + splatCount / 4)
+        }
         try autoreleasepool { () throws -> Void in
             guard let bufferA = queue.makeCommandBuffer(),
                   let blitA = bufferA.makeBlitCommandEncoder()
@@ -2343,12 +2350,19 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 gpu.background(encoderA, uniforms: &bg)
             }
             gpu.preprocess(encoderA, camera: &camera, splatCount: splatCount)
-            gpu.exclusiveScan(
-                encoderA,
-                input: resources.tilesTouched,
-                output: resources.offsets,
-                count: splatCount
-            )
+            if splatOrderChosen {
+                gpu.orderSplats(
+                    encoderA, camera: &camera, splatCount: splatCount,
+                    simdScan: sortSimdScanChosen
+                )
+            } else {
+                gpu.exclusiveScan(
+                    encoderA,
+                    input: resources.tilesTouched,
+                    output: resources.offsets,
+                    count: splatCount
+                )
+            }
             encoderA.endEncoding()
             bufferA.commit()
             // The previous step's buffer B ran while this iteration's CPU work
@@ -2366,7 +2380,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // frame produced. The exclusive scan means the total is the last
         // offset plus the last count.
         let lastOffset = resources.offsets.readElement(UInt32.self, at: splatCount - 1) ?? 0
-        let lastTouched = resources.tilesTouched.readElement(UInt32.self, at: splatCount - 1) ?? 0
+        let lastTouched = (splatOrderChosen ? resources.keysA : resources.tilesTouched).readElement(UInt32.self, at: splatCount - 1) ?? 0
         var instanceCount = Int(lastOffset) + Int(lastTouched)
 
         if instanceCount > resources.instanceCapacity {
@@ -2451,8 +2465,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // restores A's order before the step goes on. B is kept only if
             // every step matched and it was at least 3 % faster.
             let sortStart = tuning.sortCalibrationStart
-            let sortCalibrating = gpu.pipelines.radixScatterSimdScan != nil
-                && tuning.sortCalibrationSteps > 0
+            let sortCalibrating = tuning.sortCalibrationSteps > 0
                 && iteration >= sortStart
                 && iteration < sortStart + tuning.sortCalibrationSteps
             // FORWARD CALIBRATION (build 302): the frame is rendered by the
@@ -2497,35 +2510,79 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     return executing.isFinite && executing > 0 ? executing : 0
                 }
                 if sortCalibrating {
+                    // Build 306: three sorts of this frame's instances.
+                    //   L  the legacy sort: offsets over splat index, 24-bit
+                    //      keys, six passes, plain scatter. The reference.
+                    //   S  the splat-order sort, plain scatter: splats ranked
+                    //      by depth, instances emitted in that order, three
+                    //      passes on the tile bits.
+                    //   P  S with the SIMD-prefix scatter, where it exists.
+                    // S and P must reproduce L exactly: every key, and the
+                    // splat of every real entry. Padding entries all carry the
+                    // same key and no tile range reaches them, so only their
+                    // splat numbers may differ. A mismatch on the last sort run
+                    // writes L's result back before the step goes on.
                     let n = instanceCount
-                    try stage(tag("the tile sort")) { e in
-                        gpu.duplicateKeys(e, camera: &camera, splatCount: splatCount)
+                    let hasSimdScatter = gpu.pipelines.radixScatterSimdScan != nil
+                    let secondsL = try stage(tag("the tile sort")) { e in
+                        gpu.exclusiveScan(
+                            e, input: resources.tilesTouched, output: resources.offsets,
+                            count: splatCount
+                        )
+                        gpu.duplicateKeys(e, camera: &camera, splatCount: splatCount, ordered: false)
+                        gpu.radixSort(e, count: n, simdScan: false, tileOnly: false)
                     }
-                    let unsortedKeys = resources.keysA.readArray(UInt32.self, count: n)
-                    let unsortedValues = resources.valuesA.readArray(UInt32.self, count: n)
-                    let secondsA = try stage(tag("the tile sort")) { e in
-                        gpu.radixSort(e, count: n, simdScan: false)
+                    let keysL = resources.keysA.readArray(UInt32.self, count: n)
+                    let valuesL = resources.valuesA.readArray(UInt32.self, count: n)
+                    let realCount = keysL.firstIndex { ($0 >> 12) == 0xFFF } ?? keysL.count
+                    func matchesLegacy() -> Bool {
+                        let keys = resources.keysA.readArray(UInt32.self, count: n)
+                        let values = resources.valuesA.readArray(UInt32.self, count: n)
+                        guard keysL.count == n, valuesL.count == n,
+                              keys == keysL, values.count == n
+                        else { return false }
+                        return values[0..<realCount] == valuesL[0..<realCount]
                     }
-                    let keysA = resources.keysA.readArray(UInt32.self, count: n)
-                    let valuesA = resources.valuesA.readArray(UInt32.self, count: n)
-                    _ = resources.keysA.writeArray(unsortedKeys)
-                    _ = resources.valuesA.writeArray(unsortedValues)
-                    let secondsB = try stage(tag("the tile sort")) { e in
-                        gpu.radixSort(e, count: n, simdScan: true)
+                    let secondsS = try stage(tag("the tile sort")) { e in
+                        gpu.orderSplats(e, camera: &camera, splatCount: splatCount, simdScan: false)
+                        gpu.duplicateKeys(e, camera: &camera, splatCount: splatCount, ordered: true)
+                        gpu.radixSort(e, count: n, simdScan: false, tileOnly: true)
                     }
-                    let keysB = resources.keysA.readArray(UInt32.self, count: n)
-                    let valuesB = resources.valuesA.readArray(UInt32.self, count: n)
-                    let identical = keysA.count == n && keysA == keysB && valuesA == valuesB
-                    if !identical, keysA.count == n, valuesA.count == n {
-                        _ = resources.keysA.writeArray(keysA)
-                        _ = resources.valuesA.writeArray(valuesA)
+                    let matchS = matchesLegacy()
+                    var matchP = false
+                    var secondsP = 0.0
+                    if hasSimdScatter {
+                        secondsP = try stage(tag("the tile sort")) { e in
+                            gpu.orderSplats(
+                                e, camera: &camera, splatCount: splatCount, simdScan: true
+                            )
+                            gpu.duplicateKeys(
+                                e, camera: &camera, splatCount: splatCount, ordered: true
+                            )
+                            gpu.radixSort(e, count: n, simdScan: true, tileOnly: true)
+                        }
+                        matchP = matchesLegacy()
+                    }
+                    let lastMatched = hasSimdScatter ? matchP : matchS
+                    if !lastMatched, keysL.count == n, valuesL.count == n {
+                        _ = resources.keysA.writeArray(keysL)
+                        _ = resources.valuesA.writeArray(valuesL)
                     }
                     timings.sortCalibrationSteps += 1
-                    timings.sortSecondsA += secondsA
-                    timings.sortSecondsB += secondsB
-                    if !identical { timings.sortMismatchSteps += 1 }
+                    timings.sortLegacySeconds += secondsL
+                    timings.sortSecondsA += secondsS
+                    timings.sortSecondsB += secondsP
+                    if !matchS { timings.sortSplatOrderMismatchSteps += 1 }
+                    if hasSimdScatter, !matchP { timings.sortMismatchSteps += 1 }
                     if iteration == sortStart + tuning.sortCalibrationSteps - 1 {
-                        sortSimdScanChosen = timings.sortMismatchSteps == 0
+                        splatOrderChosen = tuning.splatOrderSort
+                            && timings.sortSplatOrderMismatchSteps == 0
+                            && timings.sortSecondsA < timings.sortLegacySeconds * 0.97
+                        timings.sortSplatOrderChosen = splatOrderChosen ? 1 : 0
+                        // P is S plus the SIMD scatter; its own speed-up is
+                        // judged against S, the same work with the plain one.
+                        sortSimdScanChosen = hasSimdScatter
+                            && timings.sortMismatchSteps == 0
                             && timings.sortSecondsB < timings.sortSecondsA * 0.97
                         timings.sortSimdScanChosen = sortSimdScanChosen ? 1 : 0
                     }
@@ -2534,8 +2591,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     }
                 } else {
                     try stage(tag("the tile sort")) { e in
-                        gpu.duplicateKeys(e, camera: &camera, splatCount: splatCount)
-                        gpu.radixSort(e, count: instanceCount, simdScan: sortSimdScanChosen)
+                        gpu.duplicateKeys(
+                            e, camera: &camera, splatCount: splatCount, ordered: splatOrderChosen
+                        )
+                        gpu.radixSort(
+                            e, count: instanceCount, simdScan: sortSimdScanChosen,
+                            tileOnly: splatOrderChosen
+                        )
                         gpu.tileRanges(e, instanceCount: instanceCount)
                     }
                 }
@@ -2726,8 +2788,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             else { throw TrainerError.noMetalDevice }
             encoderB.label = "trainer.step"
 
-            gpu.duplicateKeys(encoderB, camera: &camera, splatCount: splatCount)
-            gpu.radixSort(encoderB, count: instanceCount, simdScan: sortSimdScanChosen)
+            gpu.duplicateKeys(
+                encoderB, camera: &camera, splatCount: splatCount, ordered: splatOrderChosen
+            )
+            gpu.radixSort(
+                encoderB, count: instanceCount, simdScan: sortSimdScanChosen,
+                tileOnly: splatOrderChosen
+            )
             gpu.tileRanges(encoderB, instanceCount: instanceCount)
             gpu.rasterizeForward(encoderB, camera: &camera, twoPixels: forwardTwoPixelChosen)
 
@@ -3525,6 +3592,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 totalIterations: 1
             )
 
+            if resources.instanceCapacity < splatCount {
+                try resources.growInstanceCapacity(to: splatCount + splatCount / 4)
+            }
             guard let bufferA = queue.makeCommandBuffer(),
                   let encoderA = bufferA.makeComputeCommandEncoder()
             else { return nil }
@@ -3546,18 +3616,25 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             }
             gpu.fillUInt(encoderA, buffer: resources.tilesTouched, count: splatCount, value: 0)
             gpu.preprocess(encoderA, camera: &camera, splatCount: splatCount)
-            gpu.exclusiveScan(
-                encoderA,
-                input: resources.tilesTouched,
-                output: resources.offsets,
-                count: splatCount
-            )
+            if splatOrderChosen {
+                gpu.orderSplats(
+                    encoderA, camera: &camera, splatCount: splatCount,
+                    simdScan: sortSimdScanChosen
+                )
+            } else {
+                gpu.exclusiveScan(
+                    encoderA,
+                    input: resources.tilesTouched,
+                    output: resources.offsets,
+                    count: splatCount
+                )
+            }
             encoderA.endEncoding()
             bufferA.commit()
             try finish(bufferA, "the held-out preprocess")
 
             let lastOffset = resources.offsets.readElement(UInt32.self, at: splatCount - 1) ?? 0
-            let lastTouched = resources.tilesTouched.readElement(UInt32.self, at: splatCount - 1) ?? 0
+            let lastTouched = (splatOrderChosen ? resources.keysA : resources.tilesTouched).readElement(UInt32.self, at: splatCount - 1) ?? 0
             let instanceCount = Int(lastOffset) + Int(lastTouched)
             guard instanceCount > 0, instanceCount <= resources.instanceCapacity else { continue }
 
@@ -3565,8 +3642,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                   let encoderB = bufferB.makeComputeCommandEncoder()
             else { return nil }
             encoderB.label = "trainer.eval.render"
-            gpu.duplicateKeys(encoderB, camera: &camera, splatCount: splatCount)
-            gpu.radixSort(encoderB, count: instanceCount, simdScan: sortSimdScanChosen)
+            gpu.duplicateKeys(
+                encoderB, camera: &camera, splatCount: splatCount, ordered: splatOrderChosen
+            )
+            gpu.radixSort(
+                encoderB, count: instanceCount, simdScan: sortSimdScanChosen,
+                tileOnly: splatOrderChosen
+            )
             gpu.tileRanges(encoderB, instanceCount: instanceCount)
             gpu.rasterizeForward(encoderB, camera: &camera, twoPixels: forwardTwoPixelChosen)
             encoderB.endEncoding()

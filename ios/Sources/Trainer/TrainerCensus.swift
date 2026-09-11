@@ -637,10 +637,16 @@ struct TrainerTimings: Codable {
     var backwardRelativeDifference: Double = 0
     var backwardSimdSumChosen: Int = 0
 
-    /// Sort calibration (build 290): the plain radix scatter (A) against the
-    /// SIMD-prefix one (B) on the same unsorted keys. GPU seconds of each
-    /// summed, how many steps' outputs differed (must be 0: it is an integer
-    /// ranking), and whether B was then used (1) or not (0).
+    /// Sort calibration (build 290, reworked in 306). Three sorts of the same
+    /// frame: the legacy six-pass sort (L, `sortLegacySeconds`), the
+    /// splat-order sort with the plain scatter (A, `sortSecondsA`, key
+    /// generation included) and with the SIMD-prefix scatter (B,
+    /// `sortSecondsB`). Mismatch counts are steps whose order differed from
+    /// L's (must be 0: all three are integer rankings). `sortSplatOrderChosen`
+    /// 1 means the splat-order sort was used for the rest of the run.
+    var sortLegacySeconds: Double = 0
+    var sortSplatOrderMismatchSteps: Int = 0
+    var sortSplatOrderChosen: Int = 0
     var sortCalibrationSteps: Int = 0
     var sortSecondsA: Double = 0
     var sortSecondsB: Double = 0

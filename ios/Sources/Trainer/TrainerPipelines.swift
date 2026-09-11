@@ -53,6 +53,8 @@ final class TrainerPipelines {
     let radixScatterSimdScan: MTLComputePipelineState?
     let preprocess: MTLComputePipelineState
     let duplicateKeys: MTLComputePipelineState
+    let depthKeys: MTLComputePipelineState
+    let gatherTouched: MTLComputePipelineState
     let tileRanges: MTLComputePipelineState
     let rasterizeForward: MTLComputePipelineState
     let background: MTLComputePipelineState
@@ -172,6 +174,8 @@ final class TrainerPipelines {
         radixScatterSimdScan = (scatterSimd?.threadExecutionWidth == 32) ? scatterSimd : nil
         preprocess = try build(TrainerKernel.preprocess)
         duplicateKeys = try build(TrainerKernel.duplicateKeys)
+        depthKeys = try build(TrainerKernel.depthKeys)
+        gatherTouched = try build(TrainerKernel.gatherTouched)
         tileRanges = try build(TrainerKernel.tileRanges)
         rasterizeForward = try build(TrainerKernel.rasterizeForward)
         let forward2 = try? build(TrainerKernel.rasterizeForward2)
@@ -400,19 +404,50 @@ struct TrainerGPU {
     // first fits. Six passes is even, so the sorted result lands back in the
     // buffer it started in and the caller does not have to track parity.
 
-    func radixSort(_ encoder: MTLComputeCommandEncoder, count: Int, simdScan: Bool = false) {
-        guard count > 1 else { return }
+    func radixSort(
+        _ encoder: MTLComputeCommandEncoder,
+        count: Int,
+        simdScan: Bool = false,
+        tileOnly: Bool = false
+    ) {
+        if tileOnly {
+            // Build 306, splat-order mode: the instances arrive in keysB and
+            // valuesB already in (depth, splat) order, so only the twelve tile
+            // bits are sorted. Three passes, B to A to B to A, so the result
+            // still lands in keysA where every reader looks.
+            radixPasses(encoder, count: count, simdScan: simdScan,
+                        shifts: [12, 16, 20], startInA: false)
+        } else {
+            let shifts = (0..<TrainerGPUConstants.radixPasses).map {
+                UInt32($0 * TrainerGPUConstants.radixBits)
+            }
+            radixPasses(encoder, count: count, simdScan: simdScan,
+                        shifts: shifts, startInA: true)
+        }
+    }
+
+    /// Stable LSD passes, one per shift, starting from keysA/valuesA or
+    /// keysB/valuesB. The caller picks a start and a pass count that end in A.
+    private func radixPasses(
+        _ encoder: MTLComputeCommandEncoder,
+        count: Int,
+        simdScan: Bool,
+        shifts: [UInt32],
+        startInA: Bool
+    ) {
+        // One element starting in A is already sorted where it belongs; one
+        // starting in B still has to be moved.
+        guard count > (startInA ? 1 : 0) else { return }
         let scatter = (simdScan ? pipelines.radixScatterSimdScan : nil) ?? pipelines.radixScatter
         let blocks = TrainerGPU.blockCount(for: count)
         let histogramEntries = TrainerGPUConstants.radixBins * blocks
 
-        var keysIn = resources.keysA
-        var keysOut = resources.keysB
-        var valuesIn = resources.valuesA
-        var valuesOut = resources.valuesB
+        var keysIn = startInA ? resources.keysA : resources.keysB
+        var keysOut = startInA ? resources.keysB : resources.keysA
+        var valuesIn = startInA ? resources.valuesA : resources.valuesB
+        var valuesOut = startInA ? resources.valuesB : resources.valuesA
 
-        for pass in 0..<TrainerGPUConstants.radixPasses {
-            let shift = UInt32(pass * TrainerGPUConstants.radixBits)
+        for shift in shifts {
             var u = TrainerRadixUniforms(
                 count: UInt32(count), blockCount: UInt32(blocks), bitShift: shift
             )
@@ -458,6 +493,49 @@ struct TrainerGPU {
         }
     }
 
+    /// Build 306, splat-order mode, in buffer A after preprocess: the splats'
+    /// depth-sorted order into valuesA, their tile counts in that order into
+    /// keysA, and the exclusive scan of those into `offsets`. The instance
+    /// total is then offsets[n - 1] + keysA[n - 1].
+    func orderSplats(
+        _ encoder: MTLComputeCommandEncoder,
+        camera: inout TrainerCameraUniforms,
+        splatCount: Int,
+        simdScan: Bool
+    ) {
+        guard splatCount > 0 else { return }
+        encoder.setComputePipelineState(pipelines.depthKeys)
+        encoder.setBuffer(resources.raster, offset: 0, index: TrainerBind.DepthKeys.raster)
+        encoder.setBuffer(
+            resources.tilesTouched, offset: 0, index: TrainerBind.DepthKeys.tilesTouched
+        )
+        encoder.setBuffer(resources.keysB, offset: 0, index: TrainerBind.DepthKeys.keys)
+        encoder.setBuffer(resources.valuesB, offset: 0, index: TrainerBind.DepthKeys.values)
+        encoder.setBytes(
+            &camera,
+            length: MemoryLayout<TrainerCameraUniforms>.stride,
+            index: TrainerBind.DepthKeys.camera
+        )
+        dispatch1D(encoder, pipelines.depthKeys, count: splatCount)
+
+        radixPasses(encoder, count: splatCount, simdScan: simdScan,
+                    shifts: [0, 4, 8], startInA: false)
+
+        encoder.setComputePipelineState(pipelines.gatherTouched)
+        encoder.setBuffer(resources.valuesA, offset: 0, index: TrainerBind.GatherTouched.order)
+        encoder.setBuffer(
+            resources.tilesTouched, offset: 0, index: TrainerBind.GatherTouched.tilesTouched
+        )
+        encoder.setBuffer(
+            resources.keysA, offset: 0, index: TrainerBind.GatherTouched.sortedTouched
+        )
+        var n = UInt32(splatCount)
+        encoder.setBytes(&n, length: MemoryLayout<UInt32>.size, index: TrainerBind.GatherTouched.count)
+        dispatch1D(encoder, pipelines.gatherTouched, count: splatCount)
+
+        exclusiveScan(encoder, input: resources.keysA, output: resources.offsets, count: splatCount)
+    }
+
     // MARK: Forward
 
     func preprocess(
@@ -486,17 +564,30 @@ struct TrainerGPU {
     func duplicateKeys(
         _ encoder: MTLComputeCommandEncoder,
         camera: inout TrainerCameraUniforms,
-        splatCount: Int
+        splatCount: Int,
+        ordered: Bool = false
     ) {
         guard splatCount > 0 else { return }
+        // Legacy: per-splat counts and offsets, instances into keysA/valuesA
+        // for the six-pass sort. Splat order (build 306): the counts in sorted
+        // order are in keysA (orderSplats), the order in valuesA, and the
+        // instances go to keysB/valuesB for the three-pass tile sort.
         encoder.setComputePipelineState(pipelines.duplicateKeys)
         encoder.setBuffer(resources.raster, offset: 0, index: TrainerBind.DuplicateKeys.raster)
         encoder.setBuffer(
-            resources.tilesTouched, offset: 0, index: TrainerBind.DuplicateKeys.tilesTouched
+            ordered ? resources.keysA : resources.tilesTouched,
+            offset: 0, index: TrainerBind.DuplicateKeys.tilesTouched
         )
         encoder.setBuffer(resources.offsets, offset: 0, index: TrainerBind.DuplicateKeys.offsets)
-        encoder.setBuffer(resources.keysA, offset: 0, index: TrainerBind.DuplicateKeys.keys)
-        encoder.setBuffer(resources.valuesA, offset: 0, index: TrainerBind.DuplicateKeys.values)
+        encoder.setBuffer(
+            ordered ? resources.keysB : resources.keysA,
+            offset: 0, index: TrainerBind.DuplicateKeys.keys
+        )
+        encoder.setBuffer(
+            ordered ? resources.valuesB : resources.valuesA,
+            offset: 0, index: TrainerBind.DuplicateKeys.values
+        )
+        encoder.setBuffer(resources.valuesA, offset: 0, index: TrainerBind.DuplicateKeys.order)
         encoder.setBytes(
             &camera,
             length: MemoryLayout<TrainerCameraUniforms>.stride,
@@ -505,6 +596,10 @@ struct TrainerGPU {
         var cap = UInt32(resources.instanceCapacity)
         encoder.setBytes(
             &cap, length: MemoryLayout<UInt32>.size, index: TrainerBind.DuplicateKeys.instanceCap
+        )
+        var flag: UInt32 = ordered ? 1 : 0
+        encoder.setBytes(
+            &flag, length: MemoryLayout<UInt32>.size, index: TrainerBind.DuplicateKeys.ordered
         )
         dispatch1D(encoder, pipelines.duplicateKeys, count: splatCount)
     }

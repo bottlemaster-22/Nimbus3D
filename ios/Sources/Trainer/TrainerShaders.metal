@@ -1260,6 +1260,15 @@ kernel void trainer_preprocess(
 // MARK: - Forward: tile instance expansion
 // ============================================================================
 
+/// TWELVE BITS OF LOG DEPTH. See the key comment in trainer_duplicate_keys;
+/// shared with trainer_depth_keys (build 306) so both compute the same value.
+inline uint trainer_depthKey(float depth, constant TrainerCameraUniforms& cam) {
+    const float logSpan = max(log2(cam.farPlane / cam.nearPlane), 1e-3f);
+    const float norm = clamp(log2(max(depth, cam.nearPlane) / cam.nearPlane) / logSpan,
+                             0.0f, 1.0f);
+    return uint(norm * 4095.0f);
+}
+
 kernel void trainer_duplicate_keys(
     const device TrainerSplatRaster* raster       [[buffer(0)]],
     const device uint*              tilesTouched [[buffer(1)]],
@@ -1268,6 +1277,11 @@ kernel void trainer_duplicate_keys(
     device uint*                    values       [[buffer(4)]],
     constant TrainerCameraUniforms& cam          [[buffer(5)]],
     constant uint&                  instanceCap  [[buffer(6)]],
+    // Build 306, splat-order mode (ordered != 0): gid is a position in the
+    // depth-sorted splat order, `order[gid]` the splat at it, and
+    // tilesTouched and offsets are indexed by position, not by splat.
+    const device uint*              order        [[buffer(7)]],
+    constant uint&                  ordered      [[buffer(8)]],
     uint                            gid          [[thread_position_in_grid]]
 ) {
     if (gid >= cam.splatCount) { return; }
@@ -1276,7 +1290,8 @@ kernel void trainer_duplicate_keys(
 
     // The compact record, not the 64-byte one: this kernel wants mean2D, the
     // two radii and depth, which is all TrainerSplatRaster holds.
-    const TrainerSplatRaster d = raster[gid];
+    const uint splat = (ordered != 0u) ? order[gid] : gid;
+    const TrainerSplatRaster d = raster[splat];
     const float2 mean2D = float2(d.mean2D);
     // The same two halves trainer_preprocess counted tiles with. Recomputing
     // them from the conic instead would risk differing in the last bit, and
@@ -1316,10 +1331,7 @@ kernel void trainer_duplicate_keys(
     // this key is within 0.003 dB of the exact order in every frame (the
     // shipped key was within 0.018). Ties still fall back to splat-index
     // order, as before.
-    const float logSpan = max(log2(cam.farPlane / cam.nearPlane), 1e-3f);
-    const float norm = clamp(log2(max(d.depth, cam.nearPlane) / cam.nearPlane) / logSpan,
-                             0.0f, 1.0f);
-    const uint depthKey = uint(norm * 4095.0f);
+    const uint depthKey = trainer_depthKey(d.depth, cam);
 
     // Only tiles the ellipse actually reaches (see "Exact tile footprint"),
     // tested with the smaller EMIT slack on the same stored bits preprocess
@@ -1335,7 +1347,7 @@ kernel void trainer_duplicate_keys(
             if (cursor >= end || cursor >= instanceCap) { full = true; break; }
             const uint tile = uint(ty) * cam.tileCountX + uint(tx);
             keys[cursor] = (tile << 12) | depthKey;
-            values[cursor] = gid;
+            values[cursor] = splat;
             cursor += 1u;
         }
     }
@@ -1343,9 +1355,50 @@ kernel void trainer_duplicate_keys(
     // key (24 bits all set) and trainer_tile_ranges gives them no tile.
     while (cursor < end && cursor < instanceCap) {
         keys[cursor] = (kTrainerSentinelTile << 12) | 0xFFFu;
-        values[cursor] = gid;
+        values[cursor] = splat;
         cursor += 1u;
     }
+}
+
+/// Build 306: the splat-order half of the tile sort.
+///
+/// Each splat's twelve-bit log-depth key (the same trainer_depthKey that
+/// trainer_duplicate_keys puts under the tile) with its index as the value.
+/// Sorted stably over SPLATS, three passes, it gives every splat's position in
+/// (depth, splat index) order. Instances emitted in that order and then sorted
+/// stably on their twelve tile bits alone come out ordered by (tile, depth,
+/// splat index): exactly the order the six-pass 24-bit sort over instances
+/// emitted in splat-index order produces. Three passes over splats plus three
+/// over instances instead of six over instances, and there are about three
+/// instances per splat. The trainer checks the two orders match on device
+/// before it uses this one.
+///
+/// A splat that touches no tile emits nothing, so where it sorts does not
+/// matter; it gets the deepest key and its raster record is not read.
+kernel void trainer_depth_keys(
+    const device TrainerSplatRaster* raster       [[buffer(0)]],
+    const device uint*              tilesTouched [[buffer(1)]],
+    device uint*                    keys         [[buffer(2)]],
+    device uint*                    values       [[buffer(3)]],
+    constant TrainerCameraUniforms& cam          [[buffer(4)]],
+    uint                            gid          [[thread_position_in_grid]]
+) {
+    if (gid >= cam.splatCount) { return; }
+    keys[gid] = (tilesTouched[gid] == 0u)
+        ? 0xFFFu : (trainer_depthKey(raster[gid].depth, cam) & 0xFFFu);
+    values[gid] = gid;
+}
+
+/// Build 306: tilesTouched in depth-sorted splat order, for the offset scan.
+kernel void trainer_gather_touched(
+    const device uint* order         [[buffer(0)]],
+    const device uint* tilesTouched  [[buffer(1)]],
+    device uint*       sortedTouched [[buffer(2)]],
+    constant uint&     count         [[buffer(3)]],
+    uint               gid           [[thread_position_in_grid]]
+) {
+    if (gid >= count) { return; }
+    sortedTouched[gid] = tilesTouched[order[gid]];
 }
 
 /// THE FAR FIELD, RASTERISED ON THE GPU INSTEAD OF THE CPU.

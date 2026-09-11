@@ -137,6 +137,9 @@ enum TrainerKernel {
     static let rasterizeForward2 = "trainer_rasterize_forward2"
     /// Build 304: the SIMD-summed backward, two pixels per thread. Optional.
     static let rasterizeBackward2 = "trainer_rasterize_backward2"
+    /// Build 306: the splat-order tile sort.
+    static let depthKeys = "trainer_depth_keys"
+    static let gatherTouched = "trainer_gather_touched"
     static let background = "trainer_background"
     static let lossPhotometric = "trainer_loss_photometric"
     static let blurH = "trainer_blur_h"
@@ -157,7 +160,7 @@ enum TrainerKernel {
     static let all: [String] = [
         fillUInt, fillFloat, resetDensifyStats,
         scanBlock, scanAdd, radixHistogram, radixScatter,
-        preprocess, duplicateKeys, tileRanges, rasterizeForward,
+        preprocess, duplicateKeys, depthKeys, gatherTouched, tileRanges, rasterizeForward,
         lossPhotometric, blurH, blurV, ssimStats,
         lossDepth, lossFinalize, rasterizeBackward, preprocessBackward,
         samplingRateUpdate, filter3DFinalize, regularizer,
@@ -239,6 +242,23 @@ enum TrainerBind {
         static let values = 4
         static let camera = 5
         static let instanceCap = 6   // constant uint&
+        static let order = 7         // build 306: depth-sorted splat order
+        static let ordered = 8       // constant uint&: 1 in splat-order mode
+    }
+
+    enum DepthKeys {
+        static let raster = 0
+        static let tilesTouched = 1
+        static let keys = 2
+        static let values = 3
+        static let camera = 4
+    }
+
+    enum GatherTouched {
+        static let order = 0
+        static let tilesTouched = 1
+        static let sortedTouched = 2
+        static let count = 3         // constant uint&
     }
 
     enum TileRanges {
@@ -1075,7 +1095,8 @@ struct TrainerTuning: Sendable {
     var backwardCalibrationSteps: Int = 6
 
     /// Build 290: the same for the radix scatter. After the backward window,
-    /// so the two never share an iteration.
+    /// so the two never share an iteration. Build 306: this window also checks
+    /// the splat-order sort against the legacy one (see `splatOrderSort`).
     var sortCalibrationStart: Int = 310
     var sortCalibrationSteps: Int = 4
 
@@ -1090,6 +1111,12 @@ struct TrainerTuning: Sendable {
     /// 3 % faster.
     var backwardTwoPixelCalibrationStart: Int = 322
     var backwardTwoPixelCalibrationSteps: Int = 6
+
+    /// Build 306: allow the splat-order tile sort (depth-sort the splats, then
+    /// sort instances on their tile bits only). Used only after the sort
+    /// calibration window has shown it reproduces the legacy order exactly and
+    /// is at least 3 % faster; the legacy sort runs until then.
+    var splatOrderSort: Bool = true
 
     /// Build 292: after warm-up, commit the next iteration's buffer A BEFORE
     /// waiting on the previous iteration's buffer B, so the GPU does not sit
