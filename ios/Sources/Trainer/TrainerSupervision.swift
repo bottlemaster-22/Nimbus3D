@@ -255,6 +255,38 @@ final class TrainerSupervisionBuilder {
     /// (see `lowerLongEdge(to:)`).
     private var requestedLongEdge: Int
 
+    // BUILD 310: A TRAINING FRAME IS DECODED AND SAMPLED ONCE PER RUN.
+    //
+    // Nothing a training frame's supervision is built from changes during a
+    // run except the background cubemap: the photo, the pose, the intrinsics,
+    // the trust slices, the authority map, the edge map and the QC weight are
+    // all fixed once the pre-pass has finished, and `depthSamples` does not
+    // read the iteration it is handed. Yet every step rebuilt it from scratch:
+    // a JPEG decode, a float copy and a 49,152-sample loop, 7.7 ms of the
+    // prefetch worker per step on build 292 (30.7 s a run), with the loop
+    // still waiting 2.9 s for it, and every frame rebuilt about 37 times.
+    //
+    // So the first build of each frame keeps its photo as the decoder's own
+    // BYTES (3 per pixel, 1.2 MB instead of the 4.7 MB float copy) and its
+    // depth samples, and later builds rebuild the float image from the bytes
+    // with the decoder's exact expression, `Float(byte) / 255`. A frame is
+    // kept only if that round trip reproduces every float it decoded, which
+    // it does by construction, so a cached build is bit-identical to a fresh
+    // one. The background is still read fresh every time.
+    //
+    // Sized from the memory this process may still allocate, so the cache
+    // can never be what pushes the budget governor into shedding splats.
+    private struct CachedFrame {
+        let rgbBytes: [UInt8]
+        let samples: [TrainerDepthSample]
+        let supervised: Int
+    }
+    private var frameCache: [FrameID: CachedFrame] = [:]
+    private var frameCacheLimitBytes = 0
+    private(set) var frameCacheBytes = 0
+    /// Builds served from the cache, for the census.
+    private(set) var frameCacheHits = 0
+
     init(
         bundle: CaptureBundle,
         prePass: PrePassResult,
@@ -304,6 +336,16 @@ final class TrainerSupervisionBuilder {
             capacity: 3, longEdge: self.requestedLongEdge, includeLuma: false
         )
         depthCache = SmartDepthCache(capacity: 128, sampleCount: depthWidth * depthHeight)
+
+        // A third of whatever is free above 1.5 GB, at most 420 MB (108
+        // training frames take about 300 MB). Nothing when the reading is a
+        // stand-in rather than a measurement.
+        let memory = DeviceMemoryFacts.probe()
+        if !memory.availableIsEstimated {
+            let reserve: UInt64 = 1_536 * 1_048_576
+            let spare = memory.availableBytes > reserve ? memory.availableBytes - reserve : 0
+            frameCacheLimitBytes = Int(Swift.min(spare / 3, 420 * 1_048_576))
+        }
     }
 
     /// Adopts a smaller supervision grid part way through a run.
@@ -334,6 +376,9 @@ final class TrainerSupervisionBuilder {
         // of the run took.
         renderSize = nil
         renderIntrinsics = nil
+        // At the old grid, like the decodes above.
+        frameCache.removeAll()
+        frameCacheBytes = 0
         return true
     }
 
@@ -352,6 +397,37 @@ final class TrainerSupervisionBuilder {
         totalIterations: Int,
         includeDepthSamples: Bool = true
     ) -> TrainerFrameSupervision? {
+
+        // Build 310: a training frame already built this run. See CachedFrame.
+        if includeDepthSamples,
+           let fixedSize = renderSize, let k = renderIntrinsics,
+           let cached = frameCache[frame.index],
+           cached.rgbBytes.count == fixedSize.pixelCount * 3 {
+            frameCacheHits += 1
+            let bytes = cached.rgbBytes
+            let count = bytes.count
+            let groundTruth = [Float](unsafeUninitializedCapacity: count) { buffer, initialized in
+                bytes.withUnsafeBufferPointer { source in
+                    for i in 0..<count { buffer[i] = Float(source[i]) / 255 }
+                }
+                initialized = count
+            }
+            let far = backgroundCubemap()
+            return TrainerFrameSupervision(
+                frame: frame.index,
+                groundTruth: groundTruth,
+                backgroundTexels: far.texels,
+                backgroundFaceSize: far.faceSize,
+                hasBackground: far.present,
+                depthSamples: cached.samples,
+                renderSize: fixedSize,
+                intrinsics: k,
+                pose: pose(for: frame),
+                qcWeight: TrainerMath.clamp(frame.qc.weight, 0, 1),
+                meanAuthority: authority?.map(for: frame.index)?.meanAuthority ?? 0,
+                supervisedSampleCount: cached.supervised
+            )
+        }
 
         guard let image = imageCache.image(for: frame, at: ref) else {
             TrainerLog.general.error(
@@ -435,27 +511,10 @@ final class TrainerSupervisionBuilder {
 
         let framePose = pose(for: frame)
 
-        var backgroundTexels: [Float] = []
-        var backgroundFaceSize = 0
-        var hasBackground = false
-        if let background {
-            // Just the cubemap, flattened. The per-pixel rasterisation this
-            // used to do is `trainer_background` now.
-            let map = background.cubemapSnapshot
-            backgroundFaceSize = map.faceSize
-            backgroundTexels = [Float](
-                unsafeUninitializedCapacity: map.texels.count * 3
-            ) { buffer, initialized in
-                for i in 0..<map.texels.count {
-                    let t = map.texels[i]
-                    buffer[i * 3 + 0] = t.x
-                    buffer[i * 3 + 1] = t.y
-                    buffer[i * 3 + 2] = t.z
-                }
-                initialized = map.texels.count * 3
-            }
-            hasBackground = true
-        }
+        let far = backgroundCubemap()
+        let backgroundTexels = far.texels
+        let backgroundFaceSize = far.faceSize
+        let hasBackground = far.present
 
         // The held-out evaluation reads the photo, background, pose and
         // intrinsics and never a depth sample, so it asks for none.
@@ -471,6 +530,9 @@ final class TrainerSupervisionBuilder {
             : []
 
         let supervised = samples.reduce(into: 0) { $0 += ($1.weight > 0 ? 1 : 0) }
+        if includeDepthSamples {
+            rememberFrame(frame.index, groundTruth: groundTruth, samples: samples, supervised: supervised)
+        }
         let meanAuthority = authority?.map(for: frame.index)?.meanAuthority ?? 0
 
         return TrainerFrameSupervision(
@@ -487,6 +549,56 @@ final class TrainerSupervisionBuilder {
             meanAuthority: meanAuthority,
             supervisedSampleCount: supervised
         )
+    }
+
+    /// The background cubemap, flattened, read fresh: the one input that
+    /// changes during a run. The per-pixel rasterisation this used to do is
+    /// `trainer_background` now.
+    private func backgroundCubemap() -> (texels: [Float], faceSize: Int, present: Bool) {
+        guard let background else { return ([], 0, false) }
+        let map = background.cubemapSnapshot
+        let texels = [Float](
+            unsafeUninitializedCapacity: map.texels.count * 3
+        ) { buffer, initialized in
+            for i in 0..<map.texels.count {
+                let t = map.texels[i]
+                buffer[i * 3 + 0] = t.x
+                buffer[i * 3 + 1] = t.y
+                buffer[i * 3 + 2] = t.z
+            }
+            initialized = map.texels.count * 3
+        }
+        return (texels, map.faceSize, true)
+    }
+
+    /// Keeps a freshly built training frame for the rest of the run, if it
+    /// fits and if its photo survives the byte round trip exactly.
+    private func rememberFrame(
+        _ id: FrameID, groundTruth: [Float], samples: [TrainerDepthSample], supervised: Int
+    ) {
+        guard frameCacheLimitBytes > 0, frameCache[id] == nil else { return }
+        let cost = groundTruth.count + samples.count * MemoryLayout<TrainerDepthSample>.stride
+        guard frameCacheBytes + cost <= frameCacheLimitBytes else { return }
+        let count = groundTruth.count
+        var exact = true
+        let bytes = [UInt8](unsafeUninitializedCapacity: count) { buffer, initialized in
+            for i in 0..<count {
+                let value = groundTruth[i]
+                // nil for NaN, infinity or anything outside 0...255: never
+                // a trap, and the frame is then simply not kept.
+                guard let byte = UInt8(exactly: (value * 255).rounded()) else {
+                    exact = false
+                    buffer[i] = 0
+                    continue
+                }
+                buffer[i] = byte
+                if Float(byte) / 255 != value { exact = false }
+            }
+            initialized = count
+        }
+        guard exact else { return }
+        frameCache[id] = CachedFrame(rgbBytes: bytes, samples: samples, supervised: supervised)
+        frameCacheBytes += cost
     }
 
     // MARK: - Depth supervision

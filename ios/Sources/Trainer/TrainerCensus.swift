@@ -542,6 +542,10 @@ struct TrainerTimings: Codable {
     /// waited for; this is what was moved out of it. Before the prefetch
     /// existed this was 0 and `supervision` carried the whole cost.
     var supervisionPrefetched: Double = 0
+    /// Build 310: supervision builds served from the per-run frame cache (no
+    /// decode, no sampling), and the most the cache held, in MB.
+    var supervisionCacheHits: Int = 0
+    var supervisionCacheMegabytes: Double = 0
     /// CPU time blocked in waitUntilCompleted, every command buffer.
     var gpuWait: Double = 0
     /// What Metal reports the GPU spent EXECUTING, summed over every

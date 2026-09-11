@@ -848,6 +848,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // Accumulated across slices: what the worker built off the
             // critical path, which `timings.supervision` no longer sees.
             timings.supervisionPrefetched += prefetch.workerSeconds
+            timings.supervisionCacheHits += supervision.frameCacheHits
+            timings.supervisionCacheMegabytes = Swift.max(
+                timings.supervisionCacheMegabytes, Double(supervision.frameCacheBytes) / 1_048_576
+            )
         }
 
 
