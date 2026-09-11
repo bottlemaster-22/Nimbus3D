@@ -182,13 +182,17 @@ final class TrainerPipelines {
         let forward2Threads = TrainerGPUConstants.tileWidth * TrainerGPUConstants.tileHeight / 2
         rasterizeForward2 = (forward2?.maxTotalThreadsPerThreadgroup ?? 0) >= forward2Threads
             ? forward2 : nil
+        // Build 308: the kernels that add into ONE shared address (loss total,
+        // exposure and camera gradients) sum each SIMD group first where the
+        // GPU has SIMD reductions; see trainer_atomicAddShared.
+        let simdAtomics = device.supportsFamily(.apple7)
         background = try build(TrainerKernel.background)
-        lossPhotometric = try build(TrainerKernel.lossPhotometric)
+        lossPhotometric = try build(TrainerKernel.lossPhotometric, simdReduce: simdAtomics)
         blurH = try build(TrainerKernel.blurH)
         blurV = try build(TrainerKernel.blurV)
-        ssimStats = try build(TrainerKernel.ssimStats)
-        lossDepth = try build(TrainerKernel.lossDepth)
-        lossFinalize = try build(TrainerKernel.lossFinalize)
+        ssimStats = try build(TrainerKernel.ssimStats, simdReduce: simdAtomics)
+        lossDepth = try build(TrainerKernel.lossDepth, simdReduce: simdAtomics)
+        lossFinalize = try build(TrainerKernel.lossFinalize, simdReduce: simdAtomics)
         // Specialised: its batch bound uses simd_max, which is Apple7 (A14)
         // and later. Asking the device means an A12 or A13 builds the
         // unbounded variant instead of failing to build a pipeline.
@@ -204,10 +208,10 @@ final class TrainerPipelines {
             ? (try? build(TrainerKernel.rasterizeBackward2)) : nil
         rasterizeBackward2 = (backward2?.maxTotalThreadsPerThreadgroup ?? 0) >= forward2Threads
             ? backward2 : nil
-        preprocessBackward = try build(TrainerKernel.preprocessBackward)
+        preprocessBackward = try build(TrainerKernel.preprocessBackward, simdReduce: simdAtomics)
         samplingRateUpdate = try build(TrainerKernel.samplingRateUpdate)
         filter3DFinalize = try build(TrainerKernel.filter3DFinalize)
-        regularizer = try build(TrainerKernel.regularizer)
+        regularizer = try build(TrainerKernel.regularizer, simdReduce: simdAtomics)
         adamSplat = try build(TrainerKernel.adamSplat)
         adamSH = try build(TrainerKernel.adamSH)
         extractCenters = try build(TrainerKernel.extractCenters)

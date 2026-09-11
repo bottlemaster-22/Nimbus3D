@@ -620,6 +620,30 @@ static inline void trainer_atomicAddUnchecked(device atomic_float* target, float
     atomic_fetch_add_explicit(target, value, memory_order_relaxed);
 }
 
+/// Build 308: trainer_atomicAdd for ONE SHARED ADDRESS (a loss total, the
+/// per-frame exposure or camera gradient). Every thread of a kernel adding into
+/// the same float is up to 32 atomics per SIMD group queueing on one address,
+/// hundreds of thousands to millions a step. Here the SIMD group's active lanes
+/// are summed first (simd_sum and simd_is_first are defined over the ACTIVE
+/// lanes, so lanes that returned early simply do not take part) and one lane
+/// issues one atomic. Non-finite values are dropped per lane, as
+/// trainer_atomicAdd drops them. The float sum is taken in a different order,
+/// as between any two runs of the atomics.
+///
+/// Only on pipelines built with kTrainerSimdReduce (Apple7 and later); the
+/// constant removes the other branch before the function is validated, so an
+/// older GPU gets trainer_atomicAdd exactly as before.
+static inline void trainer_atomicAddShared(device atomic_float* target, float value) {
+    if (kTrainerSimdReduce) {
+        const float total = simd_sum(trainer_finiteOrZero(value));
+        if (simd_is_first() && trainer_finiteOrZero(total) != 0.0f) {
+            atomic_fetch_add_explicit(target, total, memory_order_relaxed);
+        }
+    } else {
+        trainer_atomicAdd(target, value);
+    }
+}
+
 // ============================================================================
 // MARK: - Utility fills
 // ============================================================================
@@ -1703,7 +1727,7 @@ kernel void trainer_loss_photometric(
 
     const float3 diff = rendered - truth;
     const float l1 = (abs(diff.x) + abs(diff.y) + abs(diff.z)) / 3.0f;
-    trainer_atomicAdd(lossAccum, u.frameWeight * (1.0f - u.lambdaSSIM) * l1 * invN);
+    trainer_atomicAddShared(lossAccum, u.frameWeight * (1.0f - u.lambdaSSIM) * l1 * invN);
 
     const float3 g = w * sign(diff) / 3.0f;
     gradFinal[gid * 3u + 0u] = g.x;
@@ -1854,7 +1878,7 @@ kernel void trainer_ssim_stats(
 
     // L_ssim = frameWeight * lambda * (1 - mean(SSIM))
     const float w = u.frameWeight * u.lambdaSSIM / float(max(n, 1u));
-    trainer_atomicAdd(lossAccum, w * (1.0f - ssim));
+    trainer_atomicAddShared(lossAccum, w * (1.0f - ssim));
 
     // dSSIM/d(mu_x), dSSIM/d(sigma_xy), dSSIM/d(sigma_xx)
     const float dS_dmux = (2.0f * muy * n2 * d1 - 2.0f * mux * n1 * n2)
@@ -2004,6 +2028,8 @@ kernel void trainer_loss_depth(
 
     const float w = u.depthScale * s.weight * invSamples;
     float dL_dExpected = 0.0f;
+    // Build 308: this sample's loss terms, added to lossAccum once below.
+    float lossSum = 0.0f;
 
     if (w > 0.0f && s.depth > 0.0f) {
         // --- Huber on the plain depth residual ------------------------------
@@ -2017,7 +2043,7 @@ kernel void trainer_loss_depth(
             value = abs(r) - 0.5f * delta;
             grad = (r < 0.0f) ? -1.0f : 1.0f;
         }
-        trainer_atomicAdd(lossAccum, w * value);
+        lossSum += trainer_finiteOrZero(w * value);
         dL_dExpected += w * grad;
 
         // --- F4 bimodal edge supervision ------------------------------------
@@ -2031,13 +2057,13 @@ kernel void trainer_loss_depth(
             const float d1 = expected - s.mode1;
             const float nearer = (abs(d0) <= abs(d1)) ? d0 : d1;
             const float bw = w * u.bimodalWeight;
-            trainer_atomicAdd(lossAccum, bw * 0.5f * nearer * nearer);
+            lossSum += trainer_finiteOrZero(bw * 0.5f * nearer * nearer);
             dL_dExpected += bw * nearer;
 
             const float span = max(s.mode1 - s.mode0, 1e-4f);
             const float t = clamp((expected - s.mode0) / span, 0.0f, 1.0f);
             const float tw = w * u.transitionWidthWeight;
-            trainer_atomicAdd(lossAccum, tw * 4.0f * t * (1.0f - t));
+            lossSum += trainer_finiteOrZero(tw * 4.0f * t * (1.0f - t));
             if (t > 0.0f && t < 1.0f) {
                 dL_dExpected += tw * 4.0f * (1.0f - 2.0f * t) / span;
             }
@@ -2047,7 +2073,7 @@ kernel void trainer_loss_depth(
         // Where LiDAR says there is a surface, the pixel should be explained.
         const float aw = w * u.alphaSupervisionWeight;
         const float aResidual = 1.0f - alpha;
-        trainer_atomicAdd(lossAccum, aw * aResidual * aResidual);
+        lossSum += trainer_finiteOrZero(aw * aResidual * aResidual);
         // dL/dalpha = -2 aw (1 - alpha); alpha = 1 - T, so dL/dT is the
         // negative of that.
         gradTFinal[s.pixelIndex] += 2.0f * aw * aResidual;
@@ -2064,10 +2090,11 @@ kernel void trainer_loss_depth(
         // strength whatever the trust in its RANGE reading), so the factor has
         // to be applied here rather than inherited.
         const float fw = u.freeSpaceWeight * u.depthScale * invSamples;
-        trainer_atomicAdd(lossAccum, fw * 0.5f * violation * violation);
+        lossSum += trainer_finiteOrZero(fw * 0.5f * violation * violation);
         dL_dExpected += -fw * violation;
     }
 
+    trainer_atomicAddShared(lossAccum, lossSum);
     if (dL_dExpected == 0.0f) { return; }
 
     // expected = accumulated / alpha, and alpha = 1 - T_final, so:
@@ -2139,8 +2166,8 @@ kernel void trainer_loss_finalize(
                               renderColor[gid * 3u + 1u],
                               renderColor[gid * 3u + 2u]) + T * bg;
 
-    trainer_atomicAdd(&exposureGrad[0], dot(pre, g));
-    trainer_atomicAdd(&exposureGrad[1], g.x + g.y + g.z);
+    trainer_atomicAddShared(&exposureGrad[0], dot(pre, g));
+    trainer_atomicAddShared(&exposureGrad[1], g.x + g.y + g.z);
 }
 
 
@@ -3377,12 +3404,12 @@ kernel void trainer_preprocess_backward(
         const float3 vee = float3(comm[1][2], comm[2][0], comm[0][1]);
         const float3 dOmega = dOmegaMean - 2.0f * vee;
 
-        trainer_atomicAdd(&cameraGrad[0], dOmega.x);
-        trainer_atomicAdd(&cameraGrad[1], dOmega.y);
-        trainer_atomicAdd(&cameraGrad[2], dOmega.z);
-        trainer_atomicAdd(&cameraGrad[3], dLdMeanCam.x);
-        trainer_atomicAdd(&cameraGrad[4], dLdMeanCam.y);
-        trainer_atomicAdd(&cameraGrad[5], dLdMeanCam.z);
+        trainer_atomicAddShared(&cameraGrad[0], dOmega.x);
+        trainer_atomicAddShared(&cameraGrad[1], dOmega.y);
+        trainer_atomicAddShared(&cameraGrad[2], dOmega.z);
+        trainer_atomicAddShared(&cameraGrad[3], dLdMeanCam.x);
+        trainer_atomicAddShared(&cameraGrad[4], dLdMeanCam.y);
+        trainer_atomicAddShared(&cameraGrad[5], dLdMeanCam.z);
     }
 }
 
@@ -3471,6 +3498,8 @@ kernel void trainer_regularizer(
 
     const float3 logScale = clamp(float3(s.logScale), -12.0f, 3.0f);
     const float3 scale = exp(logScale);
+    // Build 308: this splat's prior terms, added to lossAccum once at the end.
+    float lossSum = 0.0f;
 
     // --- effective-rank / disc prior ---------------------------------------
     // Effective rank of the covariance's eigenvalue spectrum, via the entropy
@@ -3489,7 +3518,7 @@ kernel void trainer_regularizer(
         const bool onEdge = (s.flags & 4u) != 0u;
         const float target = onEdge ? u.edgeTargetRank : u.discTargetRank;
         const float residual = rank - target;
-        trainer_atomicAdd(lossAccum, u.discWeight * 0.5f * residual * residual);
+        lossSum += trainer_finiteOrZero(u.discWeight * 0.5f * residual * residual);
 
         // WAS -4.0f, AND THE COMMENT SAID -4 TOO. BOTH WERE WRONG.
         //
@@ -3523,7 +3552,7 @@ kernel void trainer_regularizer(
         const float3 over = max(scale - u.maxScaleMeters, float3(0.0f));
         const float value = 0.5f * dot(over, over);
         if (value > 0.0f) {
-            trainer_atomicAdd(lossAccum, u.maxScaleWeight * value);
+            lossSum += trainer_finiteOrZero(u.maxScaleWeight * value);
             const float3 g = u.maxScaleWeight * over * scale;   // d(scale)/d(log) = scale
             grad[gid].scale0 += g.x;
             grad[gid].scale1 += g.y;
@@ -3542,11 +3571,12 @@ kernel void trainer_regularizer(
             const float gate = 1.0f - unknownFraction / max(u.binarizeUnknownCutoff, 1e-6f);
             const float sig = trainer_sigmoid(s.opacityLogit);
             const float value = sig * (1.0f - sig);
-            trainer_atomicAdd(lossAccum, u.binarizeWeight * gate * value);
+            lossSum += trainer_finiteOrZero(u.binarizeWeight * gate * value);
             // d/do [sigma (1 - sigma)] = sigma (1 - sigma) (1 - 2 sigma)
             grad[gid].opacity += u.binarizeWeight * gate * value * (1.0f - 2.0f * sig);
         }
     }
+    trainer_atomicAddShared(lossAccum, lossSum);
 }
 
 // ============================================================================
