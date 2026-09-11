@@ -1866,7 +1866,9 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 // the budget simply never asked for it. Degree 2 is where
                 // view-dependent shading (highlights, sheen) lives; degree 1
                 // can only tilt the colour along one direction.
-                iterations: sceneExtentMeters < 8 ? 4_500 : 3_500,
+                // Build 362: 30,000 for a room, the reference recipe's count.
+                // Quality first, at whatever the clock says (about 6 minutes).
+                iterations: sceneExtentMeters < 8 ? 30_000 : 3_500,
                 // Build 360: 1,080 (was 720). The exported points' median long axis
                 // stayed at 7.1 mm through every size change because a point has
                 // no reason to shrink below the pixel it is trained against, and a
@@ -1883,6 +1885,11 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 // the memory share and the governor cut the model to 20,000.
                 keyframeCount: sceneExtentMeters < 8 ? 120 : 240,
                 memoryCeilingBytes: memoryForSplats,
+                // Build 362: a six-minute run sits at .fair throughout; the
+                // degrade rung (a one-way resolution cut) would fire fifteen
+                // seconds in. With degradeAt at .serious the pause rung wins
+                // there and the run waits to cool instead of getting worse.
+                thermalPolicy: ThermalPolicy(degradeAt: .serious),
                 target: .onDevice
             )
         case .limited:
