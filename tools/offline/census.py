@@ -184,6 +184,14 @@ if d.get('memorySamples'):
     for _m in d['memorySamples']:
         print('  %6d  %7.0f  %7.0f  %7.0f  %7d/%-7d  %9d  %5d  %7.0f' % (_m['iteration'], _m['footprint'], _m['trainerBuffers'],
               _m['frameCaches'], _m['splatCount'], _m['splatCapacity'], _m['instanceCapacity'], _m['renderLongEdge'], _m.get('available', 0)))
+if d.get('memoryEvents'):
+    print('MEMORY EVENTS (iOS available, MB; only steps of 50 MB or more between consecutive readings):')
+    _prev = None
+    for _e in d['memoryEvents']:
+        if _prev is not None and abs(_e['availableMB'] - _prev['availableMB']) >= 50:
+            print('  %6d %-22s %7.0f   (%+.0f since %s @ %d)' % (_e['iteration'], _e['stage'], _e['availableMB'],
+                  _e['availableMB'] - _prev['availableMB'], _prev['stage'], _prev['iteration']))
+        _prev = _e
 if t.get('opacityResets'):
     print('opacity resets: %d' % t['opacityResets'])
 if t.get('memoryFootprintPeakMegabytes'):

@@ -158,6 +158,9 @@ struct TrainerDensifyOutcome {
     var prunedNonFinite = 0
     var carvedFromEmptySpace = 0
     var trimmedToCap = 0
+    /// Build 392: iOS's available-memory figure (MB) at points inside the pass.
+    var availableAfterCPUWorkMB: Double = 0
+    var availableAfterGatherMB: Double = 0
     /// Build 320: on a pass that ran the CPU copy path beside the GPU gather,
     /// how many 32-bit words of the six bulk arrays differed (expected 0);
     /// nil when the pass was not checked.
@@ -1104,10 +1107,12 @@ final class TrainerDensifier {
                 to: liveCount, keeping: gather == nil ? 0 : splatCount
             )
         }
+        outcome.availableAfterCPUWorkMB = Double(DeviceMemoryFacts.probe().availableBytes) / 1_048_576
         resources.splats.writeArray(splats)
         resources.stats.writeArray(stats)
         if let gather {
             try gather.apply(resources: resources, source: source, flags: flags, count: liveCount)
+            outcome.availableAfterGatherMB = Double(DeviceMemoryFacts.probe().availableBytes) / 1_048_576
             if bulkOnCPU {
                 // The checking pass: the old copy path's arrays against what
                 // the kernel wrote, bit for bit.

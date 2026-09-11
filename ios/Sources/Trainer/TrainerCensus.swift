@@ -200,6 +200,16 @@ struct TrainerCensusMemorySample: Codable {
     var available: Double = 0
 }
 
+/// Build 392: what iOS said was still available, in MB, at a named point
+/// of the loop. The memory samples every 100 iterations showed the run
+/// growing by a full set of per-point buffers at every deleting densify
+/// pass in the 200-frame / 400k configuration; these say which stage.
+struct TrainerCensusMemoryEvent: Codable {
+    var iteration: Int
+    var stage: String
+    var availableMB: Double
+}
+
 struct TrainerCensusDensifyPass: Codable {
     var sliceIndex: Int
     /// Iteration within this slice, which is what the windows are measured
@@ -860,6 +870,8 @@ struct TrainerCensus: Codable {
     var densifyPasses: [TrainerCensusDensifyPass] = []
     /// Build 370: see TrainerCensusMemorySample.
     var memorySamples: [TrainerCensusMemorySample] = []
+    /// Build 392: see TrainerCensusMemoryEvent. Capped at 4,000 entries.
+    var memoryEvents: [TrainerCensusMemoryEvent] = []
     var merge: TrainerCensusMerge?
 
     var iterationsRequested: Int
