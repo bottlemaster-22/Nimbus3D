@@ -81,6 +81,9 @@ if pre:
                      tb.get('serialSlots', 0), tb.get('parallelSeconds', 0),
                      tb.get('parallelSlots', 0), tb.get('workerCount', 0),
                      tb.get('confidenceSeconds', 0), tb.get('writeSeconds', 0)))
+            if 'sweepsRun' in tb:
+                print('                of parallel, in-order apply %.2f   plane sweeps run %d'
+                      % (tb.get('parallelApplySeconds', 0), tb.get('sweepsRun', 0)))
         sd = pre.get('seeding') or {}
         if 'secondsSampleLoop' in sd:
             print('  seed split  : before loop %.2f (edge warm-up %.2f)  sample loop %.2f'
@@ -88,6 +91,9 @@ if pre:
                   % (sd.get('secondsBeforeLoop', 0), sd.get('secondsEdgeWarmup', 0),
                      sd.get('secondsSampleLoop', 0), sd.get('secondsShaping', 0),
                      sd.get('secondsWrite', 0)))
+            if 'secondsPrefetchWait' in sd:
+                print('                of the loop, waiting on the prefetch %.2f'
+                      % sd.get('secondsPrefetchWait', 0))
     else:
         print('  no stage clocks in this census (build 144 or older)')
 
@@ -313,3 +319,13 @@ _first, _last, _n = d.get('keyframeFirstIndex', -1), d.get('keyframeLastIndex', 
 if _n and _last >= 0:
     print('\nKEYFRAMES  : frames %d to %d of %d  (%.0f%% of the capture; after the last keyframe: %d frames)'
           % (_first, _last, _n, 100.0 * (_last + 1) / _n, _n - 1 - _last))
+
+# Camera deltas the trainer learned per trained frame (build 274+).
+for s_ in (d.get('slices') or []):
+    if s_.get('cameraDeltaFrames'):
+        print('CAMERA DELTAS: %d frames  median %.3f deg / %.2f cm  max %.3f deg / %.2f cm'
+              '  common %.3f deg / %.2f cm   (clamp ceiling ~0.9 deg / 6.3 cm)'
+              % (s_['cameraDeltaFrames'], s_.get('cameraDeltaMedianDegrees', 0),
+                 s_.get('cameraDeltaMedianCentimeters', 0), s_.get('cameraDeltaMaxDegrees', 0),
+                 s_.get('cameraDeltaMaxCentimeters', 0), s_.get('cameraDeltaCommonDegrees', 0),
+                 s_.get('cameraDeltaCommonCentimeters', 0)))

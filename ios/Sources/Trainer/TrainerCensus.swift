@@ -439,6 +439,17 @@ struct TrainerCensusSlice: Codable {
     /// That is close to a training view, which is the easy case, and it points
     /// at the second failure. This measures it rather than inferring it.
     var trainedPSNR: Float?
+    /// How far training moved the cameras it was allowed to move, and whether
+    /// they moved TOGETHER (world frame). Held-out frames never get a delta,
+    /// so a common drift misregisters every held-out view by the same amount.
+    /// The per-step clamps allow at most about 0.9 deg / 6.3 cm over a run.
+    var cameraDeltaFrames: Int?
+    var cameraDeltaMedianDegrees: Float?
+    var cameraDeltaMaxDegrees: Float?
+    var cameraDeltaMedianCentimeters: Float?
+    var cameraDeltaMaxCentimeters: Float?
+    var cameraDeltaCommonCentimeters: Float?
+    var cameraDeltaCommonDegrees: Float?
 }
 
 // MARK: - The merge

@@ -1812,6 +1812,46 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // evaluation re-rendered twelve identical frames for two scalars.
             census.slices[censusRow].heldOutPSNRExposureFitted = lastHeldOutPSNRExposureFitted
 
+            // Camera deltas, read-only: size per frame and the common
+            // (world-frame mean) component. view' = D * view, so the centre
+            // moves by -R^T R_D^T t_D; the turn is R^T times the delta's axis
+            // (overall sign irrelevant to the magnitude of the mean).
+            let deltaFrames = Dictionary(
+                slice.keyframes.map { ($0.index, $0) }, uniquingKeysWith: { first, _ in first }
+            )
+            var deltaDegrees: [Float] = []
+            var deltaCentimetres: [Float] = []
+            var worldShift = SIMD3<Float>.zero
+            var worldTurn = SIMD3<Float>.zero
+            for (index, delta) in cameraDeltas {
+                guard let frame = deltaFrames[index] else { continue }
+                let dq = delta.rotation.simd.normalized
+                let halfAngle: Float = acos(Swift.min(Swift.abs(dq.real), 1))
+                deltaDegrees.append(2 * halfAngle * 180 / Float.pi)
+                deltaCentimetres.append(simd_length(delta.translation.simd) * 100)
+                let base = supervision.pose(for: frame).rotation.simd
+                let shift: SIMD3<Float> = base.inverse.act(dq.inverse.act(delta.translation.simd))
+                worldShift -= shift
+                let axis: SIMD3<Float> = dq.real < 0 ? -dq.imag : dq.imag
+                worldTurn += base.inverse.act(axis * 2)
+            }
+            if !deltaDegrees.isEmpty {
+                deltaDegrees.sort()
+                deltaCentimetres.sort()
+                let count = Float(deltaDegrees.count)
+                let row = censusRow
+                census.slices[row].cameraDeltaFrames = deltaDegrees.count
+                census.slices[row].cameraDeltaMedianDegrees = deltaDegrees[deltaDegrees.count / 2]
+                census.slices[row].cameraDeltaMaxDegrees = deltaDegrees[deltaDegrees.count - 1]
+                census.slices[row].cameraDeltaMedianCentimeters =
+                    deltaCentimetres[deltaCentimetres.count / 2]
+                census.slices[row].cameraDeltaMaxCentimeters =
+                    deltaCentimetres[deltaCentimetres.count - 1]
+                census.slices[row].cameraDeltaCommonCentimeters = simd_length(worldShift / count) * 100
+                census.slices[row].cameraDeltaCommonDegrees =
+                    simd_length(worldTurn / count) * 180 / Float.pi
+            }
+
             // The same measurement on frames the model DID see. Sampled
             // evenly across the shuffle rather than taking the first few, and
             // limited to the SAME COUNT as the held-out set so the two numbers
@@ -2884,7 +2924,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
         for frame in frames.prefix(24) {
             guard let frameSupervision = supervision.build(
-                frame: frame, iteration: 0, totalIterations: 1
+                frame: frame, iteration: 0, totalIterations: 1, includeDepthSamples: false
             ) else { continue }
             guard frameSupervision.renderSize == renderSize else { continue }
 

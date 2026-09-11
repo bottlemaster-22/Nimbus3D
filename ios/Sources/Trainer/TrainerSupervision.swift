@@ -349,7 +349,8 @@ final class TrainerSupervisionBuilder {
     func build(
         frame: CaptureFrame,
         iteration: Int,
-        totalIterations: Int
+        totalIterations: Int,
+        includeDepthSamples: Bool = true
     ) -> TrainerFrameSupervision? {
 
         guard let image = imageCache.image(for: frame, at: ref) else {
@@ -456,14 +457,18 @@ final class TrainerSupervisionBuilder {
             hasBackground = true
         }
 
-        let samples = depthSamples(
-            frame: frame,
-            pose: framePose,
-            renderIntrinsics: k,
-            size: fixedSize,
-            iteration: iteration,
-            totalIterations: totalIterations
-        )
+        // The held-out evaluation reads the photo, background, pose and
+        // intrinsics and never a depth sample, so it asks for none.
+        let samples = includeDepthSamples
+            ? depthSamples(
+                frame: frame,
+                pose: framePose,
+                renderIntrinsics: k,
+                size: fixedSize,
+                iteration: iteration,
+                totalIterations: totalIterations
+            )
+            : []
 
         let supervised = samples.reduce(into: 0) { $0 += ($1.weight > 0 ? 1 : 0) }
         let meanAuthority = authority?.map(for: frame.index)?.meanAuthority ?? 0

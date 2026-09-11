@@ -71,52 +71,45 @@ enum PLYCodec {
         header += "end_header\n"
 
         let floatsPerPoint = 3 + 3 + 3 + shDim * 3 + 1 + 3 + 4
-        var body = Data(capacity: n * floatsPerPoint * 4)
-
-        for i in 0..<n {
-            let p = cloud.positions[i]
-            // RUB -> RDF: negate y, z.
-            body.appendFloat32LE(p.x)
-            body.appendFloat32LE(-p.y)
-            body.appendFloat32LE(-p.z)
-
-            body.appendFloat32LE(0); body.appendFloat32LE(0); body.appendFloat32LE(0)  // normal, unused
-
-            let dc = cloud.colorDC[i]
-            body.appendFloat32LE(dc.x); body.appendFloat32LE(dc.y); body.appendFloat32LE(dc.z)
-
-            if shDim > 0 {
-                let coeffs = cloud.shRest[i]
-                for channel in 0..<3 {
-                    for k in 0..<shDim {
-                        body.appendFloat32LE(coeffs[k][channel])
+        // Every value's little-endian bit pattern into ONE buffer, then one
+        // append: the bytes appendFloat32LE produced one Data.append at a
+        // time (14.1 M of them for 832k seeds), without the body-to-out copy.
+        // No NaN sanitising, exactly like appendFloat32LE.
+        var words = [UInt32](repeating: 0, count: n * floatsPerPoint)
+        words.withUnsafeMutableBufferPointer { w in
+            var o = 0
+            func put(_ v: Float) { w[o] = v.bitPattern.littleEndian; o += 1 }
+            for i in 0..<n {
+                let p = cloud.positions[i]
+                // RUB -> RDF: negate y, z.
+                put(p.x); put(-p.y); put(-p.z)
+                put(0); put(0); put(0)  // normal, unused
+                let dc = cloud.colorDC[i]
+                put(dc.x); put(dc.y); put(dc.z)
+                if shDim > 0 {
+                    let coeffs = cloud.shRest[i]
+                    for channel in 0..<3 {
+                        for k in 0..<shDim { put(coeffs[k][channel]) }
                     }
                 }
+                put(cloud.opacityLogits[i])
+                let s = cloud.logScales[i]
+                put(s.x); put(s.y); put(s.z)
+                // Stored quaternion is (x, y, z, w); RUB -> RDF negates y, z only.
+                // A degenerate (zero-length) input would normalize to NaN; fall
+                // back to the identity rotation rather than writing NaN floats.
+                let rawRotation = cloud.rotations[i]
+                let rotLenSq = simd_length_squared(rawRotation)
+                let r = simd_normalize(
+                    (rotLenSq.isFinite && rotLenSq > 1e-12) ? rawRotation : SIMD4<Float>(0, 0, 0, 1)
+                )
+                // rot_0 = w, rot_1 = x, rot_2 = y (negated), rot_3 = z (negated).
+                put(r.w); put(r.x); put(-r.y); put(-r.z)
             }
-
-            body.appendFloat32LE(cloud.opacityLogits[i])
-
-            let s = cloud.logScales[i]
-            body.appendFloat32LE(s.x); body.appendFloat32LE(s.y); body.appendFloat32LE(s.z)
-
-            // Stored quaternion is (x, y, z, w); RUB -> RDF negates y, z only.
-            // A degenerate (zero-length) input would normalize to NaN; fall
-            // back to the identity rotation rather than writing NaN floats.
-            let rawRotation = cloud.rotations[i]
-            let rotLenSq = simd_length_squared(rawRotation)
-            let r = simd_normalize(
-                (rotLenSq.isFinite && rotLenSq > 1e-12) ? rawRotation : SIMD4<Float>(0, 0, 0, 1)
-            )
-            // rot_0 = w, rot_1 = x, rot_2 = y (negated), rot_3 = z (negated).
-            body.appendFloat32LE(r.w)
-            body.appendFloat32LE(r.x)
-            body.appendFloat32LE(-r.y)
-            body.appendFloat32LE(-r.z)
         }
-
-        var out = Data()
+        var out = Data(capacity: header.utf8.count + words.count * 4)
         out.appendASCII(header)
-        out.append(body)
+        words.withUnsafeBufferPointer { out.append($0) }
         return out
     }
 

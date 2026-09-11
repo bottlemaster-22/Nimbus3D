@@ -48,6 +48,8 @@ enum PrePassPaths {
     /// type lives in `Sources/Core`, which this module does not own, and
     /// because a report about the work must never be able to break the work.
     static var census: String { "\(directory)/census.json" }
+    /// The revisit edges the pose graph was solved on (a report, like census).
+    static var revisits: String { "\(directory)/revisits.json" }
     static var occupancy: String { "\(directory)/occupancy.bin" }
     // The four F6 fields and the F3 edge folder below are WRITTEN by
     // `Sources/Smart` (`TwoScaleTrustField`, `NativeDepthEdgeClassifier`),

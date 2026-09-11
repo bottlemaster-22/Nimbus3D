@@ -557,6 +557,14 @@ public final class PrePassPipeline: PrePassService, @unchecked Sendable {
             return copy
         }
         refinedBundle.revisitPairs = revisits
+        // The edges the graph was solved on, so the offline tools can re-solve
+        // it and test each edge for degeneracy. Until now no copy of the 132
+        // confirmed ICP edges existed anywhere on disk. A report: it must
+        // never break the pass.
+        try? PrePassBinary.write(
+            ContractsJSON.encoder().encode(revisits),
+            to: ref.url(forRelativePath: PrePassPaths.revisits)
+        )
 
         // The rigid correction each submap actually received, recovered from
         // the frame nearest its window centre. It includes the time-offset

@@ -640,11 +640,17 @@ struct TrainerTuning: Sendable {
     /// there is no term anywhere in the loss that knows a photograph is
     /// blurred.
     ///
-    /// 5 is deliberately small. The walk produced 868 frames for 120
-    /// keyframes, so a window of 5 is well inside one spacing interval and
-    /// cannot turn the selection into a prefix or collapse the spread; every
-    /// candidate in the window has already passed the same spacing gate.
-    var keyframeSharpnessLookahead: Int = 5
+    /// OFF (0) since build 274. With 5, the walk resumed after the GATE
+    /// frame, not after the frame the window picked, so the next frames
+    /// passed the turn gate measured against the pick and chose it again.
+    /// On scan_20260906_164840 that re-picked 29 of 120 slots (91 distinct
+    /// frames), and because the held-out split takes every tenth entry of
+    /// that list, 6 of the 12 held-out frames were ALSO trained on
+    /// (tools/offline/kf_exact.py, exact against held_out_frames.json).
+    /// Every held-out score from build 244 to 272 is flattered by that.
+    /// Re-enable only together with a walk that resumes after the pick, and
+    /// price the spread that causes (build 264).
+    var keyframeSharpnessLookahead: Int = 0
 
     /// How much better a score has to be to count as an improvement. Below
     /// this it is noise, and waiting for noise to clear is what turns a

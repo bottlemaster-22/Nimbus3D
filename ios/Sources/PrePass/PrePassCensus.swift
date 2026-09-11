@@ -659,6 +659,9 @@ public struct PrePassCensus: Codable, Sendable {
         public var secondsShaping: Double?
         /// The PLY and the flags file.
         public var secondsWrite: Double?
+        /// Of `secondsSampleLoop`, blocked in the seed prefetch (depth,
+        /// points and photo for the keyframe about to be walked).
+        public var secondsPrefetchWait: Double?
 
         public init() {}
     }

@@ -599,10 +599,13 @@ enum PrePassInitialSplatBuilder {
 
         let loopStarted = Date()
         census.secondsBeforeLoop = loopStarted.timeIntervalSince(seedingStarted)
+        var prefetchWaitSeconds: Double = 0
         for (keyframeIndex, frame) in keyframes.enumerated() {
             try Task.checkCancellation()
 
+            let waitStarted = Date()
             let inputs = prefetch.take(frame) ?? prefetch.load(frame)
+            prefetchWaitSeconds += Date().timeIntervalSince(waitStarted)
 
             // STARTED BEFORE THIS FRAME'S SAMPLE LOOP, which is the whole
             // point: the next frame decodes while these 49,152 samples are
@@ -764,6 +767,7 @@ enum PrePassInitialSplatBuilder {
         }
 
         census.secondsSampleLoop = Date().timeIntervalSince(loopStarted)
+        census.secondsPrefetchWait = prefetchWaitSeconds
         let count = position.count
 
         // Recorded BEFORE the guard below, so the run that produced nothing

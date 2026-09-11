@@ -42,7 +42,9 @@ Sources: `scratchpad/refuted_all.json` (A00-A72), `refuted_missed.json` (M00-M49
 | A24 | Adam sign coherence 0.50 | OPEN-LOW | refuter did not run it; measures opacity only, extrapolated to scale |
 | A25 | disc prior sets the shape of a third of the model | **REOPEN (experiment)** | fair null leaves a 3.44x excess; forensics measured the prior dominating 98.7% of discs. The proposed null test, discPriorWeight 0, has NEVER been run |
 | A26 | exposure model cannot absorb the variation | **REOPEN** | the refutation's "exposure constant" used frames 0-15 only; across the capture exposureDurationSeconds spans 0.0100-0.0167 s = 0.74 stops (A39's own data). And A38 measured the per-frame correction reaching gain 1.001-1.002: effectively inert |
-| A27 | misregistration 1.8 px, not the ceiling | OPEN (re-measure) | its 'pose worth 2.4x more with the veil gone' used the unclamped render, and the veil is not real. Re-run lossq_align.py with the clamped tools before reading anything into it; A11's census-based pose numbers stand |
+| A27 | misregistration 1.8 px, not the ceiling | CLOSED (re-measured, clamped) | build 266, frames 0-15 (submap 0), lossq_align_cv.py, reproduced by the checker's own run: sub-pixel shift median 2.05 px (0.227 deg); whole-image gain +0.437 dB in-sample, +0.25 cross-validated left/right, +0.20 top/bottom; not one rigid shift (quadrants disagree by a median 4.7 px). Registration inside the anchored submap is worth about +0.25 dB on untrained views. No photos near an owner boundary, so the tear (below) is not in this number. Re-run as a CONTROL on every registration build |
+| A27t | the frame 0-15 misregistration is a camera-to-IMU timing error | REFUTED (measured) | reg_timing.py, 13 untrained frames: best dt +12.2 ms, R^2 0.170, leave-one-out 0.078, at the p95 of shuffled flows; removing it RAISES the median shift 2.37 to 3.38 px. The calibrated 1.3 ms offset stands. 13 frames, one scan |
+| TEAR | one rigid correction per submap tears the camera path at owner boundaries | OPEN (device A/B) | reg_boundaries.py, cross-checked from prepass_result submap corrections: all 18 boundaries, median 1.18 deg / 3.4 cm (13 px), worst 2.08 deg / 23.9 cm (67 px) between frames a third of a second apart, against 0.06 deg / 0.16 cm inside a submap. Fix: interpolate the correction in time between bracketing submaps. Needs its own build |
 | VEIL | splats within 0.5 m of the camera | CLOSED(evidence) | an ARTEFACT of the offline tools: none of their three Jacobian copies had the device's tangent clamp (250+). Unclamped: +2.2 dB mean from deleting them. Clamped, as the phone renders: +0.000 dB on all 16 frames. The phone has no veil |
 | A28 | radix saving small | CLOSED(shipped) | 6 passes shipped in 252 |
 | A29 | byte-traffic comment undercounts 39% | CLOSED(evidence) | peak vs mean; mean 786,967 within 3% of the comment |
@@ -178,3 +180,11 @@ Every offline RENDER measurement from build 250 to today used an unclamped proje
 ## CORRECTION 2, 2026-09-11
 
 I concluded from 256 -> 260 that dropping tgIndex made gpuStep 6.5% slower and reverted it. 266 restored it and measured 52.4 s, the same as 260 without it. The single-run comparison was inside the noise. Speed conclusions of about 3 s or less from one device run each are not evidence.
+
+
+## Keyframe selector (2026-09-11, build 274)
+
+| id | finding | verdict | what I checked |
+|---|---|---|---|
+| KF-DUP | the sharpness look-ahead re-picks frames and leaks held-out frames into training | **CONFIRMED, fixed in 274** | I ran tools/offline/kf_exact.py myself: it reproduces held_out_frames.json and the 0..439 span exactly, and prints 29 duplicate slots of 120. I read selectKeyframes: after the window picks a frame ahead, the loop continues from the gate frame, and the next frames pass the turn gate measured against the pick, so they pick it again. splitHeldOut takes every tenth entry of the list, so a back-to-back duplicate lands one copy in each set: 6 of 12 held-out frames were trained. Every held-out score from 244 to 272 is flattered. Fix: look-ahead 0 (the pre-244 greedy), 120 distinct frames, predicted held-out [17, 61, 109, 155, 199, 231, 272, 314, 352, 392, 425, 460], span 0..485 |
+| KF-MORE | more keyframes with today's code | OPEN (priced) | kf_price.py: above ~128 distinct frames the authority and edge caches (128 each) thrash; at 228+ keyframes the planner switches to 19-slice training. Raise both caps before going past 128 |

@@ -914,110 +914,140 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         }
         census.candidatesAfterCap = candidates.count
 
-        // 3. Align each surviving candidate with point-to-plane ICP.
-        //
-        // Sequential with a tiny cache rather than a task group: each
-        // unprojected frame is ~5 MB, and holding a few hundred of them
-        // resident to parallelise a stage that already fits in the budget is
-        // exactly the "never assume the scene fits memory" mistake this
-        // product is supposed to be better than.
+        // 3. Align each surviving candidate with point-to-plane ICP, ON EVERY
+        // CORE. Each alignment is a pure function of its two depth frames and
+        // the VIO guess: PrePassICP.align, PrePassFramePoints.build and
+        // PrePassDepthFrame.load hold no shared state, and the time-offset
+        // stage already loads depth concurrently. Candidates sharing frame A
+        // are contiguous after this sort, so each run unprojects A once and
+        // each B once on its own worker: about two 1.73 MB frames per core
+        // (measured size; this comment used to say ~5 MB). Outcomes land in
+        // candidate order and are folded by the same serial bookkeeping as
+        // before, so the results and every census counter match the old
+        // serial loop, including where a depth load throws.
         candidates.sort {
             $0.a.index == $1.a.index ? $0.b.index < $1.b.index : $0.a.index < $1.a.index
         }
+        let ordered = candidates
+        let runStarts: [Int] = ordered.indices.filter {
+            $0 == 0 || ordered[$0].a.index != ordered[$0 - 1].a.index
+        } + [ordered.count]
+        let runCount = runStarts.count - 1
 
-        var cache: [FrameID: PrePassFramePoints] = [:]
-        var cacheOrder: [FrameID] = []
-        let cacheLimit = 8
-
-        func points(for frame: CaptureFrame) throws -> PrePassFramePoints? {
-            if let hit = cache[frame.index] { return hit }
+        enum RevisitOutcome {
+            case noDepth
+            case rejected
+            case aligned(PrePassICPResult)
+        }
+        func unprojected(_ frame: CaptureFrame) throws -> PrePassFramePoints? {
             guard let depthFrame = try PrePassDepthFrame.load(
                 frame: frame, settings: bundle.settings, at: ref
             ) else { return nil }
-            let built = PrePassFramePoints.build(
+            return PrePassFramePoints.build(
                 depthFrame: depthFrame,
                 geometry: geometry,
                 maxRangeMeters: bundle.settings.lidarMaxRangeMeters
             )
-            cache[frame.index] = built
-            cacheOrder.append(frame.index)
-            if cacheOrder.count > cacheLimit {
-                let evicted = cacheOrder.removeFirst()
-                cache[evicted] = nil
-            }
-            return built
         }
 
+        try Task.checkCancellation()
+        var outcomes = [RevisitOutcome?](repeating: nil, count: ordered.count)
+        var runErrors = [Error?](repeating: nil, count: runCount)
+        outcomes.withUnsafeMutableBufferPointer { out in
+            runErrors.withUnsafeMutableBufferPointer { errors in
+                DispatchQueue.concurrentPerform(iterations: runCount) { r in
+                    do {
+                        let source = try unprojected(ordered[runStarts[r]].a)
+                        for k in runStarts[r]..<runStarts[r + 1] {
+                            let candidate = ordered[k]
+                            // Serial order: A first, and B is not loaded when
+                            // A has no depth.
+                            guard let source, let target = try unprojected(candidate.b) else {
+                                out[k] = RevisitOutcome.noDepth
+                                continue
+                            }
+                            let icp = PrePassICP.align(
+                                source: source,
+                                target: target,
+                                geometry: geometry,
+                                initial: PrePassRigid.relative(
+                                    from: candidate.a.rawPose, to: candidate.b.rawPose
+                                )
+                            )
+                            out[k] = icp.converged
+                                ? RevisitOutcome.aligned(icp) : RevisitOutcome.rejected
+                        }
+                    } catch {
+                        errors[r] = error
+                    }
+                }
+            }
+        }
+        try Task.checkCancellation()
+
         var results: [RevisitPair] = []
-        for candidate in candidates {
-            try Task.checkCancellation()
-
-            guard let sourcePoints = try points(for: candidate.a),
-                  let targetPoints = try points(for: candidate.b)
-            else {
-                // No depth for one of them: record the geometric agreement so
-                // the QC card can still count it, but with zero confidence so
-                // the pose graph ignores it. A pose-proximity "measurement" is
-                // just the VIO estimate handed back, and feeding an estimate
-                // to the optimiser as if it were an observation is how a pose
-                // graph convinces itself it is right.
-                census.candidatesWithoutDepth += 1
-                results.append(
-                    RevisitPair(
-                        frameA: candidate.a.index,
-                        frameB: candidate.b.index,
-                        method: .poseProximity,
-                        measuredRelativePose: PrePassRigid.relative(
-                            from: candidate.a.rawPose, to: candidate.b.rawPose
-                        ),
-                        translationResidualMeters: 0,
-                        rotationResidualDegrees: 0,
-                        inlierCount: 0,
-                        confidence: 0
+        for r in 0..<runCount {
+            for k in runStarts[r]..<runStarts[r + 1] {
+                guard let outcome = outcomes[k] else { continue }
+                let candidate = ordered[k]
+                let initial = PrePassRigid.relative(
+                    from: candidate.a.rawPose, to: candidate.b.rawPose
+                )
+                switch outcome {
+                case .noDepth:
+                    // No depth for one of them: record the geometric agreement
+                    // so the QC card can still count it, but with zero
+                    // confidence so the pose graph ignores it. A
+                    // pose-proximity "measurement" is just the VIO estimate
+                    // handed back, and feeding an estimate to the optimiser as
+                    // if it were an observation is how a pose graph convinces
+                    // itself it is right.
+                    census.candidatesWithoutDepth += 1
+                    results.append(
+                        RevisitPair(
+                            frameA: candidate.a.index,
+                            frameB: candidate.b.index,
+                            method: .poseProximity,
+                            measuredRelativePose: initial,
+                            translationResidualMeters: 0,
+                            rotationResidualDegrees: 0,
+                            inlierCount: 0,
+                            confidence: 0
+                        )
                     )
-                )
-                continue
+                case .rejected:
+                    rejectedRevisitCandidates += 1
+                    census.icpRejected += 1
+                case .aligned(let icp):
+                    census.icpConverged += 1
+                    // The residual IS the drift measurement: how far the LiDAR
+                    // says the two frames really are apart, minus where VIO
+                    // put them.
+                    let error = PrePassSE3(icp.relativePose) * PrePassSE3(initial).inverse
+                    let translationResidual = Float(simd_length(error.translation))
+                    let rotationResidual = Float(error.rotationAngleDegrees)
+                    // Confidence from the alignment's own evidence, not from a
+                    // guess: how much of the source found a match, and how
+                    // tight the fit is.
+                    let fitTerm = Float(Swift.max(0, 1 - Double(icp.rmsMeters) / 0.03))
+                    let confidence = Swift.min(
+                        Swift.max(icp.inlierFraction * 0.6 + fitTerm * 0.4, 0), 1
+                    )
+                    results.append(
+                        RevisitPair(
+                            frameA: candidate.a.index,
+                            frameB: candidate.b.index,
+                            method: .depthICP,
+                            measuredRelativePose: icp.relativePose,
+                            translationResidualMeters: translationResidual,
+                            rotationResidualDegrees: rotationResidual,
+                            inlierCount: icp.inlierCount,
+                            confidence: confidence
+                        )
+                    )
+                }
             }
-
-            let initial = PrePassRigid.relative(from: candidate.a.rawPose, to: candidate.b.rawPose)
-            let icp = PrePassICP.align(
-                source: sourcePoints,
-                target: targetPoints,
-                geometry: geometry,
-                initial: initial
-            )
-            guard icp.converged else {
-                rejectedRevisitCandidates += 1
-                census.icpRejected += 1
-                continue
-            }
-            census.icpConverged += 1
-
-            // The residual IS the drift measurement: how far the LiDAR says
-            // the two frames really are apart, minus where VIO put them.
-            let error = PrePassSE3(icp.relativePose) * PrePassSE3(initial).inverse
-            let translationResidual = Float(simd_length(error.translation))
-            let rotationResidual = Float(error.rotationAngleDegrees)
-
-            // Confidence from the alignment's own evidence, not from a guess:
-            // how much of the source found a match, and how tight the fit is.
-            let fitTerm = Float(Swift.max(0, 1 - Double(icp.rmsMeters) / 0.03))
-            let confidence = Swift.min(
-                Swift.max(icp.inlierFraction * 0.6 + fitTerm * 0.4, 0), 1
-            )
-
-            results.append(
-                RevisitPair(
-                    frameA: candidate.a.index,
-                    frameB: candidate.b.index,
-                    method: .depthICP,
-                    measuredRelativePose: icp.relativePose,
-                    translationResidualMeters: translationResidual,
-                    rotationResidualDegrees: rotationResidual,
-                    inlierCount: icp.inlierCount,
-                    confidence: confidence
-                )
-            )
+            if let runError = runErrors[r] { throw runError }
         }
 
         // One pass over the finished list. The medians are what turn "3 loop

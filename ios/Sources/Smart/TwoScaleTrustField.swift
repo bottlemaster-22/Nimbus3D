@@ -70,8 +70,15 @@ final class SmartChunkedWriter {
     }
 
     func appendFloats(_ values: [Float]) throws {
-        var chunk = Data(capacity: values.count * 4)
-        for v in values { SmartBinary.append(v, to: &chunk) }
+        // One buffer, one append: the exact bytes SmartBinary.append(Float)
+        // produced one 4-byte Data.append at a time (non-finite -> 0, then
+        // the little-endian bit pattern). That was 49,152 appends per slot
+        // and 42.7 M per 868-frame file.
+        let words = values.map { v -> UInt32 in
+            let safe: Float = v.isFinite ? v : 0
+            return safe.bitPattern.littleEndian
+        }
+        let chunk = words.withUnsafeBufferPointer { Data(buffer: $0) }
         try append(chunk)
     }
 
@@ -166,6 +173,12 @@ public struct TrustBuildTimings: Codable, Sendable, Equatable {
     public var serialSlots = 0
     public var parallelSlots = 0
     public var workerCount = 0
+    /// Of `parallelSeconds`, the serial in-order apply: noise rows, bias
+    /// accumulator adds, confidence-level counts, affines. Optional so a
+    /// census written before it existed still decodes.
+    public var parallelApplySeconds: Double?
+    /// Plane-sweep verifications actually run (the budget is 20,000).
+    public var sweepsRun: Int?
 
     public init() {}
 }
@@ -241,7 +254,10 @@ public final class TwoScaleTrustField: TrustField {
     private struct TrustSlotResult {
         var sigma: [Float]
         var bias: [TrustBiasEntry] = []
-        var levelResiduals: [(level: Int, value: Float)] = []
+        /// Per ARKit confidence level: residuals recorded, and how many sat
+        /// inside `confidenceTolerance`. All `recalibrate` ever read.
+        var levelCount = [0, 0, 0]
+        var levelInside = [0, 0, 0]
         var affine: (FrameID, SmartDepthAffine)?
     }
 
@@ -333,7 +349,8 @@ public final class TwoScaleTrustField: TrustField {
         // from. This is the raw material for the recalibration in step 5:
         // ARKit's 0/1/2 is a ranking, and these buckets say what that ranking
         // is actually worth on THIS scan.
-        var residualsByLevel: [[Float]] = [[], [], []]
+        var levelTotals = [0, 0, 0]
+        var levelInsideTotals = [0, 0, 0]
         var affines: [(FrameID, SmartDepthAffine)] = []
 
         let noiseWriter = try SmartChunkedWriter(url: ref.url(forRelativePath: noisePath))
@@ -429,7 +446,8 @@ public final class TwoScaleTrustField: TrustField {
                 var affineSensor: [Float] = []
                 var affineTarget: [Float] = []
                 var bias: [TrustBiasEntry] = []
-                var levels: [(level: Int, value: Float)] = []
+                var levelCount = [0, 0, 0]
+                var levelInside = [0, 0, 0]
 
                 // Partner poses and depths once per frame, not per sample.
                 var partnerPoses: [Pose] = []
@@ -539,7 +557,10 @@ public final class TwoScaleTrustField: TrustField {
 
                             let level = Int(i < confidence.count ? confidence[i] : 1)
                             if level >= 0, level < 3 {
-                                levels.append((level: level, value: abs(medianResidual)))
+                                levelCount[level] += 1
+                                if abs(medianResidual) <= Self.confidenceTolerance {
+                                    levelInside[level] += 1
+                                }
                             }
 
                             affineSensor.append(z)
@@ -592,7 +613,9 @@ public final class TwoScaleTrustField: TrustField {
                 }
 
                 return TrustSlotResult(
-                    sigma: sigma, bias: bias, levelResiduals: levels, affine: slotAffine
+                    sigma: sigma, bias: bias,
+                    levelCount: levelCount, levelInside: levelInside,
+                    affine: slotAffine
                 )
             }
         }
@@ -605,8 +628,9 @@ public final class TwoScaleTrustField: TrustField {
                     world: entry.world, residual: entry.residual, timeSeconds: entry.time
                 )
             }
-            for entry in result.levelResiduals {
-                residualsByLevel[entry.level].append(entry.value)
+            for level in 0..<3 {
+                levelTotals[level] += result.levelCount[level]
+                levelInsideTotals[level] += result.levelInside[level]
             }
             if let slotAffine = result.affine { affines.append(slotAffine) }
         }
@@ -624,6 +648,7 @@ public final class TwoScaleTrustField: TrustField {
         }
         let serialSlots = slot
         let parallelStarted = Date()
+        var parallelApplySeconds: Double = 0
 
         // Phase 2: every core. Each worker walks a run of consecutive slots
         // through its own depth cache, so neighbouring frames share their
@@ -656,6 +681,7 @@ public final class TwoScaleTrustField: TrustField {
                     }
                 }
             }
+            let applyStarted = Date()
             for (k, result) in results.enumerated() {
                 // Never skip a slot: a missing row would shear every later
                 // frame's trust into another frame's samples.
@@ -665,6 +691,7 @@ public final class TwoScaleTrustField: TrustField {
                 }
                 try apply(result)
             }
+            parallelApplySeconds += Date().timeIntervalSince(applyStarted)
             slot += chunk
         }
         let parallelEnded = Date()
@@ -676,7 +703,9 @@ public final class TwoScaleTrustField: TrustField {
         try noiseWriter.close()
 
         // --- 5. Recalibrate ARKit confidence. -----------------------------
-        let levelProbabilities = Self.recalibrate(residualsByLevel: residualsByLevel)
+        let levelProbabilities = Self.recalibrate(
+            levelCount: levelTotals, levelInside: levelInsideTotals
+        )
         SmartLog.trust.info(
             """
             ARKit confidence remapped from ranking to probability: \
@@ -726,6 +755,8 @@ public final class TwoScaleTrustField: TrustField {
         timings.serialSlots = serialSlots
         timings.parallelSlots = parallelSlots
         timings.workerCount = workerCount
+        timings.parallelApplySeconds = parallelApplySeconds
+        timings.sweepsRun = startingSweepBudget - planeSweepBudget
         lock.lock()
         buildTimings = timings
         lock.unlock()
@@ -999,17 +1030,21 @@ public final class TwoScaleTrustField: TrustField {
     ///
     /// Monotonicity is then enforced, because a level ordering that inverts is
     /// a sign of too little data rather than of ARKit being backwards.
-    static func recalibrate(residualsByLevel: [[Float]]) -> [Float] {
-        let tolerance: Float = 0.02
+    /// A residual inside this is counted as the sensor being right.
+    static let confidenceTolerance: Float = 0.02
+
+    /// Per level, how many residuals were recorded and how many sat inside
+    /// `confidenceTolerance`: the only two numbers this ever read from the
+    /// ~10.7 M residuals it used to be handed. Same division, same bits.
+    static func recalibrate(levelCount: [Int], levelInside: [Int]) -> [Float] {
         // Priors, used for any level that did not collect enough residuals to
         // say anything. Ordered, and deliberately not extreme.
         var p: [Float] = [0.30, 0.60, 0.85]
         for level in 0..<3 {
-            let residuals = residualsByLevel[level]
-            guard residuals.count >= 32 else { continue }
-            var inside = 0
-            for r in residuals where r <= tolerance { inside += 1 }
-            p[level] = SmartMath.clamp(Float(inside) / Float(residuals.count), 0.02, 0.99)
+            guard levelCount[level] >= 32 else { continue }
+            p[level] = SmartMath.clamp(
+                Float(levelInside[level]) / Float(levelCount[level]), 0.02, 0.99
+            )
         }
         p[1] = Swift.max(p[1], p[0])
         p[2] = Swift.max(p[2], p[1])
@@ -1132,6 +1167,10 @@ public final class TwoScaleTrustField: TrustField {
         let half = settings.planeSweepRangeMeters
         var scores = [Float](repeating: 0, count: steps)
         var counts = [Int](repeating: 0, count: steps)
+        // One patch buffer for every (partner, step), filled and normalised
+        // in place. This was two heap arrays per (partner, step): 256 per
+        // swept sample, 5.12 M over the 20,000-sample budget, all serial.
+        var patch = [Float](repeating: 0, count: referencePatch.count)
 
         for partner in partners {
             guard
@@ -1146,8 +1185,7 @@ public final class TwoScaleTrustField: TrustField {
                 let candidateDepth = depth + (t * 2 - 1) * half
                 guard candidateDepth > 0.05 else { continue }
 
-                var patch: [Float] = []
-                patch.reserveCapacity(referencePatch.count)
+                var filled = 0
                 var usable = true
                 for dy in -radius...radius {
                     for dx in -radius...radius {
@@ -1169,14 +1207,15 @@ public final class TwoScaleTrustField: TrustField {
                             usable = false
                             break
                         }
-                        patch.append(partnerImage.lumaBilinear(inPartner))
+                        patch[filled] = partnerImage.lumaBilinear(inPartner)
+                        filled += 1
                     }
                     if !usable { break }
                 }
-                guard usable, let partnerStats = Self.zeroMeanUnitNorm(patch) else { continue }
+                guard usable, Self.zeroMeanUnitNormInPlace(&patch, count: filled) else { continue }
 
                 var ncc: Float = 0
-                for j in 0..<referenceStats.count { ncc += referenceStats[j] * partnerStats[j] }
+                for j in 0..<referenceStats.count { ncc += referenceStats[j] * patch[j] }
                 scores[s] += ncc
                 counts[s] += 1
             }
@@ -1223,6 +1262,23 @@ public final class TwoScaleTrustField: TrustField {
         guard norm > 1e-4 else { return nil }
         for i in 0..<centred.count { centred[i] /= norm }
         return centred
+    }
+
+    /// `zeroMeanUnitNorm` on the first `n` entries of `patch`, in place and
+    /// without its two allocations: the same sums in the same order, so the
+    /// same bits. Returns false exactly where that returns nil.
+    static func zeroMeanUnitNormInPlace(_ patch: inout [Float], count n: Int) -> Bool {
+        guard n > 1 else { return false }
+        var sum: Float = 0
+        for i in 0..<n { sum += patch[i] }
+        let mean = sum / Float(n)
+        for i in 0..<n { patch[i] -= mean }
+        var norm: Float = 0
+        for i in 0..<n { norm += patch[i] * patch[i] }
+        norm = sqrt(norm)
+        guard norm > 1e-4 else { return false }
+        for i in 0..<n { patch[i] /= norm }
+        return true
     }
 
     // MARK: - Static helpers
@@ -1385,7 +1441,19 @@ struct SmartBiasAccumulator {
     mutating func add(world: SIMD3<Float>, residual: Float, timeSeconds: Double) {
         guard residual.isFinite, abs(residual) < 5 else { return }
         let key = SmartMorton.key(world, voxelSize: voxelSizeMeters)
-        var cell = cells[key] ?? Cell()
+        // Mutated IN PLACE through the default subscript: one hash lookup
+        // instead of two, and the Cell is never copied, so its Set is never
+        // shared and never copied when a new time bucket goes in. Same
+        // statements in the same order, so the same bits.
+        Self.accumulate(
+            into: &cells[key, default: Cell()], residual: residual,
+            timeSeconds: timeSeconds, bucketSeconds: timeBucketSeconds
+        )
+    }
+
+    private static func accumulate(
+        into cell: inout Cell, residual: Float, timeSeconds: Double, bucketSeconds: Double
+    ) {
         cell.count += 1
         let delta = residual - cell.mean
         cell.mean += delta / Float(cell.count)
@@ -1395,12 +1463,11 @@ struct SmartBiasAccumulator {
             // this timestamp is read out of capture_bundle.json. Finite is
             // not enough on its own. At two seconds per bucket the window
             // below is longer than any scan will ever be.
-            let bucket = (timeSeconds / timeBucketSeconds).rounded(.down)
+            let bucket = (timeSeconds / bucketSeconds).rounded(.down)
             if bucket > -1e15, bucket < 1e15 {
                 cell.times.insert(Int32(truncatingIfNeeded: Int(bucket)))
             }
         }
-        cells[key] = cell
     }
 
     func sortedCells() -> [SmartTrustBiasCell] {

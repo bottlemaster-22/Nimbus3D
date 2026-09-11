@@ -1001,3 +1001,26 @@ Same keyframes (0 to 439), same scan. The only trainer changes since 266 are 268
 ### BUILD 272
 
 - **Confidence rewrite on every core**, rows written in slot order: same bytes. 0.87 s serial.
+
+Build 271/272 green (ae3d513).
+
+---
+
+## 2026-09-11 : Build 274, the keyframe look-ahead leaked the test set; one quality change plus exact speed work
+
+### THE LEAK (research workflow, confirmed by my own run and reading)
+
+`keyframeSharpnessLookahead` 5 (since 244) picked the best-weighted frame up to 5 ahead, but the walk carried on from the gate frame, so the next frames passed the turn gate measured against the pick and chose it again. kf_exact.py reproduces held_out_frames.json and the span exactly and prints 29 duplicate slots of 120. splitHeldOut takes every tenth entry, so a back-to-back duplicate lands in both sets: 6 of the 12 held-out frames (18, 164, 209, 233, 355, 394) also trained. EVERY held-out PSNR from 244 to 272 is flattered. The only quality change in 274: look-ahead 0 (the pre-244 greedy). Predicted exactly: 120 distinct keyframes, 108 trained, span 0..485, held_out_frames.json [17, 61, 109, 155, 199, 231, 272, 314, 352, 392, 425, 460]. Offline: views per Gaussian 11.2 to 14.2, share seen by 3 or fewer views 10.2 to 6.0 percent, tile work -4.5 percent; training-frame blur p50 1.09 to 1.46 render px.
+
+**The held-out number will FALL and that is not the model getting worse.** The estimate for 266's clean half is about 18.9 dB (assumes the leaked half scored near the trained-view 22.0). Success line from the researcher: best held-out >= 20.0 and SSIM >= 0.66 on the clean set; failure below 19.0 or SSIM below 0.64. From 274 on, compare against 274, not against 20.47.
+
+### EXACT CHANGES (output identical; census signatures say if not)
+
+- Trust: `appendFloats` one bulk buffer (85 M four-byte appends); plane sweep's ZNCC in place (5.12 M allocations); bias accumulator mutated in place (one hash, no Set copy); residuals by confidence level replaced by the two counts `recalibrate` ever read (10.7 M appends).
+- Trust clocks: `parallelApplySeconds`, `sweepsRun`. Seeding: `secondsPrefetchWait`.
+- PLY writer: one bulk buffer (14.1 M appends and a 56.6 MB copy). Same bytes, incl. no NaN sanitising.
+- Held-out eval builds no depth samples (it never read them).
+- Revisit ICP on every core, folded in candidate order: must reproduce icpConverged 132, icpRejected 468, confirmedPairs 132, poseGraph.initialCost 4520.09.
+- Census: trainer camera deltas per slice (median, max, common-mode). Ceiling ~0.9 deg / 6.3 cm.
+
+Registration research (ledger A27, A27t, TEAR): the rigid image shift is worth +0.25 dB cross-validated, it is not a timing error, and the pose graph TEARS the path at all 18 submap boundaries (median 1.18 deg / 3.4 cm, worst 2.08 deg / 23.9 cm between consecutive frames). The continuous-correction fix is the next quality A/B, its own build.
