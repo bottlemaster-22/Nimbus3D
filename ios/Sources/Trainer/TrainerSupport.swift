@@ -1099,6 +1099,12 @@ struct TrainerTuning: Sendable {
     var filter3DFallbackMeters: Float = 0.01
     /// How often the per-Gaussian sampling-rate sweep is re-run.
     var filter3DIntervalIterations: Int = 500
+    /// Build 390 (local): run the 3D-filter sweep on the CPU instead of as
+    /// command buffers. Same arithmetic as trainer_sampling_rate_update and
+    /// trainer_filter3d_finalize; about 0.1 s a sweep on six cores at
+    /// 400,000 points. The GPU sweep is where build 384's memory stepped up
+    /// by hundreds of MB a sweep; this path submits nothing.
+    var filter3DOnCPU: Bool = false
 
     // --- Exposure (F5, F8) -----------------------------------------------------
 

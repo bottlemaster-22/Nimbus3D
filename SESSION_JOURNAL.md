@@ -1455,3 +1455,5 @@ State: HEAD carries the sweep experiment (ten cameras per command buffer), the 2
    If it still steps: revert the two Contracts lines to 120 / 330,000 (comments say EXPERIMENT), push, and that is the release build; the leak then needs the sweep replaced (compute the 3D filter on the CPU from the cameras' distances once per level, 3 sweeps a run) rather than found.
 4. Never re-enable `supervisionPreload` or the full builder's frame cache (both grow memory; see builds 334 and 380).
 5. Rules that held up: opacity resets off (376), soft memory gates freeze growth only (346), caches released only on the OS headroom gate (380).
+
+LOCAL (unpushed): `TrainerTuning.filter3DOnCPU` (default false) runs the 3D-filter sweep on the CPU with the kernels' exact arithmetic (updateFilter3DOnCPU, concurrentPerform over 4,096-point chunks, no command buffers). Plan B for Monday if the batched GPU sweep still steps the memory curve: set it true and push; expect about 0.1 s a sweep at 400,000 points.

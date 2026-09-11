@@ -1739,17 +1739,28 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 // The full-size builder and grid whatever phase this is (build
                 // 328): a sampling rate is a property of the camera the model
                 // will be viewed through, and the sweep touches no pixel buffer.
-                try updateFilter3D(
-                    gpu: gpu,
-                    resources: resources,
-                    queue: queue,
-                    keyframes: slice.keyframes,
-                    supervision: supervision,
-                    cameraDeltas: cameraDeltas,
-                    splatCount: splatCount,
-                    shCoefficientCount: shCoefficientCount,
-                    renderSize: fullRenderSize
-                )
+                if tuning.filter3DOnCPU {
+                    updateFilter3DOnCPU(
+                        resources: resources,
+                        keyframes: slice.keyframes,
+                        supervision: supervision,
+                        cameraDeltas: cameraDeltas,
+                        splatCount: splatCount,
+                        renderSize: fullRenderSize
+                    )
+                } else {
+                    try updateFilter3D(
+                        gpu: gpu,
+                        resources: resources,
+                        queue: queue,
+                        keyframes: slice.keyframes,
+                        supervision: supervision,
+                        cameraDeltas: cameraDeltas,
+                        splatCount: splatCount,
+                        shCoefficientCount: shCoefficientCount,
+                        renderSize: fullRenderSize
+                    )
+                }
             }
 
             // --- IS THIS RUN STILL GETTING BETTER? -----------------------------
@@ -4267,6 +4278,80 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 supervision: supervision, cameraDeltas: cameraDeltas, splatCount: splatCount,
                 shCoefficientCount: shCoefficientCount, renderSize: renderSize
             )
+        }
+    }
+
+    /// Build 390 (local): the sweep on the CPU. For every point, the sampling
+    /// rate max(fx, fy) / depth at each of the sweep's cameras it projects
+    /// into (same stride, near, far and image bounds as the kernel), the
+    /// fourth largest kept, and filter width filterScale / rate, or the
+    /// fallback when no camera sees it: trainer_sampling_rate_update and
+    /// trainer_filter3d_finalize, line for line. The caller has drained the
+    /// step, so the shared buffers are read and written directly.
+    private func updateFilter3DOnCPU(
+        resources: TrainerResources,
+        keyframes: [CaptureFrame],
+        supervision: TrainerSupervisionBuilder,
+        cameraDeltas: [FrameID: Pose],
+        splatCount: Int,
+        renderSize: TrainerRenderSize
+    ) {
+        guard splatCount > 0, !keyframes.isEmpty else { return }
+        let intrinsics = supervision.renderIntrinsics
+            ?? CameraIntrinsics(
+                width: renderSize.width, height: renderSize.height,
+                fx: Float(renderSize.width), fy: Float(renderSize.width),
+                cx: Float(renderSize.width) / 2, cy: Float(renderSize.height) / 2
+            )
+        let stride = Swift.max(keyframes.count / 64, 1)
+        var views: [simd_float4x4] = []
+        var index = 0
+        while index < keyframes.count {
+            let frame = keyframes[index]
+            let base = supervision.pose(for: frame).matrix
+            views.append(cameraDeltas[frame.index].map { $0.matrix * base } ?? base)
+            index += stride
+        }
+        let fx = intrinsics.fx, fy = intrinsics.fy, cx = intrinsics.cx, cy = intrinsics.cy
+        let width = Float(renderSize.width), height = Float(renderSize.height)
+        let focal = Swift.max(fx, fy)
+        let near: Float = 0.05, far: Float = 100
+        let filterScale = tuning.filter3DScale
+        let fallback = tuning.filter3DFallbackMeters
+        let splatStride = MemoryLayout<TrainerSplat>.stride
+        let statsStride = MemoryLayout<TrainerSplatStats>.stride
+        guard resources.splats.length >= splatCount * splatStride,
+              resources.stats.length >= splatCount * statsStride
+        else { return }
+        let splats = resources.splats.contents().bindMemory(to: TrainerSplat.self, capacity: splatCount)
+        let stats = resources.stats.contents().bindMemory(to: TrainerSplatStats.self, capacity: splatCount)
+        let chunk = 4096
+        let chunks = (splatCount + chunk - 1) / chunk
+        DispatchQueue.concurrentPerform(iterations: chunks) { c in
+            let lo = c * chunk
+            let hi = Swift.min(lo + chunk, splatCount)
+            for i in lo..<hi {
+                let mean = SIMD4<Float>(splats[i].meanX, splats[i].meanY, splats[i].meanZ, 1)
+                var r0: Float = 0, r1: Float = 0, r2: Float = 0, r3: Float = 0
+                for view in views {
+                    let p = view * mean
+                    let z = p.z
+                    if z < near || z > far { continue }
+                    let u = fx * p.x / z + cx
+                    let v = fy * p.y / z + cy
+                    if u < 0 || v < 0 || u >= width || v >= height { continue }
+                    let rate = focal / Swift.max(z, 1e-4)
+                    if rate > r0 { r3 = r2; r2 = r1; r1 = r0; r0 = rate }
+                    else if rate > r1 { r3 = r2; r2 = r1; r1 = rate }
+                    else if rate > r2 { r3 = r2; r2 = rate }
+                    else if rate > r3 { r3 = rate }
+                }
+                var rate = r3
+                if rate <= 0 { rate = r2 }
+                if rate <= 0 { rate = r1 }
+                if rate <= 0 { rate = r0 }
+                stats[i].filter3D = rate > 0 ? filterScale / rate : fallback
+            }
         }
     }
 
