@@ -294,7 +294,9 @@ final class TrainerBudgetGovernor {
     // process may still allocate, so 0.6 of it tripped at 1.11 GB of run
     // footprint on a phone reporting 1.85 GB free, 70 MB above build 338's
     // whole run; the floor gate below is the real jetsam guard.
-    private let memoryUseFraction: Float = 0.8
+    // 0.85 (build 368): degree-3 rows at 1,080 px put the estimate at about
+    // 1.39 GB of a 1.85 GB allowance; the floor gate is the jetsam guard.
+    private let memoryUseFraction: Float = 0.85
 
     /// The least unallocated headroom this governor will let the process run
     /// on before it starts shedding work, whatever else is true.
