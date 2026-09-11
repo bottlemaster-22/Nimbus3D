@@ -441,3 +441,30 @@ if t.get('blurCalibrationSteps', 0):
           % (_k, 1000 * t['blurSecondsA'] / _k, 1000 * t['blurSecondsB'] / _k,
              t['blurSecondsB'] / max(t['blurSecondsA'], 1e-12), t.get('blurMismatchSteps', 0),
              'B (fused) used' if t.get('blurFusedChosen') else 'A kept'))
+
+# --- The exported points themselves (build 370): what a viewer will draw ---------
+try:
+    import numpy as _np, re as _re
+    _ply = path.replace('train_census.json', 'model.ply')
+    with open(_ply, 'rb') as _f:
+        _h = b''
+        while not _h.endswith(b'end_header
+'):
+            _h += _f.readline()
+        _hs = _h.decode('latin1')
+        _n = int(_re.search(r'element vertex (\d+)', _hs).group(1))
+        _props = _re.findall(r'property (\w+) (\w+)', _hs)
+        _a = _np.fromfile(_f, dtype=_np.dtype([(q[1], '<f4') for q in _props]), count=_n)
+    _sc = _np.exp(_np.stack([_a['scale_0'], _a['scale_1'], _a['scale_2']], 1))
+    _op = 1 / (1 + _np.exp(-_a['opacity']))
+    _model = _sc.max(1) < 1.0
+    _rest = len([q for q in _props if q[1].startswith('f_rest')])
+    print('EXPORTED PLY: %d points (%d model + %d far shell), SH rest %d (degree %s)'
+          % (_n, _model.sum(), (~_model).sum(), _rest, {9: 1, 24: 2, 45: 3}.get(_rest, '?')))
+    print('  point size, long axis: median %.1f mm  p10 %.1f  p90 %.1f;  short axis median %.2f mm'
+          % (1000 * _np.median(_sc.max(1)[_model]), 1000 * _np.percentile(_sc.max(1)[_model], 10),
+             1000 * _np.percentile(_sc.max(1)[_model], 90), 1000 * _np.median(_sc.min(1)[_model])))
+    print('  opacity: median %.2f, %.1f%% under 0.1     (Scaniverse reference: 3.4 mm median, 1%% under 0.1, SH degree 3)'
+          % (_np.median(_op[_model]), 100 * (_op[_model] < 0.1).mean()))
+except Exception as _e:
+    print('EXPORTED PLY: not measured (%s)' % _e)
