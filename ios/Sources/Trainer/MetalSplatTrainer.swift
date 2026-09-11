@@ -987,6 +987,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // this index; preloads started up to this index.
         var levelsDropped = 0
         var preloadsStarted = 1
+        // Build 364: the iteration of the last opacity reset, for the prune grace.
+        var lastOpacityReset = Int.min / 2
 
         // --- Census: open this slice's row now ---------------------------------
         // Opened before anything can go wrong and filled in as the slice runs,
@@ -1822,6 +1824,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // settings mean something.
             let inPruneWindow = progressFraction >= settings.pruneStartFraction
                 && progressFraction <= settings.pruneEndFraction
+                && iteration - lastOpacityReset >= tuning.opacityResetPruneGraceIterations
             if iteration > 0,
                iteration % Swift.max(tuning.densifyIntervalIterations, 1) == 0
             {
@@ -1890,6 +1893,16 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 try resetDensifyStats(
                     gpu: gpu, resources: resources, queue: queue, splatCount: splatCount
                 )
+                // Build 364: the opacity reset, on the densify cadence and only
+                // while growth is allowed, as the reference does it. The GPU
+                // is idle here (the pass and the stats reset both waited).
+                if tuning.opacityResetIntervalIterations > 0, inDensifyWindow,
+                   iteration % tuning.opacityResetIntervalIterations == 0
+                {
+                    resetOpacity(resources: resources, splatCount: splatCount)
+                    lastOpacityReset = iteration
+                    timings.opacityResets += 1
+                }
 
                 // --- Did this pass add anything, and how long has that been
                 //     true --------------------------------------------------
@@ -4067,6 +4080,31 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         resources.shAdamM.zeroAll()
         resources.shAdamV.zeroAll()
         return outSplats.count
+    }
+
+    /// Build 364: clamps every point's opacity down to `tuning.opacityResetTo`
+    /// and clears the optimiser's first and second moments of the opacity
+    /// lane. A CPU pass over shared buffers; the caller guarantees the GPU is
+    /// idle. Points that cannot earn their opacity back are pruned once the
+    /// grace period (`opacityResetPruneGraceIterations`) has passed.
+    private func resetOpacity(resources: TrainerResources, splatCount: Int) {
+        guard splatCount > 0 else { return }
+        let ceiling = TrainerMath.logit(tuning.opacityResetTo)
+        guard ceiling.isFinite else { return }
+        let stride = MemoryLayout<TrainerSplat>.stride
+        let gradStride = MemoryLayout<TrainerSplatGrad>.stride
+        guard resources.splats.length >= splatCount * stride,
+              resources.adamM.length >= splatCount * gradStride,
+              resources.adamV.length >= splatCount * gradStride
+        else { return }
+        let splats = resources.splats.contents().bindMemory(to: TrainerSplat.self, capacity: splatCount)
+        let m = resources.adamM.contents().bindMemory(to: TrainerSplatGrad.self, capacity: splatCount)
+        let v = resources.adamV.contents().bindMemory(to: TrainerSplatGrad.self, capacity: splatCount)
+        for i in 0..<splatCount {
+            if splats[i].opacityLogit > ceiling { splats[i].opacityLogit = ceiling }
+            m[i].opacity = 0
+            v[i].opacity = 0
+        }
     }
 
     private func resetDensifyStats(

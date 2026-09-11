@@ -1076,6 +1076,17 @@ struct TrainerTuning: Sendable {
     /// the EXPORTED sizes. 0.5 is the filter of a render at twice the training
     /// long edge (1,440 px), which is the least any viewer draws at.
     var exportFilter3DScale: Float = 0.75
+    /// Build 364: the reference recipe's opacity reset. Every this many
+    /// iterations, inside the densify window, every point's opacity is
+    /// clamped down to `opacityResetTo` and the optimiser's memory of the
+    /// opacity lane is cleared, so a point that was only alive by habit has
+    /// to earn its opacity again. 0 turns it off.
+    var opacityResetIntervalIterations: Int = 3000
+    var opacityResetTo: Float = 0.01
+    /// Faint-point pruning waits this long after a reset, so the points that
+    /// are recovering are not the ones it removes (the reference prunes at
+    /// 0.005, below the reset value; ours prunes at 0.08 and needs the wait).
+    var opacityResetPruneGraceIterations: Int = 500
     /// Filter size, world metres, for a Gaussian no camera ever sampled.
     var filter3DFallbackMeters: Float = 0.01
     /// How often the per-Gaussian sampling-rate sweep is re-run.

@@ -735,6 +735,8 @@ struct TrainerTimings: Codable {
     /// Build 336: the largest process-wide footprint the memory poll saw
     /// (what this run had allocated since it began), in MB.
     var memoryFootprintPeakMegabytes: Double = 0
+    /// Build 364: opacity resets performed (the reference recipe's, every 3,000).
+    var opacityResets: Int = 0
     /// Build 330: the pose check. Photometric loss (L1 + SSIM terms) of the
     /// frame at its current camera correction and after one gradient step,
     /// on the same model; 1 if the step lowered it (full-rate refinement

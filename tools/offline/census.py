@@ -179,6 +179,8 @@ if t.get('mergedSteps'):    print('merged steps: %d of %d overlapped ran as one 
 if 'supervisionCacheHits' in t:
     print('frame cache: %d builds served without a decode, cache peak %.0f MB'
           % (t['supervisionCacheHits'], t.get('supervisionCacheMegabytes', 0)))
+if t.get('opacityResets'):
+    print('opacity resets: %d' % t['opacityResets'])
 if t.get('memoryFootprintPeakMegabytes'):
     print('MEMORY: run footprint peaked at %.0f MB (ceiling %.0f MB)'
           % (t['memoryFootprintPeakMegabytes'],

@@ -1402,3 +1402,7 @@ Measured against the owner's Scaniverse export of the same room (427,710 points,
 ### BUILD 362: 30,000 iterations, quality first
 
 Owner's call: the reference recipe's iteration count, quality over the clock. Room budget iterations 4,500 -> 30,000 (levels stay fractional: 360 px to 13,500, 720 px to 24,000, 1,080 px for the last 6,000). Thermal: degradeAt .fair -> .serious for rooms, so a warm phone pauses to cool instead of taking the one-way resolution cut fifteen seconds in. Calibration windows moved to 24,200-24,229 (inside the 1,080-px level, where the choices matter). Early stop keeps its 400-iteration evals and 4-eval patience, so a plateau in the final level ships the best cloud early. Not applied yet: opacity reset every 3,000 (needs a kernel or a CPU pass over the Adam state), SH degree 3 (shader work). Expected about 6 to 7 minutes.
+
+### BUILD 364: opacity reset every 3,000 iterations
+
+The reference recipe's reset, missing until now: on the densify cadence, inside the densify window, every point's opacity logit is clamped to logit(0.01) and adamM/adamV's opacity lanes are zeroed (a CPU pass over the shared buffers with the GPU idle, right after the densify pass and the stats reset). Because our faint prune sits at 0.08 (the reference's is 0.005, below the reset value), pruning waits 500 iterations after each reset so recovering points are not the ones removed. Census: `timings.opacityResets`.
