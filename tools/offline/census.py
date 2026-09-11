@@ -448,8 +448,7 @@ try:
     _ply = path.replace('train_census.json', 'model.ply')
     with open(_ply, 'rb') as _f:
         _h = b''
-        while not _h.endswith(b'end_header
-'):
+        while not _h.endswith(b'end_header\n'):
             _h += _f.readline()
         _hs = _h.decode('latin1')
         _n = int(_re.search(r'element vertex (\d+)', _hs).group(1))
