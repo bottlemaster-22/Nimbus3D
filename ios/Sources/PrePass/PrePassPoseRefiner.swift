@@ -1143,11 +1143,45 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         let n = submaps.count
         let dimension = 6 * n
 
+        // CONTINUOUS CORRECTION: a frame's correction is interpolated in time
+        // between the two submaps whose window centres bracket it. One rigid
+        // correction per owner tore build 266's path at all 18 owner
+        // boundaries: consecutive frames a third of a second apart differed by
+        // a median 1.18 deg / 3.4 cm and up to 2.08 deg / 23.9 cm, against
+        // 0.06 deg / 0.16 cm inside an owner (tools/offline/reg_boundaries.py).
+        // Frames before submap 0's centre keep M_0 exactly.
+        let centreTimes = submaps.map { 0.5 * ($0.startTimeSeconds + $0.endTimeSeconds) }
+        let timeOf = Dictionary(
+            frames.map { ($0.index, $0.timestampSeconds) }, uniquingKeysWith: { first, _ in first }
+        )
+        typealias Bracket = (low: Int, high: Int, s: Double)
+        func bracket(_ time: Double) -> Bracket {
+            guard n > 1, time > centreTimes[0] else { return (0, 0, 0) }
+            guard time < centreTimes[n - 1] else { return (n - 1, n - 1, 0) }
+            var low = 0
+            var high = n - 1
+            while high - low > 1 {
+                let mid = (low + high) / 2
+                if centreTimes[mid] <= time { low = mid } else { high = mid }
+            }
+            let span = centreTimes[high] - centreTimes[low]
+            guard span > 1e-9 else { return (low, low, 0) }
+            return (low, high, (time - centreTimes[low]) / span)
+        }
+        /// exp(s log(M_high M_low^-1)) M_low: M_low at s = 0, M_high at s = 1.
+        func blended(_ state: [PrePassSE3], _ b: Bracket) -> PrePassSE3 {
+            guard b.low != b.high, b.s > 0 else { return state[b.low] }
+            let d = state[b.low].inverse.then(state[b.high]).logVector()
+            return state[b.low].then(PrePassSE3.exp(d.map { $0 * b.s }))
+        }
+
         // Usable edges only. A zero-confidence pair is a geometric note for
         // the QC card, not an observation (see `detectRevisits`).
         struct Edge {
             var slotA: Int
             var slotB: Int
+            var bracketA: (low: Int, high: Int, s: Double)
+            var bracketB: (low: Int, high: Int, s: Double)
             var measurement: PrePassSE3
             var poseA: PrePassSE3
             var poseB: PrePassSE3
@@ -1159,12 +1193,15 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
             guard let submapA = owners[pair.frameA], let submapB = owners[pair.frameB],
                   let slotA = slotOfSubmap[submapA], let slotB = slotOfSubmap[submapB],
                   slotA != slotB,
+                  let timeA = timeOf[pair.frameA], let timeB = timeOf[pair.frameB],
                   let rawA = basePoses[pair.frameA], let rawB = basePoses[pair.frameB]
             else { continue }
             edges.append(
                 Edge(
                     slotA: slotA,
                     slotB: slotB,
+                    bracketA: bracket(timeA),
+                    bracketB: bracket(timeB),
                     measurement: PrePassSE3(pair.measuredRelativePose),
                     poseA: PrePassSE3(rawA),
                     poseB: PrePassSE3(rawB),
@@ -1204,8 +1241,8 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         func graphCost(_ state: [PrePassSE3], delta: Double) -> Double {
             var total: Double = 0
             for edge in edges {
-                let pA = state[edge.slotA].then(edge.poseA)
-                let pB = state[edge.slotB].then(edge.poseB)
+                let pA = blended(state, edge.bracketA).then(edge.poseA)
+                let pB = blended(state, edge.bracketB).then(edge.poseB)
                 let error = pA.inverse.then(pB).then(edge.measurement.inverse)
                 var residual = error.logVector()
                 for i in 0..<3 { residual[i] *= revisitRotationWeight }
@@ -1256,8 +1293,8 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
 
             // --- Revisit edges
             for edge in edges {
-                let mA = corrections[edge.slotA]
-                let mB = corrections[edge.slotB]
+                let mA = blended(corrections, edge.bracketA)
+                let mB = blended(corrections, edge.bracketB)
                 let pA = mA.then(edge.poseA)      // raw_a * M_a  (apply M first)
                 let pB = mB.then(edge.poseB)
                 let e = pA.inverse.then(pB)       // P_b * P_a^-1
@@ -1307,9 +1344,16 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
                 accumulate(
                     h: &h, g: &g, dimension: dimension,
                     residual: residual, weight: robust,
+                    // First order: a left increment on either bracketing submap
+                    // reaches the blended correction weighted by (1 - s) and s.
+                    // Same order of approximation as the Jl^-1 ~ I above; the
+                    // LM cost test uses the exact blend. When low == high, s is
+                    // 0 and the second block of each pair adds zeros.
                     blocks: [
-                        (edge.slotB, jacobianB, 1.0),
-                        (edge.slotA, jacobianAFull, -1.0)
+                        (edge.bracketB.low, jacobianB, 1.0 - edge.bracketB.s),
+                        (edge.bracketB.high, jacobianB, edge.bracketB.s),
+                        (edge.bracketA.low, jacobianAFull, -(1.0 - edge.bracketA.s)),
+                        (edge.bracketA.high, jacobianAFull, -edge.bracketA.s)
                     ],
                     rowScales: (revisitRotationWeight, revisitTranslationWeight)
                 )
@@ -1408,8 +1452,8 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         residualCentimeters.reserveCapacity(edges.count)
         residualDegrees.reserveCapacity(edges.count)
         for edge in edges {
-            let pA = corrections[edge.slotA].then(edge.poseA)
-            let pB = corrections[edge.slotB].then(edge.poseB)
+            let pA = blended(corrections, edge.bracketA).then(edge.poseA)
+            let pB = blended(corrections, edge.bracketB).then(edge.poseB)
             let error = pA.inverse.then(pB).then(edge.measurement.inverse)
             residualCentimeters.append(Float(simd_length(error.translation) * 100))
             residualDegrees.append(Float(error.rotationAngleDegrees))
@@ -1454,12 +1498,9 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         refined.reserveCapacity(frames.count)
         for frame in frames {
             let base = basePoses[frame.index] ?? frame.rawPose
-            guard let submap = owners[frame.index], let slot = slotOfSubmap[submap] else {
-                refined[String(frame.index)] = base
-                continue
-            }
-            // refined = raw * M  (apply M to the world point first).
-            refined[String(frame.index)] = corrections[slot].then(PrePassSE3(base)).pose
+            // refined = raw * M(t)  (apply M to the world point first).
+            refined[String(frame.index)] = blended(corrections, bracket(frame.timestampSeconds))
+                .then(PrePassSE3(base)).pose
         }
 
         // How far the cameras actually moved. A graph with edges that moves
@@ -1478,9 +1519,7 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
             census.maxPoseShiftCentimeters = shifts.max() ?? 0
         }
         // The tear: refined relative motion of consecutive frames against the
-        // relative motion that went in. One rigid correction per owner submap
-        // leaves a jump at every owner boundary; offline on build 266 the
-        // worst was 23.9 cm / 3.1 deg between frames a third of a second apart.
+        // relative motion that went in. About 23.9 cm / 3.1 deg on build 266.
         var tearCentimeters: Float = 0
         var tearDegrees: Float = 0
         for k in 1..<frames.count {
