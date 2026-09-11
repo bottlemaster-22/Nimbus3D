@@ -4136,14 +4136,16 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         queue: MTLCommandQueue,
         splatCount: Int
     ) throws {
-        guard let buffer = queue.makeCommandBuffer(),
-              let encoder = buffer.makeComputeCommandEncoder()
-        else { throw TrainerError.noMetalDevice }
-        encoder.label = "trainer.resetDensifyStats"
-        gpu.resetDensifyStats(encoder, count: splatCount)
-        encoder.endEncoding()
-        buffer.commit()
-        try finish(buffer, "a reset pass")
+        try autoreleasepool {
+            guard let buffer = queue.makeCommandBuffer(),
+                  let encoder = buffer.makeComputeCommandEncoder()
+            else { throw TrainerError.noMetalDevice }
+            encoder.label = "trainer.resetDensifyStats"
+            gpu.resetDensifyStats(encoder, count: splatCount)
+            encoder.endEncoding()
+            buffer.commit()
+            try finish(buffer, "a reset pass")
+        }
     }
 
     /// Wait for a batch of GPU work AND ask whether it actually worked.
@@ -4224,6 +4226,28 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// accidental close-up shrinking the filter for a Gaussian the rest of the
     /// capture only saw from three metres away.
     private func updateFilter3D(
+        gpu: TrainerGPU,
+        resources: TrainerResources,
+        queue: MTLCommandQueue,
+        keyframes: [CaptureFrame],
+        supervision: TrainerSupervisionBuilder,
+        cameraDeltas: [FrameID: Pose],
+        splatCount: Int,
+        shCoefficientCount: Int,
+        renderSize: TrainerRenderSize
+    ) throws {
+        // Build 372: one command buffer per camera, all autoreleased; see
+        // TrainerDensifier.run.
+        try autoreleasepool {
+            try updateFilter3DInner(
+                gpu: gpu, resources: resources, queue: queue, keyframes: keyframes,
+                supervision: supervision, cameraDeltas: cameraDeltas, splatCount: splatCount,
+                shCoefficientCount: shCoefficientCount, renderSize: renderSize
+            )
+        }
+    }
+
+    private func updateFilter3DInner(
         gpu: TrainerGPU,
         resources: TrainerResources,
         queue: MTLCommandQueue,

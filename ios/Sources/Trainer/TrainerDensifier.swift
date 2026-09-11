@@ -347,6 +347,31 @@ final class TrainerDensifier {
         /// Run the CPU path beside the gather and compare the results.
         checkGather: Bool = false
     ) throws -> TrainerDensifyOutcome {
+        // Build 372: every Metal object this pass makes (command buffers,
+        // encoders, temporary buffers) is autoreleased, and the training
+        // loop is one long detached task whose pool never drains. The step
+        // encoders already run inside a pool; the 300 passes of a 30,000-
+        // iteration run did not, and build 368 grew to 2.8 GB and was killed.
+        try autoreleasepool {
+            try runInner(
+                resources: resources, splatCount: splatCount, splatCap: splatCap,
+                sceneExtentMeters: sceneExtentMeters, allowGrowth: allowGrowth,
+                allowPrune: allowPrune, carver: carver, gather: gather, checkGather: checkGather
+            )
+        }
+    }
+
+    private func runInner(
+        resources: TrainerResources,
+        splatCount: Int,
+        splatCap: Int,
+        sceneExtentMeters: Float,
+        allowGrowth: Bool,
+        allowPrune: Bool,
+        carver: FreeSpaceCarver?,
+        gather: TrainerDensifyGather?,
+        checkGather: Bool
+    ) throws -> TrainerDensifyOutcome {
 
         var outcome = TrainerDensifyOutcome()
         // Every return below, early or late or thrown, goes through this. A

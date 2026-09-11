@@ -1414,3 +1414,7 @@ trainer_evalSH gains the degree-3 block (7 basis terms, reference constants and 
 ### BUILD 370: the census survives a memory kill
 
 368 (30k, 1,080 px, SH3, resets) reached 2.8 GB of process memory and was killed past iteration 10,000, inside level 0 (360 px); the owner says the preview looked good at 9,000-10,000. Nothing was on disk because the census is written at the end. Now: a memory sample every 500 iterations (footprint, trainer buffers, frame caches, population, capacity, instance capacity, long edge) and the census file rewritten every 1,000 iterations, so the next kill leaves the curve. census.py prints it. No mitigation yet: the growth is not identified (candidates: something per densify pass or per preview at degree 3, instance-capacity growth, or the reset's effect on per-pixel work is not memory at all).
+
+### BUILD 372: autorelease pools around the densify pass and the filter sweep
+
+The most likely shape of 368's growth: the loop is one detached task whose autorelease pool never drains, the step encoders run inside their own pools (builds 300+), but the densify pass (300 of them at 30k) and the 3D-filter sweep (60, one command buffer per camera) do not. Both now run inside `autoreleasepool`. Not proven: 370's memory curve is what proves or refutes it.
