@@ -65,8 +65,9 @@ struct PrePassSeedInputs {
     var depthUnreadable = false
 }
 
-/// Decodes ONE keyframe ahead, on a background queue, so the loading for
-/// frame N+1 happens while frame N's samples are being walked.
+/// Decodes keyframes AHEAD, several at once on a concurrent background queue
+/// (`lookahead`, build 296; it was one frame on one worker), so the loading for
+/// the next frames happens while frame N's samples are being walked.
 ///
 /// WHY: seeding measured 16.65 s of a 22.0 s pre-pass, 76% of it, across 174
 /// keyframes. That is 96 ms a frame, and each frame begins by reading a depth
@@ -74,10 +75,10 @@ struct PrePassSeedInputs {
 /// a 1920x1440 JPEG, all before a single sample is examined. None of that
 /// needs the previous frame's answer.
 ///
-/// The same shape as `TrainerSupervisionPrefetch`, and safe for the same
-/// reason: exactly one thread touches the work at a time. `start` waits for
-/// any previous worker, `take` waits before handing back. Everything captured
-/// here is read-only for the whole pass.
+/// Safe because each load is a pure function of its frame and writes only its
+/// own entry in `results`, under `lock`; `take` waits for that frame's work
+/// item before handing it back, and `drain` waits for all of them. Everything
+/// captured here is read-only for the whole pass.
 ///
 /// The edge map is deliberately NOT prefetched. `edgeMapFor` arrives as a
 /// non-escaping closure and cannot cross to a worker thread, and it is a
@@ -91,12 +92,21 @@ final class PrePassSeedPrefetch: @unchecked Sendable {
     private let width: Int
     private let height: Int
 
+    /// How many keyframes ahead are loaded at once (build 296). The loop spends
+    /// ~3 ms a keyframe on its samples and a load (depth, points, photo) takes
+    /// ~6 ms, so one worker one frame ahead left the loop waiting 0.57 s of its
+    /// 1.07 s on build 276. Several loads in flight on a concurrent queue keep
+    /// it fed. Each load is a pure function of its frame, so the inputs are
+    /// byte-identical whichever thread produced them.
+    static let lookahead = 4
+
     private let queue = DispatchQueue(
-        label: "likova.prepass.seed-prefetch", qos: .userInitiated
+        label: "likova.prepass.seed-prefetch", qos: .userInitiated,
+        attributes: .concurrent
     )
-    private var work: DispatchWorkItem?
-    private var key: FrameID?
-    private var built = PrePassSeedInputs()
+    private let lock = NSLock()
+    private var inFlight: [FrameID: DispatchWorkItem] = [:]
+    private var results: [FrameID: PrePassSeedInputs] = [:]
 
     init(
         bundle: CaptureBundle, ref: CaptureBundleRef,
@@ -134,34 +144,50 @@ final class PrePassSeedPrefetch: @unchecked Sendable {
         return out
     }
 
+    /// Starts loading `frame` unless it is already loading or loaded.
     func start(_ frame: CaptureFrame) {
-        drain()
-        let item = DispatchWorkItem { [self] in
-            built = load(frame)
+        let index = frame.index
+        lock.lock()
+        if inFlight[index] != nil || results[index] != nil {
+            lock.unlock()
+            return
         }
-        key = frame.index
-        work = item
+        let item = DispatchWorkItem { [self] in
+            let value = load(frame)
+            lock.lock()
+            results[index] = value
+            lock.unlock()
+        }
+        inFlight[index] = item
+        lock.unlock()
         queue.async(execute: item)
     }
 
-    /// The prefetched frame if it is the one being asked for, otherwise nil
-    /// and the caller loads it itself. Blocks until the worker is done either
-    /// way, so nothing is in flight afterwards.
+    /// Waits for `frame`'s load and hands it over, or nil when it was never
+    /// started (the caller then loads it inline, as before).
     func take(_ frame: CaptureFrame) -> PrePassSeedInputs? {
-        work?.wait()
-        work = nil
-        let matched = key == frame.index
-        let value = built
-        key = nil
-        built = PrePassSeedInputs()
-        return matched ? value : nil
+        lock.lock()
+        let item = inFlight[frame.index]
+        lock.unlock()
+        guard let item else { return nil }
+        item.wait()
+        lock.lock()
+        inFlight[frame.index] = nil
+        let value = results.removeValue(forKey: frame.index)
+        lock.unlock()
+        return value
     }
 
+    /// Waits for every load in flight and drops what is left over.
     func drain() {
-        work?.wait()
-        work = nil
-        key = nil
-        built = PrePassSeedInputs()
+        lock.lock()
+        let items = Array(inFlight.values)
+        lock.unlock()
+        for item in items { item.wait() }
+        lock.lock()
+        inFlight.removeAll()
+        results.removeAll()
+        lock.unlock()
     }
 }
 
@@ -595,7 +621,7 @@ enum PrePassInitialSplatBuilder {
             maxRange: maxRange, width: width, height: height
         )
         defer { prefetch.drain() }
-        if let first = keyframes.first { prefetch.start(first) }
+        for first in keyframes.prefix(PrePassSeedPrefetch.lookahead) { prefetch.start(first) }
 
         let loopStarted = Date()
         census.secondsBeforeLoop = loopStarted.timeIntervalSince(seedingStarted)
@@ -611,8 +637,9 @@ enum PrePassInitialSplatBuilder {
             // point: the next frame decodes while these 49,152 samples are
             // walked. Above the skip guards below, so a frame with no depth
             // still leaves a worker running for the one after it.
-            if keyframeIndex + 1 < keyframes.count {
-                prefetch.start(keyframes[keyframeIndex + 1])
+            for ahead in 1...PrePassSeedPrefetch.lookahead
+            where keyframeIndex + ahead < keyframes.count {
+                prefetch.start(keyframes[keyframeIndex + ahead])
             }
 
             if inputs.depthUnreadable {

@@ -1198,3 +1198,7 @@ Nothing in the app shows a rate. The owner's "around 50 RPS" matches 4,000 itera
 ### BUILD 294: the trust build's plane sweeps on every core
 
 The serial prefix was 1.2 s for 13 slots (20,000 sweeps, one at a time). Per budgeted slot now: pass 1 lists, in sample order, every sample that reaches the sweep call (eligibility depends only on data before the call); the sweeps run on every core in 512-candidate order-preserving chunks and are consumed in order against the budget exactly as the loop would (a nil result spends nothing), stopping where it runs out; pass 2 is the slot as before with each sweep looked up. Same samples swept, same results, same order, same bytes. Pass 1 repeats ~1.4 ms of non-sweep work per serial slot.
+
+### BUILD 296: seeding loads four keyframes ahead, concurrently
+
+The seeding sample loop (1.07 s on 276) spent 0.57 s waiting on its one-frame-ahead prefetch: a load (depth sidecar, unprojection, photo decode) takes ~6 ms against ~3 ms of sample work. PrePassSeedPrefetch now keeps `lookahead` (4) loads in flight on a concurrent queue, each writing its own entry under a lock; take waits for that frame's item; a frame never started still loads inline. Each load is a pure function of its frame, so the inputs, the loop and init_splats.ply are byte-identical. Census: seeding.secondsPrefetchWait should fall toward 0.
