@@ -5032,7 +5032,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             sh: resources.sh.readArray(Float.self, count: count * shPerSplat),
             shPerSplat: shPerSplat,
             stats: resources.stats.readArray(TrainerSplatStats.self, count: count),
-            shDegree: shDegree
+            shDegree: shDegree,
+            filter3DScale: tuning.exportFilter3DScale
         )
     }
 
@@ -5044,7 +5045,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         sh: [Float],
         shPerSplat: Int,
         stats: [TrainerSplatStats],
-        shDegree: SHDegree
+        shDegree: SHDegree,
+        /// Share of the training-grid 3D filter width folded into the sizes
+        /// (build 356). 1 is the training render's own.
+        filter3DScale: Float = 1
     ) -> SplatCloud {
         guard !splats.isEmpty else { return SplatCloud.empty(shDegree: shDegree) }
         let restCount = shDegree.restCoefficientCount
@@ -5166,8 +5170,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // 3.4 mm in the Scaniverse reference while the trained views scored
             // 22 dB. Viewers draw at 1,440 px and up, where the right filter
             // is half as wide, so half is what the file carries.
-            let scale = tuning.exportFilter3DScale
-            let changed = try cloud.fuse3DFilter(filters.map { $0 * scale })
+            let changed = try cloud.fuse3DFilter(filters.map { $0 * filter3DScale })
             TrainerLog.general.notice(
                 "Folded the 3D low-pass filter into \(changed) of \(cloud.count) points."
             )
