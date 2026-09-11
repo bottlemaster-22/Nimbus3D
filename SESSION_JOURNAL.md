@@ -1024,3 +1024,63 @@ Build 271/272 green (ae3d513).
 - Census: trainer camera deltas per slice (median, max, common-mode). Ceiling ~0.9 deg / 6.3 cm.
 
 Registration research (ledger A27, A27t, TEAR): the rigid image shift is worth +0.25 dB cross-validated, it is not a timing error, and the pose graph TEARS the path at all 18 submap boundaries (median 1.18 deg / 3.4 cm, worst 2.08 deg / 23.9 cm between consecutive frames). The continuous-correction fix is the next quality A/B, its own build.
+
+Builds 273/274 green (0c2033c). 274 is the build to test.
+
+---
+
+## 2026-09-11 : Build 276 prepared, HELD until 274 is measured
+
+Research workflows both finished (8 + 2 agents). Everything below was checked against the code or reproduced before it went in.
+
+### THE ONE QUALITY CHANGE: continuous pose correction (ledger TEAR)
+
+The pose graph applied one rigid correction per owner submap, so the camera path TORE at all 18 owner boundaries on 266: consecutive frames a third of a second apart differ by a median 1.18 deg / 3.4 cm and up to 2.08 deg / 23.9 cm (reg_boundaries.py, cross-checked from prepass_result's submap corrections), against 0.06 deg / 0.16 cm inside a submap. 44 percent of frames sit within 10 frames of a boundary; held-out frame 47 is one frame past the worst. Now each frame's correction is interpolated in time between the two submaps whose window centres bracket it: exp(s log(M_h M_l^-1)) M_l. I checked the maths against PrePassSE3 (then = apply self first; left increments), the Jacobian split (first order (1-s, s); LM still accepts on the exact cost) and accumulate (duplicate slots and cross terms sum correctly). Frames before submap 0's centre keep M_0, so frames 0-15 stay a valid A27 control. New census: poseGraph.maxConsecutiveTearCentimeters / Degrees (expect about 23.9 cm / 3.1 deg to fall below about 1 cm / 0.2 deg).
+
+### EXACT OR RECORD-ONLY
+
+- **Seeded training order.** `order.shuffle()` drew from the system generator, so every run trained a different sequence (the comment said "reproducible"; it was not). Now SplitMix64 with a fixed seed. Changes the order once, then every run of a build repeats it: one known share of the run-to-run noise gone.
+- **Per-frame held-out PSNR** in the census (`heldOutPerFrame`), so builds with different held-out sets can be compared on the frames they share.
+- **Held-out curve records raw AND exposure-fitted** (`psnrRaw`, `psnrExposureFitted`); selection still on fitted, bit-identical (same expression, verified by reading evaluateHeldOut). Switching selection to raw is its own device A/B later.
+- `model/exposure.bin` and `prepass/revisits.json` go out with the diagnostics.
+
+### EXPOSURE, what the workflow found (ledger A38, A26, EXP-LS, EXP-FIX, HDR)
+
+The per-frame GAIN is inert, the BIAS is not: it reaches up to 62 percent of its clamp and flatters trained frames only (+0.46 dB on fixed renders). Photos 0-15 are 6-16 percent brighter than the model's render and white balance drifts up to 12 percent; ISO was never recorded (the camera-device bug fixed in 270). The held-out least-squares fit reads render error (gain vs PSNR r = +0.93), and checkpoint selection runs on it. Queued device A/Bs: a first-moment brightness gain (new tuning fields; bias 0; after warm-up; re-centred), then raw selection. Capture: the HDR check reads the video format before it is chosen.
+
+### QUEUE, one variable each, against 274's clean held-out set
+
+1. 274 (look-ahead off) - to test now.
+2. 276 continuous correction (+ seeded order and records).
+3. A54: split share 1.0 and shrink 2.0 (sizesim: p50 5.4 to 6.5 mm if the optimiser keeps it; nothing if it reverts). Watch prunedLowOpacity for relocation holes.
+4. A25: disc prior off (never run; the prior binds 3.8x over its null; watch needles).
+5. Exposure first-moment gain. 6. Raw selection. 7. A59 SH rest LR 20 to 5. A45 rides with whichever passes.
+8. Round-robin ICP cap to 2,000 (after 276). Pose-graph anneal hold.
+
+---
+
+## 2026-09-11 : Build 274 measured, and 276 re-planned around a fixed test set
+
+### BUILD 274, MEASURED
+
+Every exact signature matched: held_out_frames.json [17, 61, 109, 155, 199, 231, 272, 314, 352, 392, 425, 460] and span 0..485 exactly as kf_exact.py predicted, authorityFramesBuilt 244, revisits icpConverged 132 / rejected 468 / confirmed 132, poseGraph.initialCost 4520.09, seeds 831,975 with trustedCount 375,502 and onEdgeCount 202,116.
+
+| | 270 | 274 |
+|---|---|---|
+| pre-pass | 7.9 s | **5.6 s** (revisits 0.91 to 0.28, trust 3.41 to 2.07: confidence 0.87 to 0.17, parallel apply 0.08; seeding write 0.19 to 0.02) |
+| training | 62 s | 60 s (gpuStep 43.5) |
+| **total** | 69.9 s | **~65.6 s** |
+| best held-out (fitted) / SSIM | 20.42 / 0.666 (leaked set) | **17.84 / 0.593** (clean set) |
+| trained-view PSNR | 21.98 | 21.54, gap **+4.0 dB** |
+
+The drop is not comparable: the test set changed completely and 266/270's was half trained frames. The estimate for 270's clean half was ~18.9; 274 is ~1 dB under it, inside the frame-to-frame spread (frames 0-15 alone range 14.5 to 19.5 dB). Cannot tell from this pair whether look-ahead 0 cost anything. What IS clear: the honest generalisation gap is ~4 dB, so what makes unseen views disagree (registration, exposure) matters more than it looked.
+
+Camera deltas (first census): median 0.000 deg / 0.01 cm, max 0.056 deg / 0.13 cm, common mode ~0. The trainer's pose refinement is effectively OFF (lr 1e-5). Not hiding pose error; not fixing any either.
+
+Remaining pre-pass: trust serial prefix 1.20 s (13 slots, 20,000 sweeps), seeding loop 1.03 s of which 0.56 s waiting on the prefetch (decode-bound), carving 1.07 s.
+
+### BUILD 276 (re-planned)
+
+The tear fix changes refined poses, and the keyframe walk runs on refined poses with gate margins of 2e-6, so it would have swapped the whole held-out set again. So 276 first makes the test set FIXED: every pool frame with index % 40 == 20 is removed from the walk and, inside the trained span, held out. The walk picks 120 - 12 = 108 (train plus held-out stays at 120, under the 128-frame caches). kf_fixed.py predicts exactly: 108 trained, span 0..434, held out [20, 60, 100, 140, 180, 220, 260, 300, 340, 380, 420], overlap none. 276 is the NEW BASELINE; it also carries the seeded order, per-frame held-out scores, raw-beside-fitted curve, the consecutive-frame tear MEASUREMENT (no fix), exposure.bin and revisits.json in diagnostics.
+
+**278 = the continuous-correction fix alone**, compared per frame on the same fixed set (saved: scratchpad tearfix.patch).

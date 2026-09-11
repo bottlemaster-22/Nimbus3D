@@ -87,6 +87,7 @@ enum TrainerSlicePlanner {
         bundle: CaptureBundle,
         prePass: PrePassResult,
         keyframes: [CaptureFrame],
+        fixedHeldOut: [CaptureFrame]? = nil,
         budget: TrainingBudget,
         heldOutFraction: Float
     ) -> [TrainerSlice] {
@@ -102,7 +103,10 @@ enum TrainerSlicePlanner {
 
         if !useSubmaps {
             let bounds = boundingBox(of: keyframes, prePass: prePass, fallback: bundle.sceneBounds)
-            let split = splitHeldOut(keyframes, fraction: heldOutFraction)
+            // A fixed held-out set, when the selector made one, is already
+            // out of `keyframes` (see selectKeyframes).
+            let split = fixedHeldOut.map { (train: keyframes, heldOut: $0) }
+                ?? splitHeldOut(keyframes, fraction: heldOutFraction)
             return [
                 TrainerSlice(
                     index: 0,
@@ -171,7 +175,13 @@ enum TrainerSlicePlanner {
                 ? submap.bounds
                 : boundingBox(of: frames, prePass: prePass, fallback: bundle.sceneBounds)
 
-            let split = splitHeldOut(frames, fraction: heldOutFraction)
+            // With a fixed held-out set, this slice scores the held-out
+            // frames inside its own frame range.
+            let low = frames.map(\.index).min() ?? 0
+            let high = frames.map(\.index).max() ?? 0
+            let split = fixedHeldOut.map { fixed in
+                (train: frames, heldOut: fixed.filter { $0.index >= low && $0.index <= high })
+            } ?? splitHeldOut(frames, fraction: heldOutFraction)
             slices.append(
                 TrainerSlice(
                     index: nextIndex,
@@ -193,7 +203,10 @@ enum TrainerSlicePlanner {
         // returning an empty array.
         if slices.isEmpty {
             let bounds = boundingBox(of: keyframes, prePass: prePass, fallback: bundle.sceneBounds)
-            let split = splitHeldOut(keyframes, fraction: heldOutFraction)
+            // A fixed held-out set, when the selector made one, is already
+            // out of `keyframes` (see selectKeyframes).
+            let split = fixedHeldOut.map { (train: keyframes, heldOut: $0) }
+                ?? splitHeldOut(keyframes, fraction: heldOutFraction)
             return [
                 TrainerSlice(
                     index: 0,

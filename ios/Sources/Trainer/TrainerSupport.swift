@@ -1050,6 +1050,13 @@ struct TrainerTuning: Sendable {
     /// resolve the changes being made is not worth its training data.
     var heldOutFraction: Float = 0.10
 
+    /// Held-out frames FIXED by frame index (build 276): every frame with
+    /// index % 40 == 20 is kept out of the keyframe walk and, inside the
+    /// trained span, scored. Independent of the walk and of the poses, so a
+    /// pose-graph or selector change no longer swaps the test set. 0 or 1
+    /// falls back to every tenth chosen keyframe (the old split).
+    var heldOutFrameStride: Int = 40
+
     init() {}
 }
 

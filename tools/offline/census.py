@@ -329,3 +329,22 @@ for s_ in (d.get('slices') or []):
                  s_.get('cameraDeltaMedianCentimeters', 0), s_.get('cameraDeltaMaxDegrees', 0),
                  s_.get('cameraDeltaMaxCentimeters', 0), s_.get('cameraDeltaCommonDegrees', 0),
                  s_.get('cameraDeltaCommonCentimeters', 0)))
+
+# Per-frame held-out scores (build 276+), and the pose-graph tear.
+for s_ in (d.get('slices') or []):
+    pf = s_.get('heldOutPerFrame')
+    if pf:
+        print('HELD-OUT PER FRAME: ' + '  '.join('%d:%.2f' % (e['frameIndex'], e['psnr']) for e in pf))
+curve = [e for s_ in (d.get('slices') or []) for e in (s_.get('heldOutCurve') or []) if 'psnrRaw' in e]
+if curve:
+    print('HELD-OUT CURVE raw vs fitted: ' + '  '.join(
+        '%d:%.2f/%.2f' % (e['iteration'], e['psnrRaw'], e.get('psnrExposureFitted') or 0) for e in curve))
+try:
+    _pre_census = json.load(open(pre_path, encoding='utf-8'))
+except Exception:
+    _pre_census = None
+if _pre_census:
+    pg = _pre_census.get('poseGraph') or {}
+    if 'maxConsecutiveTearCentimeters' in pg:
+        print('POSE GRAPH TEAR: worst consecutive-frame %.1f cm / %.2f deg  (build 266: 23.9 cm / 3.1 deg)'
+              % (pg['maxConsecutiveTearCentimeters'], pg.get('maxConsecutiveTearDegrees', 0)))

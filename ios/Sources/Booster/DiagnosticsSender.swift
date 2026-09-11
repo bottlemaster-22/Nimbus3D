@@ -52,7 +52,8 @@ public final class DiagnosticsSender: ObservableObject {
         "model/held_out_frames.json",
         "prepass/prepass_result.json",
         "prepass/census.json",
-        "prepass/revisits.json"
+        "prepass/revisits.json",
+        "model/exposure.bin"
     ]
 
     @Published public private(set) var isSending = false

@@ -1477,6 +1477,28 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
             census.medianPoseShiftCentimeters = PrePassStats.median(shifts)
             census.maxPoseShiftCentimeters = shifts.max() ?? 0
         }
+        // The tear: refined relative motion of consecutive frames against the
+        // relative motion that went in. One rigid correction per owner submap
+        // leaves a jump at every owner boundary; offline on build 266 the
+        // worst was 23.9 cm / 3.1 deg between frames a third of a second apart.
+        var tearCentimeters: Float = 0
+        var tearDegrees: Float = 0
+        for k in 1..<frames.count {
+            guard let baseA = basePoses[frames[k - 1].index],
+                  let baseB = basePoses[frames[k].index],
+                  let outA = refined[String(frames[k - 1].index)],
+                  let outB = refined[String(frames[k].index)]
+            else { continue }
+            let before = PrePassSE3(baseA).inverse.then(PrePassSE3(baseB))
+            let after = PrePassSE3(outA).inverse.then(PrePassSE3(outB))
+            let tear = before.inverse.then(after)
+            let centimetres = Float(simd_length(tear.translation)) * 100
+            let degrees = Float(tear.rotationAngleDegrees)
+            if centimetres.isFinite { tearCentimeters = Swift.max(tearCentimeters, centimetres) }
+            if degrees.isFinite { tearDegrees = Swift.max(tearDegrees, degrees) }
+        }
+        census.maxConsecutiveTearCentimeters = tearCentimeters
+        census.maxConsecutiveTearDegrees = tearDegrees
         return refined
     }
 

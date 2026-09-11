@@ -45,6 +45,20 @@ import Foundation
 import Metal
 import simd
 
+/// SplitMix64: a fixed, portable generator, so the keyframe visiting order is
+/// the same on every run of a build.
+struct TrainerSplitMix64: RandomNumberGenerator {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+
 public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
     /// Where the run's time actually went. Written by `finish` and by the
@@ -65,6 +79,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     private var lastHeldOutSSIM: Float?
     /// Set by evaluateHeldOut(alsoScoreExposureFitted: true); nil otherwise.
     private var lastHeldOutPSNRExposureFitted: Float?
+    /// (frame index, raw PSNR) for every frame the most recent evaluateHeldOut
+    /// scored, in the order it scored them. Read immediately after the call.
+    private var lastHeldOutPerFrame: [TrainerHeldOutFrameScore] = []
     private var heldOutPSNRSum: Double = 0
     private var heldOutPSNRCount: Int = 0
 
@@ -495,13 +512,15 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         timings.smartLayer += CFAbsoluteTimeGetCurrent() - smartClock
 
         // --- Keyframes --------------------------------------------------------
-        let keyframes = selectKeyframes(bundle: bundle, prePass: prePass, budget: governor.current)
+        let selection = selectKeyframes(bundle: bundle, prePass: prePass, budget: governor.current)
+        let keyframes = selection.keyframes
         guard !keyframes.isEmpty else { throw TrainerError.noKeyframes }
 
         let slices = TrainerSlicePlanner.plan(
             bundle: bundle,
             prePass: prePass,
             keyframes: keyframes,
+            fixedHeldOut: selection.fixedHeldOut,
             budget: governor.current,
             heldOutFraction: tuning.heldOutFraction
         )
@@ -944,10 +963,15 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         var lossEMA: Float?
         var order = Array(slice.keyframes.indices)
         var orderCursor = 0
-        // A fixed shuffle rather than a fresh one each epoch: reproducible, and
-        // an epoch still visits every keyframe exactly once, which is what
-        // matters for coverage.
-        order.shuffle()
+        // A fixed shuffle rather than a fresh one each epoch: an epoch still
+        // visits every keyframe exactly once, which is what matters for
+        // coverage. SEEDED since build 276: `shuffle()` alone drew from the
+        // system generator, so the order (and the model) differed on every
+        // run and the comment's "reproducible" was false. Two runs of one
+        // build now train the same sequence, which takes that share out of
+        // the run-to-run noise every A/B is read against.
+        var orderRNG = TrainerSplitMix64(seed: 0x4C69_4B4F_5641)
+        order.shuffle(using: &orderRNG)
 
         let totalIterations = Swift.max(slice.iterationBudget, 1)
         // This slice's share of the whole run. When the governor lowers the
@@ -1404,7 +1428,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                !slice.heldOutKeyframes.isEmpty
             {
                 let evalFrom = CFAbsoluteTimeGetCurrent()
-                let score = try evaluateHeldOut(
+                // Raw AND fitted from the same renders (alsoScoreExposureFitted
+                // computes the fitted MSE with the same expression fitExposure
+                // did, so `score` is bit-identical to before). Selection still
+                // runs on the fitted score; the raw one is recorded beside it so
+                // switching selection to raw (a device A/B) can be priced from
+                // one run. See REFUTATION_LEDGER EXP-LS.
+                let rawScore = try evaluateHeldOut(
                     gpu: gpu,
                     resources: resources,
                     queue: queue,
@@ -1415,15 +1445,19 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     splatCount: splatCount,
                     shCoefficientCount: shCoefficientCount,
                     renderSize: renderSize,
-                    fitExposure: true
+                    alsoScoreExposureFitted: true
                 )
                 timings.earlyStopEval += CFAbsoluteTimeGetCurrent() - evalFrom
+                let fittedScore = lastHeldOutPSNRExposureFitted
+                let score = fittedScore
                 if let score, score.isFinite {
                     census.heldOutCurve.append(
                         TrainerHeldOutSample(
                             iteration: iterationsRunSoFar + iteration,
                             psnr: score,
-                            splatCount: splatCount
+                            splatCount: splatCount,
+                            psnrRaw: rawScore,
+                            psnrExposureFitted: fittedScore
                         )
                     )
                     // A DIP WHILE THE MODEL IS STILL BEING BUILT IS NOT
@@ -1797,6 +1831,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             )
             census.slices[censusRow].heldOutPSNR = psnr
             census.slices[censusRow].heldOutSSIM = lastHeldOutSSIM
+            census.slices[censusRow].heldOutPerFrame = lastHeldOutPerFrame
             census.slices[censusRow].stoppedEarly = stoppedEarly
             census.slices[censusRow].bestHeldOutPSNR =
                 bestHeldOut.isFinite ? bestHeldOut : nil
@@ -2887,6 +2922,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     ) throws -> Float? {
 
         lastHeldOutPSNRExposureFitted = nil
+        lastHeldOutPerFrame = []
         guard splatCount > 0, !frames.isEmpty else { return nil }
         // HELD-OUT VIEWS MUST NOT REACH A DENSIFY PASS. The eval's preprocess
         // writes denom, visibleFlag and maxRadiusPxBits into the live stats
@@ -3131,7 +3167,11 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             let frameMSE = sum / Double(pixelCount * 3)
             // A frame that matches exactly would be infinite dB; clamp it to
             // the same 99 the old code returned for the whole set.
-            totalPSNR += frameMSE > 1e-12 ? 10 * log10(1.0 / frameMSE) : 99
+            let framePSNR = frameMSE > 1e-12 ? 10 * log10(1.0 / frameMSE) : 99
+            totalPSNR += framePSNR
+            lastHeldOutPerFrame.append(
+                TrainerHeldOutFrameScore(frameIndex: Int(frame.index), psnr: Float(framePSNR))
+            )
             if alsoScoreExposureFitted {
                 let fittedMSE = sumFitted / Double(pixelCount * 3)
                 totalPSNRFitted += fittedMSE > 1e-12 ? 10 * log10(1.0 / fittedMSE) : 99
@@ -3546,9 +3586,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         bundle: CaptureBundle,
         prePass: PrePassResult,
         budget: TrainingBudget
-    ) -> [CaptureFrame] {
+    ) -> (keyframes: [CaptureFrame], fixedHeldOut: [CaptureFrame]?) {
         let frames = bundle.frames.sorted { $0.index < $1.index }
-        guard !frames.isEmpty else { return [] }
+        guard !frames.isEmpty else { return ([], nil) }
 
         // A frame with no usable pixels is not a supervision view. This is a
         // quality floor, not a discard: the frame stays in the capture and in
@@ -3557,7 +3597,30 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         let pool = usable.isEmpty ? frames : usable
 
         let target = Swift.max(budget.keyframeCount, 8)
-        if pool.count <= target { return pool }
+        if pool.count <= target { return (pool, nil) }
+
+        // A FIXED HELD-OUT SET (build 276). The held-out frames used to be
+        // every tenth entry of the chosen list, so any change to the walk (a
+        // look-ahead, a gate, or a pose change upstream, since the walk runs
+        // on refined poses) swapped the whole test set and no two builds
+        // could be compared. 274 against 266 was exactly that: best held-out
+        // 17.84 against a leaked 20.42 on a different set of frames. Now the
+        // candidates are fixed by frame index alone (index % stride ==
+        // stride / 2), they are removed from the walk so they can never
+        // train, and the held-out set is the candidates inside the trained
+        // span. The walk picks `target` minus the held-out share, so train
+        // plus held-out stays at the budget and under the 128-frame caches.
+        let heldOutStride = tuning.heldOutFrameStride
+        let heldOutCandidates: Set<FrameID> = heldOutStride > 1
+            ? Set(pool.filter { Int($0.index) % heldOutStride == heldOutStride / 2 }.map(\.index))
+            : []
+        let walk = heldOutCandidates.isEmpty
+            ? pool : pool.filter { !heldOutCandidates.contains($0.index) }
+        // Guarded: a tuning value is not trusted to be finite.
+        let rawShare = (Float(target) * tuning.heldOutFraction).rounded()
+        let heldOutShare = heldOutCandidates.isEmpty || !rawShare.isFinite
+            ? 0 : Int(Swift.min(Float(target), Swift.max(0, rawShare)))
+        let trainTarget = Swift.max(target - heldOutShare, 8)
 
         // Greedy spacing on the refined poses.
         var chosen: [CaptureFrame] = []
@@ -3568,15 +3631,15 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // uniform. Measured from the actual path length, not assumed.
         var pathLength: Float = 0
         var previous: SIMD3<Float>?
-        for frame in pool {
+        for frame in walk {
             let pose = prePass.refinedPose(for: frame.index) ?? frame.refinedPose ?? frame.rawPose
             let c = pose.center.simd
             if let previous { pathLength += simd_distance(previous, c) }
             previous = c
         }
-        let spacing = pathLength > 0 ? pathLength / Float(target) : 0
+        let spacing = pathLength > 0 ? pathLength / Float(trainTarget) : 0
 
-        for frame in pool {
+        for frame in walk {
             let pose = prePass.refinedPose(for: frame.index) ?? frame.refinedPose ?? frame.rawPose
             let center = pose.center.simd
             let forward = pose.forward.simd
@@ -3603,10 +3666,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // same gate; only the choice within it changes.
             var best = frame
             if tuning.keyframeSharpnessLookahead > 0,
-               let here = pool.firstIndex(where: { $0.index == frame.index })
+               let here = walk.firstIndex(where: { $0.index == frame.index })
             {
                 let limit = Swift.min(
-                    here + tuning.keyframeSharpnessLookahead, pool.count - 1
+                    here + tuning.keyframeSharpnessLookahead, walk.count - 1
                 )
                 if limit > here {
                     // By qc.weight, NOT by motion blur. Build 264 compared
@@ -3620,7 +3683,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     // measured as a loss offline too: 13.9 views per splat
                     // fell to 11.6 to 12.1. Sharper supervision has to come
                     // with MORE keyframes, not a thinner spread.
-                    for candidate in pool[here...limit]
+                    for candidate in walk[here...limit]
                     where candidate.qc.weight > best.qc.weight {
                         best = candidate
                     }
@@ -3631,17 +3694,24 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 ?? best.refinedPose ?? best.rawPose
             lastCenter = bestPose.center.simd
             lastForward = bestPose.forward.simd
-            if chosen.count >= target { break }
+            if chosen.count >= trainTarget { break }
         }
 
-        if chosen.count < Swift.min(target, pool.count) {
+        if chosen.count < Swift.min(trainTarget, walk.count) {
             // The greedy pass was too strict for this walk (a scan taken from
             // one spot, for instance). Fall back to an even stride, which is
             // still a spread rather than a prefix.
-            let step = Swift.max(pool.count / target, 1)
-            chosen = Swift.stride(from: 0, to: pool.count, by: step).map { pool[$0] }
+            let step = Swift.max(walk.count / trainTarget, 1)
+            chosen = Swift.stride(from: 0, to: walk.count, by: step).map { walk[$0] }
         }
-        return chosen
+
+        guard !heldOutCandidates.isEmpty,
+              let low = chosen.map(\.index).min(), let high = chosen.map(\.index).max()
+        else { return (chosen, nil) }
+        let heldOut = pool.filter {
+            heldOutCandidates.contains($0.index) && $0.index >= low && $0.index <= high
+        }
+        return (chosen, heldOut.isEmpty ? nil : heldOut)
     }
 
     // MARK: - Progress

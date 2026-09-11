@@ -391,6 +391,12 @@ public struct PrePassCensus: Codable, Sendable {
         /// nothing, and that is worth seeing.
         public var medianPoseShiftCentimeters: Float = 0
         public var maxPoseShiftCentimeters: Float = 0
+        /// Worst disagreement between two consecutive frames' refined relative
+        /// motion and the relative motion that went in: the TEAR a per-submap
+        /// correction leaves at a submap boundary. Optional: the Codable
+        /// conformance is synthesized and an older census must still decode.
+        public var maxConsecutiveTearCentimeters: Float?
+        public var maxConsecutiveTearDegrees: Float?
         /// True when the optional LiDAR-anchored refinement ran, and whether
         /// its own improvement check accepted it.
         public var fineRefinementRan = false

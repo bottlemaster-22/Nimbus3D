@@ -414,6 +414,10 @@ struct TrainerCensusSlice: Codable {
     /// a build can gain half a decibel of PSNR by getting the room's overall
     /// brightness right while smearing every edge, and only this notices.
     var heldOutSSIM: Float?
+    /// Raw held-out PSNR per frame from the FINAL evaluation, same frames and
+    /// order as `heldOutPSNR`'s mean. Lets two builds compare the frames they
+    /// share like for like when their held-out sets differ.
+    var heldOutPerFrame: [TrainerHeldOutFrameScore]?
     /// True when the run stopped because held-out PSNR stopped improving,
     /// rather than because it reached its iteration budget.
     var stoppedEarly: Bool = false
@@ -513,10 +517,20 @@ struct TrainerCensusAlert: Codable {
 /// training on. The sequence of these is the answer to "how many rounds is
 /// right", which no constant can know in advance because it depends on how
 /// many views the capture has and how much parallax they carry.
+struct TrainerHeldOutFrameScore: Codable {
+    var frameIndex: Int
+    var psnr: Float
+}
+
 struct TrainerHeldOutSample: Codable {
     var iteration: Int
     var psnr: Float
     var splatCount: Int
+    /// Raw held-out PSNR (held-out frames at identity exposure from build 274).
+    var psnrRaw: Float? = nil
+    /// The same renders after the per-frame gain+bias least-squares fit;
+    /// equal to `psnr` while selection runs on the fitted score.
+    var psnrExposureFitted: Float? = nil
 }
 
 struct TrainerTimings: Codable {
