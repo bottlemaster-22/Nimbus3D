@@ -957,6 +957,18 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         if coarsePhaseOn, let first = slice.keyframes.first {
             _ = supervision.build(frame: first, iteration: 0, totalIterations: 1, includeDepthSamples: false)
         }
+        // BUILD 382, A WORKAROUND: NO FRAME CACHE FOR THE FULL-SIZE BUILDER.
+        // Three runs at 1,080 px (376, 378, 380) grew by about 3.5 MB an
+        // iteration, one photo's worth, for exactly as long as that builder's
+        // cache was alive, and stopped growing the moment the governor
+        // dropped it (380 reached 2.9 GB and was cut to 20,000 points; 378,
+        // whose cache went at iteration 24,050, stayed at 1.1 GB and made
+        // the first decent scan). The coarse builders' caches ran for 21,000
+        // iterations with the footprint flat, so the fault is specific to the
+        // full-size path and not yet found. Until it is, the last level
+        // decodes each photo on the prefetch worker (about 40 ms, mostly
+        // hidden behind a 25 ms GPU step).
+        if coarsePhaseOn { supervision.dropFrameCache(disable: true) }
         if coarsePhaseOn, tuning.supervisionPreload { preloads.first?.start() }
         defer {
             prefetch.drain()
@@ -1447,7 +1459,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 // written to disk every 1,000, so a run the OS kills for memory
                 // (368: 2.8 GB, dead past iteration 10,000, nothing on disk)
                 // leaves the curve behind.
-                if iteration % 500 == 0 {
+                if iteration % 100 == 0 {
                     census.memorySamples.append(TrainerCensusMemorySample(
                         iteration: iterationsRunSoFar + iteration,
                         footprint: Double(reading.footprintBytes) / 1_048_576,
