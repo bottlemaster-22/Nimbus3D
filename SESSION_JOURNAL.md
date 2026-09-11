@@ -1084,3 +1084,25 @@ Remaining pre-pass: trust serial prefix 1.20 s (13 slots, 20,000 sweeps), seedin
 The tear fix changes refined poses, and the keyframe walk runs on refined poses with gate margins of 2e-6, so it would have swapped the whole held-out set again. So 276 first makes the test set FIXED: every pool frame with index % 40 == 20 is removed from the walk and, inside the trained span, held out. The walk picks 120 - 12 = 108 (train plus held-out stays at 120, under the 128-frame caches). kf_fixed.py predicts exactly: 108 trained, span 0..434, held out [20, 60, 100, 140, 180, 220, 260, 300, 340, 380, 420], overlap none. 276 is the NEW BASELINE; it also carries the seeded order, per-frame held-out scores, raw-beside-fitted curve, the consecutive-frame tear MEASUREMENT (no fix), exposure.bin and revisits.json in diagnostics.
 
 **278 = the continuous-correction fix alone**, compared per frame on the same fixed set (saved: scratchpad tearfix.patch).
+
+---
+
+## 2026-09-11 : Builds 276 and 278 measured on the fixed held-out set
+
+276 matched kf_fixed.py exactly: 108 trained, span 0..434, held out [20, 60, 100, 140, 180, 220, 260, 300, 340, 380, 420]; tear measured 23.9 cm / 3.12 deg (offline said 23.93 / 3.12).
+
+| | 276 (baseline) | 278 (continuous correction) |
+|---|---|---|
+| worst consecutive-frame tear | 23.9 cm / 3.12 deg | **1.4 cm / 0.15 deg** |
+| best held-out (fitted) | 19.20 | 19.26 |
+| raw end / SSIM | 18.62 / 0.6257 | 18.63 / 0.6230 |
+| trained-view | 21.45 | 21.55 |
+| pose graph final residual | 2.79 cm / 1.45 deg | 2.96 cm / 1.41 deg (cost 962 -> 1000) |
+| seeds | 831,975 | 846,971 (seeding follows the refined poses) |
+| total | ~67.7 s | ~65.6 s |
+
+Per frame 276 -> 278: 20 15.50->15.24, **60 12.03->14.29**, 100 16.05->14.95, 140 18.58->17.86, 180 17.44->18.31, 220 20.81->22.12, 260 18.36->19.71, 300 26.38->25.54, 340 18.65->17.82, 380 20.81->18.57, 420 20.22->20.55. Mean neutral; per-frame swings of +/-2 dB both ways, because the new poses also moved the keyframe walk (span 434 -> 436) and the seeds. Frame 60, the 276 outlier and the nearest held-out frame to the worst tear (45-46), gained the most. KEPT: it removes a real discontinuity at no measured cost, and the round-robin ICP cap needs it. Per-frame noise of a same-build rerun (seeded order, GPU atomics still unordered) is NOT MEASURED; worth one repeat run some time.
+
+The raw curve rises to the end (17.64 at 800 to 18.61 at 3600); fitted sits ~0.6 dB above. exposure.bin on 276: gain 0.988-1.008, bias -0.024..+0.023 (gain inert, bias moving, as the exposure workflow predicted).
+
+**Build 280: A54 alone** (split share 1.0, split shrink 2.0), against 278 on the same set. Signatures: addedByClone 0, addedBySplit ~152k, relocated ~19k; p50 at or below 6.5 mm with spread >= 5x means densification persists, p50 7.3-7.6 mm means the optimiser erases it; prunedLowOpacity in the thousands means relocation holes (130 on 278). Revert if best held-out falls more than 0.4 dB below 19.26.
