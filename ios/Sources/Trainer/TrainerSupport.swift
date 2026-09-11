@@ -135,7 +135,7 @@ enum TrainerKernel {
     static let rasterizeForward = "trainer_rasterize_forward"
     /// Build 302: two pixels per thread. Optional, so not in `all`.
     static let rasterizeForward2 = "trainer_rasterize_forward2"
-    /// Build 304: the SIMD-summed backward, two pixels per thread. Optional.
+    /// Build 304: the backward, two pixels per thread (plain atomics since 312). Optional.
     static let rasterizeBackward2 = "trainer_rasterize_backward2"
     /// Build 306: the splat-order tile sort.
     static let depthKeys = "trainer_depth_keys"

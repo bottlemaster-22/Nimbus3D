@@ -73,7 +73,7 @@ final class TrainerPipelines {
     /// 128-thread threadgroup or failed to build. Used only after the
     /// trainer calibration has shown it renders the same image, faster.
     let rasterizeForward2: MTLComputePipelineState?
-    /// The two-pixel SIMD-summed backward (build 304), nil before Apple7 or
+    /// The two-pixel backward (build 304; plain atomics since 312), nil before Apple7 or
     /// if it failed to build. Used only after the trainer calibration has
     /// shown its gradients agree with the backward in use, and it is faster.
     let rasterizeBackward2: MTLComputePipelineState?

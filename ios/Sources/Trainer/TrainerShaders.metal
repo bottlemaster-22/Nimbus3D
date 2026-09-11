@@ -2778,15 +2778,19 @@ kernel void trainer_rasterize_backward(
 }
 
 // ============================================================================
-// MARK: - Backward: rasterise, two pixels per thread (build 304)
+// MARK: - Backward: rasterise, two pixels per thread (build 304, 312)
 //
-// The SIMD-summed backward above with each thread owning TWO pixels, the one
-// at row tPos.y and the one 8 rows below, as trainer_rasterize_forward2 does.
+// The PLAIN backward above (per-thread atomics; build 292 measured the
+// SIMD-summed one 1.49x slower) with each thread owning TWO pixels, the one at
+// row tPos.y and the one 8 rows below, as trainer_rasterize_forward2 does.
 // Each staged splat is read from threadgroup memory once for both pixels, and
-// a SIMD group's one simd_sum and one set of atomics per splat now covers 64
-// pixels instead of 32, so both are halved per pixel. The per-pixel maths is
-// the loop above statement for statement, moved into trainer_backwardPixel so
-// both pixels run the same code in the same order.
+// where both pixels take something from the same splat their contributions
+// are added in registers and sent as ONE set of atomics instead of two. Each
+// thread also stops its walk of a batch at the deepest entry either of its
+// pixels reached, which is exact: the per-pixel test would reject every entry
+// past it. The per-pixel maths is the loop above statement for statement,
+// moved into trainer_backwardPixel so both pixels run the same code in the
+// same order.
 //
 // Sums are added in a different float order, as between any two runs of the
 // atomics. The trainer runs this and the kernel in use on the same iteration,
@@ -2963,8 +2967,9 @@ kernel void trainer_rasterize_backward2(
     const uint total = (rangeEnd > rangeStart) ? (rangeEnd - rangeStart) : 0u;
     const uint batches = (total + TRAINER_TILE_AREA - 1u) / TRAINER_TILE_AREA;
 
-    // Per SIMD group, over both of each lane's pixels; called by every lane.
-    const uint groupDeepest = simd_max(max(a.lastContributor, b.lastContributor));
+    // The deepest list position either of this thread's pixels composited.
+    // Per THREAD: nothing below needs the lanes of a SIMD group in step.
+    const uint deepest = max(a.lastContributor, b.lastContributor);
 
     // Threadgroup-uniform batch loop, as in trainer_rasterize_backward: every
     // thread reaches both barriers and stages its two entries every batch.
@@ -2989,11 +2994,11 @@ kernel void trainer_rasterize_backward2(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Uniform per SIMD group; nothing inside `continue`s, so simd_any and
-        // simd_sum always see every lane.
-        if (batchBase < groupDeepest) {
+        // The barriers above and below stay outside this branch.
+        if (batchBase < deepest) {
             const uint here = min(TRAINER_TILE_AREA, total - batchBase);
-            for (int j = int(here) - 1; j >= 0; --j) {
+            const uint upto = min(here, deepest - batchBase);
+            for (int j = int(upto) - 1; j >= 0; --j) {
                 const uint globalIndex = batchBase + uint(j) + 1u;
                 const float2 xy = tgXY[j];
                 const float4 co = tgConicOpacity[j];
@@ -3007,26 +3012,20 @@ kernel void trainer_rasterize_backward2(
                                       gA, gB, gC, contributes);
                 trainer_backwardPixel(b, globalIndex, xy, co, cutoff, colorDepth, cam,
                                       gA, gB, gC, contributes);
-                if (simd_any(contributes)) {
-                    gA = simd_sum(gA);
-                    gB = simd_sum(gB);
-                    gC = simd_sum(gC);
-                    if (simd_is_first()) {
-                        device TrainerSplatGrad2DAtomic* g = &splatGrad2D[tgIndex[j]];
-                        if (gA.x != 0.0f) { trainer_atomicAddUnchecked(&g->color0, gA.x); }
-                        if (gA.y != 0.0f) { trainer_atomicAddUnchecked(&g->color1, gA.y); }
-                        if (gA.z != 0.0f) { trainer_atomicAddUnchecked(&g->color2, gA.z); }
-                        if (gA.w != 0.0f) { trainer_atomicAddUnchecked(&g->opacity, gA.w); }
-                        if (gB.x != 0.0f) { trainer_atomicAddUnchecked(&g->mean2D0, gB.x); }
-                        if (gB.y != 0.0f) { trainer_atomicAddUnchecked(&g->mean2D1, gB.y); }
-                        if (gB.z != 0.0f) { trainer_atomicAddUnchecked(&g->conic0, gB.z); }
-                        if (gB.w != 0.0f) { trainer_atomicAddUnchecked(&g->conic1, gB.w); }
-                        if (gC.x != 0.0f) { trainer_atomicAddUnchecked(&g->conic2, gC.x); }
-                        if (gC.y != 0.0f) { trainer_atomicAddUnchecked(&g->absGrad2D, gC.y); }
-                        if (gC.z != 0.0f) { trainer_atomicAddUnchecked(&g->visAccum, gC.z); }
-                        if (gC.w != 0.0f) { trainer_atomicAddUnchecked(&g->unknownAccum, gC.w); }
-                    }
-                }
+                if (!contributes) { continue; }
+                device TrainerSplatGrad2DAtomic* g = &splatGrad2D[tgIndex[j]];
+                if (gA.x != 0.0f) { trainer_atomicAddUnchecked(&g->color0, gA.x); }
+                if (gA.y != 0.0f) { trainer_atomicAddUnchecked(&g->color1, gA.y); }
+                if (gA.z != 0.0f) { trainer_atomicAddUnchecked(&g->color2, gA.z); }
+                if (gA.w != 0.0f) { trainer_atomicAddUnchecked(&g->opacity, gA.w); }
+                if (gB.x != 0.0f) { trainer_atomicAddUnchecked(&g->mean2D0, gB.x); }
+                if (gB.y != 0.0f) { trainer_atomicAddUnchecked(&g->mean2D1, gB.y); }
+                if (gB.z != 0.0f) { trainer_atomicAddUnchecked(&g->conic0, gB.z); }
+                if (gB.w != 0.0f) { trainer_atomicAddUnchecked(&g->conic1, gB.w); }
+                if (gC.x != 0.0f) { trainer_atomicAddUnchecked(&g->conic2, gC.x); }
+                if (gC.y != 0.0f) { trainer_atomicAddUnchecked(&g->absGrad2D, gC.y); }
+                if (gC.z != 0.0f) { trainer_atomicAddUnchecked(&g->visAccum, gC.z); }
+                if (gC.w != 0.0f) { trainer_atomicAddUnchecked(&g->unknownAccum, gC.w); }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3088,11 +3087,7 @@ kernel void trainer_preprocess_backward(
     // whole record is. Bounded by cam.shCoeffCount, the same stride every SH
     // reader uses, so a smaller SH budget never touches the next row.
     splatGrad[gid] = TrainerSplatGrad{};
-    {
-        const uint shRow = cam.shCoeffCount * 3u;
-        const uint shRowBase = gid * shRow;
-        for (uint k = 0u; k < shRow; ++k) { shGrad[shRowBase + k] = 0.0f; }
-    }
+    // The shGrad row is cleared further down, at the SH block (build 314).
 
     // FOLD THIS ITERATION'S RASTER STATISTICS INTO THE PER-INTERVAL ONES.
     //
@@ -3169,10 +3164,23 @@ kernel void trainer_preprocess_backward(
 
     float3 dLdDir = float3(0.0f);
 
+    // BUILD 314: THE ROW IS WRITTEN, NOT ZEROED AND THEN READ BACK. The blocks
+    // below always write whole degrees (0; 1 when active > 1; 2 when
+    // active > 4), so only the entries past the last written degree need the
+    // zero, and the written ones take their value with one store instead of a
+    // zero store, a load and a second store. 0 + v is v, so the row holds the
+    // same values as before (a -0 gradient now stays -0, which no reader can
+    // tell from +0).
+    {
+        const uint shRow = cam.shCoeffCount * 3u;
+        const uint written = min(shRow, (active > 4u) ? 27u : ((active > 1u) ? 12u : 3u));
+        for (uint k = written; k < shRow; ++k) { shGrad[shBase + k] = 0.0f; }
+    }
+
     // Degree 0.
-    shGrad[shBase + 0u] += TRAINER_SH_C0 * dLdColor.x;
-    shGrad[shBase + 1u] += TRAINER_SH_C0 * dLdColor.y;
-    shGrad[shBase + 2u] += TRAINER_SH_C0 * dLdColor.z;
+    shGrad[shBase + 0u] = TRAINER_SH_C0 * dLdColor.x;
+    shGrad[shBase + 1u] = TRAINER_SH_C0 * dLdColor.y;
+    shGrad[shBase + 2u] = TRAINER_SH_C0 * dLdColor.z;
 
     if (active > 1u) {
         const float x = dir.x, y = dir.y, z = dir.z;
@@ -3180,9 +3188,9 @@ kernel void trainer_preprocess_backward(
         const float b2 =  TRAINER_SH_C1 * z;
         const float b3 = -TRAINER_SH_C1 * x;
         for (uint c = 0; c < 3u; ++c) {
-            shGrad[shBase + 3u + c] += b1 * dLdColor[c];
-            shGrad[shBase + 6u + c] += b2 * dLdColor[c];
-            shGrad[shBase + 9u + c] += b3 * dLdColor[c];
+            shGrad[shBase + 3u + c] = b1 * dLdColor[c];
+            shGrad[shBase + 6u + c] = b2 * dLdColor[c];
+            shGrad[shBase + 9u + c] = b3 * dLdColor[c];
         }
         const float3 s1 = float3(sh[shBase + 3u], sh[shBase + 4u], sh[shBase + 5u]);
         const float3 s2 = float3(sh[shBase + 6u], sh[shBase + 7u], sh[shBase + 8u]);
@@ -3200,11 +3208,11 @@ kernel void trainer_preprocess_backward(
             const float b7 = TRAINER_SH_C2_3 * xz;
             const float b8 = TRAINER_SH_C2_4 * (xx - yy);
             for (uint c = 0; c < 3u; ++c) {
-                shGrad[shBase + 12u + c] += b4 * dLdColor[c];
-                shGrad[shBase + 15u + c] += b5 * dLdColor[c];
-                shGrad[shBase + 18u + c] += b6 * dLdColor[c];
-                shGrad[shBase + 21u + c] += b7 * dLdColor[c];
-                shGrad[shBase + 24u + c] += b8 * dLdColor[c];
+                shGrad[shBase + 12u + c] = b4 * dLdColor[c];
+                shGrad[shBase + 15u + c] = b5 * dLdColor[c];
+                shGrad[shBase + 18u + c] = b6 * dLdColor[c];
+                shGrad[shBase + 21u + c] = b7 * dLdColor[c];
+                shGrad[shBase + 24u + c] = b8 * dLdColor[c];
             }
             const float3 s4 = float3(sh[shBase + 12u], sh[shBase + 13u], sh[shBase + 14u]);
             const float3 s5 = float3(sh[shBase + 15u], sh[shBase + 16u], sh[shBase + 17u]);

@@ -669,7 +669,7 @@ struct TrainerTimings: Codable {
     var forwardTwoPixelChosen: Int = 0
 
     /// Two-pixel backward calibration (build 304): the backward chosen above
-    /// (A) against the two-pixel SIMD-summed one (B), same fields as the
+    /// (A) against the two-pixel one (B; plain atomics since 312), same fields as the
     /// first backward calibration.
     var backwardTwoPixelCalibrationSteps: Int = 0
     var backwardTwoPixelSecondsA: Double = 0
