@@ -347,7 +347,13 @@ final class TrainerSupervisionBuilder {
     // Sized from the memory this process may still allocate, so the cache
     // can never be what pushes the budget governor into shedding splats.
     private struct CachedFrame {
-        let rgbBytes: [UInt8]
+        /// Build 378: the photo is kept as full-resolution luma plus chroma at
+        /// half resolution (4:2:0, interleaved Cb Cr), half the bytes of RGB.
+        /// Luma is exact; chroma is what the phone's JPEG carried anyway.
+        let width: Int
+        let height: Int
+        let luma: [UInt8]
+        let chroma: [UInt8]
         let samples: [TrainerDepthSample]
         let supervised: Int
     }
@@ -481,12 +487,12 @@ final class TrainerSupervisionBuilder {
         if includeDepthSamples,
            let fixedSize = renderSize, let k = renderIntrinsics,
            let cached = frameCache[frame.index],
-           cached.rgbBytes.count == fixedSize.pixelCount * 3 {
+           cached.width == fixedSize.width, cached.height == fixedSize.height {
             frameCacheHits += 1
             let far = backgroundCubemap()
             return TrainerFrameSupervision(
                 frame: frame.index,
-                groundTruthBytes: cached.rgbBytes,
+                groundTruthBytes: Self.expandYCbCr(cached),
                 backgroundTexels: far.texels,
                 backgroundFaceSize: far.faceSize,
                 hasBackground: far.present,
@@ -589,7 +595,10 @@ final class TrainerSupervisionBuilder {
 
         let supervised = samples.reduce(into: 0) { $0 += ($1.weight > 0 ? 1 : 0) }
         if includeDepthSamples {
-            rememberFrame(frame.index, bytes: groundTruthBytes, samples: samples, supervised: supervised)
+            rememberFrame(
+                frame.index, bytes: groundTruthBytes, width: fixedSize.width, height: fixedSize.height,
+                samples: samples, supervised: supervised
+            )
         }
         let meanAuthority = authority?.map(for: frame.index)?.meanAuthority ?? 0
 
@@ -632,13 +641,88 @@ final class TrainerSupervisionBuilder {
     /// Keeps a freshly built training frame for the rest of the run, if it
     /// fits.
     private func rememberFrame(
-        _ id: FrameID, bytes: [UInt8], samples: [TrainerDepthSample], supervised: Int
+        _ id: FrameID, bytes: [UInt8], width: Int, height: Int,
+        samples: [TrainerDepthSample], supervised: Int
     ) {
-        guard frameCacheLimitBytes > 0, frameCache[id] == nil else { return }
-        let cost = bytes.count + samples.count * MemoryLayout<TrainerDepthSample>.stride
+        guard frameCacheLimitBytes > 0, frameCache[id] == nil,
+              width > 0, height > 0, bytes.count == width * height * 3
+        else { return }
+        let (luma, chroma) = Self.compressYCbCr(bytes, width: width, height: height)
+        let cost = luma.count + chroma.count + samples.count * MemoryLayout<TrainerDepthSample>.stride
         guard frameCacheBytes + cost <= frameCacheLimitBytes else { return }
-        frameCache[id] = CachedFrame(rgbBytes: bytes, samples: samples, supervised: supervised)
+        frameCache[id] = CachedFrame(
+            width: width, height: height, luma: luma, chroma: chroma,
+            samples: samples, supervised: supervised
+        )
         frameCacheBytes += cost
+    }
+
+    /// RGB -> luma at full resolution plus interleaved Cb, Cr averaged over
+    /// each 2x2 block (BT.601 full range, integer arithmetic). Build 378.
+    private static func compressYCbCr(_ rgb: [UInt8], width: Int, height: Int) -> ([UInt8], [UInt8]) {
+        let cw = (width + 1) / 2, ch = (height + 1) / 2
+        var luma = [UInt8](repeating: 0, count: width * height)
+        var chroma = [UInt8](repeating: 128, count: cw * ch * 2)
+        rgb.withUnsafeBufferPointer { src in
+            luma.withUnsafeMutableBufferPointer { y in
+                chroma.withUnsafeMutableBufferPointer { c in
+                    for by in 0..<ch {
+                        for bx in 0..<cw {
+                            var cbSum = 0, crSum = 0, n = 0
+                            for dy in 0..<2 {
+                                let py = by * 2 + dy
+                                if py >= height { continue }
+                                for dx in 0..<2 {
+                                    let px = bx * 2 + dx
+                                    if px >= width { continue }
+                                    let i = (py * width + px) * 3
+                                    let r = Int(src[i]), g = Int(src[i + 1]), b = Int(src[i + 2])
+                                    y[py * width + px] = UInt8(clamping: (77 * r + 150 * g + 29 * b + 128) >> 8)
+                                    cbSum += 128 + ((-43 * r - 85 * g + 128 * b + 128) >> 8)
+                                    crSum += 128 + ((128 * r - 107 * g - 21 * b + 128) >> 8)
+                                    n += 1
+                                }
+                            }
+                            let k = (by * cw + bx) * 2
+                            if n > 0 {
+                                c[k] = UInt8(clamping: (cbSum + n / 2) / n)
+                                c[k + 1] = UInt8(clamping: (crSum + n / 2) / n)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return (luma, chroma)
+    }
+
+    /// The inverse of `compressYCbCr`: each 2x2 block takes its stored chroma.
+    private static func expandYCbCr(_ cached: CachedFrame) -> [UInt8] {
+        let width = cached.width, height = cached.height
+        let cw = (width + 1) / 2
+        let count = width * height * 3
+        guard cached.luma.count == width * height, cached.chroma.count >= cw * ((height + 1) / 2) * 2 else {
+            return [UInt8](repeating: 0, count: count)
+        }
+        return [UInt8](unsafeUninitializedCapacity: count) { dst, initialized in
+            cached.luma.withUnsafeBufferPointer { y in
+                cached.chroma.withUnsafeBufferPointer { c in
+                    for py in 0..<height {
+                        let crow = (py / 2) * cw
+                        for px in 0..<width {
+                            let k = (crow + px / 2) * 2
+                            let cb = Int(c[k]) - 128, cr = Int(c[k + 1]) - 128
+                            let l = Int(y[py * width + px])
+                            let o = (py * width + px) * 3
+                            dst[o] = UInt8(clamping: l + ((359 * cr + 128) >> 8))
+                            dst[o + 1] = UInt8(clamping: l - ((88 * cb + 183 * cr + 128) >> 8))
+                            dst[o + 2] = UInt8(clamping: l + ((454 * cb + 128) >> 8))
+                        }
+                    }
+                }
+            }
+            initialized = count
+        }
     }
 
     // MARK: - Depth supervision

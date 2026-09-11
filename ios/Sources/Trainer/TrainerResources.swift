@@ -163,7 +163,12 @@ final class TrainerResources {
     /// the largest per-Gaussian array (SH). Per-Gaussian capacity.
     private(set) var densifySource: MTLBuffer
     private(set) var densifyFlags: MTLBuffer
-    private(set) var densifyScratch: MTLBuffer
+    /// Build 378: the densifier's staging row IS the SH gradient buffer. The
+    /// gather runs between steps, when shGrad is dead (preprocess_backward
+    /// rewrites every row before the optimiser reads it), and the two are the
+    /// same size, so a second copy of the largest per-point row was 63 MB of
+    /// nothing at 330,000 points with degree-3 colour.
+    var densifyScratch: MTLBuffer { shGrad }
     /// Build 322: a copy of splats, sh and stats (end to end) taken inside a
     /// step's command buffer for the preview, converted off the loop.
     private(set) var snapshotStaging: MTLBuffer
@@ -258,7 +263,6 @@ final class TrainerResources {
         splatGrad2D = try make("splatGrad2D", n * 64)
         densifySource = try make("densifySource", n * 4)
         densifyFlags = try make("densifyFlags", n)
-        densifyScratch = try make("densifyScratch", shFloats * MemoryLayout<Float>.stride)
         snapshotStaging = try make("snapshotStaging", Self.snapshotStagingBytes(splats: n, shFloats: shFloats))
         // 6 faces, 64x64 (build 326), three floats each. Fixed size: it does not scale
         // with splats or pixels, so it is allocated once and never resized.
@@ -361,7 +365,7 @@ final class TrainerResources {
             splats, sh, stats, draws, samplingTopK, tilesTouched, offsets,
             splatGrad, shGrad, adamM, adamV, shAdamM, shAdamV,
             splatGrad2D, bgCubemap, raster, centers,
-            densifySource, densifyFlags, densifyScratch, snapshotStaging, evalStaging,
+            densifySource, densifyFlags, snapshotStaging, evalStaging,
             warmupStaging,
             keysA, keysB, valuesA, valuesB, tileRanges,
             radixHistogram, radixHistogramScan,
@@ -393,7 +397,7 @@ final class TrainerResources {
             + MemoryLayout<TrainerSamplingTopK>.stride     // Mip-Splatting rates
             + MemoryLayout<TrainerSplatGrad>.stride * 3    // gradient + Adam m + v
             + shFloats * 4 * 4                             // sh + grad + m + v
-            + shFloats * 4 + 4 + 1                         // densify scratch, source, flags
+            + 4 + 1                                        // densify source, flags (scratch is shGrad)
             + MemoryLayout<TrainerSplat>.stride            // snapshot staging: splat,
             + shFloats * 4                                 //   sh,
             + MemoryLayout<TrainerSplatStats>.stride       //   stats
@@ -669,7 +673,6 @@ final class TrainerResources {
         centers = placeholder
         densifySource = placeholder
         densifyFlags = placeholder
-        densifyScratch = placeholder
         snapshotStaging = placeholder
 
         // The eight that carry state across the resize, allocated into the
@@ -714,7 +717,6 @@ final class TrainerResources {
         centers = try makeBuffer("centers", n * 3 * 4)
         densifySource = try makeBuffer("densifySource", n * 4)
         densifyFlags = try makeBuffer("densifyFlags", n)
-        densifyScratch = try makeBuffer("densifyScratch", shFloats * floatStride)
         snapshotStaging = try makeBuffer(
             "snapshotStaging", Self.snapshotStagingBytes(splats: n, shFloats: shFloats)
         )

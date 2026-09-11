@@ -1798,7 +1798,11 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
         // budget was never memory-derived at all, while this type's own header
         // claimed every number here is measured. Asking the trainer keeps the
         // two in step: change a GPU layout and this follows.
-        let memoryForSplats = availableMemoryBytes / 2
+        // 60 % (build 378; was half). This is the governor's memory ceiling as
+        // well as the cap's source; at half, 376 crossed it entering the
+        // 1,080-px level and lost its frame cache. The live share gate
+        // (0.85 of what iOS says is left) and the floor gate stay.
+        let memoryForSplats = availableMemoryBytes * 3 / 5
         func capFromMemory(at shDegree: SHDegree) -> Int {
             let perSplat = UInt64(Swift.max(1, TrainerResources.bytesPerSplat(
                 shCoefficientCount: 1 + shDegree.restCoefficientCount
@@ -1809,7 +1813,7 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
         let scaleCap: Int
         switch sceneExtentMeters {
         case ..<3: scaleCap = 150_000    // one object
-        case ..<8: scaleCap = 330_000    // a room (build 350, back from 400,000: 348 scored lower and cost 1.5 s more GPU; the 330,000 cap bound from round 700 with 420 MB of the memory ceiling unused)
+        case ..<8: scaleCap = 300_000    // a room (build 378, from 330,000: degree-3 rows at 1,080 px need the room; the 330,000 cap bound from round 700 with 420 MB of the memory ceiling unused)
         default: scaleCap = 500_000      // a floor or a house
         }
 

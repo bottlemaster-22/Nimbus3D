@@ -1081,7 +1081,13 @@ struct TrainerTuning: Sendable {
     /// clamped down to `opacityResetTo` and the optimiser's memory of the
     /// opacity lane is cleared, so a point that was only alive by habit has
     /// to earn its opacity again. 0 turns it off.
-    var opacityResetIntervalIterations: Int = 3000
+    // OFF (build 378). 376's census: the reset at 24,000 (the first at the
+    // 1,080-px size) was followed by a prune that took the population from
+    // 330,000 to 131,000 and the held-out score from 15.9 to 14.1 dB, and the
+    // score before any reset had reached was already below build 338's. With
+    // relocation treating every reset point as a donor, the recipe's reset
+    // does not transplant.
+    var opacityResetIntervalIterations: Int = 0
     var opacityResetTo: Float = 0.01
     /// Faint-point pruning waits this long after a reset, so the points that
     /// are recovering are not the ones it removes (the reference prunes at

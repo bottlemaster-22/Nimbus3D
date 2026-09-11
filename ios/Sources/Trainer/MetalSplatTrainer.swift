@@ -1463,8 +1463,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     ))
                 }
                 if iteration > 0, iteration % 1000 == 0 {
-                    census.iterationsCompleted = iterationsRunSoFar + iteration
-                    TrainerCensusWriter.write(census, at: ref)
+                    // A copy: the slice adds its count to the census at its end.
+                    var partial = census
+                    partial.iterationsCompleted = iterationsRunSoFar + iteration
+                    TrainerCensusWriter.write(partial, at: ref)
                 }
                 var change = governor.degradeForMemory(
                     reading: reading,
