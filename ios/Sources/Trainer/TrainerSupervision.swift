@@ -46,8 +46,10 @@ import simd
 /// Everything one training step needs about one keyframe.
 struct TrainerFrameSupervision {
     var frame: FrameID
-    /// Ground-truth RGB at the render resolution, three floats per pixel.
-    var groundTruth: [Float]
+    /// Ground-truth RGB at the render resolution, THREE BYTES per pixel
+    /// (build 314). The loss kernel turns each byte into `Float(byte) / 255`
+    /// through a table Swift computed, so it is the decoder's float exactly.
+    var groundTruthBytes: [UInt8]
     /// The background CUBEMAP, flattened to three floats per texel, face-major
     /// then row-major. Empty when no background model is available, and
     /// `hasBackground` is then false rather than a black image being passed
@@ -231,7 +233,6 @@ final class TrainerSupervisionBuilder {
     private let edges: NativeDepthEdgeClassifier?
     private let background: DirectionalBackgroundModel?
 
-    private var imageCache: SmartImageCache
     private let depthCache: SmartDepthCache
 
     private let depthWidth: Int
@@ -266,13 +267,10 @@ final class TrainerSupervisionBuilder {
     // prefetch worker per step on build 292 (30.7 s a run), with the loop
     // still waiting 2.9 s for it, and every frame rebuilt about 37 times.
     //
-    // So the first build of each frame keeps its photo as the decoder's own
-    // BYTES (3 per pixel, 1.2 MB instead of the 4.7 MB float copy) and its
-    // depth samples, and later builds rebuild the float image from the bytes
-    // with the decoder's exact expression, `Float(byte) / 255`. A frame is
-    // kept only if that round trip reproduces every float it decoded, which
-    // it does by construction, so a cached build is bit-identical to a fresh
-    // one. The background is still read fresh every time.
+    // So the first build of each frame keeps its photo bytes (3 per pixel,
+    // 1.2 MB; since build 314 the bytes ARE the supervision) and its depth
+    // samples, and later builds hand those back: a cached build is identical
+    // to a fresh one. The background is still read fresh every time.
     //
     // Sized from the memory this process may still allocate, so the cache
     // can never be what pushes the budget governor into shedding splats.
@@ -317,24 +315,14 @@ final class TrainerSupervisionBuilder {
             bundle.intrinsics, depthWidth: depthWidth, depthHeight: depthHeight
         )
 
-        // THE IMAGE CACHE STAYS AT THREE, and that is a memory decision
-        // rather than a good one. A SmartImage at 720x540 is 7.78 MB, because
-        // `rgb` is [SIMD3<Float>] whose stride is 16 bytes with a quarter of
-        // it padding, plus a luma plane the trainer never reads. Covering a
-        // 114 frame cycle would be 887 MB against a 687 MB peak. Fixing it
-        // properly means caching packed bytes instead of floats, which is a
-        // real change and not this one.
+        // NO IMAGE CACHE ANY MORE (build 314): photos are decoded straight to
+        // bytes by SmartImageLoader.loadRGB8 and kept in `frameCache` for the
+        // run. (The 3-entry SmartImage cache that was here held 7.78 MB
+        // floats a frame and hit 0 per cent over a 108-frame round robin.)
         //
-        // THE DEPTH CACHE DOES NOT HAVE THAT PROBLEM. A frame's samples are
+        // THE DEPTH CACHE covers the cycle: a frame's samples are
         // depthWidth * depthHeight floats, about 196 KB at 256x192, so 128
-        // frames is roughly 25 MB and the cycle is covered. At 3 it had a 0%%
-        // hit rate: the trainer shuffles its keyframes once and then walks
-        // them round-robin, so the reuse distance is the whole cycle and
-        // nothing was ever still resident when it came round again.
-        // includeLuma false: this builder reads only image.rgb.
-        imageCache = SmartImageCache(
-            capacity: 3, longEdge: self.requestedLongEdge, includeLuma: false
-        )
+        // frames is roughly 25 MB.
         depthCache = SmartDepthCache(capacity: 128, sampleCount: depthWidth * depthHeight)
 
         // A third of whatever is free above 1.5 GB, at most 420 MB (108
@@ -370,7 +358,6 @@ final class TrainerSupervisionBuilder {
         let target = Swift.max(pixels, 64)
         guard target < requestedLongEdge else { return false }
         requestedLongEdge = target
-        imageCache = SmartImageCache(capacity: 3, longEdge: target, includeLuma: false)
         // Cleared, not recomputed: the next decodable frame fixes the new grid
         // and rescales the intrinsics to it, by the same path the first frame
         // of the run took.
@@ -404,18 +391,10 @@ final class TrainerSupervisionBuilder {
            let cached = frameCache[frame.index],
            cached.rgbBytes.count == fixedSize.pixelCount * 3 {
             frameCacheHits += 1
-            let bytes = cached.rgbBytes
-            let count = bytes.count
-            let groundTruth = [Float](unsafeUninitializedCapacity: count) { buffer, initialized in
-                bytes.withUnsafeBufferPointer { source in
-                    for i in 0..<count { buffer[i] = Float(source[i]) / 255 }
-                }
-                initialized = count
-            }
             let far = backgroundCubemap()
             return TrainerFrameSupervision(
                 frame: frame.index,
-                groundTruth: groundTruth,
+                groundTruthBytes: cached.rgbBytes,
                 backgroundTexels: far.texels,
                 backgroundFaceSize: far.faceSize,
                 hasBackground: far.present,
@@ -429,7 +408,9 @@ final class TrainerSupervisionBuilder {
             )
         }
 
-        guard let image = imageCache.image(for: frame, at: ref) else {
+        guard let image = SmartImageLoader.loadRGB8(
+            url: ref.url(forRelativePath: frame.imagePath), longEdge: requestedLongEdge
+        ) else {
             TrainerLog.general.error(
                 "Photo for frame \(frame.index) could not be read; that frame is skipped"
             )
@@ -490,24 +471,9 @@ final class TrainerSupervisionBuilder {
         }
 
         let pixelCount = fixedSize.pixelCount
-        // NOT `[Float](repeating: 0, ...)`. That form zeroes every byte and
-        // then this loop overwrites every byte, so the memset is pure waste:
-        // 18.66 MB of it per iteration across the five allocations the
-        // supervision build makes, on the CPU, on the thread the GPU is
-        // waiting behind. `unsafeUninitializedCapacity` skips the zeroing and
-        // is safe here for the one reason that matters: EVERY element is
-        // assigned before any element is read.
-        let groundTruth = [Float](
-            unsafeUninitializedCapacity: pixelCount * 3
-        ) { buffer, initialized in
-            for i in 0..<pixelCount {
-                let rgb = image.rgb[i]
-                buffer[i * 3 + 0] = rgb.x
-                buffer[i * 3 + 1] = rgb.y
-                buffer[i * 3 + 2] = rgb.z
-            }
-            initialized = pixelCount * 3
-        }
+        guard image.rgb.count == pixelCount * 3 else { return nil }
+        // The decoder's bytes, as they are. See TrainerFrameSupervision.
+        let groundTruthBytes = image.rgb
 
         let framePose = pose(for: frame)
 
@@ -531,13 +497,13 @@ final class TrainerSupervisionBuilder {
 
         let supervised = samples.reduce(into: 0) { $0 += ($1.weight > 0 ? 1 : 0) }
         if includeDepthSamples {
-            rememberFrame(frame.index, groundTruth: groundTruth, samples: samples, supervised: supervised)
+            rememberFrame(frame.index, bytes: groundTruthBytes, samples: samples, supervised: supervised)
         }
         let meanAuthority = authority?.map(for: frame.index)?.meanAuthority ?? 0
 
         return TrainerFrameSupervision(
             frame: frame.index,
-            groundTruth: groundTruth,
+            groundTruthBytes: groundTruthBytes,
             backgroundTexels: backgroundTexels,
             backgroundFaceSize: backgroundFaceSize,
             hasBackground: hasBackground,
@@ -572,31 +538,13 @@ final class TrainerSupervisionBuilder {
     }
 
     /// Keeps a freshly built training frame for the rest of the run, if it
-    /// fits and if its photo survives the byte round trip exactly.
+    /// fits.
     private func rememberFrame(
-        _ id: FrameID, groundTruth: [Float], samples: [TrainerDepthSample], supervised: Int
+        _ id: FrameID, bytes: [UInt8], samples: [TrainerDepthSample], supervised: Int
     ) {
         guard frameCacheLimitBytes > 0, frameCache[id] == nil else { return }
-        let cost = groundTruth.count + samples.count * MemoryLayout<TrainerDepthSample>.stride
+        let cost = bytes.count + samples.count * MemoryLayout<TrainerDepthSample>.stride
         guard frameCacheBytes + cost <= frameCacheLimitBytes else { return }
-        let count = groundTruth.count
-        var exact = true
-        let bytes = [UInt8](unsafeUninitializedCapacity: count) { buffer, initialized in
-            for i in 0..<count {
-                let value = groundTruth[i]
-                // nil for NaN, infinity or anything outside 0...255: never
-                // a trap, and the frame is then simply not kept.
-                guard let byte = UInt8(exactly: (value * 255).rounded()) else {
-                    exact = false
-                    buffer[i] = 0
-                    continue
-                }
-                buffer[i] = byte
-                if Float(byte) / 255 != value { exact = false }
-            }
-            initialized = count
-        }
-        guard exact else { return }
         frameCache[id] = CachedFrame(rgbBytes: bytes, samples: samples, supervised: supervised)
         frameCacheBytes += cost
     }

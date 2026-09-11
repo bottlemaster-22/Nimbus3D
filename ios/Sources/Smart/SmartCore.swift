@@ -975,7 +975,79 @@ enum SmartImageLoader {
         #endif
     }
 
+    /// A capture JPEG decoded straight to PACKED 8-BIT RGB, three bytes per
+    /// pixel, row major, at the same reduced size `load` decodes at.
+    ///
+    /// Build 314, for training supervision: the trainer's loss kernel takes
+    /// these bytes and looks each one up in a 256-entry table of
+    /// `Float(i) / 255` computed in Swift, so the colour the GPU sees is the
+    /// very float `decode` would have produced, at a quarter of the bytes.
+    /// (The GPU is not asked to divide: the shaders compile with fast math,
+    /// under which a division may be an approximation.)
+    static func loadRGB8(url: URL, longEdge: Int) -> (width: Int, height: Int, rgb: [UInt8])? {
+        #if canImport(CoreGraphics)
+        return autoreleasepool { () -> (width: Int, height: Int, rgb: [UInt8])? in
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+                SmartLog.general.error(
+                    "Could not open image \(url.lastPathComponent, privacy: .public)"
+                )
+                return nil
+            }
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceThumbnailMaxPixelSize: longEdge
+            ]
+            guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+            else { return nil }
+            return decodeRGB8(cg)
+        }
+        #else
+        _ = url
+        _ = longEdge
+        return nil
+        #endif
+    }
+
     #if canImport(CoreGraphics)
+    /// The same draw as `decode`, keeping the bytes: the RGBA8 context's
+    /// pixels with the unused fourth byte dropped.
+    static func decodeRGB8(_ cg: CGImage) -> (width: Int, height: Int, rgb: [UInt8])? {
+        let w = cg.width, h = cg.height
+        guard w > 0, h > 0 else { return nil }
+        var pixels = [UInt8](repeating: 0, count: w * h * 4)
+        let space = CGColorSpaceCreateDeviceRGB()
+        let info = CGImageAlphaInfo.noneSkipLast.rawValue
+        let drew: Bool = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard
+                let base = buffer.baseAddress,
+                let ctx = CGContext(
+                    data: base,
+                    width: w,
+                    height: h,
+                    bitsPerComponent: 8,
+                    bytesPerRow: w * 4,
+                    space: space,
+                    bitmapInfo: info
+                )
+            else { return false }
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard drew else { return nil }
+        let count = w * h
+        let rgb = [UInt8](unsafeUninitializedCapacity: count * 3) { buffer, n in
+            for i in 0..<count {
+                buffer[i * 3 + 0] = pixels[i * 4 + 0]
+                buffer[i * 3 + 1] = pixels[i * 4 + 1]
+                buffer[i * 3 + 2] = pixels[i * 4 + 2]
+            }
+            n = count * 3
+        }
+        return (w, h, rgb)
+    }
+
     static func decode(_ cg: CGImage, includeLuma: Bool = true) -> SmartImage? {
         let w = cg.width, h = cg.height
         guard w > 0, h > 0 else { return nil }

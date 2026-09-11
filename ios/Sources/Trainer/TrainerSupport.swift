@@ -295,6 +295,7 @@ enum TrainerBind {
         static let ssimPlanes = 6
         static let lossAccum = 7
         static let uniforms = 8      // TrainerLossUniforms
+        static let gtLevels = 9      // build 314: 256 floats, Float(i) / 255
     }
 
     enum Blur {

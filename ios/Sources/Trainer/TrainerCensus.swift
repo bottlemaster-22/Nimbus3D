@@ -575,6 +575,14 @@ struct TrainerTimings: Codable {
     /// this is the largest thing between the census opening and the loop
     /// that no clock covered (the pipelines are compiled before it opens).
     var smartLayer: Double = 0
+    /// Build 314: the parts of `smartLayer`, each timed on its own. The
+    /// trust fields and the free-space map load beside the edge maps, so
+    /// these can add up to more than the total.
+    var smartLayerTrust: Double = 0
+    var smartLayerEdges: Double = 0
+    var smartLayerAuthority: Double = 0
+    var smartLayerBackground: Double = 0
+    var smartLayerCarver: Double = 0
 
     /// The one command buffer that holds the sort, the forward raster, the
     /// losses, the backward raster and the optimiser. It used to be labelled

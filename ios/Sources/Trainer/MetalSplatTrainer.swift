@@ -111,7 +111,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     private var pendingStep: PendingStep?
 
     /// Held-out (and trained-view) supervision built by evaluateHeldOut, kept
-    /// for the run (build 300). ~4.7 MB a frame, 11 or 12 frames.
+    /// for the run (build 300). ~1.2 MB a frame (bytes since 314), 11 or 12 frames.
     private var evalSupervisionCache: [FrameID: TrainerFrameSupervision] = [:]
 
     /// One frame's render, read back by evaluateHeldOut for scoring.
@@ -122,6 +122,19 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         let background: [Float]?
         let groundTruth: [Float]
         let exposure: SIMD2<Float>
+    }
+
+    /// The decoder's floats from the supervision bytes: `Float(byte) / 255`,
+    /// the expression SmartImageLoader.decode used, so the CPU score is taken
+    /// on exactly the values it was taken on before build 314.
+    private static func groundTruthFloats(_ bytes: [UInt8]) -> [Float] {
+        let count = bytes.count
+        return [Float](unsafeUninitializedCapacity: count) { buffer, initialized in
+            bytes.withUnsafeBufferPointer { source in
+                for i in 0..<count { buffer[i] = Float(source[i]) / 255 }
+            }
+            initialized = count
+        }
     }
 
     /// One frame's scores. `ssim` is nil when no 8x8 block qualified, which is
@@ -2220,7 +2233,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
         // --- Upload this frame's supervision -------------------------------------
         let uploadFrom = CFAbsoluteTimeGetCurrent()
-        resources.gtColorIn.writeArray(supervision.groundTruth)
+        resources.gtColorIn.writeArray(supervision.groundTruthBytes)
         // The far field is 72 KB of cubemap now, not a 4.67 MB rasterised
         // image. `trainer_background` turns it into bgColor on the GPU in
         // command buffer A below.
@@ -3572,7 +3585,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             }
             guard frameSupervision.renderSize == renderSize else { continue }
 
-            resources.gtColorIn.writeArray(frameSupervision.groundTruth)
+            // No ground-truth upload: the held-out render runs no loss kernel,
+            // and the score is taken on the CPU from the bytes below. (This
+            // used to copy 4.67 MB a frame into a buffer nothing read.)
             // The far field comes from the SAME trainer_background kernel the
             // training path uses, encoded into buffer A below and read back
             // after buffer B. It was the CPU loop backgroundImage, 6 to 10 ms a
@@ -3693,7 +3708,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 rendered: rendered,
                 transmittance: transmittance,
                 background: heldOutBackground,
-                groundTruth: frameSupervision.groundTruth,
+                groundTruth: Self.groundTruthFloats(frameSupervision.groundTruthBytes),
                 exposure: exposures[frame.index] ?? SIMD2<Float>(1, 0)
             ))
         }
@@ -4184,20 +4199,17 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
         var layer = SmartLayer()
 
-        if let refs = prePass.trust {
-            let field = TwoScaleTrustField(settings: settings)
-            field.prepare(bundle: bundle)
-            do {
-                try await field.load(refs, at: ref)
-                layer.trust = field
-            } catch {
-                let why = error.localizedDescription
-                TrainerLog.general.error(
-                    "The trust fields could not be read (\(why, privacy: .public)); depth is supervised at a flat weight instead"
-                )
-            }
-        }
+        // BUILD 314: THE INDEPENDENT LOADS RUN AT THE SAME TIME. The trust
+        // fields, the edge maps and the free-space map are three separate
+        // files with nothing in common, so they load together; the authority
+        // map needs the trust fields and the far field needs the authority
+        // map, so those two follow. Each load is timed on its own for the
+        // census (its duration, overlapped or not), beside the total.
+        let settings = self.settings
+        async let trustLoad = Self.loadTrust(prePass.trust, bundle: bundle, at: ref, settings: settings)
+        async let carverLoad = Self.loadCarver(prePass.occupancy, at: ref)
 
+        let edgesClock = CFAbsoluteTimeGetCurrent()
         if let refs = prePass.edges {
             let classifier = NativeDepthEdgeClassifier(settings: settings)
             classifier.load(refs, bundle: bundle, at: ref)
@@ -4209,7 +4221,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 )
             }
         }
+        timings.smartLayerEdges += CFAbsoluteTimeGetCurrent() - edgesClock
 
+        let trust = await trustLoad
+        layer.trust = trust.value.field
+        timings.smartLayerTrust += trust.value.seconds
+
+        let authorityClock = CFAbsoluteTimeGetCurrent()
         let authorityMap = SmartAuthorityMap(settings: settings)
         authorityMap.prepare(
             bundle: bundle,
@@ -4219,7 +4237,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             trust: layer.trust
         )
         if authorityMap.isPrepared { layer.authority = authorityMap }
+        timings.smartLayerAuthority += CFAbsoluteTimeGetCurrent() - authorityClock
 
+        let backgroundClock = CFAbsoluteTimeGetCurrent()
         let background = DirectionalBackgroundModel(settings: settings)
         background.prepare(authorityMap)
         do {
@@ -4231,21 +4251,60 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 "The far field could not be fitted (\(why, privacy: .public)); distant surfaces are left to the Gaussians"
             )
         }
+        timings.smartLayerBackground += CFAbsoluteTimeGetCurrent() - backgroundClock
 
-        if let grid = prePass.occupancy {
-            let carver = VoxelFreeSpaceCarver()
-            do {
-                try await carver.load(grid, at: ref)
-                layer.carver = carver
-            } catch {
-                let why = error.localizedDescription
-                TrainerLog.general.error(
-                    "The free-space map could not be read (\(why, privacy: .public)); nothing is deleted on free-space grounds this run"
-                )
-            }
-        }
+        let carver = await carverLoad
+        layer.carver = carver.value.carver
+        timings.smartLayerCarver += carver.value.seconds
 
         return layer
+    }
+
+    /// A value handed back from an `async let` child. The SMART objects are
+    /// plain classes; nothing touches one until its load has returned.
+    private struct SmartLoad<T>: @unchecked Sendable {
+        let value: T
+    }
+
+    private static func loadTrust(
+        _ refs: TrustFieldRefs?,
+        bundle: CaptureBundle,
+        at ref: CaptureBundleRef,
+        settings: SmartLossSettings
+    ) async -> SmartLoad<(field: TwoScaleTrustField?, seconds: Double)> {
+        guard let refs else { return SmartLoad(value: (nil, 0)) }
+        let clock = CFAbsoluteTimeGetCurrent()
+        let field = TwoScaleTrustField(settings: settings)
+        field.prepare(bundle: bundle)
+        do {
+            try await field.load(refs, at: ref)
+            return SmartLoad(value: (field, CFAbsoluteTimeGetCurrent() - clock))
+        } catch {
+            let why = error.localizedDescription
+            TrainerLog.general.error(
+                "The trust fields could not be read (\(why, privacy: .public)); depth is supervised at a flat weight instead"
+            )
+            return SmartLoad(value: (nil, CFAbsoluteTimeGetCurrent() - clock))
+        }
+    }
+
+    private static func loadCarver(
+        _ grid: OccupancyGridRef?,
+        at ref: CaptureBundleRef
+    ) async -> SmartLoad<(carver: VoxelFreeSpaceCarver?, seconds: Double)> {
+        guard let grid else { return SmartLoad(value: (nil, 0)) }
+        let clock = CFAbsoluteTimeGetCurrent()
+        let carver = VoxelFreeSpaceCarver()
+        do {
+            try await carver.load(grid, at: ref)
+            return SmartLoad(value: (carver, CFAbsoluteTimeGetCurrent() - clock))
+        } catch {
+            let why = error.localizedDescription
+            TrainerLog.general.error(
+                "The free-space map could not be read (\(why, privacy: .public)); nothing is deleted on free-space grounds this run"
+            )
+            return SmartLoad(value: (nil, CFAbsoluteTimeGetCurrent() - clock))
+        }
     }
 
     // MARK: - Keyframe selection

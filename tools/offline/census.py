@@ -107,7 +107,8 @@ ORDER = ['gpuBusy', 'gpuScan', 'gpuStep', 'gpuSort', 'gpuForward', 'gpuLosses',
          'gpuBackward', 'gpuOptimiser', 'gpuOther', 'gpuWait',
          'supervision', 'supervisionPrefetched',
          'densify', 'previewSnapshot', 'filterSweep', 'upload', 'prologue',
-         'smartLayer', 'encodeStep']
+         'smartLayer', 'smartLayerTrust', 'smartLayerEdges', 'smartLayerAuthority',
+         'smartLayerBackground', 'smartLayerCarver', 'encodeStep']
 for k in ORDER:
     if k not in t:
         continue

@@ -1695,7 +1695,7 @@ kernel void trainer_rasterize_forward(
 kernel void trainer_loss_photometric(
     const device float*           renderColor [[buffer(0)]],
     const device float*           renderTFinal[[buffer(1)]],
-    const device float*           gtColor     [[buffer(2)]],
+    const device uchar*           gtColor     [[buffer(2)]],   // 3 BYTES per pixel (build 314)
     const device float*           bgColor     [[buffer(3)]],
     device float*                 composited  [[buffer(4)]],   // 3 per pixel, post-exposure
     device float*                 gradFinal   [[buffer(5)]],   // 3 per pixel, dL/dC_final
@@ -1703,6 +1703,10 @@ kernel void trainer_loss_photometric(
                                                                // plane 1 = gt luma
     device atomic_float*          lossAccum   [[buffer(7)]],
     constant TrainerLossUniforms& u           [[buffer(8)]],
+    // Build 314: `Float(i) / 255` for i in 0...255, computed by Swift. A byte
+    // looked up here is the float the CPU decoder produced, bit for bit; a
+    // division here would not be, since this library compiles with fast math.
+    const device float*           gtLevels    [[buffer(9)]],
     uint                          gid         [[thread_position_in_grid]]
 ) {
     if (gid >= u.pixelCount) { return; }
@@ -1718,9 +1722,9 @@ kernel void trainer_loss_photometric(
     const float3 preExposure = splat + T * bg;
     const float3 rendered = u.exposureGain * preExposure + u.exposureBias;
 
-    const float3 truth = float3(gtColor[gid * 3u + 0u],
-                                gtColor[gid * 3u + 1u],
-                                gtColor[gid * 3u + 2u]);
+    const float3 truth = float3(gtLevels[gtColor[gid * 3u + 0u]],
+                                gtLevels[gtColor[gid * 3u + 1u]],
+                                gtLevels[gtColor[gid * 3u + 2u]]);
 
     const float invN = 1.0f / float(max(u.pixelCount, 1u));
     const float w = u.frameWeight * (1.0f - u.lambdaSSIM) * invN;

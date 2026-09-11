@@ -689,6 +689,7 @@ struct TrainerGPU {
             resources.renderTFinal, offset: 0, index: TrainerBind.LossPhotometric.renderTFinal
         )
         encoder.setBuffer(resources.gtColorIn, offset: 0, index: TrainerBind.LossPhotometric.gtColor)
+        encoder.setBuffer(resources.gtLevels, offset: 0, index: TrainerBind.LossPhotometric.gtLevels)
         encoder.setBuffer(resources.bgColor, offset: 0, index: TrainerBind.LossPhotometric.bgColor)
         encoder.setBuffer(
             resources.composited, offset: 0, index: TrainerBind.LossPhotometric.composited

@@ -115,6 +115,9 @@ final class TrainerResources {
     private(set) var renderNContrib: MTLBuffer
 
     private(set) var gtColor: MTLBuffer
+    /// Build 314: 256 floats, `Float(i) / 255` computed in Swift, so the
+    /// loss kernel turns a ground-truth byte into the decoder's exact float.
+    let gtLevels: MTLBuffer
     private(set) var bgColor: MTLBuffer
     private(set) var composited: MTLBuffer
     private(set) var gradFinal: MTLBuffer
@@ -282,7 +285,7 @@ final class TrainerResources {
         renderTFinal = try make("renderTFinal", px * 4)
         renderNContrib = try make("renderNContrib", px * 4)
 
-        gtColor = try make("gtColor", px * 3 * 4)
+        gtColor = try make("gtColor", px * 3)
         bgColor = try make("bgColor", px * 3 * 4)
         composited = try make("composited", px * 3 * 4)
         gradFinal = try make("gradFinal", px * 3 * 4)
@@ -303,15 +306,17 @@ final class TrainerResources {
             "depthSamples",
             self.depthSampleCapacity * MemoryLayout<TrainerDepthSample>.stride
         )
-        gtColorAlt = try make("gtColorAlt", px * 3 * 4)
+        gtColorAlt = try make("gtColorAlt", px * 3)
         bgCubemapAlt = try make("bgCubemapAlt", 6 * 32 * 32 * 3 * 4)
         depthSamplesAlt = try make(
             "depthSamplesAlt",
             self.depthSampleCapacity * MemoryLayout<TrainerDepthSample>.stride
         )
         readbackStaging = try make("readbackStaging", 128)
+        gtLevels = try make("gtLevels", 256 * 4)
 
         recomputeResidentBytes()
+        _ = gtLevels.writeArray((0..<256).map { Float($0) / 255 })
     }
 
     // MARK: - Accounting
@@ -334,7 +339,7 @@ final class TrainerResources {
             gradDepthRend, gradTFinal, unknownMask,
             ssimSrc, ssimMid, ssimTmp,
             lossAccum, exposureGrad, cameraGrad, depthSamples,
-            gtColorAlt, bgCubemapAlt, depthSamplesAlt, readbackStaging
+            gtColorAlt, bgCubemapAlt, depthSamplesAlt, readbackStaging, gtLevels
         ]
         list.append(contentsOf: scanBlockSums)
         list.append(contentsOf: scanBlockSumsScanned)
@@ -370,7 +375,6 @@ final class TrainerResources {
             + 1 // renderDepth
             + 1 // renderTFinal
             + 1 // renderNContrib (uint, same width)
-            + 3 // gtColor
             + 3 // bgColor
             + 3 // composited
             + 3 // gradFinal
@@ -379,7 +383,8 @@ final class TrainerResources {
             + 1 // gradTFinal
             + 1 // unknownMask
         let ssimFloats = TrainerGPUConstants.ssimPlaneCount * 3   // src, mid, tmp
-        return (perPixelFloats + ssimFloats) * 4
+        // gtColor and gtColorAlt: three BYTES per pixel each (build 314).
+        return (perPixelFloats + ssimFloats) * 4 + 3 * 2
     }
 
     // MARK: - Allocation
@@ -714,8 +719,8 @@ final class TrainerResources {
         renderTFinal = try makeBuffer("renderTFinal", px * 4)
         renderNContrib = try makeBuffer("renderNContrib", px * 4)
 
-        gtColor = try makeBuffer("gtColor", px * 3 * 4)
-        gtColorAlt = try makeBuffer("gtColorAlt", px * 3 * 4)
+        gtColor = try makeBuffer("gtColor", px * 3)
+        gtColorAlt = try makeBuffer("gtColorAlt", px * 3)
         bgColor = try makeBuffer("bgColor", px * 3 * 4)
         composited = try makeBuffer("composited", px * 3 * 4)
         gradFinal = try makeBuffer("gradFinal", px * 3 * 4)
