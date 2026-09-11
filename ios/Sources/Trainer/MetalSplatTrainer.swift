@@ -947,7 +947,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         if coarsePhaseOn, let first = slice.keyframes.first {
             _ = supervision.build(frame: first, iteration: 0, totalIterations: 1, includeDepthSamples: false)
         }
-        if coarsePhaseOn { preloads.first?.start() }
+        if coarsePhaseOn, tuning.supervisionPreload { preloads.first?.start() }
         defer {
             prefetch.drain()
             coarsePrefetches.forEach { $0.drain() }
@@ -1295,7 +1295,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 coarseSupervisions[levelsDropped].dropFrameCache(disable: true)
                 levelsDropped += 1
             }
-            while preloadsStarted <= activeLevel + 1, preloadsStarted < preloads.count {
+            while tuning.supervisionPreload, preloadsStarted <= activeLevel + 1, preloadsStarted < preloads.count {
                 preloads[preloadsStarted].start()
                 preloadsStarted += 1
             }

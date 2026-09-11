@@ -1212,6 +1212,14 @@ struct TrainerTuning: Sendable {
     /// 4,500). Empty arrays switch it off.
     var coarseResolutionFractions: [Float] = [0.30, 0.55]
     var coarseResolutionScales: [Float] = [0.5, 0.75]
+    /// BUILD 338: OFF. The background preload (build 332) put a second
+    /// builder to work while the active level's prefetch worker built on
+    /// another, the first time two frames were ever built at once for the
+    /// whole of a level, and builds 334 and 336 died at random points inside
+    /// exactly those windows (rounds 20, 200, about 1,300) while build 330,
+    /// which never had two builders running, completed every run. Every
+    /// level now decodes its frames on first visit, as build 330 did.
+    var supervisionPreload: Bool = false
 
 
     init() {}
