@@ -1740,8 +1740,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 // The full-size builder and grid whatever phase this is (build
                 // 328): a sampling rate is a property of the camera the model
                 // will be viewed through, and the sweep touches no pixel buffer.
-                memoryEvent("sweep.start", iteration: iterationsRunSoFar + iteration)
-                defer { memoryEvent("sweep.end", iteration: iterationsRunSoFar + iteration) }
+                census.memoryEvents.append(memoryEvent("sweep.start", iteration: iterationsRunSoFar + iteration))
+                defer { census.memoryEvents.append(memoryEvent("sweep.end", iteration: iterationsRunSoFar + iteration)) }
                 if tuning.filter3DOnCPU {
                     updateFilter3DOnCPU(
                         resources: resources,
@@ -1795,8 +1795,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 // when the last level began) may still be inside the builder;
                 // the evaluation builds on it from this thread, so wait first.
                 preloads.last?.join()
-                memoryEvent("eval.start", iteration: iterationsRunSoFar + iteration)
-                defer { memoryEvent("eval.end", iteration: iterationsRunSoFar + iteration) }
+                census.memoryEvents.append(memoryEvent("eval.start", iteration: iterationsRunSoFar + iteration))
+                defer { census.memoryEvents.append(memoryEvent("eval.end", iteration: iterationsRunSoFar + iteration)) }
                 let rawScore = try evaluateHeldOut(
                     gpu: gpu,
                     resources: resources,
@@ -1894,7 +1894,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 let carveDue = iteration % Swift.max(tuning.carveIntervalIterations, 1) == 0
                 let densifyFrom = CFAbsoluteTimeGetCurrent()
                 defer { timings.densify += CFAbsoluteTimeGetCurrent() - densifyFrom }
-                memoryEvent("densify.start", iteration: iterationsRunSoFar + iteration)
+                census.memoryEvents.append(memoryEvent("densify.start", iteration: iterationsRunSoFar + iteration))
                 let outcome = try densifier.run(
                     resources: resources,
                     splatCount: splatCount,
@@ -1929,7 +1929,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         availableMB: outcome.availableAfterGatherMB
                     ))
                 }
-                memoryEvent("densify.end", iteration: iterationsRunSoFar + iteration)
+                census.memoryEvents.append(memoryEvent("densify.end", iteration: iterationsRunSoFar + iteration))
                 if let mismatches = outcome.gatherMismatches {
                     timings.densifyGatherChecks += 1
                     timings.densifyGatherMismatches += mismatches
@@ -4184,12 +4184,11 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     }
 
     /// Build 392: one available-memory reading into the census, named.
-    private func memoryEvent(_ stage: String, iteration: Int) {
-        guard census.memoryEvents.count < 4_000 else { return }
-        census.memoryEvents.append(TrainerCensusMemoryEvent(
+    private func memoryEvent(_ stage: String, iteration: Int) -> TrainerCensusMemoryEvent {
+        TrainerCensusMemoryEvent(
             iteration: iteration, stage: stage,
             availableMB: Double(DeviceMemoryFacts.probe().availableBytes) / 1_048_576
-        ))
+        )
     }
 
     private func resetDensifyStats(
