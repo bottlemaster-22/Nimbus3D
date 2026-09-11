@@ -1444,3 +1444,14 @@ The most likely shape of 368's growth: the loop is one detached task whose autor
 updateFilter3DInner now encodes ten cameras per command buffer (one pool per batch) instead of one command buffer per camera. Installable build is 388 (= 382's configuration). To test the experiment after the reset: push this commit, then set keyframes 200 and cap 400k (the leaking configuration) in Contracts.swift, run, and read `MEMORY CURVE` from census.py: if the steps at the sweeps are gone, the per-command-buffer theory holds and 200/400k becomes usable.
 
 LOCAL (unpushed) additions: the authority-map cache holds 256 entries for captures over 128 frames (a 200-frame set thrashed the 128-entry LRU on every build); Contracts carries the EXPERIMENT configuration (200 frames, cap 400k) so the next push tests the batched sweep directly. If the 100-iteration memory curve still steps at the sweeps, revert those two Contracts lines (120 / 330,000) and push again; 388 is the last proven build.
+
+### MONDAY CHECKLIST (one day, ~10 min a CI cycle)
+
+State: HEAD carries the sweep experiment (ten cameras per command buffer), the 256-entry authority cache and the EXPERIMENT configuration (200 frames, cap 400k) in Contracts.swift. Installed on the phone: 388 (120 frames, 330k, proven: 5 m 53 s, 20.87 / 0.663).
+
+1. `git push origin build/first-ci`; watch the PR run (`gh run list --branch build/first-ci --limit 2`); install when the archive is green. Start the Booster first: `cd booster && PYTHONPATH=src py -3.12 -m nimbus_booster.cli serve` (check `netstat -ano | findstr :8760`).
+2. Run the room, send diagnostics, then `python tools/offline/census.py`. Read three lines: `MEMORY CURVE` (steps of hundreds of MB at 1,000 / 1,500 / 2,000 mean the sweep still leaks), `HELD-OUT, CAMERAS ALIGNED`, and `point size`.
+3. If the curve is flat: keep 200 / 400k, and the next lever is 240 frames or cap 450k (memory line must stay under the ceiling printed beside it).
+   If it still steps: revert the two Contracts lines to 120 / 330,000 (comments say EXPERIMENT), push, and that is the release build; the leak then needs the sweep replaced (compute the 3D filter on the CPU from the cameras' distances once per level, 3 sweeps a run) rather than found.
+4. Never re-enable `supervisionPreload` or the full builder's frame cache (both grow memory; see builds 334 and 380).
+5. Rules that held up: opacity resets off (376), soft memory gates freeze growth only (346), caches released only on the OS headroom gate (380).
