@@ -348,3 +348,13 @@ if _pre_census:
     if 'maxConsecutiveTearCentimeters' in pg:
         print('POSE GRAPH TEAR: worst consecutive-frame %.1f cm / %.2f deg  (build 266: 23.9 cm / 3.1 deg)'
               % (pg['maxConsecutiveTearCentimeters'], pg.get('maxConsecutiveTearDegrees', 0)))
+
+# Sampled GPU stage profile (build 286+): ms per iteration per stage.
+_n = t.get('profiledSteps', 0)
+if _n:
+    parts = [('sort', 'gpuSort'), ('forward', 'gpuForward'), ('losses', 'gpuLosses'),
+             ('backward', 'gpuBackward'), ('optimiser', 'gpuOptimiser')]
+    tot = sum(t.get(k, 0) for _, k in parts)
+    print('GPU STAGES (%d sampled steps): ' % _n + '  '.join(
+        '%s %.2f ms (%.0f%%)' % (nm, 1000 * t.get(k, 0) / _n, 100 * t.get(k, 0) / max(tot, 1e-12))
+        for nm, k in parts) + '  | sum %.2f ms' % (1000 * tot / _n))

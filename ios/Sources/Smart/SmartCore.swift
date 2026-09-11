@@ -259,15 +259,11 @@ public struct SmartLossSettings: Codable, Hashable, Sendable {
         // a converged pose graph, exporting the best model rather than the
         // last - is kept.
         //
-        // 0 IN BUILD 284 (A25): the null test that had never run. 266's model
-        // at 0.001 held 20.2 % of splats within 0.01 of rank 2 against a 5.3 %
-        // shape-permutation null (3.8x), so the prior does bind; whether it
-        // helps held-out views was never measured. The kernel's
-        // `if (u.discWeight > 0.0f)` makes 0 exactly off, and that also turns
-        // off the onEdge needle target. Judged against 278 on the fixed held-out
-        // set; restore 0.001 if best held-out falls more than 0.4 dB below
-        // 19.26, or if needles (8.7 %) and p90 (16.1 mm) jump.
-        discPriorWeight: Float = 0,
+        // A25 (weight 0, the null that has never run) went out as build 284 and
+        // was pulled back UNTESTED in 286: the owner moved the work to speed
+        // without quality loss, and an untested quality experiment does not
+        // belong under fifty builds of speed work. Still open in the ledger.
+        discPriorWeight: Float = 0.001,
         discTargetEffectiveRank: Float = 2.0,
         // BACK TO 1.0. I CHANGED THIS AND IT MADE THE PICTURE WORSE.
         //

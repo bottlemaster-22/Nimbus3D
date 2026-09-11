@@ -618,6 +618,12 @@ struct TrainerTimings: Codable {
     var gpuLosses: Double = 0
     var gpuBackward: Double = 0
     var gpuOptimiser: Double = 0
+    /// Build 286: the five buckets above are filled again, but only on SAMPLED
+    /// iterations (every `stageProfileEvery`), where command buffer B is split
+    /// five ways. This is how many were sampled: each bucket divided by it is
+    /// that stage's GPU milliseconds per iteration. The sampled iterations'
+    /// time is NOT in gpuStep.
+    var profiledSteps: Int = 0
 
     /// How many command buffers were waited on. gpuWait divided by this is
     /// the average round-trip cost, which is the number that says whether

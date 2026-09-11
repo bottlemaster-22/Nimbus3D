@@ -1057,6 +1057,12 @@ struct TrainerTuning: Sendable {
     /// falls back to every tenth chosen keyframe (the old split).
     var heldOutFrameStride: Int = 40
 
+    /// Every this many iterations, command buffer B is split into its five
+    /// stages (sort, forward, losses, backward, optimiser) and each is timed
+    /// on the GPU (build 286). 16 samples a 4,000-iteration run at about 1 ms
+    /// of extra round trips each. 0 turns it off.
+    var stageProfileEvery: Int = 250
+
     init() {}
 }
 

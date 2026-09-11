@@ -834,6 +834,60 @@ kernel void trainer_radix_scatter(
 // MARK: - Forward: preprocess
 // ============================================================================
 
+// ============================================================================
+// MARK: - Exact tile footprint (build 286)
+//
+// The tile box of a splat is the axis-aligned box of its alpha-threshold
+// ellipse, and for the elongated, rotated discs this model is made of much of
+// that box is empty: every rasteriser thread of such a tile rejects the splat
+// with the cheap power cutoff. Measured offline (tools/offline/tile_cull.py,
+// 13 views of the 282 model) 11.7 % of all tile instances are tiles in which
+// NO pixel centre can pass that cutoff.
+//
+// A pixel passes the rasterisers' cheap test when power >= cutoff, i.e.
+// q(d) = a dx^2 + 2 b dx dy + c dy^2 <= -2 * cutoff with (a, b, c) the conic.
+// A tile is kept when the minimum of q over the rectangle spanning its pixel
+// CENTRES is at or below that level plus a slack. Dropping the others removes
+// only (splat, tile) pairs every pixel of which the rasterisers already
+// `continue` past, so the image and every gradient are unchanged.
+//
+// COUNT AND EMIT MUST AGREE. trainer_preprocess counts hits with a LARGER
+// slack than trainer_duplicate_keys emits with, from the same stored bits
+// (the TrainerSplatRaster record), so the count can only meet or exceed the
+// emitted hits; duplicate_keys pads the rest of the reserved range with
+// sentinel keys that sort last and that trainer_tile_ranges skips.
+// ============================================================================
+
+constant float kTrainerTileEmitSlack = 0.02f;
+constant float kTrainerTileCountSlack = 0.12f;
+/// Tile field of a padding key. The key keeps the tile in 12 bits, so a real
+/// tile id is always below 4095 (a 720 px frame has 1,530 tiles).
+constant uint kTrainerSentinelTile = 0xFFFu;
+
+/// min over dy in [y0, y1] of a*x*x + 2*b*x*dy + c*dy*dy (c > 0).
+inline float trainer_edgeMinQ(float a, float b, float c, float x, float y0, float y1) {
+    const float dy = clamp(-b * x / c, y0, y1);
+    return a * x * x + 2.0f * b * x * dy + c * dy * dy;
+}
+
+inline bool trainer_tileHitsEllipse(
+    float2 mean2D, float3 conic, float level, int tx, int ty
+) {
+    const float x0 = float(tx * int(TRAINER_TILE_W)) + 0.5f - mean2D.x;
+    const float x1 = x0 + float(TRAINER_TILE_W - 1u);
+    const float y0 = float(ty * int(TRAINER_TILE_H)) + 0.5f - mean2D.y;
+    const float y1 = y0 + float(TRAINER_TILE_H - 1u);
+    if (x0 <= 0.0f && x1 >= 0.0f && y0 <= 0.0f && y1 >= 0.0f) { return true; }
+    const float a = conic.x;
+    const float b = conic.y;
+    const float c = conic.z;
+    const float m = min(
+        min(trainer_edgeMinQ(a, b, c, x0, y0, y1), trainer_edgeMinQ(a, b, c, x1, y0, y1)),
+        min(trainer_edgeMinQ(c, b, a, y0, x0, x1), trainer_edgeMinQ(c, b, a, y1, x0, x1))
+    );
+    return m <= level;
+}
+
 kernel void trainer_preprocess(
     const device TrainerSplat*        splats  [[buffer(0)]],
     const device float*               sh      [[buffer(1)]],
@@ -1024,7 +1078,8 @@ kernel void trainer_preprocess(
     const int maxY = min(int(cam.tileCountY),
                          int(ceil((mean2D.y + radiusY) / float(TRAINER_TILE_H))));
     if (maxX <= minX || maxY <= minY) { return; }
-    const uint touched = uint(maxX - minX) * uint(maxY - minY);
+    // `touched` is counted below, once the raster record it must agree with
+    // has been written. See "Exact tile footprint".
 
     // --- colour -------------------------------------------------------------
     const float3 dir = normalize(meanWorld - float3(cam.cameraCenter));
@@ -1126,6 +1181,24 @@ kernel void trainer_preprocess(
     r.pad1 = 0.0h;
     raster[gid] = r;
 
+    // EXACT TILE COUNT, from the same stored bits trainer_duplicate_keys will
+    // read (r.mean2D, r.conic, r.pad0), with the larger COUNT slack.
+    const float countLevel = -2.0f * float(r.pad0) + kTrainerTileCountSlack;
+    const float2 rMean = float2(r.mean2D);
+    const float3 rConic = float3(r.conic);
+    uint touched = 0u;
+    for (int ty = minY; ty < maxY; ++ty) {
+        for (int tx = minX; tx < maxX; ++tx) {
+            if (trainer_tileHitsEllipse(rMean, rConic, countLevel, tx, ty)) { touched += 1u; }
+        }
+    }
+    // A splat whose box meets the screen but whose ellipse reaches no pixel
+    // centre keeps ONE slot (a padding key), so tilesTouched > 0 still means
+    // exactly what it meant before: the sparse Adam, the regulariser and
+    // preprocess_backward gate on it, and denom and maxRadius below are
+    // written for exactly the same splats as before this change.
+    touched = max(touched, 1u);
+
     tilesTouched[gid] = touched;
 
     // visibleFlag is no longer written or read. The regulariser and both
@@ -1204,15 +1277,30 @@ kernel void trainer_duplicate_keys(
                              0.0f, 1.0f);
     const uint depthKey = uint(norm * 4095.0f);
 
+    // Only tiles the ellipse actually reaches (see "Exact tile footprint"),
+    // tested with the smaller EMIT slack on the same stored bits preprocess
+    // counted with, so the hits fit the `touched` slots reserved for them.
+    const float emitLevel = -2.0f * float(d.pad0) + kTrainerTileEmitSlack;
+    const float3 conic = float3(d.conic);
     uint cursor = offsets[gid];
-    for (int ty = minY; ty < maxY; ++ty) {
+    const uint end = cursor + touched;
+    bool full = false;
+    for (int ty = minY; ty < maxY && !full; ++ty) {
         for (int tx = minX; tx < maxX; ++tx) {
-            if (cursor >= instanceCap) { return; }
+            if (!trainer_tileHitsEllipse(mean2D, conic, emitLevel, tx, ty)) { continue; }
+            if (cursor >= end || cursor >= instanceCap) { full = true; break; }
             const uint tile = uint(ty) * cam.tileCountX + uint(tx);
             keys[cursor] = (tile << 12) | depthKey;
             values[cursor] = gid;
             cursor += 1u;
         }
+    }
+    // Pad the rest of the reserved range. Sentinel keys sort after every real
+    // key (24 bits all set) and trainer_tile_ranges gives them no tile.
+    while (cursor < end && cursor < instanceCap) {
+        keys[cursor] = (kTrainerSentinelTile << 12) | 0xFFFu;
+        values[cursor] = gid;
+        cursor += 1u;
     }
 }
 
@@ -1319,6 +1407,16 @@ kernel void trainer_tile_ranges(
 ) {
     if (gid >= count) { return; }
     const uint tile = keys[gid] >> 12;
+    // Padding from trainer_duplicate_keys: no tile. Sentinels sort last, so
+    // the first one closes the last real tile's range and the rest are
+    // skipped; no range ever reaches them.
+    if (tile == kTrainerSentinelTile) {
+        if (gid > 0u) {
+            const uint prev = keys[gid - 1u] >> 12;
+            if (prev != kTrainerSentinelTile) { tileRanges[2u * prev + 1u] = gid; }
+        }
+        return;
+    }
     if (gid == 0u) {
         tileRanges[2u * tile] = 0u;
     } else {

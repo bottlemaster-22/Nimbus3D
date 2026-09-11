@@ -1144,3 +1144,21 @@ Densification persisted (sizesim's "optimiser keeps it" branch, even past its 5.
 50,000 more splats and 100,000 more seeds bought 0.04 dB. The under-coverage reading is refuted: the loss is the split geometry itself (children at 1/2 on all axes, no clones), not the cap. A54 and the cap go back to 278's values. Open, untested: share 0.8 with shrink 2.0 (sizesim put most of the p50 effect there, and it keeps clones).
 
 **Build 284: 278 exactly, plus A25 (disc prior weight 0.001 -> 0).** Never run. The kernel gate `if (u.discWeight > 0)` switches off the rank term and the onEdge needle target together. Watch needles (8.7 % on 278) and p90, and the owner's eye on cluttered regions (0.005 artefacted there in 240).
+
+---
+
+## 2026-09-11 : THE SPEED CAMPAIGN. Owner: 50 builds before the next test; speed only, quality must not drop; target 100+ rounds/s (ideally 150-200); no big workflows (usage)
+
+Where a round goes now (278/284 censuses): ~15 ms wall per iteration (60 s / 4,000). GPU busy 48.7 s, so the GPU idles ~11 s of 60 (two commit-and-waits per iteration, CPU supervision upload, readbacks). The last stage split (an older build, recorded in runIteration's comment): backward raster 13.18 ms, forward 4.63, sort 2.19, losses 1.99, optimiser 1.23. The backward does up to 11 device float atomics per CONTRIBUTING pixel-splat pair (colour x3, opacity, mean x2, conic x3, absGrad, visAccum): that is the wall.
+
+Arithmetic of the target: 100 rounds/s is 10 ms/iteration; 200 is 5 ms. Removing all idle gets ~82/s; past that the GPU work itself must fall ~20 % (100/s) to ~60 % (200/s).
+
+Plan: (1) measure (sampled stage profile), (2) exact work cuts, (3) the backward rewritten to accumulate per tile in threadgroup memory with SIMD pre-reduction, shipped BESIDE the current kernel with an on-device self-check (both run on the same iteration, gradients compared, both timed, the faster one used only if they agree), so large GPU changes can land without owner tests, (4) one command buffer per iteration with GPU-side counts and lagged readbacks, (5) training photos resident on the GPU.
+
+Measured offline for (2): exact ellipse-tile culling removes 11.7 % of tile instances (tools/offline/tile_cull.py, 13 views, 2.52 M -> 2.23 M).
+
+### BUILD 286
+
+- A25 pulled back (disc prior 0.001) untested: not a speed change.
+- **Sampled stage profile**: every 250th iteration command buffer B is split five ways (sort, forward, losses, backward, optimiser) and each timed; `timings.profiledSteps`. census.py prints ms per iteration per stage.
+- **Exact tile footprint**: preprocess counts only tiles whose pixel-centre rectangle the cutoff ellipse reaches (q <= -2*cutoff + 0.12), from the stored raster record; duplicate_keys emits with slack 0.02 and pads its reserved range with sentinel keys (tile 0xFFF) that sort last; tile_ranges skips them. A splat whose box meets the screen but reaches no pixel centre keeps one padding slot so tilesTouched keeps its meaning (Adam gating, denom, maxRadius unchanged). Output identical by construction: the dropped pairs are exactly those every pixel already `continue`d past.

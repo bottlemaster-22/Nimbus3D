@@ -2227,6 +2227,64 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // exception and this comment is the note saying so. Re-splitting is
         // uncommenting one function.
         try autoreleasepool { () throws -> Void in
+            // SAMPLED STAGE PROFILE (build 286). The same kernels in the same
+            // order, split into five command buffers so `finish` can time each
+            // stage on the GPU. Buffers on one queue run in order and see each
+            // other's writes, so the step computes exactly what the single
+            // buffer below does; only ~1 ms of round trips is added, on 16
+            // iterations a run. This is the breakdown every speed decision
+            // from here on is read against.
+            let profileEvery = tuning.stageProfileEvery
+            if profileEvery > 0, iteration % profileEvery == profileEvery / 2 {
+                func stage(_ label: String, _ encode: (MTLComputeCommandEncoder) -> Void) throws {
+                    guard let buffer = queue.makeCommandBuffer(),
+                          let encoder = buffer.makeComputeCommandEncoder()
+                    else { throw TrainerError.noMetalDevice }
+                    encoder.label = label
+                    encode(encoder)
+                    encoder.endEncoding()
+                    buffer.commit()
+                    try finish(buffer, label)
+                }
+                try stage("the tile sort") { e in
+                    gpu.duplicateKeys(e, camera: &camera, splatCount: splatCount)
+                    gpu.radixSort(e, count: instanceCount)
+                    gpu.tileRanges(e, instanceCount: instanceCount)
+                }
+                try stage("the forward raster") { e in
+                    gpu.rasterizeForward(e, camera: &camera)
+                }
+                try stage("the losses") { e in
+                    gpu.lossPhotometric(e, loss: &loss)
+                    gpu.ssim(e, loss: &loss)
+                    gpu.lossFinalize(e, loss: &loss)
+                    gpu.lossDepth(e, loss: &loss, sampleCount: sampleCount)
+                }
+                try stage("the backward raster") { e in
+                    gpu.rasterizeBackward(e, camera: &camera, loss: &loss)
+                    gpu.preprocessBackward(e, camera: &camera, splatCount: splatCount)
+                }
+                try stage("the optimiser") { e in
+                    var reg = regularizerUniforms(
+                        splatCount: splatCount, iteration: iteration,
+                        totalIterations: totalIterations
+                    )
+                    gpu.regularizer(e, reg: &reg)
+                    var adam = adamUniforms(
+                        splatCount: splatCount,
+                        shCoefficientCount: shCoefficientCount,
+                        iteration: iteration,
+                        totalIterations: totalIterations,
+                        sceneExtent: sceneExtent
+                    )
+                    gpu.adamSplat(e, adam: &adam)
+                    gpu.adamSH(e, adam: &adam)
+                }
+                timings.encodeStep += CFAbsoluteTimeGetCurrent() - encodeStepFrom
+                timings.profiledSteps += 1
+                return
+            }
+
             guard let bufferB = queue.makeCommandBuffer(),
                   let encoderB = bufferB.makeComputeCommandEncoder()
             else { throw TrainerError.noMetalDevice }
