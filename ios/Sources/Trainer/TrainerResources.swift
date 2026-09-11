@@ -158,6 +158,12 @@ final class TrainerResources {
     /// arguments, written by trainer_sort_setup. GPU-only; the counts reach
     /// the CPU through `readbackStaging`.
     let sortArgs: MTLBuffer
+    /// Build 320: the densifier's index map (one UInt32 and one byte per
+    /// surviving Gaussian) and a scratch the gather writes into, sized like
+    /// the largest per-Gaussian array (SH). Per-Gaussian capacity.
+    private(set) var densifySource: MTLBuffer
+    private(set) var densifyFlags: MTLBuffer
+    private(set) var densifyScratch: MTLBuffer
 
     // MARK: Accounting
 
@@ -240,6 +246,9 @@ final class TrainerResources {
         // Costs 28 bytes per splat over the four buffers it replaces, about
         // 8 MB at the 300,000 cap.
         splatGrad2D = try make("splatGrad2D", n * 64)
+        densifySource = try make("densifySource", n * 4)
+        densifyFlags = try make("densifyFlags", n)
+        densifyScratch = try make("densifyScratch", shFloats * MemoryLayout<Float>.stride)
         // 6 faces, 32x32, three floats each. Fixed size: it does not scale
         // with splats or pixels, so it is allocated once and never resized.
         bgCubemap = try make("bgCubemap", 6 * 32 * 32 * 3 * 4)
@@ -339,6 +348,7 @@ final class TrainerResources {
             splats, sh, stats, draws, samplingTopK, tilesTouched, offsets,
             splatGrad, shGrad, adamM, adamV, shAdamM, shAdamV,
             splatGrad2D, bgCubemap, raster, centers,
+            densifySource, densifyFlags, densifyScratch,
             keysA, keysB, valuesA, valuesB, tileRanges,
             radixHistogram, radixHistogramScan,
             renderColor, renderAlpha, renderDepth, renderTFinal, renderNContrib,
@@ -369,6 +379,7 @@ final class TrainerResources {
             + MemoryLayout<TrainerSamplingTopK>.stride     // Mip-Splatting rates
             + MemoryLayout<TrainerSplatGrad>.stride * 3    // gradient + Adam m + v
             + shFloats * 4 * 4                             // sh + grad + m + v
+            + shFloats * 4 + 4 + 1                         // densify scratch, source, flags
             + 4 * 2                                        // tilesTouched, offsets
             + 4 * (2 + 3 + 3 + 1)                          // mean2D, conic, colour, opacity
             + 4 * 3                                        // extracted centres
@@ -612,6 +623,9 @@ final class TrainerResources {
         shGrad = placeholder
         splatGrad2D = placeholder
         centers = placeholder
+        densifySource = placeholder
+        densifyFlags = placeholder
+        densifyScratch = placeholder
 
         // The eight that carry state across the resize, allocated into the
         // headroom the release above just freed. Each replacement is filled
@@ -653,6 +667,9 @@ final class TrainerResources {
         shGrad = try makeBuffer("shGrad", shFloats * floatStride)
         splatGrad2D = try makeBuffer("splatGrad2D", n * 64)
         centers = try makeBuffer("centers", n * 3 * 4)
+        densifySource = try makeBuffer("densifySource", n * 4)
+        densifyFlags = try makeBuffer("densifyFlags", n)
+        densifyScratch = try makeBuffer("densifyScratch", shFloats * floatStride)
 
         // Level zero of the scan scratch is sized from the padded splat array,
         // so it moves with the capacity even though the sort capacity has not.

@@ -41,6 +41,7 @@
 //
 
 import Foundation
+import Metal
 import simd
 
 /// Why a densification pass created the number of Gaussians it created,
@@ -98,6 +99,54 @@ enum TrainerDensifyGrowthVerdict: String, Codable, Sendable {
 /// splats created" from a shrug into a diagnosis. Every one of these is a
 /// value this function already computed; none of them costs an extra pass over
 /// the buffers and none of them touches the GPU.
+/// Build 320: applies the densifier's decision to the six bulk per-Gaussian
+/// arrays on the GPU. See trainer_densify_gather.
+struct TrainerDensifyGather {
+    let gpu: TrainerGPU
+    let queue: MTLCommandQueue
+
+    func apply(
+        resources: TrainerResources, source: [UInt32], flags: [UInt8], count: Int
+    ) throws {
+        guard count > 0 else { return }
+        _ = resources.densifySource.writeArray(source)
+        _ = resources.densifyFlags.writeArray(flags)
+        guard let buffer = queue.makeCommandBuffer() else { throw TrainerError.noMetalDevice }
+        let shWords = resources.shFloatsPerSplat
+        let gradWords = MemoryLayout<TrainerSplatGrad>.stride / 4
+        let topKWords = MemoryLayout<TrainerSamplingTopK>.stride / 4
+        let sh = UInt32(TrainerDensifier.zeroSHMoments)
+        let adam = UInt32(TrainerDensifier.zeroAdam)
+        let arrays: [(MTLBuffer, Int, UInt32)] = [
+            (resources.sh, shWords, 0),
+            (resources.shAdamM, shWords, sh),
+            (resources.shAdamV, shWords, sh),
+            (resources.adamM, gradWords, adam),
+            (resources.adamV, gradWords, adam),
+            (resources.samplingTopK, topKWords, 0)
+        ]
+        // Each array: gathered into the scratch, then copied back over
+        // itself. Encoder boundaries order the two, and the scratch is sized
+        // for the largest of them.
+        for (array, words, mask) in arrays {
+            guard let encoder = buffer.makeComputeCommandEncoder() else {
+                throw TrainerError.noMetalDevice
+            }
+            gpu.densifyGather(encoder, from: array, wordsPerRecord: words, zeroMask: mask, count: count)
+            encoder.endEncoding()
+            guard let blit = buffer.makeBlitCommandEncoder() else { throw TrainerError.noMetalDevice }
+            let bytes = Swift.min(count * words * 4, array.length, resources.densifyScratch.length)
+            blit.copy(from: resources.densifyScratch, sourceOffset: 0, to: array, destinationOffset: 0, size: bytes)
+            blit.endEncoding()
+        }
+        buffer.commit()
+        buffer.waitUntilCompleted()
+        if let error = buffer.error {
+            throw TrainerError.gpuFailed(stage: "the densify gather", detail: error.localizedDescription)
+        }
+    }
+}
+
 struct TrainerDensifyOutcome {
     var splatCountBefore = 0
     var splatCountAfter = 0
@@ -109,6 +158,10 @@ struct TrainerDensifyOutcome {
     var prunedNonFinite = 0
     var carvedFromEmptySpace = 0
     var trimmedToCap = 0
+    /// Build 320: on a pass that ran the CPU copy path beside the GPU gather,
+    /// how many 32-bit words of the six bulk arrays differed (expected 0);
+    /// nil when the pass was not checked.
+    var gatherMismatches: Int? = nil
 
     // --- Why this pass could or could not do anything -----------------------
 
@@ -288,7 +341,11 @@ final class TrainerDensifier {
         sceneExtentMeters: Float,
         allowGrowth: Bool,
         allowPrune: Bool,
-        carver: FreeSpaceCarver?
+        carver: FreeSpaceCarver?,
+        /// Build 320: applies the index map on the GPU. nil keeps the CPU path.
+        gather: TrainerDensifyGather? = nil,
+        /// Run the CPU path beside the gather and compare the results.
+        checkGather: Bool = false
     ) throws -> TrainerDensifyOutcome {
 
         var outcome = TrainerDensifyOutcome()
@@ -313,12 +370,26 @@ final class TrainerDensifier {
         let shPerSplat = resources.shFloatsPerSplat
         var splats = resources.splats.readArray(TrainerSplat.self, count: splatCount)
         var stats = resources.stats.readArray(TrainerSplatStats.self, count: splatCount)
-        var sh = resources.sh.readArray(Float.self, count: splatCount * shPerSplat)
-        var adamM = resources.adamM.readArray(TrainerSplatGrad.self, count: splatCount)
-        var adamV = resources.adamV.readArray(TrainerSplatGrad.self, count: splatCount)
-        var shM = resources.shAdamM.readArray(Float.self, count: splatCount * shPerSplat)
-        var shV = resources.shAdamV.readArray(Float.self, count: splatCount * shPerSplat)
-        var topK = resources.samplingTopK.readArray(TrainerSamplingTopK.self, count: splatCount)
+        // BUILD 320: THE SIX BULK ARRAYS STAY ON THE GPU. Nothing below READS
+        // sh, the Adam moments or the sampling rates; the pass only copies
+        // records of them (a child takes its parent's, a donor its target's)
+        // or zeroes them. So each surviving index carries the OLD index its
+        // values come from and which of its moments start at zero, and a
+        // kernel applies that (trainer_densify_gather). The arrays are read
+        // here only when there is no gather, or on a checking pass, where the
+        // old copy path runs beside the new one and the two are compared.
+        let bulkOnCPU = gather == nil || checkGather
+        var sh = bulkOnCPU ? resources.sh.readArray(Float.self, count: splatCount * shPerSplat) : []
+        var adamM = bulkOnCPU ? resources.adamM.readArray(TrainerSplatGrad.self, count: splatCount) : []
+        var adamV = bulkOnCPU ? resources.adamV.readArray(TrainerSplatGrad.self, count: splatCount) : []
+        var shM = bulkOnCPU ? resources.shAdamM.readArray(Float.self, count: splatCount * shPerSplat) : []
+        var shV = bulkOnCPU ? resources.shAdamV.readArray(Float.self, count: splatCount * shPerSplat) : []
+        var topK = bulkOnCPU ? resources.samplingTopK.readArray(TrainerSamplingTopK.self, count: splatCount) : []
+        var source = [UInt32](unsafeUninitializedCapacity: splatCount) { buffer, n in
+            for i in 0..<splatCount { buffer[i] = UInt32(i) }
+            n = splatCount
+        }
+        var flags = [UInt8](repeating: 0, count: splatCount)
 
         guard splats.count == splatCount, stats.count == splatCount else {
             TrainerLog.densify.error("Densification skipped: the GPU buffers read short")
@@ -517,8 +588,12 @@ final class TrainerDensifier {
         var newSplats: [TrainerSplat] = []
         var newSH: [Float] = []
         var newTopK: [TrainerSamplingTopK] = []
+        var newSource: [UInt32] = []
+        var newFlags: [UInt8] = []
         newSplats.reserveCapacity(growthAllowance)
-        newSH.reserveCapacity(growthAllowance * shPerSplat)
+        newSH.reserveCapacity(bulkOnCPU ? growthAllowance * shPerSplat : 0)
+        newSource.reserveCapacity(growthAllowance)
+        newFlags.reserveCapacity(growthAllowance)
 
         var added = 0
         if growthAllowance > 0 {
@@ -568,16 +643,23 @@ final class TrainerDensifier {
                     // The parent's optimiser state described a Gaussian that no
                     // longer exists. Keeping it makes the child's first step
                     // fly off in the parent's direction.
-                    adamM[index] = TrainerSplatGrad()
-                    adamV[index] = TrainerSplatGrad()
+                    flags[index] |= Self.zeroAdam
+                    if bulkOnCPU {
+                        adamM[index] = TrainerSplatGrad()
+                        adamV[index] = TrainerSplatGrad()
+                    }
 
                     var childB = parent
                     childB.mean = parent.mean - offset
                     childB.logScale = shrunk
                     childB.flags = parent.flags | TrainerSplatFlag.densified
                     newSplats.append(childB)
-                    newSH.append(contentsOf: sh[(index * shPerSplat)..<((index + 1) * shPerSplat)])
-                    newTopK.append(topK[index])
+                    newSource.append(source[index])
+                    newFlags.append(Self.zeroAdam | Self.zeroSHMoments)
+                    if bulkOnCPU {
+                        newSH.append(contentsOf: sh[(index * shPerSplat)..<((index + 1) * shPerSplat)])
+                        newTopK.append(topK[index])
+                    }
                     added += 1
                     outcome.split += 1
                 } else {
@@ -591,8 +673,12 @@ final class TrainerDensifier {
                     clone.mean = parent.mean + offset
                     clone.flags = parent.flags | TrainerSplatFlag.densified
                     newSplats.append(clone)
-                    newSH.append(contentsOf: sh[(index * shPerSplat)..<((index + 1) * shPerSplat)])
-                    newTopK.append(topK[index])
+                    newSource.append(source[index])
+                    newFlags.append(Self.zeroAdam | Self.zeroSHMoments)
+                    if bulkOnCPU {
+                        newSH.append(contentsOf: sh[(index * shPerSplat)..<((index + 1) * shPerSplat)])
+                        newTopK.append(topK[index])
+                    }
                     added += 1
                     outcome.cloned += 1
                 }
@@ -723,17 +809,26 @@ final class TrainerDensifier {
                 splats[target] = kept
 
                 // The donor's colour comes with it; its old colour belonged to
-                // wherever it used to be.
-                for c in 0..<shPerSplat {
-                    sh[donor * shPerSplat + c] = sh[target * shPerSplat + c]
-                    shM[donor * shPerSplat + c] = 0
-                    shV[donor * shPerSplat + c] = 0
+                // wherever it used to be. `source[target]` rather than `target`:
+                // the target's own values were never moved this pass (only
+                // donors are written), so its source is itself unless it was
+                // a donor earlier in this loop, and then this follows the copy
+                // exactly as the array copy below does.
+                source[donor] = source[target]
+                flags[donor] = Self.zeroAdam | Self.zeroSHMoments
+                flags[target] |= Self.zeroAdam
+                if bulkOnCPU {
+                    for c in 0..<shPerSplat {
+                        sh[donor * shPerSplat + c] = sh[target * shPerSplat + c]
+                        shM[donor * shPerSplat + c] = 0
+                        shV[donor * shPerSplat + c] = 0
+                    }
+                    topK[donor] = topK[target]
+                    adamM[donor] = TrainerSplatGrad()
+                    adamV[donor] = TrainerSplatGrad()
+                    adamM[target] = TrainerSplatGrad()
+                    adamV[target] = TrainerSplatGrad()
                 }
-                topK[donor] = topK[target]
-                adamM[donor] = TrainerSplatGrad()
-                adamV[donor] = TrainerSplatGrad()
-                adamM[target] = TrainerSplatGrad()
-                adamV[target] = TrainerSplatGrad()
                 stats[donor].stepCount = 0
                 // filter3D is a property of WHERE a Gaussian sits (the camera
                 // sampling rate there). The moved copy now sits at the target,
@@ -750,17 +845,23 @@ final class TrainerDensifier {
         // starts at step 1 rather than at the global iteration number.
         if !newSplats.isEmpty {
             splats.append(contentsOf: newSplats)
-            sh.append(contentsOf: newSH)
-            topK.append(contentsOf: newTopK)
+            source.append(contentsOf: newSource)
+            flags.append(contentsOf: newFlags)
             for _ in 0..<newSplats.count {
-                adamM.append(TrainerSplatGrad())
-                adamV.append(TrainerSplatGrad())
                 var fresh = TrainerSplatStats()
                 fresh.filter3D = 0
                 stats.append(fresh)
             }
-            shM.append(contentsOf: [Float](repeating: 0, count: newSplats.count * shPerSplat))
-            shV.append(contentsOf: [Float](repeating: 0, count: newSplats.count * shPerSplat))
+            if bulkOnCPU {
+                sh.append(contentsOf: newSH)
+                topK.append(contentsOf: newTopK)
+                for _ in 0..<newSplats.count {
+                    adamM.append(TrainerSplatGrad())
+                    adamV.append(TrainerSplatGrad())
+                }
+                shM.append(contentsOf: [Float](repeating: 0, count: newSplats.count * shPerSplat))
+                shV.append(contentsOf: [Float](repeating: 0, count: newSplats.count * shPerSplat))
+            }
         }
 
         var liveCount = splats.count
@@ -910,69 +1011,133 @@ final class TrainerDensifier {
         if survivorCount != liveCount {
             var outSplats: [TrainerSplat] = []
             var outStats: [TrainerSplatStats] = []
-            var outSH: [Float] = []
-            var outM: [TrainerSplatGrad] = []
-            var outV: [TrainerSplatGrad] = []
-            var outSHM: [Float] = []
-            var outSHV: [Float] = []
-            var outTopK: [TrainerSamplingTopK] = []
-            // All EIGHT, not three. The five that were missing grew by
-            // doubling, so compacting a 300,000 splat model reallocated and
-            // copied them about eighteen times each, every densification
-            // pass that removed anything. That is 29 passes in a real run.
+            var outSource: [UInt32] = []
+            var outFlags: [UInt8] = []
             outSplats.reserveCapacity(survivorCount)
             outStats.reserveCapacity(survivorCount)
-            outSH.reserveCapacity(survivorCount * shPerSplat)
-            outM.reserveCapacity(survivorCount)
-            outV.reserveCapacity(survivorCount)
-            outSHM.reserveCapacity(survivorCount * shPerSplat)
-            outSHV.reserveCapacity(survivorCount * shPerSplat)
-            outTopK.reserveCapacity(survivorCount)
-
+            outSource.reserveCapacity(survivorCount)
+            outFlags.reserveCapacity(survivorCount)
             for i in 0..<liveCount where keep[i] {
                 outSplats.append(splats[i])
                 outStats.append(i < stats.count ? stats[i] : TrainerSplatStats())
-                outM.append(i < adamM.count ? adamM[i] : TrainerSplatGrad())
-                outV.append(i < adamV.count ? adamV[i] : TrainerSplatGrad())
-                outTopK.append(i < topK.count ? topK[i] : TrainerSamplingTopK())
-                let base = i * shPerSplat
-                if base + shPerSplat <= sh.count {
-                    outSH.append(contentsOf: sh[base..<(base + shPerSplat)])
-                    outSHM.append(contentsOf: shM[base..<(base + shPerSplat)])
-                    outSHV.append(contentsOf: shV[base..<(base + shPerSplat)])
-                } else {
-                    outSH.append(contentsOf: [Float](repeating: 0, count: shPerSplat))
-                    outSHM.append(contentsOf: [Float](repeating: 0, count: shPerSplat))
-                    outSHV.append(contentsOf: [Float](repeating: 0, count: shPerSplat))
+                outSource.append(source[i])
+                outFlags.append(flags[i])
+            }
+            if bulkOnCPU {
+                // All SIX, not three. The three that were missing grew by
+                // doubling, so compacting a 300,000 splat model reallocated and
+                // copied them about eighteen times each, every densification
+                // pass that removed anything. That is 29 passes in a real run.
+                var outSH: [Float] = []
+                var outM: [TrainerSplatGrad] = []
+                var outV: [TrainerSplatGrad] = []
+                var outSHM: [Float] = []
+                var outSHV: [Float] = []
+                var outTopK: [TrainerSamplingTopK] = []
+                outSH.reserveCapacity(survivorCount * shPerSplat)
+                outM.reserveCapacity(survivorCount)
+                outV.reserveCapacity(survivorCount)
+                outSHM.reserveCapacity(survivorCount * shPerSplat)
+                outSHV.reserveCapacity(survivorCount * shPerSplat)
+                outTopK.reserveCapacity(survivorCount)
+                for i in 0..<liveCount where keep[i] {
+                    outM.append(i < adamM.count ? adamM[i] : TrainerSplatGrad())
+                    outV.append(i < adamV.count ? adamV[i] : TrainerSplatGrad())
+                    outTopK.append(i < topK.count ? topK[i] : TrainerSamplingTopK())
+                    let base = i * shPerSplat
+                    if base + shPerSplat <= sh.count {
+                        outSH.append(contentsOf: sh[base..<(base + shPerSplat)])
+                        outSHM.append(contentsOf: shM[base..<(base + shPerSplat)])
+                        outSHV.append(contentsOf: shV[base..<(base + shPerSplat)])
+                    } else {
+                        outSH.append(contentsOf: [Float](repeating: 0, count: shPerSplat))
+                        outSHM.append(contentsOf: [Float](repeating: 0, count: shPerSplat))
+                        outSHV.append(contentsOf: [Float](repeating: 0, count: shPerSplat))
+                    }
                 }
+                sh = outSH
+                adamM = outM
+                adamV = outV
+                shM = outSHM
+                shV = outSHV
+                topK = outTopK
             }
 
             splats = outSplats
             stats = outStats
-            sh = outSH
-            adamM = outM
-            adamV = outV
-            shM = outSHM
-            shV = outSHV
-            topK = outTopK
+            source = outSource
+            flags = outFlags
             liveCount = splats.count
         }
 
         // --- 8. Write back -----------------------------------------------------
         if liveCount > resources.splatCapacity {
-            try resources.resizeSplatCapacity(to: liveCount, keeping: 0)
+            // With a gather the six arrays' OLD records are its input, so a
+            // resize keeps them (the CPU path rewrites everything and keeps
+            // nothing, as before).
+            try resources.resizeSplatCapacity(
+                to: liveCount, keeping: gather == nil ? 0 : splatCount
+            )
         }
         resources.splats.writeArray(splats)
         resources.stats.writeArray(stats)
-        resources.sh.writeArray(sh)
-        resources.adamM.writeArray(adamM)
-        resources.adamV.writeArray(adamV)
-        resources.shAdamM.writeArray(shM)
-        resources.shAdamV.writeArray(shV)
-        resources.samplingTopK.writeArray(topK)
+        if let gather {
+            try gather.apply(resources: resources, source: source, flags: flags, count: liveCount)
+            if bulkOnCPU {
+                // The checking pass: the old copy path's arrays against what
+                // the kernel wrote, bit for bit.
+                var mismatches = 0
+                mismatches += Self.mismatchedWords(resources.sh, expected: sh)
+                mismatches += Self.mismatchedWords(resources.shAdamM, expected: shM)
+                mismatches += Self.mismatchedWords(resources.shAdamV, expected: shV)
+                mismatches += Self.mismatchedWords(resources.adamM, expected: adamM)
+                mismatches += Self.mismatchedWords(resources.adamV, expected: adamV)
+                mismatches += Self.mismatchedWords(resources.samplingTopK, expected: topK)
+                outcome.gatherMismatches = mismatches
+                if mismatches > 0 {
+                    // The CPU path is the reference: its arrays are written
+                    // over the gather's, and the trainer stops using the gather.
+                    resources.sh.writeArray(sh)
+                    resources.adamM.writeArray(adamM)
+                    resources.adamV.writeArray(adamV)
+                    resources.shAdamM.writeArray(shM)
+                    resources.shAdamV.writeArray(shV)
+                    resources.samplingTopK.writeArray(topK)
+                    TrainerLog.densify.error(
+                        "Densify gather check: \(mismatches) words differed from the CPU path; the CPU path is used from here"
+                    )
+                }
+            }
+        } else {
+            resources.sh.writeArray(sh)
+            resources.adamM.writeArray(adamM)
+            resources.adamV.writeArray(adamV)
+            resources.shAdamM.writeArray(shM)
+            resources.shAdamV.writeArray(shV)
+            resources.samplingTopK.writeArray(topK)
+        }
 
         outcome.splatCountAfter = liveCount
         return outcome
+    }
+
+    static let zeroAdam: UInt8 = 1
+    static let zeroSHMoments: UInt8 = 2
+
+    /// Words of `buffer`'s first `expected.count` records that differ from
+    /// `expected`, compared as raw 32-bit patterns (so NaN payloads and signed
+    /// zeros count as what they are).
+    private static func mismatchedWords<T>(_ buffer: MTLBuffer, expected: [T]) -> Int {
+        let bytes = expected.count * MemoryLayout<T>.stride
+        let words = bytes / 4
+        let actual = buffer.readArray(UInt32.self, count: words)
+        guard actual.count == words else { return words }
+        return expected.withUnsafeBytes { raw -> Int in
+            let want = raw.bindMemory(to: UInt32.self)
+            var differing = 0
+            for i in 0..<words where want[i] != actual[i] { differing += 1 }
+            return differing
+        }
     }
 
     // MARK: - Bounded selection

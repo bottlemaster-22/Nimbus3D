@@ -195,6 +195,13 @@ public final class NativeDepthEdgeClassifier: EdgeClassifier, @unchecked Sendabl
         }
 
         lock.lock()
+        // Re-checked under the lock (build 320): two threads that built the
+        // same frame must not both append its key to the order, or the
+        // eviction below removes a live entry. See SmartImageCache.image.
+        if let existing = cache[frame] {
+            lock.unlock()
+            return existing
+        }
         cache[frame] = classes
         cacheOrder.append(frame)
         while cacheOrder.count > cacheCapacity {

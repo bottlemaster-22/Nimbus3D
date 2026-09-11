@@ -142,6 +142,8 @@ enum TrainerKernel {
     static let gatherTouched = "trainer_gather_touched"
     /// Build 316: sizes the sort on the GPU.
     static let sortSetup = "trainer_sort_setup"
+    /// Build 320: applies the densifier's index map to the bulk arrays.
+    static let densifyGather = "trainer_densify_gather"
     static let background = "trainer_background"
     static let lossPhotometric = "trainer_loss_photometric"
     static let blurH = "trainer_blur_h"
@@ -164,7 +166,8 @@ enum TrainerKernel {
     static let all: [String] = [
         fillUInt, fillFloat, resetDensifyStats,
         scanBlock, scanAdd, radixHistogram, radixScatter,
-        preprocess, duplicateKeys, depthKeys, gatherTouched, sortSetup, tileRanges, rasterizeForward,
+        preprocess, duplicateKeys, depthKeys, gatherTouched, sortSetup, densifyGather, tileRanges,
+        rasterizeForward,
         lossPhotometric, blurH, blurV, ssimStats,
         lossDepth, lossFinalize, rasterizeBackward, preprocessBackward,
         samplingRateUpdate, filter3DFinalize, regularizer,
@@ -272,6 +275,16 @@ enum TrainerBind {
         static let camera = 3
         static let instanceCap = 4   // constant uint&
         static let groupWidth = 5    // constant uint&
+    }
+
+    enum DensifyGather {
+        static let src = 0
+        static let dst = 1
+        static let source = 2
+        static let flags = 3
+        static let wordsPer = 4      // constant uint&
+        static let zeroMask = 5      // constant uint&
+        static let count = 6         // constant uint&
     }
 
     enum TileRanges {

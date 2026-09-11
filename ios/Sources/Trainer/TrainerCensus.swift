@@ -557,6 +557,10 @@ struct TrainerTimings: Codable {
     /// findings claiming to live inside it. Now they can be checked instead of
     /// believed.
     var densify: Double = 0
+    /// Build 320: densify passes whose GPU gather was checked against the
+    /// CPU copy path, and the words that differed across them (expected 0).
+    var densifyGatherChecks: Int = 0
+    var densifyGatherMismatches: Int = 0
     var previewSnapshot: Double = 0
     var filterSweep: Double = 0
     /// runIteration only: seconds from buffer A's completion to buffer B's

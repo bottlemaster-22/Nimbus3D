@@ -95,6 +95,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     private var backwardTwoPixelChosen = false
     /// Set by the blur calibration (build 318): use the fused SSIM blur.
     private var blurFusedChosen = false
+    /// Build 320: the densifier applies its decision on the GPU; cleared
+    /// for the run if the first pass's check found a difference.
+    private var densifyGatherUsable = true
     /// Set by the sort calibration (build 306): use the splat-order tile sort.
     private var splatOrderChosen = false
 
@@ -524,6 +527,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         forwardTwoPixelChosen = false
         backwardTwoPixelChosen = false
         blurFusedChosen = false
+        densifyGatherUsable = true
         splatOrderChosen = false
         // A step left running by a run that threw cannot belong to this one.
         // Its buffer finishes on its own; its read-backs are not wanted.
@@ -1644,9 +1648,20 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     sceneExtentMeters: sceneExtent,
                     allowGrowth: inDensifyWindow,
                     allowPrune: inPruneWindow,
-                    carver: carveDue ? smart.carver : nil
+                    carver: carveDue ? smart.carver : nil,
+                    // Build 320: the bulk arrays stay on the GPU. The first
+                    // pass of the run also runs the CPU path and compares; a
+                    // difference switches the run back to the CPU path.
+                    gather: densifyGatherUsable
+                        ? TrainerDensifyGather(gpu: gpu, queue: queue) : nil,
+                    checkGather: densifyPassesRun == 0
                 )
                 splatCount = outcome.splatCountAfter
+                if let mismatches = outcome.gatherMismatches {
+                    timings.densifyGatherChecks += 1
+                    timings.densifyGatherMismatches += mismatches
+                    if mismatches > 0 { densifyGatherUsable = false }
+                }
 
                 // One census row per pass. This is the whole ledger of where
                 // the geometry went: what the windows said, what room there

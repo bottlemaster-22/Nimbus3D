@@ -57,6 +57,7 @@ final class TrainerPipelines {
     let gatherTouched: MTLComputePipelineState
     let tileRanges: MTLComputePipelineState
     let sortSetup: MTLComputePipelineState
+    let densifyGather: MTLComputePipelineState
     let rasterizeForward: MTLComputePipelineState
     let background: MTLComputePipelineState
     let lossPhotometric: MTLComputePipelineState
@@ -182,6 +183,7 @@ final class TrainerPipelines {
         gatherTouched = try build(TrainerKernel.gatherTouched)
         tileRanges = try build(TrainerKernel.tileRanges)
         sortSetup = try build(TrainerKernel.sortSetup)
+        densifyGather = try build(TrainerKernel.densifyGather)
         rasterizeForward = try build(TrainerKernel.rasterizeForward)
         let forward2 = try? build(TrainerKernel.rasterizeForward2)
         let forward2Threads = TrainerGPUConstants.tileWidth * TrainerGPUConstants.tileHeight / 2
@@ -696,6 +698,34 @@ struct TrainerGPU {
             indirectBuffer: resources.sortArgs, indirectBufferOffset: 14 * stride,
             threadsPerThreadgroup: MTLSize(width: indirectGroupWidth, height: 1, depth: 1)
         )
+    }
+
+    // MARK: Build 320: the densifier's gather
+
+    /// Writes `count` records of `array` into `densifyScratch`, each record
+    /// taken from `array` at `densifySource[j]` or zeroed where
+    /// `densifyFlags[j]` has a bit of `zeroMask`. The caller blits the scratch
+    /// back over `array`.
+    func densifyGather(
+        _ encoder: MTLComputeCommandEncoder,
+        from array: MTLBuffer,
+        wordsPerRecord: Int,
+        zeroMask: UInt32,
+        count: Int
+    ) {
+        guard count > 0, wordsPerRecord > 0 else { return }
+        encoder.setComputePipelineState(pipelines.densifyGather)
+        encoder.setBuffer(array, offset: 0, index: TrainerBind.DensifyGather.src)
+        encoder.setBuffer(resources.densifyScratch, offset: 0, index: TrainerBind.DensifyGather.dst)
+        encoder.setBuffer(resources.densifySource, offset: 0, index: TrainerBind.DensifyGather.source)
+        encoder.setBuffer(resources.densifyFlags, offset: 0, index: TrainerBind.DensifyGather.flags)
+        var words = UInt32(wordsPerRecord)
+        encoder.setBytes(&words, length: MemoryLayout<UInt32>.size, index: TrainerBind.DensifyGather.wordsPer)
+        var mask = zeroMask
+        encoder.setBytes(&mask, length: MemoryLayout<UInt32>.size, index: TrainerBind.DensifyGather.zeroMask)
+        var n = UInt32(count)
+        encoder.setBytes(&n, length: MemoryLayout<UInt32>.size, index: TrainerBind.DensifyGather.count)
+        dispatch1D(encoder, pipelines.densifyGather, count: count * wordsPerRecord)
     }
 
     // MARK: Forward

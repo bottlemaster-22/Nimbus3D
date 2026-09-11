@@ -3653,6 +3653,40 @@ kernel void trainer_filter3d_finalize(
     stats[gid].filter3D = (rate > 0.0f) ? (filterScale / rate) : fallback;
 }
 
+// MARK: - Densification: gather (build 320)
+//
+// The densifier decides on the CPU and used to move every per-Gaussian array
+// through host memory to apply the decision: eight arrays read, compacted
+// in Swift and written back, about 260 MB a pass at 300,000 Gaussians,
+// 39 passes a run. Six of those arrays (SH, its two Adam moments, the two
+// splat Adam moments, the sampling rates) are never READ by the decision and
+// only ever COPIED or ZEROED by it, so the decision is now expressed as one
+// record per surviving index (`source[j]`: the old index its values come
+// from; `flags[j]`: which of its moments start at zero) and applied here,
+// word for word, on the GPU. `splats` and `stats` still go through the CPU:
+// the decision reads and rewrites them.
+// ============================================================================
+
+constant uint kTrainerDensifyZeroAdam = 1u;
+constant uint kTrainerDensifyZeroSHMoments = 2u;
+
+kernel void trainer_densify_gather(
+    const device uint*  src        [[buffer(0)]],
+    device uint*        dst        [[buffer(1)]],
+    const device uint*  source     [[buffer(2)]],   // old index per new record
+    const device uchar* flags      [[buffer(3)]],   // kTrainerDensifyZero* bits
+    constant uint&      wordsPer   [[buffer(4)]],   // words per record
+    constant uint&      zeroMask   [[buffer(5)]],   // flag bits that zero THIS array
+    constant uint&      count      [[buffer(6)]],   // new records
+    uint                gid        [[thread_position_in_grid]]
+) {
+    const uint j = gid / wordsPer;
+    if (j >= count) { return; }
+    const uint k = gid - j * wordsPer;
+    const bool zero = (uint(flags[j]) & zeroMask) != 0u;
+    dst[gid] = zero ? 0u : src[source[j] * wordsPer + k];
+}
+
 // ============================================================================
 // MARK: - Regulariser (F4)
 // ============================================================================
