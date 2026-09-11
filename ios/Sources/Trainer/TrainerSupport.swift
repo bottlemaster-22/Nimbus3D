@@ -1072,6 +1072,10 @@ struct TrainerTuning: Sendable {
 
     /// Mip-Splatting's filter scale constant.
     var filter3DScale: Float = 0.2
+    /// Build 356: the share of the training-grid 3D filter width folded into
+    /// the EXPORTED sizes. 0.5 is the filter of a render at twice the training
+    /// long edge (1,440 px), which is the least any viewer draws at.
+    var exportFilter3DScale: Float = 0.5
     /// Filter size, world metres, for a Gaussian no camera ever sampled.
     var filter3DFallbackMeters: Float = 0.01
     /// How often the per-Gaussian sampling-rate sweep is re-run.

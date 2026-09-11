@@ -5159,7 +5159,15 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             return cloud
         }
         do {
-            let changed = try cloud.fuse3DFilter(filters)
+            // BUILD 356: THE EXPORT IS SHARPER THAN THE TRAINING RENDER. The
+            // filter width is the training grid's (720 px long edge): folded in
+            // whole, every exported point is at least about one 720-px pixel
+            // wide, which is why the median long axis sat at 7.1 mm against
+            // 3.4 mm in the Scaniverse reference while the trained views scored
+            // 22 dB. Viewers draw at 1,440 px and up, where the right filter
+            // is half as wide, so half is what the file carries.
+            let scale = tuning.exportFilter3DScale
+            let changed = try cloud.fuse3DFilter(filters.map { $0 * scale })
             TrainerLog.general.notice(
                 "Folded the 3D low-pass filter into \(changed) of \(cloud.count) points."
             )
