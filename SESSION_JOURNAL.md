@@ -978,3 +978,26 @@ What was silently off: the shutter cap, the ISO record, the brightness hold, the
 - tgIndex comment corrected (the 6.5 percent claim was noise).
 
 Research workflows running: keyframe coverage, registration, size gap, remaining speed (8 agents) and the exposure model (2 agents).
+
+---
+
+## 2026-09-11 : Build 270 measured, fastest yet: 69.9 s
+
+| | 266 | 270 |
+|---|---|---|
+| pre-pass | 8.6 s | **7.9 s** |
+| training | 73 s | **62 s** |
+| **total** | 81.6 s | **69.9 s** |
+| gpuStep | 52.4 | 45.5 |
+| supervision wait | 3.7 | **1.1** |
+| supervision worker (CPU, off the critical path) | 43.8 | **29.5** |
+| best held-out PSNR / SSIM | 20.47 / 0.6654 | 20.42 / 0.6661 |
+
+Same keyframes (0 to 439), same scan. The only trainer changes since 266 are 268's supervision fixes (per-frame trust slices, rgb-only decode): 14 s less CPU work in the worker. gpuStep fell 7 s with no GPU change. Two readings, not separated: run-to-run noise (+/-3 s seen before), or the phone's CPU and GPU sharing one power and memory budget, so a worker burning 14 s less CPU leaves the GPU more. If the second, CPU work that overlaps training is not free even when it is off the critical path.
+
+**Trust split (first measurement):** setup 0.02, serial plane-sweep prefix **1.30 s for 13 slots** (100 ms a slot), parallel 1.21 s for 855 slots on 6 cores, confidence rewrite **0.87 s** (serial), writes 0.00.
+**Seeding split:** edge warm-up 0.25, sample loop **1.06**, shaping 0.14, write 0.19.
+
+### BUILD 272
+
+- **Confidence rewrite on every core**, rows written in slot order: same bytes. 0.87 s serial.

@@ -689,7 +689,7 @@ public final class TwoScaleTrustField: TrustField {
             slotCount: slotCount,
             samplesPerFrame: perFrame,
             framesByIndex: framesByIndex,
-            depthCache: depthCache,
+            workerCount: workerCount,
             bundleRef: ref,
             levelProbabilities: levelProbabilities
         )
@@ -1021,40 +1021,57 @@ public final class TwoScaleTrustField: TrustField {
         slotCount: Int,
         samplesPerFrame: Int,
         framesByIndex: [Int: CaptureFrame],
-        depthCache: SmartDepthCache,
+        workerCount: Int,
         bundleRef: CaptureBundleRef,
         levelProbabilities: [Float]
     ) throws {
         let writer = try SmartChunkedWriter(url: url)
-        // The SECOND full walk over every slot in this build, and it costs the
-        // same as the first: the depth cache holds only a handful of frames, so
-        // nearly every slot here is a miss that opens this frame's depth and
-        // confidence sidecars again, and every slot writes another
-        // `samplesPerFrame` floats. Same pool, same reason as the loop in
-        // `build`, and the same reshaping: `continue` cannot cross a closure
-        // boundary, so the skip path writes its all-zero frame and RETURNS.
-        // confidence_recal.bin is frame-major like the noise field, so that
-        // write has to happen before the return or every later frame's
-        // confidence reads back off by one frame.
-        for slot in 0..<slotCount {
-            try autoreleasepool { () throws -> Void in
-                guard
-                    let frame = framesByIndex[slot],
-                    let depth = depthCache.depth(for: frame, at: bundleRef)
-                else {
-                    try writer.appendFloats([Float](repeating: 0, count: samplesPerFrame))
-                    return
-                }
-                let confidence = depthCache.confidence(for: frame, at: bundleRef)
-                var out = [Float](repeating: 0, count: samplesPerFrame)
-                for i in 0..<samplesPerFrame {
-                    guard i < depth.count, depth[i] > 0, SmartMath.isUsableDepth(depth[i])
-                    else { continue }
-                    let level = Swift.max(0, Swift.min(2, Int(i < confidence.count ? confidence[i] : 1)))
-                    out[i] = levelProbabilities[level]
-                }
-                try writer.appendFloats(out)
+        // The SECOND full walk over every slot in this build: 0.87 s on build
+        // 270, one slot at a time, nearly every slot a cache miss that opens
+        // this frame's depth and confidence sidecars again. Each row depends
+        // only on its own frame, so rows are built on every core, a run of
+        // eight consecutive slots per worker through its own cache, and
+        // written strictly in slot order. confidence_recal.bin is frame-major
+        // with no header, so a slot with no depth still writes its all-zero
+        // row, or every later frame's confidence would read back one frame
+        // off. Same rows, same order, same bytes as the serial loop.
+        func row(_ slot: Int, _ cache: SmartDepthCache) -> [Float] {
+            var out = [Float](repeating: 0, count: samplesPerFrame)
+            guard
+                let frame = framesByIndex[slot],
+                let depth = cache.depth(for: frame, at: bundleRef)
+            else { return out }
+            let confidence = cache.confidence(for: frame, at: bundleRef)
+            for i in 0..<samplesPerFrame {
+                guard i < depth.count, depth[i] > 0, SmartMath.isUsableDepth(depth[i])
+                else { continue }
+                let level = Swift.max(0, Swift.min(2, Int(i < confidence.count ? confidence[i] : 1)))
+                out[i] = levelProbabilities[level]
             }
+            return out
+        }
+        let workers = Swift.max(1, workerCount)
+        let slotsPerWorker = 8
+        let caches = (0..<workers).map { _ in
+            SmartDepthCache(capacity: 2, sampleCount: samplesPerFrame)
+        }
+        var base = 0
+        while base < slotCount {
+            let start = base
+            let chunk = Swift.min(workers * slotsPerWorker, slotCount - start)
+            var rows = [[Float]](repeating: [], count: chunk)
+            rows.withUnsafeMutableBufferPointer { out in
+                DispatchQueue.concurrentPerform(iterations: workers) { w in
+                    var k = w * slotsPerWorker
+                    let end = Swift.min(k + slotsPerWorker, chunk)
+                    while k < end {
+                        out[k] = autoreleasepool { row(start + k, caches[w]) }
+                        k += 1
+                    }
+                }
+            }
+            for r in rows { try writer.appendFloats(r) }
+            base += chunk
         }
         try writer.close()
     }
