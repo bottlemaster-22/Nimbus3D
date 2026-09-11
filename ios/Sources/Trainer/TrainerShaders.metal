@@ -2698,6 +2698,262 @@ kernel void trainer_rasterize_backward(
 }
 
 // ============================================================================
+// MARK: - Backward: rasterise, two pixels per thread (build 304)
+//
+// The SIMD-summed backward above with each thread owning TWO pixels, the one
+// at row tPos.y and the one 8 rows below, as trainer_rasterize_forward2 does.
+// Each staged splat is read from threadgroup memory once for both pixels, and
+// a SIMD group's one simd_sum and one set of atomics per splat now covers 64
+// pixels instead of 32, so both are halved per pixel. The per-pixel maths is
+// the loop above statement for statement, moved into trainer_backwardPixel so
+// both pixels run the same code in the same order.
+//
+// Sums are added in a different float order, as between any two runs of the
+// atomics. The trainer runs this and the kernel in use on the same iteration,
+// compares the gradients and times both before switching (MetalSplatTrainer,
+// two-pixel backward calibration).
+// ============================================================================
+
+struct TrainerBackwardPixel {
+    float  T;
+    float3 accumColor;
+    float  accumDepth;
+    float  lastAlpha;
+    float3 lastColor;
+    float  lastDepth;
+    float3 dLdC;
+    float  dLdD;
+    float  dLdTTotal;
+    float  TFinal;
+    float  isUnknown;
+    float2 center;
+    uint   lastContributor;
+    bool   inside;
+    bool   hasColorGrad;
+};
+
+/// The per-pixel setup of trainer_rasterize_backward, for one pixel.
+inline TrainerBackwardPixel trainer_backwardPixelInit(
+    uint2                           pixel,
+    constant TrainerCameraUniforms& cam,
+    constant TrainerLossUniforms&   lu,
+    const device float*             renderTFinal,
+    const device uint*              renderNContrib,
+    const device float*             gradSplatColor,
+    const device float*             gradDepth,
+    const device float*             gradTFinal,
+    const device float*             bgColor,
+    const device float*             unknownMask
+) {
+    TrainerBackwardPixel p;
+    p.inside = (pixel.x < cam.imageWidth) && (pixel.y < cam.imageHeight);
+    const uint pixelIndex = p.inside ? (pixel.y * cam.imageWidth + pixel.x) : 0u;
+    p.center = float2(float(pixel.x) + 0.5f, float(pixel.y) + 0.5f);
+    p.TFinal = p.inside ? renderTFinal[pixelIndex] : 1.0f;
+    p.lastContributor = p.inside ? renderNContrib[pixelIndex] : 0u;
+    p.dLdC = float3(0.0f);
+    p.dLdD = 0.0f;
+    float dLdTExtra = 0.0f;
+    float3 bg = float3(0.0f);
+    p.isUnknown = 0.0f;
+    if (p.inside) {
+        p.dLdC = float3(gradSplatColor[pixelIndex * 3u + 0u],
+                        gradSplatColor[pixelIndex * 3u + 1u],
+                        gradSplatColor[pixelIndex * 3u + 2u]);
+        p.dLdD = gradDepth[pixelIndex];
+        dLdTExtra = gradTFinal[pixelIndex];
+        if (lu.hasBackground != 0u) {
+            bg = float3(bgColor[pixelIndex * 3u + 0u],
+                        bgColor[pixelIndex * 3u + 1u],
+                        bgColor[pixelIndex * 3u + 2u]);
+        }
+        p.isUnknown = unknownMask[pixelIndex];
+    }
+    p.dLdTTotal = dLdTExtra + dot(bg, p.dLdC);
+    p.hasColorGrad = any(p.dLdC != float3(0.0f));
+    p.T = p.TFinal;
+    p.accumColor = float3(0.0f);
+    p.accumDepth = 0.0f;
+    p.lastAlpha = 0.0f;
+    p.lastColor = float3(0.0f);
+    p.lastDepth = 0.0f;
+    return p;
+}
+
+/// One (pixel, splat) pair of the SIMD-summed loop in
+/// trainer_rasterize_backward, ADDING into gA/gB/gC so two pixels can share
+/// them. Returns without touching anything wherever that loop's pixel did not
+/// contribute.
+inline void trainer_backwardPixel(
+    thread TrainerBackwardPixel&    p,
+    uint                            globalIndex,
+    float2                          xy,
+    float4                          co,
+    float                           cutoff,
+    float4                          colorDepth,
+    constant TrainerCameraUniforms& cam,
+    thread float4&                  gA,
+    thread float4&                  gB,
+    thread float4&                  gC,
+    thread bool&                    contributes
+) {
+    if (!p.inside || globalIndex > p.lastContributor) { return; }
+    const float2 delta = xy - p.center;
+    const float power = -0.5f * (co.x * delta.x * delta.x
+                                 + co.z * delta.y * delta.y)
+                        - co.y * delta.x * delta.y;
+    if (power < cutoff) { return; }
+    const float gaussian = exp(power);
+    const float alpha = min(0.99f, co.w * gaussian);
+    if (alpha < cam.minAlpha) { return; }
+    p.T = p.T / max(1.0f - alpha, 1e-6f);
+    const float weight = alpha * p.T;
+    const float3 color = colorDepth.xyz;
+    const float depth = colorDepth.w;
+    float dLdAlpha = 0.0f;
+    p.accumColor = p.lastAlpha * p.lastColor + (1.0f - p.lastAlpha) * p.accumColor;
+    p.lastColor = color;
+    dLdAlpha += dot(color - p.accumColor, p.dLdC);
+    if (cam.renderDepth != 0u) {
+        p.accumDepth = p.lastAlpha * p.lastDepth + (1.0f - p.lastAlpha) * p.accumDepth;
+        p.lastDepth = depth;
+        dLdAlpha += (depth - p.accumDepth) * p.dLdD;
+    }
+    dLdAlpha *= p.T;
+    p.lastAlpha = alpha;
+    dLdAlpha += (-p.TFinal / max(1.0f - alpha, 1e-6f)) * p.dLdTTotal;
+    const float dLdG = co.w * dLdAlpha;
+    const float dLdPower = dLdG * gaussian;
+    if (trainer_isNonFinite(dLdPower) || trainer_isNonFinite(weight)) { return; }
+    contributes = true;
+    if (p.hasColorGrad) { gA.xyz += weight * p.dLdC; }
+    if (dLdPower != 0.0f) {
+        gA.w += gaussian * dLdAlpha;
+        const float gdx = -(co.x * delta.x + co.y * delta.y);
+        const float gdy = -(co.z * delta.y + co.y * delta.x);
+        const float2 dLdMean2D = float2(dLdG * gaussian * gdx,
+                                        dLdG * gaussian * gdy);
+        gB += float4(dLdMean2D.x, dLdMean2D.y,
+                     dLdPower * (-0.5f * delta.x * delta.x),
+                     dLdPower * (-delta.x * delta.y));
+        gC.x += dLdPower * (-0.5f * delta.y * delta.y);
+        gC.y += length(dLdMean2D);
+    }
+    gC.z += weight;
+    if (p.isUnknown > 0.0f) { gC.w += weight; }
+}
+
+kernel void trainer_rasterize_backward2(
+    const device uint*              values      [[buffer(0)]],
+    const device uint*              tileRanges  [[buffer(1)]],
+    const device TrainerSplatRaster* raster     [[buffer(2)]],
+    const device float*             renderTFinal[[buffer(3)]],
+    const device uint*              renderNContrib [[buffer(4)]],
+    const device float*             gradSplatColor [[buffer(5)]],
+    const device float*             gradDepth   [[buffer(6)]],
+    const device float*             gradTFinal  [[buffer(7)]],
+    const device float*             bgColor     [[buffer(8)]],
+    const device float*             unknownMask [[buffer(9)]],
+    device TrainerSplatGrad2DAtomic* splatGrad2D [[buffer(10)]],
+    constant TrainerCameraUniforms& cam         [[buffer(15)]],
+    constant TrainerLossUniforms&   lu          [[buffer(16)]],
+    uint2                           tgPos       [[threadgroup_position_in_grid]],
+    uint2                           tPos        [[thread_position_in_threadgroup]],
+    uint                            tid         [[thread_index_in_threadgroup]]
+) {
+    threadgroup uint   tgIndex[TRAINER_TILE_AREA];
+    threadgroup float2 tgXY[TRAINER_TILE_AREA];
+    threadgroup float4 tgConicOpacity[TRAINER_TILE_AREA];
+    threadgroup float4 tgColorDepth[TRAINER_TILE_AREA];
+    threadgroup half   tgCutoff[TRAINER_TILE_AREA];
+
+    const uint threads = TRAINER_TILE_AREA / 2u;
+    const uint tileID = tgPos.y * cam.tileCountX + tgPos.x;
+    const uint px = tgPos.x * TRAINER_TILE_W + tPos.x;
+    const uint pyA = tgPos.y * TRAINER_TILE_H + tPos.y;
+    TrainerBackwardPixel a = trainer_backwardPixelInit(
+        uint2(px, pyA), cam, lu, renderTFinal, renderNContrib,
+        gradSplatColor, gradDepth, gradTFinal, bgColor, unknownMask);
+    TrainerBackwardPixel b = trainer_backwardPixelInit(
+        uint2(px, pyA + TRAINER_TILE_H / 2u), cam, lu, renderTFinal, renderNContrib,
+        gradSplatColor, gradDepth, gradTFinal, bgColor, unknownMask);
+
+    const uint rangeStart = tileRanges[2u * tileID];
+    const uint rangeEnd = tileRanges[2u * tileID + 1u];
+    const uint total = (rangeEnd > rangeStart) ? (rangeEnd - rangeStart) : 0u;
+    const uint batches = (total + TRAINER_TILE_AREA - 1u) / TRAINER_TILE_AREA;
+
+    // Per SIMD group, over both of each lane's pixels; called by every lane.
+    const uint groupDeepest = simd_max(max(a.lastContributor, b.lastContributor));
+
+    // Threadgroup-uniform batch loop, as in trainer_rasterize_backward: every
+    // thread reaches both barriers and stages its two entries every batch.
+    for (int bt = int(batches) - 1; bt >= 0; --bt) {
+        const uint batchBase = uint(bt) * TRAINER_TILE_AREA;
+        for (uint k = tid; k < TRAINER_TILE_AREA; k += threads) {
+            const uint load = rangeStart + batchBase + k;
+            if (load < rangeEnd) {
+                const uint splatIndex = values[load];
+                tgIndex[k] = splatIndex;
+                const TrainerSplatRaster d = raster[splatIndex];
+                tgXY[k] = float2(d.mean2D);
+                tgConicOpacity[k] = float4(float3(d.conic), float(d.opacity));
+                tgColorDepth[k] = float4(
+                    float(d.color0), float(d.color1), float(d.color2), d.depth
+                );
+                tgCutoff[k] = d.pad0;
+            } else {
+                tgConicOpacity[k] = float4(0.0f);
+                tgCutoff[k] = 60000.0h;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Uniform per SIMD group; nothing inside `continue`s, so simd_any and
+        // simd_sum always see every lane.
+        if (batchBase < groupDeepest) {
+            const uint here = min(TRAINER_TILE_AREA, total - batchBase);
+            for (int j = int(here) - 1; j >= 0; --j) {
+                const uint globalIndex = batchBase + uint(j) + 1u;
+                const float2 xy = tgXY[j];
+                const float4 co = tgConicOpacity[j];
+                const float cutoff = float(tgCutoff[j]);
+                const float4 colorDepth = tgColorDepth[j];
+                float4 gA = float4(0.0f);   // colour r, g, b, opacity
+                float4 gB = float4(0.0f);   // mean2D x, y, conic 0, conic 1
+                float4 gC = float4(0.0f);   // conic 2, absGrad2D, visAccum, unknownAccum
+                bool contributes = false;
+                trainer_backwardPixel(a, globalIndex, xy, co, cutoff, colorDepth, cam,
+                                      gA, gB, gC, contributes);
+                trainer_backwardPixel(b, globalIndex, xy, co, cutoff, colorDepth, cam,
+                                      gA, gB, gC, contributes);
+                if (simd_any(contributes)) {
+                    gA = simd_sum(gA);
+                    gB = simd_sum(gB);
+                    gC = simd_sum(gC);
+                    if (simd_is_first()) {
+                        device TrainerSplatGrad2DAtomic* g = &splatGrad2D[tgIndex[j]];
+                        if (gA.x != 0.0f) { trainer_atomicAddUnchecked(&g->color0, gA.x); }
+                        if (gA.y != 0.0f) { trainer_atomicAddUnchecked(&g->color1, gA.y); }
+                        if (gA.z != 0.0f) { trainer_atomicAddUnchecked(&g->color2, gA.z); }
+                        if (gA.w != 0.0f) { trainer_atomicAddUnchecked(&g->opacity, gA.w); }
+                        if (gB.x != 0.0f) { trainer_atomicAddUnchecked(&g->mean2D0, gB.x); }
+                        if (gB.y != 0.0f) { trainer_atomicAddUnchecked(&g->mean2D1, gB.y); }
+                        if (gB.z != 0.0f) { trainer_atomicAddUnchecked(&g->conic0, gB.z); }
+                        if (gB.w != 0.0f) { trainer_atomicAddUnchecked(&g->conic1, gB.w); }
+                        if (gC.x != 0.0f) { trainer_atomicAddUnchecked(&g->conic2, gC.x); }
+                        if (gC.y != 0.0f) { trainer_atomicAddUnchecked(&g->absGrad2D, gC.y); }
+                        if (gC.z != 0.0f) { trainer_atomicAddUnchecked(&g->visAccum, gC.z); }
+                        if (gC.w != 0.0f) { trainer_atomicAddUnchecked(&g->unknownAccum, gC.w); }
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ============================================================================
 // MARK: - Backward: preprocess
 //
 // Maps the 2D gradients back onto means, log-scales, rotations, opacity, SH,

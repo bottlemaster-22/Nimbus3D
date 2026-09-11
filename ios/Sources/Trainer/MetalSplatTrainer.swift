@@ -91,6 +91,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// Set by the forward calibration (build 302): use the two-pixel forward
     /// rasteriser for the rest of the run.
     private var forwardTwoPixelChosen = false
+    /// Set by the two-pixel backward calibration (build 304).
+    private var backwardTwoPixelChosen = false
 
     /// A training step whose command buffer B was committed and left running
     /// (build 292): the CPU went on to the next iteration's supervision and
@@ -507,6 +509,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         backwardSimdSumChosen = false
         sortSimdScanChosen = false
         forwardTwoPixelChosen = false
+        backwardTwoPixelChosen = false
         // A step left running by a run that threw cannot belong to this one.
         // Its buffer finishes on its own; its read-backs are not wanted.
         pendingStep = nil
@@ -2089,6 +2092,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
            iteration < forwardStart + tuning.forwardCalibrationSteps {
             return true
         }
+        let backward2Start = tuning.backwardTwoPixelCalibrationStart
+        if gpu.pipelines.rasterizeBackward2 != nil,
+           tuning.backwardTwoPixelCalibrationSteps > 0,
+           iteration >= backward2Start,
+           iteration < backward2Start + tuning.backwardTwoPixelCalibrationSteps {
+            return true
+        }
         return false
     }
 
@@ -2455,11 +2465,20 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 && tuning.forwardCalibrationSteps > 0
                 && iteration >= forwardStart
                 && iteration < forwardStart + tuning.forwardCalibrationSteps
-            if profiling || calibrating || sortCalibrating || forwardCalibrating {
+            // TWO-PIXEL BACKWARD CALIBRATION (build 304): the same as the
+            // backward calibration, with A the backward that one chose and B
+            // the two-pixel kernel.
+            let backward2Start = tuning.backwardTwoPixelCalibrationStart
+            let backward2Calibrating = gpu.pipelines.rasterizeBackward2 != nil
+                && tuning.backwardTwoPixelCalibrationSteps > 0
+                && iteration >= backward2Start
+                && iteration < backward2Start + tuning.backwardTwoPixelCalibrationSteps
+            if profiling || calibrating || sortCalibrating || forwardCalibrating
+                || backward2Calibrating {
                 // Calibration iterations are timed under their own label, so
                 // they never skew the stage profile.
                 func tag(_ label: String) -> String {
-                    (calibrating || sortCalibrating || forwardCalibrating)
+                    (calibrating || sortCalibrating || forwardCalibrating || backward2Calibrating)
                         ? "the backward calibration" : label
                 }
                 @discardableResult
@@ -2594,10 +2613,16 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     gpu.lossFinalize(e, loss: &loss)
                     gpu.lossDepth(e, loss: &loss, sampleCount: sampleCount)
                 }
-                if calibrating {
+                if calibrating || backward2Calibrating {
                     let floats = splatCount * 16
+                    // Window 1: plain (A) against SIMD-summed (B). Window 2: the
+                    // backward window 1 chose (A) against the two-pixel one (B).
+                    let twoPixelWindow = !calibrating
+                    let referenceSimdSum = twoPixelWindow && backwardSimdSumChosen
                     let secondsA = try stage(tag("the backward raster")) { e in
-                        gpu.rasterizeBackward(e, camera: &camera, loss: &loss, simdSum: false)
+                        gpu.rasterizeBackward(
+                            e, camera: &camera, loss: &loss, simdSum: referenceSimdSum
+                        )
                     }
                     let gradientsA = resources.splatGrad2D.readArray(Float.self, count: floats)
                     guard let clearBuffer = queue.makeCommandBuffer(),
@@ -2608,7 +2633,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     clearBuffer.commit()
                     try finish(clearBuffer, "the backward calibration")
                     let secondsB = try stage(tag("the backward raster")) { e in
-                        gpu.rasterizeBackward(e, camera: &camera, loss: &loss, simdSum: true)
+                        gpu.rasterizeBackward(
+                            e, camera: &camera, loss: &loss, simdSum: true,
+                            twoPixels: twoPixelWindow
+                        )
                     }
                     let gradientsB = resources.splatGrad2D.readArray(Float.self, count: floats)
                     var difference = 0.0
@@ -2631,17 +2659,34 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     if !agreedNow, gradientsA.count == floats {
                         _ = resources.splatGrad2D.writeArray(gradientsA)
                     }
-                    timings.backwardCalibrationSteps += 1
-                    timings.backwardSecondsA += secondsA
-                    timings.backwardSecondsB += secondsB
-                    timings.backwardRelativeDifference = Swift.max(
-                        timings.backwardRelativeDifference, relative
-                    )
-                    if iteration == calibrationStart + tuning.backwardCalibrationSteps - 1 {
-                        let agrees = timings.backwardRelativeDifference < 1e-3
-                        let faster = timings.backwardSecondsB < timings.backwardSecondsA * 0.97
-                        backwardSimdSumChosen = agrees && faster
-                        timings.backwardSimdSumChosen = backwardSimdSumChosen ? 1 : 0
+                    if twoPixelWindow {
+                        timings.backwardTwoPixelCalibrationSteps += 1
+                        timings.backwardTwoPixelSecondsA += secondsA
+                        timings.backwardTwoPixelSecondsB += secondsB
+                        timings.backwardTwoPixelRelativeDifference = Swift.max(
+                            timings.backwardTwoPixelRelativeDifference, relative
+                        )
+                        let last = backward2Start + tuning.backwardTwoPixelCalibrationSteps - 1
+                        if iteration == last {
+                            let agrees = timings.backwardTwoPixelRelativeDifference < 1e-3
+                            let faster = timings.backwardTwoPixelSecondsB
+                                < timings.backwardTwoPixelSecondsA * 0.97
+                            backwardTwoPixelChosen = agrees && faster
+                            timings.backwardTwoPixelChosen = backwardTwoPixelChosen ? 1 : 0
+                        }
+                    } else {
+                        timings.backwardCalibrationSteps += 1
+                        timings.backwardSecondsA += secondsA
+                        timings.backwardSecondsB += secondsB
+                        timings.backwardRelativeDifference = Swift.max(
+                            timings.backwardRelativeDifference, relative
+                        )
+                        if iteration == calibrationStart + tuning.backwardCalibrationSteps - 1 {
+                            let agrees = timings.backwardRelativeDifference < 1e-3
+                            let faster = timings.backwardSecondsB < timings.backwardSecondsA * 0.97
+                            backwardSimdSumChosen = agrees && faster
+                            timings.backwardSimdSumChosen = backwardSimdSumChosen ? 1 : 0
+                        }
                     }
                     try stage(tag("the backward raster")) { e in
                         gpu.preprocessBackward(e, camera: &camera, splatCount: splatCount)
@@ -2649,7 +2694,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 } else {
                     try stage(tag("the backward raster")) { e in
                         gpu.rasterizeBackward(
-                            e, camera: &camera, loss: &loss, simdSum: backwardSimdSumChosen
+                            e, camera: &camera, loss: &loss, simdSum: backwardSimdSumChosen,
+                            twoPixels: backwardTwoPixelChosen
                         )
                         gpu.preprocessBackward(e, camera: &camera, splatCount: splatCount)
                     }
@@ -2691,7 +2737,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             gpu.lossDepth(encoderB, loss: &loss, sampleCount: sampleCount)
 
             gpu.rasterizeBackward(
-                encoderB, camera: &camera, loss: &loss, simdSum: backwardSimdSumChosen
+                encoderB, camera: &camera, loss: &loss, simdSum: backwardSimdSumChosen,
+                twoPixels: backwardTwoPixelChosen
             )
             gpu.preprocessBackward(encoderB, camera: &camera, splatCount: splatCount)
 

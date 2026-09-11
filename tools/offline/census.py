@@ -384,3 +384,12 @@ if t.get('forwardCalibrationSteps', 0):
              t['forwardSecondsB'] / max(t['forwardSecondsA'], 1e-12), t.get('forwardMaxDifference', 0),
              t.get('forwardMismatchSteps', 0),
              'B (two-pixel) used' if t.get('forwardTwoPixelChosen') else 'A kept'))
+
+# Two-pixel backward calibration (build 304+): chosen backward (A) against two-pixel (B).
+if t.get('backwardTwoPixelCalibrationSteps', 0):
+    _k = t['backwardTwoPixelCalibrationSteps']
+    print('BACKWARD 2-PIXEL CALIBRATION: %d steps  A %.2f ms  B %.2f ms  (B/A %.3f)  worst rel diff %.2e  -> %s'
+          % (_k, 1000 * t['backwardTwoPixelSecondsA'] / _k, 1000 * t['backwardTwoPixelSecondsB'] / _k,
+             t['backwardTwoPixelSecondsB'] / max(t['backwardTwoPixelSecondsA'], 1e-12),
+             t['backwardTwoPixelRelativeDifference'],
+             'B (two-pixel) used' if t.get('backwardTwoPixelChosen') else 'A kept'))

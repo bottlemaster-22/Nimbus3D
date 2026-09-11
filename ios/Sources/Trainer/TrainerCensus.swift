@@ -658,6 +658,15 @@ struct TrainerTimings: Codable {
     var forwardMismatchSteps: Int = 0
     var forwardTwoPixelChosen: Int = 0
 
+    /// Two-pixel backward calibration (build 304): the backward chosen above
+    /// (A) against the two-pixel SIMD-summed one (B), same fields as the
+    /// first backward calibration.
+    var backwardTwoPixelCalibrationSteps: Int = 0
+    var backwardTwoPixelSecondsA: Double = 0
+    var backwardTwoPixelSecondsB: Double = 0
+    var backwardTwoPixelRelativeDifference: Double = 0
+    var backwardTwoPixelChosen: Int = 0
+
     /// Build 292: steps whose buffer B was left running while the next
     /// iteration's CPU work and buffer A went ahead (completed later by
     /// drainPendingStep).

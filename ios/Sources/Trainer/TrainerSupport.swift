@@ -135,6 +135,8 @@ enum TrainerKernel {
     static let rasterizeForward = "trainer_rasterize_forward"
     /// Build 302: two pixels per thread. Optional, so not in `all`.
     static let rasterizeForward2 = "trainer_rasterize_forward2"
+    /// Build 304: the SIMD-summed backward, two pixels per thread. Optional.
+    static let rasterizeBackward2 = "trainer_rasterize_backward2"
     static let background = "trainer_background"
     static let lossPhotometric = "trainer_loss_photometric"
     static let blurH = "trainer_blur_h"
@@ -1081,6 +1083,13 @@ struct TrainerTuning: Sendable {
     /// sort window.
     var forwardCalibrationStart: Int = 316
     var forwardCalibrationSteps: Int = 4
+
+    /// Build 304: the two-pixel backward against the backward the first
+    /// window chose (plain or SIMD-summed), after the forward window. Kept
+    /// only if its gradients agree (relative L1 < 1e-3) and it is at least
+    /// 3 % faster.
+    var backwardTwoPixelCalibrationStart: Int = 322
+    var backwardTwoPixelCalibrationSteps: Int = 6
 
     /// Build 292: after warm-up, commit the next iteration's buffer A BEFORE
     /// waiting on the previous iteration's buffer B, so the GPU does not sit

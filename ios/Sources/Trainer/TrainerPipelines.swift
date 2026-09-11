@@ -71,6 +71,10 @@ final class TrainerPipelines {
     /// 128-thread threadgroup or failed to build. Used only after the
     /// trainer calibration has shown it renders the same image, faster.
     let rasterizeForward2: MTLComputePipelineState?
+    /// The two-pixel SIMD-summed backward (build 304), nil before Apple7 or
+    /// if it failed to build. Used only after the trainer calibration has
+    /// shown its gradients agree with the backward in use, and it is faster.
+    let rasterizeBackward2: MTLComputePipelineState?
     let preprocessBackward: MTLComputePipelineState
     let samplingRateUpdate: MTLComputePipelineState
     let filter3DFinalize: MTLComputePipelineState
@@ -192,6 +196,10 @@ final class TrainerPipelines {
         // trains exactly as before rather than failing to start.
         rasterizeBackwardSimdSum = device.supportsFamily(.apple7)
             ? (try? buildBackwardSimdSum(TrainerKernel.rasterizeBackward)) : nil
+        let backward2 = device.supportsFamily(.apple7)
+            ? (try? build(TrainerKernel.rasterizeBackward2)) : nil
+        rasterizeBackward2 = (backward2?.maxTotalThreadsPerThreadgroup ?? 0) >= forward2Threads
+            ? backward2 : nil
         preprocessBackward = try build(TrainerKernel.preprocessBackward)
         samplingRateUpdate = try build(TrainerKernel.samplingRateUpdate)
         filter3DFinalize = try build(TrainerKernel.filter3DFinalize)
@@ -753,13 +761,19 @@ struct TrainerGPU {
         _ encoder: MTLComputeCommandEncoder,
         camera: inout TrainerCameraUniforms,
         loss: inout TrainerLossUniforms,
-        simdSum: Bool = false
+        simdSum: Bool = false,
+        twoPixels: Bool = false
     ) {
         let size = resources.renderSize
         guard size.tileCount > 0 else { return }
-        // Same bindings and dispatch for both: only the specialisation differs.
-        let pipeline = (simdSum ? pipelines.rasterizeBackwardSimdSum : nil)
+        // Same bindings for all three: the specialisations differ, and the
+        // two-pixel kernel (build 304) runs half the rows of threads.
+        let twoPixel = twoPixels ? pipelines.rasterizeBackward2 : nil
+        let pipeline = twoPixel
+            ?? (simdSum ? pipelines.rasterizeBackwardSimdSum : nil)
             ?? pipelines.rasterizeBackward
+        let rows = twoPixel == nil
+            ? TrainerGPUConstants.tileHeight : TrainerGPUConstants.tileHeight / 2
         encoder.setComputePipelineState(pipeline)
         encoder.setBuffer(resources.valuesA, offset: 0, index: TrainerBind.RasterizeBackward.values)
         encoder.setBuffer(
@@ -806,7 +820,7 @@ struct TrainerGPU {
             MTLSize(width: size.tileCountX, height: size.tileCountY, depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: TrainerGPUConstants.tileWidth,
-                height: TrainerGPUConstants.tileHeight,
+                height: rows,
                 depth: 1
             )
         )

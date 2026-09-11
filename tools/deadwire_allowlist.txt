@@ -96,7 +96,6 @@ PrePassMath.swift:compose  # HARMLESS: spare pose algebra. The pipeline composes
 PrePassSensorIO.swift:corner  # HARMLESS: spare voxel-key helper beside the live centre-of-voxel one.
 PrePassSensorIO.swift:saturatedFraction  # HARMLESS: whole-frame "how blown out was this" summary. Deliberately NOT the F5 saturation mask, which is per pixel and lives in SmartAuthorityMap; the glass detector has its own brightLuma test. Documented at the declaration.
 PrePassSensorIO.swift:sobelMagnitude  # HARMLESS: spare gradient helper. The edge classifier in Sources/Smart runs its own operator on the native depth grid, not on this greyscale image.
-PrePassSurvey.swift:centimetres  # ARTEFACT: local used only in the survey's own log interpolation.
 PrePassSurvey.swift:milliseconds  # ARTEFACT: same, in the time-offset log line.
 
 # ---------------------------------------------------------------------------
@@ -106,7 +105,6 @@ DirectionalBackgroundModel.swift:composite  # HARMLESS: the CPU reference for th
 DirectionalBackgroundModel.swift:currentCubemap  # HARMLESS: the same accessor's other half, for a CPU caller that does not exist yet.
 SmartAuthorityMap.swift:windowAnchorCount  # ARTEFACT: local used only in the prepare() log line's interpolation.
 SmartCore.swift:huber  # HARMLESS: CPU mirror of the shader's Huber loss, kept as the readable reference for the GPU version.
-TwoScaleTrustField.swift:sweepsRun  # ARTEFACT: local used only in the trust-field summary log interpolation.
 TwoScaleTrustField.swift:presetName  # ARTEFACT: local used only in that same summary log line, which now says whether the run used the full or economy cost preset.
 
 # ---------------------------------------------------------------------------
@@ -151,8 +149,6 @@ TrainerGPULayouts.swift:visibleFlag  # ARTEFACT: Metal struct mirror, TrainerSpl
 TrainerGPULayouts.swift:meanCamX  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 0.
 TrainerGPULayouts.swift:meanCamY  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 4.
 TrainerGPULayouts.swift:meanCamZ  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 8.
-TrainerGPULayouts.swift:mean2DX  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 16.
-TrainerGPULayouts.swift:mean2DY  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 20.
 TrainerGPULayouts.swift:radiusPxPackedHalf2  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 24. Two halves on the GPU side; Swift never reads it, only the stride.
 TrainerGPULayouts.swift:colorPackedHalf2B  # ARTEFACT: Metal struct mirror, TrainerSplatRaster offset 28. Swift never reads it, only the stride.
 TrainerGPULayouts.swift:colorPackedHalf2A  # ARTEFACT: Metal struct mirror, TrainerSplatRaster offset 24. Swift never reads it, only the stride.
@@ -160,7 +156,6 @@ TrainerGPULayouts.swift:conicX  # ARTEFACT: Metal struct mirror, TrainerSplatRas
 TrainerGPULayouts.swift:conicY  # ARTEFACT: Metal struct mirror, TrainerSplatRaster offset 20. Swift never reads it, only the stride.
 TrainerGPULayouts.swift:conicZ  # ARTEFACT: Metal struct mirror, TrainerSplatRaster offset 24. Swift never reads it, only the stride.
 TrainerGPULayouts.swift:opacityAndColor0  # ARTEFACT: Metal struct mirror, TrainerSplatRaster offset 28. Swift never reads it, only the stride.
-TrainerGPULayouts.swift:depth  # ARTEFACT: Metal struct mirror, TrainerSplatRaster offset 8. Swift never reads it, only the stride.
 TrainerGPULayouts.swift:radiusPackedHalf2  # ARTEFACT: Metal struct mirror, TrainerSplatRaster offset 12. Swift never reads it, only the stride.
 TrainerGPULayouts.swift:conicA  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 32.
 TrainerGPULayouts.swift:conicB  # ARTEFACT: Metal struct mirror, TrainerSplatDraw offset 36.
@@ -214,4 +209,3 @@ ViewerGPULayouts.swift:overlapNormalizer  # ARTEFACT: Metal struct mirror, Unifo
 ViewerGPULayouts.swift:baseInstance  # ARTEFACT: Metal struct mirror, part of the indirect draw argument layout the GPU fills in.
 ViewerSupport.swift:readUInt16  # HARMLESS: spare little-endian reader, kept for the same reason as Export's Int32 pair.
 ViewerSupport.swift:remainder  # ARTEFACT: local used on the next line, inside "\(minutes)m \(remainder)s".
-TwoScaleTrustField.swift:parallelSlots  # ARTEFACT: local used only in the trust build's serial/parallel split log interpolation, beside sweepsRun and presetName.
