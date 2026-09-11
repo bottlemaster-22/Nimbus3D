@@ -162,8 +162,9 @@ if t.get('snapshotsStaged'):
           % t['snapshotsStaged'])
 if t.get('densifyGatherChecks'):    print('densify gather: %d pass(es) checked against the CPU path, %d words differed'
           % (t['densifyGatherChecks'], t.get('densifyGatherMismatches', 0)))
-if t.get('mergedSteps'):    print('merged steps: %d of %d overlapped ran as one command buffer; %d ran short of instance slots'
-          % (t['mergedSteps'], t.get('overlappedSteps', 0), t.get('truncatedInstanceSteps', 0)))
+if t.get('mergedSteps'):    print('merged steps: %d of %d overlapped ran as one command buffer (%d in warm-up); %d ran short of instance slots'
+          % (t['mergedSteps'], t.get('overlappedSteps', 0), t.get('warmupOverlappedSteps', 0),
+             t.get('truncatedInstanceSteps', 0)))
 if 'supervisionCacheHits' in t:
     print('frame cache: %d builds served without a decode, cache peak %.0f MB'
           % (t['supervisionCacheHits'], t.get('supervisionCacheMegabytes', 0)))

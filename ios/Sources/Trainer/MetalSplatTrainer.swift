@@ -119,6 +119,12 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         /// Build 322: this step's command buffer copied that many Gaussians
         /// (splats, sh, stats) into snapshotStaging for the preview; 0 = none.
         let snapshotCount: Int
+        /// Build 324: a warm-up step, whose buffer copied gradFinal and
+        /// renderTFinal into warmupStaging for the far field's update. The
+        /// supervision (pose, intrinsics) and the model it updates ride along.
+        let warmup: Bool
+        let supervision: TrainerFrameSupervision?
+        let background: DirectionalBackgroundModel?
     }
     private var pendingStep: PendingStep?
     /// Build 316: a merged step ran short of instance slots and needs this
@@ -1409,6 +1415,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // build. Nothing between here and the old position touches the
             // builder, and `iteration += 1` happens on the skip path too, so
             // the guess stays correct.
+            // Build 324: a warm-up step that is about to apply the far field's
+            // accumulated update completes BEFORE the next frame's supervision
+            // is built, so that frame's copy of the field is the updated one,
+            // exactly as when the step ran synchronously.
+            if let running = pendingStep, running.warmup, running.iteration % 20 == 0 {
+                try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
+            }
             if !order.isEmpty {
                 let nextFrame = slice.keyframes[order[orderCursor % order.count]]
                 prefetch.start(
@@ -2258,6 +2271,24 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             }
         }
 
+        // Build 324: the far field's update, from the step's staged copy of
+        // gradFinal and renderTFinal, the arithmetic runIteration applies
+        // from the live buffers, applied every twentieth iteration as there.
+        if pending.warmup, let background = pending.background,
+           let supervision = pending.supervision, pending.iteration <= warmupEnd {
+            let size = resources.renderSize
+            let slotBase = pending.slot * TrainerResources.warmupStagingSlotBytes(pixelCount: size.pixelCount)
+            accumulateBackgroundGradient(
+                background: background,
+                gradFinal: resources.warmupStaging, gradOffset: slotBase,
+                tFinal: resources.warmupStaging, tOffset: slotBase + size.pixelCount * 12,
+                size: size, supervision: supervision
+            )
+            if pending.iteration % 20 == 0 {
+                background.applyAccumulatedGradient(learningRate: 0.25)
+            }
+        }
+
         // Build 316: the instance count the setup kernel found, one step late.
         // `needed` is what the frame produced, `used` what the sort was given;
         // they differ only when the buffers were too small, and then this step
@@ -2449,7 +2480,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         lossEMA: inout Float?,
         exposures: inout [FrameID: SIMD2<Float>],
         cameraDeltas: inout [FrameID: Pose],
-        frame: CaptureFrame
+        frame: CaptureFrame,
+        /// Build 324: non-nil for a warm-up step, whose gradFinal and
+        /// renderTFinal are copied into warmupStaging for this model's update.
+        background: DirectionalBackgroundModel? = nil
     ) throws -> StepResult {
         let size = resources.renderSize
 
@@ -2612,6 +2646,16 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                       to: resources.readbackStaging, destinationOffset: base + 32, size: 24)
             copy.copy(from: resources.sortArgs, sourceOffset: 0,
                       to: resources.readbackStaging, destinationOffset: base + 56, size: 8)
+            if background != nil {
+                // Build 324: the far field's gradient planes, for completeStep.
+                let px = size.pixelCount
+                let warmBase = slot * TrainerResources.warmupStagingSlotBytes(pixelCount: px)
+                copy.copy(from: resources.gradFinal, sourceOffset: 0,
+                          to: resources.warmupStaging, destinationOffset: warmBase, size: px * 12)
+                copy.copy(from: resources.renderTFinal, sourceOffset: 0,
+                          to: resources.warmupStaging, destinationOffset: warmBase + px * 12,
+                          size: px * 4)
+            }
             copy.endEncoding()
             buffer.commit()
             return buffer
@@ -2621,10 +2665,14 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             buffer: committed, slot: slot, frame: frame,
             exposure: exposure, iteration: iteration,
             totalIterations: totalIterations, splatCount: splatCount, merged: true,
-            snapshotCount: snapshotCount
+            snapshotCount: snapshotCount,
+            warmup: background != nil,
+            supervision: background != nil ? supervision : nil,
+            background: background
         )
         timings.overlappedSteps += 1
         timings.mergedSteps += 1
+        if background != nil { timings.warmupOverlappedSteps += 1 }
 
         // The previous step is queued in front of this one; complete it now.
         // Its read-backs land one iteration late, as build 292's did, and its
@@ -2683,10 +2731,16 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // those are overlapped.
         let overlapWarmupEnd = Int(Float(totalIterations) * tuning.warmupFraction)
         let backgroundStillLearning = background.map { !$0.isFrozen } ?? false
+        // Build 324: warm-up steps are overlapped too, as merged steps that
+        // stage the far field's gradient for completeStep. The one iteration
+        // that freezes the field (the first past warm-up) still runs
+        // synchronously below, after draining the last warm-up step, so the
+        // field's last update lands before the freeze as it always did.
+        let warmupOverlap = tuning.overlapWarmup && tuning.mergedCommandBuffer
+            && iteration <= overlapWarmupEnd
         let deferCompletion = tuning.overlapIterations
-            && iteration > overlapWarmupEnd
-            && !backgroundStillLearning
             && !stepIsSplit(iteration, gpu: gpu)
+            && ((iteration > overlapWarmupEnd && !backgroundStillLearning) || warmupOverlap)
         if deferCompletion, tuning.mergedCommandBuffer {
             return try runMergedIteration(
                 gpu: gpu, resources: resources, queue: queue, supervision: supervision,
@@ -2694,7 +2748,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 iteration: iteration, totalIterations: totalIterations,
                 sceneExtent: sceneExtent, shCoefficientCount: shCoefficientCount,
                 trust: trust, lossEMA: &lossEMA, exposures: &exposures,
-                cameraDeltas: &cameraDeltas, frame: frame
+                cameraDeltas: &cameraDeltas, frame: frame,
+                background: warmupOverlap ? background : nil
             )
         }
         if !deferCompletion {
@@ -3334,7 +3389,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     buffer: bufferB, slot: resources.inputSlot, frame: frame,
                     exposure: exposure, iteration: iteration,
                     totalIterations: totalIterations, splatCount: splatCount, merged: false,
-                    snapshotCount: 0
+                    snapshotCount: 0, warmup: false, supervision: nil, background: nil
                 )
                 timings.overlappedSteps += 1
                 return
@@ -3393,8 +3448,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         if let background, iteration <= warmupEnd {
             accumulateBackgroundGradient(
                 background: background,
-                resources: resources,
-                supervision: supervision
+                gradFinal: resources.gradFinal, gradOffset: 0,
+                tFinal: resources.renderTFinal, tOffset: 0,
+                size: resources.renderSize, supervision: supervision
             )
             if iteration % 20 == 0 {
                 background.applyAccumulatedGradient(learningRate: 0.25)
@@ -3917,12 +3973,17 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// Gaussians already cover opaquely says nothing about what is behind
     /// them. Sampled on a stride: the field is a 32x32x6 cubemap, and every
     /// pixel of every frame would be a hundred samples per texel per iteration.
+    /// `gradFinal` and `tFinal` are the live buffers (the synchronous path) or
+    /// a warm-up step's staged copies of them at the given offsets (build 324).
     private func accumulateBackgroundGradient(
         background: DirectionalBackgroundModel,
-        resources: TrainerResources,
+        gradFinal: MTLBuffer,
+        gradOffset: Int,
+        tFinal: MTLBuffer,
+        tOffset: Int,
+        size: TrainerRenderSize,
         supervision: TrainerFrameSupervision
     ) {
-        let size = resources.renderSize
         let pixelCount = size.pixelCount
         guard pixelCount > 0 else { return }
 
@@ -3941,8 +4002,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // Read the two buffers in place. They are shared-storage, the GPU is
         // idle at this point in the iteration, and copying 4 MB of gradient
         // into a Swift array to walk it once would cost more than the walk.
-        _ = resources.gradFinal.withElements(Float.self, count: pixelCount * 3) { gradFinal in
-            _ = resources.renderTFinal.withElements(Float.self, count: pixelCount) { tFinal in
+        _ = gradFinal.withElements(Float.self, count: pixelCount * 3, byteOffset: gradOffset) { gradFinal in
+            _ = tFinal.withElements(Float.self, count: pixelCount, byteOffset: tOffset) { tFinal in
                 var index = 0
                 while index < pixelCount {
                     let transmittance = tFinal[index]

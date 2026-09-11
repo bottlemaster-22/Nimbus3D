@@ -711,6 +711,9 @@ struct TrainerTimings: Codable {
     /// (the sort was clamped to the capacity that step; the buffers grew
     /// before the next). Expected 0.
     var mergedSteps: Int = 0
+    /// Build 324: of the merged steps, warm-up steps (far-field gradient
+    /// staged and accumulated on completion).
+    var warmupOverlappedSteps: Int = 0
     var truncatedInstanceSteps: Int = 0
 
     /// How many command buffers were waited on. gpuWait divided by this is

@@ -1163,6 +1163,14 @@ struct TrainerTuning: Sendable {
     /// buffers with the count read back in between.
     var mergedCommandBuffer: Bool = true
 
+    /// Build 324: warm-up steps are overlapped too. Their one extra
+    /// read-back, the far field's gradient, is copied into a staging slot by
+    /// the step's own command buffer and accumulated when the step completes,
+    /// and a step about to apply the accumulated update is completed before
+    /// the next frame's supervision is built, so every update lands where
+    /// the synchronous path landed it.
+    var overlapWarmup: Bool = true
+
     init() {}
 }
 
@@ -1268,6 +1276,21 @@ extension MTLBuffer {
     ) -> R? {
         guard count > 0, length >= count * MemoryLayout<T>.stride else { return nil }
         let raw = contents().bindMemory(to: T.self, capacity: count)
+        return body(UnsafeBufferPointer(start: raw, count: count))
+    }
+
+    /// `withElements` from `byteOffset` bytes in (build 324: the warm-up
+    /// staging holds a step's gradient planes end to end).
+    func withElements<T, R>(
+        _ type: T.Type,
+        count: Int,
+        byteOffset: Int,
+        _ body: (UnsafeBufferPointer<T>) -> R
+    ) -> R? {
+        guard count > 0, byteOffset >= 0,
+              length >= byteOffset + count * MemoryLayout<T>.stride
+        else { return nil }
+        let raw = contents().advanced(by: byteOffset).bindMemory(to: T.self, capacity: count)
         return body(UnsafeBufferPointer(start: raw, count: count))
     }
 

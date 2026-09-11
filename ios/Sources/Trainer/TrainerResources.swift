@@ -171,6 +171,9 @@ final class TrainerResources {
     /// (counts, colour, transmittance, background), so the next frame
     /// renders while this one is read back. See evalStagingSlotBytes.
     private(set) var evalStaging: MTLBuffer
+    /// Build 324: two slots a warm-up step copies gradFinal and renderTFinal
+    /// into for the far field's update. See warmupStagingSlotBytes.
+    private(set) var warmupStaging: MTLBuffer
 
     // MARK: Accounting
 
@@ -306,6 +309,7 @@ final class TrainerResources {
         renderTFinal = try make("renderTFinal", px * 4)
         renderNContrib = try make("renderNContrib", px * 4)
         evalStaging = try make("evalStaging", 2 * Self.evalStagingSlotBytes(pixelCount: px))
+        warmupStaging = try make("warmupStaging", 2 * Self.warmupStagingSlotBytes(pixelCount: px))
 
         gtColor = try make("gtColor", px * 3)
         bgColor = try make("bgColor", px * 3 * 4)
@@ -358,6 +362,7 @@ final class TrainerResources {
             splatGrad, shGrad, adamM, adamV, shAdamM, shAdamV,
             splatGrad2D, bgCubemap, raster, centers,
             densifySource, densifyFlags, densifyScratch, snapshotStaging, evalStaging,
+            warmupStaging,
             keysA, keysB, valuesA, valuesB, tileRanges,
             radixHistogram, radixHistogramScan,
             renderColor, renderAlpha, renderDepth, renderTFinal, renderNContrib,
@@ -415,7 +420,14 @@ final class TrainerResources {
         let ssimFloats = TrainerGPUConstants.ssimPlaneCount * 3   // src, mid, tmp
         // gtColor and gtColorAlt: three BYTES per pixel each (build 314), and
         // the two held-out staging slots, 28 bytes per pixel each (build 322).
-        return (perPixelFloats + ssimFloats) * 4 + 3 * 2 + 28 * 2
+        // Plus the two warm-up staging slots, 16 bytes per pixel each (build 324).
+        return (perPixelFloats + ssimFloats) * 4 + 3 * 2 + 28 * 2 + 16 * 2
+    }
+
+    /// Bytes of one warm-up staging slot: gradFinal (12 per pixel) then
+    /// renderTFinal (4).
+    static func warmupStagingSlotBytes(pixelCount: Int) -> Int {
+        pixelCount * 16
     }
 
     /// Bytes of one held-out staging slot: 16 for the instance counts, then
@@ -753,6 +765,7 @@ final class TrainerResources {
         renderTFinal = placeholder
         renderNContrib = placeholder
         evalStaging = placeholder
+        warmupStaging = placeholder
         gtColor = placeholder
         gtColorAlt = placeholder
         bgColor = placeholder
@@ -774,6 +787,7 @@ final class TrainerResources {
         renderTFinal = try makeBuffer("renderTFinal", px * 4)
         renderNContrib = try makeBuffer("renderNContrib", px * 4)
         evalStaging = try makeBuffer("evalStaging", 2 * Self.evalStagingSlotBytes(pixelCount: px))
+        warmupStaging = try makeBuffer("warmupStaging", 2 * Self.warmupStagingSlotBytes(pixelCount: px))
 
         gtColor = try makeBuffer("gtColor", px * 3)
         gtColorAlt = try makeBuffer("gtColorAlt", px * 3)
