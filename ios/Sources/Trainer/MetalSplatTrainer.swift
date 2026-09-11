@@ -5258,8 +5258,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         var exported = cloud
         if let background {
             let box = bounds(of: cloud)
-            let centre = (box.min + box.max) * 0.5
-            let extent = Swift.max(simd_length(box.max - box.min), 1)
+            let lo = SIMD3<Float>(box.min.x, box.min.y, box.min.z)
+            let hi = SIMD3<Float>(box.max.x, box.max.y, box.max.z)
+            let centre = (lo + hi) * 0.5
+            let extent = Swift.max(simd_length(hi - lo), 1)
             let radius = extent * 50
             let cubemap = background.cubemapSnapshot
             let shellCount = 24_576
