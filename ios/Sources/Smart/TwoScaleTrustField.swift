@@ -268,6 +268,19 @@ public final class TwoScaleTrustField: TrustField {
         let time: Double
     }
 
+    /// A sample that reaches the plane-sweep call in computeSlot, with what
+    /// the call needs (build 294). Collected in sample order so the sweeps can
+    /// run on every core and still be consumed in that order.
+    private struct TrustSweepCandidate {
+        let index: Int
+        let u: Int
+        let v: Int
+        let depth: Float
+        let frame: CaptureFrame
+        let pose: Pose
+        let partners: [CaptureFrame]
+    }
+
     public func build(
         bundle: CaptureBundle,
         prePassPoses: [String: Pose],
@@ -405,8 +418,15 @@ public final class TwoScaleTrustField: TrustField {
         // loop wrote.
         let frameLookup = framesByIndex
 
+        /// `collect`: record every sample that reaches the plane sweep instead of
+        /// sweeping it (the slot result is then discarded). `precomputed`: the
+        /// sweep result for each sample the serial loop would have swept, keyed
+        /// by sample index, looked up instead of computed. Neither changes which
+        /// samples reach the sweep: that depends only on data before the call.
         func computeSlot(
-            _ slot: Int, sweepBudget: inout Int, cache: SmartDepthCache
+            _ slot: Int, sweepBudget: inout Int, cache: SmartDepthCache,
+            collect: ((TrustSweepCandidate) -> Void)? = nil,
+            precomputed: [Int: PlaneSweepResult?]? = nil
         ) -> TrustSlotResult {
             return autoreleasepool { () -> TrustSlotResult in
                 guard
@@ -515,20 +535,34 @@ public final class TwoScaleTrustField: TrustField {
                             )
 
                             // Optional photometric second opinion, budgeted.
-                            if sweepBudget > 0,
-                               let sweep = self.planeSweep(
-                                   frame: frame,
-                                   pose: pose,
-                                   partners: partnerFrames,
-                                   poses: poses,
-                                   u: u,
-                                   v: v,
-                                   depth: z,
-                                   nativeK: nativeK,
-                                   imageCache: imageCache,
-                                   ref: ref
-                               )
-                            {
+                            let sweepResult: PlaneSweepResult?
+                            if let collect {
+                                collect(TrustSweepCandidate(
+                                    index: i, u: u, v: v, depth: z,
+                                    frame: frame, pose: pose, partners: partnerFrames
+                                ))
+                                sweepResult = nil
+                            } else if sweepBudget > 0 {
+                                if let precomputed {
+                                    sweepResult = precomputed[i] ?? nil
+                                } else {
+                                    sweepResult = self.planeSweep(
+                                        frame: frame,
+                                        pose: pose,
+                                        partners: partnerFrames,
+                                        poses: poses,
+                                        u: u,
+                                        v: v,
+                                        depth: z,
+                                        nativeK: nativeK,
+                                        imageCache: imageCache,
+                                        ref: ref
+                                    )
+                                }
+                            } else {
+                                sweepResult = nil
+                            }
+                            if let sweep = sweepResult {
                                 sweepBudget -= 1
                                 let agreement = SmartMath.smoothdrop(
                                     0.02, settings.planeSweepRangeMeters, abs(sweep.offsetMeters)
@@ -638,12 +672,63 @@ public final class TwoScaleTrustField: TrustField {
         // Phase 1: serial, exactly as before, while any slot could still sweep.
         let serialStarted = Date()
         var slot = 0
+        // THE SWEEPS THEMSELVES ON EVERY CORE (build 294). The serial prefix
+        // was 1.2 s for 13 slots on build 274: 20,000 plane sweeps one at a
+        // time. For each budgeted slot: pass 1 lists, in sample order, every
+        // sample that reaches the sweep call (which depends only on data
+        // before the call, never on a sweep result); the sweeps for those run
+        // on every core in order-preserving chunks and are consumed in order
+        // against the budget exactly as the loop would (a nil result spends
+        // nothing), stopping where the budget runs out; pass 2 is the slot as
+        // before with each sweep looked up instead of computed. Same samples
+        // swept, same results, same order, same bytes. planeSweep reads only
+        // immutable state, its own locals and the locked image cache.
+        let sweepChunk = 512
         while slot < slotCount, planeSweepBudget > 0 {
             if Task.isCancelled {
                 try? noiseWriter.close()
                 throw NimbusError.cancelled
             }
-            try apply(computeSlot(slot, sweepBudget: &planeSweepBudget, cache: depthCache))
+            var candidates: [TrustSweepCandidate] = []
+            var collectBudget = 0
+            _ = computeSlot(
+                slot, sweepBudget: &collectBudget, cache: depthCache,
+                collect: { candidates.append($0) }
+            )
+            let candidateList = candidates
+            var swept: [Int: PlaneSweepResult?] = [:]
+            var budget = planeSweepBudget
+            var next = 0
+            while next < candidateList.count, budget > 0 {
+                let chunk = Swift.min(sweepChunk, candidateList.count - next)
+                let base = next
+                var chunkResults = [PlaneSweepResult?](repeating: nil, count: chunk)
+                chunkResults.withUnsafeMutableBufferPointer { out in
+                    DispatchQueue.concurrentPerform(iterations: chunk) { c in
+                        let candidate = candidateList[base + c]
+                        out[c] = self.planeSweep(
+                            frame: candidate.frame,
+                            pose: candidate.pose,
+                            partners: candidate.partners,
+                            poses: poses,
+                            u: candidate.u,
+                            v: candidate.v,
+                            depth: candidate.depth,
+                            nativeK: nativeK,
+                            imageCache: imageCache,
+                            ref: ref
+                        )
+                    }
+                }
+                for c in 0..<chunk where budget > 0 {
+                    swept[candidateList[base + c].index] = chunkResults[c]
+                    if chunkResults[c] != nil { budget -= 1 }
+                }
+                next += chunk
+            }
+            try apply(computeSlot(
+                slot, sweepBudget: &planeSweepBudget, cache: depthCache, precomputed: swept
+            ))
             slot += 1
         }
         let serialSlots = slot

@@ -1188,3 +1188,13 @@ The GPU idled ~1.4 ms an iteration (~5.6 s a run): after each buffer B the CPU d
 Why it is exact for training: parameters are only touched by the GPU, in queue order, so A(n+1) sees B(n)'s Adam step as before. gtColor, bgCubemap and depthSamples are doubled (`inputSlot`, and the next step always takes the slot the running one is not using, so a skipped iteration cannot collide). B copies its read-backs (loss, exposure gradient, camera gradient) into a staging slot, because A(n+1)'s clear wipes the originals. Exposure and camera updates are per frame and land before that frame is next visited; the loss EMA only feeds progress. Everything that reads GPU state between iterations drains first: both budget-change paths, a render-size change, the 3D-filter sweep, the held-out eval, densify, the preview snapshot and the end of the slice (11 call sites). Warm-up (the background gradient is read every iteration), the split profile steps and both calibrations are never overlapped. Census: `overlappedSteps`.
 
 Expected: most of the ~1.4 ms/iteration GPU idle, about 3 to 5 s a run. The A-to-B gap (count read-back, B encode) remains.
+
+Build 291/292 green (e23c868).
+
+### THE METRIC, re-read (2026-09-11)
+
+Nothing in the app shows a rate. The owner's "around 50 RPS" matches 4,000 iterations over the WHOLE processing time on 266 (4,000 / 81.6 s = 49). So the target counts every second, pre-pass and training one-offs included: 100 RPS is ~40 s total, 150 is ~27 s. Latest measured total ~65.6 s (~61 RPS). A per-SIMD-group row skip in the rasterisers was measured offline (tools/offline/strip_cull.py: 36.9 % of (splat, group) iterations skippable by y-range, 41.8 % by an exact strip test) and NOT built: the skipped iterations are exactly the ones the cheap power cutoff already rejects in ~8 instructions, and the test costs 3-4 on every iteration, so the average goes up.
+
+### BUILD 294: the trust build's plane sweeps on every core
+
+The serial prefix was 1.2 s for 13 slots (20,000 sweeps, one at a time). Per budgeted slot now: pass 1 lists, in sample order, every sample that reaches the sweep call (eligibility depends only on data before the call); the sweeps run on every core in 512-candidate order-preserving chunks and are consumed in order against the budget exactly as the loop would (a nil result spends nothing), stopping where it runs out; pass 2 is the slot as before with each sweep looked up. Same samples swept, same results, same order, same bytes. Pass 1 repeats ~1.4 ms of non-sweep work per serial slot.
