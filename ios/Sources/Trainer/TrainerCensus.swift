@@ -625,6 +625,18 @@ struct TrainerTimings: Codable {
     /// time is NOT in gpuStep.
     var profiledSteps: Int = 0
 
+    /// Backward calibration (build 288): on `backwardCalibrationSteps`
+    /// iterations the plain backward rasteriser (A) and the SIMD-summed one
+    /// (B) ran on the same inputs. GPU seconds of each summed over those
+    /// iterations, the worst relative L1 difference of their gradients (capped
+    /// at 1e9 so the census always encodes), and whether B was then used for
+    /// the rest of the run (1) or not (0).
+    var backwardCalibrationSteps: Int = 0
+    var backwardSecondsA: Double = 0
+    var backwardSecondsB: Double = 0
+    var backwardRelativeDifference: Double = 0
+    var backwardSimdSumChosen: Int = 0
+
     /// How many command buffers were waited on. gpuWait divided by this is
     /// the average round-trip cost, which is the number that says whether
     /// merging command buffers would be worth anything.

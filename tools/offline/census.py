@@ -358,3 +358,12 @@ if _n:
     print('GPU STAGES (%d sampled steps): ' % _n + '  '.join(
         '%s %.2f ms (%.0f%%)' % (nm, 1000 * t.get(k, 0) / _n, 100 * t.get(k, 0) / max(tot, 1e-12))
         for nm, k in parts) + '  | sum %.2f ms' % (1000 * tot / _n))
+
+# Backward calibration (build 288+): plain (A) against SIMD-summed (B).
+if t.get('backwardCalibrationSteps', 0):
+    _k = t['backwardCalibrationSteps']
+    print('BACKWARD CALIBRATION: %d steps  A %.2f ms  B %.2f ms  (B/A %.3f)  worst rel diff %.2e  -> %s'
+          % (_k, 1000 * t['backwardSecondsA'] / _k, 1000 * t['backwardSecondsB'] / _k,
+             t['backwardSecondsB'] / max(t['backwardSecondsA'], 1e-12),
+             t['backwardRelativeDifference'],
+             'B (SIMD-summed) used' if t.get('backwardSimdSumChosen') else 'A kept'))

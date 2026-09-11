@@ -1063,6 +1063,13 @@ struct TrainerTuning: Sendable {
     /// of extra round trips each. 0 turns it off.
     var stageProfileEvery: Int = 250
 
+    /// Build 288: from this iteration, for this many, run both backward
+    /// rasterisers on the same inputs, compare and time them, and keep the
+    /// SIMD-summed one only if it agrees (relative L1 < 1e-3) and is at least
+    /// 3 % faster. Past warm-up so the model being compared is a real one.
+    var backwardCalibrationStart: Int = 300
+    var backwardCalibrationSteps: Int = 6
+
     init() {}
 }
 

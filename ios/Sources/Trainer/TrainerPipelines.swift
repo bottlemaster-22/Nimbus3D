@@ -59,6 +59,10 @@ final class TrainerPipelines {
     let lossDepth: MTLComputePipelineState
     let lossFinalize: MTLComputePipelineState
     let rasterizeBackward: MTLComputePipelineState
+    /// The SIMD-summed backward (build 288), nil where it cannot be built
+    /// (pre-Apple7) or failed to. Used only once the trainer's on-device
+    /// calibration has shown it agrees with `rasterizeBackward` and is faster.
+    let rasterizeBackwardSimdSum: MTLComputePipelineState?
     let preprocessBackward: MTLComputePipelineState
     let samplingRateUpdate: MTLComputePipelineState
     let filter3DFinalize: MTLComputePipelineState
@@ -92,6 +96,19 @@ final class TrainerPipelines {
                     kernel: name, reason: error.localizedDescription
                 )
             }
+        }
+
+        /// The backward rasteriser with BOTH specialisations on: the simd_max
+        /// batch bound and the SIMD-summed accumulation.
+        func buildBackwardSimdSum(_ name: String) throws -> MTLComputePipelineState {
+            let values = MTLFunctionConstantValues()
+            var reduce = true
+            values.setConstantValue(&reduce, type: .bool, index: 0)
+            var sum = true
+            values.setConstantValue(&sum, type: .bool, index: 1)
+            let function = try library.makeFunction(name: name, constantValues: values)
+            function.label = name + ".simdSum"
+            return try device.makeComputePipelineState(function: function)
         }
 
         func build(_ name: String) throws -> MTLComputePipelineState {
@@ -134,6 +151,10 @@ final class TrainerPipelines {
             TrainerKernel.rasterizeBackward,
             simdReduce: device.supportsFamily(.apple7)
         )
+        // Optional by design: a device or compiler that cannot build it
+        // trains exactly as before rather than failing to start.
+        rasterizeBackwardSimdSum = device.supportsFamily(.apple7)
+            ? (try? buildBackwardSimdSum(TrainerKernel.rasterizeBackward)) : nil
         preprocessBackward = try build(TrainerKernel.preprocessBackward)
         samplingRateUpdate = try build(TrainerKernel.samplingRateUpdate)
         filter3DFinalize = try build(TrainerKernel.filter3DFinalize)
@@ -688,11 +709,15 @@ struct TrainerGPU {
     func rasterizeBackward(
         _ encoder: MTLComputeCommandEncoder,
         camera: inout TrainerCameraUniforms,
-        loss: inout TrainerLossUniforms
+        loss: inout TrainerLossUniforms,
+        simdSum: Bool = false
     ) {
         let size = resources.renderSize
         guard size.tileCount > 0 else { return }
-        encoder.setComputePipelineState(pipelines.rasterizeBackward)
+        // Same bindings and dispatch for both: only the specialisation differs.
+        let pipeline = (simdSum ? pipelines.rasterizeBackwardSimdSum : nil)
+            ?? pipelines.rasterizeBackward
+        encoder.setComputePipelineState(pipeline)
         encoder.setBuffer(resources.valuesA, offset: 0, index: TrainerBind.RasterizeBackward.values)
         encoder.setBuffer(
             resources.tileRanges, offset: 0, index: TrainerBind.RasterizeBackward.tileRanges

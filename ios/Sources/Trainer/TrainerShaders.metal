@@ -80,6 +80,14 @@ using namespace metal;
 /// instead of failing and being reported as a missing kernel.
 constant bool kTrainerSimdReduce [[function_constant(0)]];
 
+/// Build 288: the backward rasteriser's SIMD-SUMMED variant. Compiled as a
+/// second pipeline from the same kernel with this constant set (Apple7+ only,
+/// and only alongside kTrainerSimdReduce). Undefined, as it is for every other
+/// pipeline, means false.
+constant bool kTrainerBackwardSimdSum [[function_constant(1)]];
+constant bool kBackwardSimdSum = is_function_constant_defined(kTrainerBackwardSimdSum)
+    ? kTrainerBackwardSimdSum : false;
+
 // ============================================================================
 // MARK: - Constants (mirrored in TrainerGPUConstants)
 // ============================================================================
@@ -2247,7 +2255,111 @@ kernel void trainer_rasterize_backward(
         // The two threadgroup_barrier calls stay OUTSIDE this branch, where
         // they already are. Groups diverge here, and a barrier reachable by
         // only some lanes is a hang, not a missed optimisation.
-        if (inside && batchBase < groupDeepest) {
+        if (kBackwardSimdSum) {
+            // SIMD-SUMMED ACCUMULATION (build 288). The same per-pixel maths
+            // as the loop below, but instead of every contributing pixel
+            // issuing up to eleven device atomics, the 32 lanes of the SIMD
+            // group add their contributions for splat j together first and
+            // ONE lane issues the atomics. Device atomics per (splat, SIMD
+            // group) fall from up to 32 x 11 to 11.
+            //
+            // UNIFORM CONTROL FLOW IS THE WHOLE DESIGN. simd_any and
+            // simd_sum need every lane of the group, so nothing in this block
+            // `continue`s: a lane that would have skipped sets `contributes`
+            // false and adds zeros. The gate is `batchBase < groupDeepest`,
+            // which is uniform per group (groupDeepest is a simd_max), and
+            // `inside` moves into the per-lane test. The loops' bounds are
+            // the same for every lane. Pixel state (T, the running colour and
+            // depth, lastAlpha) changes exactly where the loop below changes
+            // it, in the same order.
+            //
+            // Not bit-identical: float sums in a different order, as atomics
+            // already are between runs. The trainer runs this and the plain
+            // loop on the same iteration, compares the gradients and times
+            // both before it will use this one (MetalSplatTrainer, backward
+            // calibration).
+            if (batchBase < groupDeepest) {
+                const uint here = min(TRAINER_TILE_AREA, total - batchBase);
+                for (int j = int(here) - 1; j >= 0; --j) {
+                    const uint globalIndex = batchBase + uint(j) + 1u;
+                    float4 gA = float4(0.0f);   // colour r, g, b, opacity
+                    float4 gB = float4(0.0f);   // mean2D x, y, conic 0, conic 1
+                    float4 gC = float4(0.0f);   // conic 2, absGrad2D, visAccum, unknownAccum
+                    bool contributes = false;
+                    if (inside && globalIndex <= lastContributor) {
+                        const float2 delta = tgXY[j] - pixelCenter;
+                        const float4 co = tgConicOpacity[j];
+                        const float power = -0.5f * (co.x * delta.x * delta.x
+                                                     + co.z * delta.y * delta.y)
+                                            - co.y * delta.x * delta.y;
+                        if (power >= float(tgCutoff[j])) {
+                            const float gaussian = exp(power);
+                            const float alpha = min(0.99f, co.w * gaussian);
+                            if (alpha >= cam.minAlpha) {
+                                T = T / max(1.0f - alpha, 1e-6f);
+                                const float weight = alpha * T;
+                                const float3 color = float3(tgColorDepth[j].xyz);
+                                const float depth = tgColorDepth[j].w;
+                                float dLdAlpha = 0.0f;
+                                accumColor = lastAlpha * lastColor
+                                    + (1.0f - lastAlpha) * accumColor;
+                                lastColor = color;
+                                dLdAlpha += dot(color - accumColor, dLdC);
+                                if (cam.renderDepth != 0u) {
+                                    accumDepth = lastAlpha * lastDepth
+                                        + (1.0f - lastAlpha) * accumDepth;
+                                    lastDepth = depth;
+                                    dLdAlpha += (depth - accumDepth) * dLdD;
+                                }
+                                dLdAlpha *= T;
+                                lastAlpha = alpha;
+                                dLdAlpha += (-TFinal / max(1.0f - alpha, 1e-6f)) * dLdTTotal;
+                                const float dLdG = co.w * dLdAlpha;
+                                const float dLdPower = dLdG * gaussian;
+                                if (!(trainer_isNonFinite(dLdPower) || trainer_isNonFinite(weight))) {
+                                    contributes = true;
+                                    if (pixelHasColorGrad) { gA.xyz = weight * dLdC; }
+                                    if (dLdPower != 0.0f) {
+                                        gA.w = gaussian * dLdAlpha;
+                                        const float gdx = -(co.x * delta.x + co.y * delta.y);
+                                        const float gdy = -(co.z * delta.y + co.y * delta.x);
+                                        const float2 dLdMean2D = float2(dLdG * gaussian * gdx,
+                                                                        dLdG * gaussian * gdy);
+                                        gB = float4(dLdMean2D.x, dLdMean2D.y,
+                                                    dLdPower * (-0.5f * delta.x * delta.x),
+                                                    dLdPower * (-delta.x * delta.y));
+                                        gC.x = dLdPower * (-0.5f * delta.y * delta.y);
+                                        gC.y = length(dLdMean2D);
+                                    }
+                                    gC.z = weight;
+                                    gC.w = (isUnknown > 0.0f) ? weight : 0.0f;
+                                }
+                            }
+                        }
+                    }
+                    if (simd_any(contributes)) {
+                        gA = simd_sum(gA);
+                        gB = simd_sum(gB);
+                        gC = simd_sum(gC);
+                        if (simd_is_first()) {
+                            device TrainerSplatGrad2DAtomic* g = &splatGrad2D[tgIndex[j]];
+                            if (gA.x != 0.0f) { trainer_atomicAddUnchecked(&g->color0, gA.x); }
+                            if (gA.y != 0.0f) { trainer_atomicAddUnchecked(&g->color1, gA.y); }
+                            if (gA.z != 0.0f) { trainer_atomicAddUnchecked(&g->color2, gA.z); }
+                            if (gA.w != 0.0f) { trainer_atomicAddUnchecked(&g->opacity, gA.w); }
+                            if (gB.x != 0.0f) { trainer_atomicAddUnchecked(&g->mean2D0, gB.x); }
+                            if (gB.y != 0.0f) { trainer_atomicAddUnchecked(&g->mean2D1, gB.y); }
+                            if (gB.z != 0.0f) { trainer_atomicAddUnchecked(&g->conic0, gB.z); }
+                            if (gB.w != 0.0f) { trainer_atomicAddUnchecked(&g->conic1, gB.w); }
+                            if (gC.x != 0.0f) { trainer_atomicAddUnchecked(&g->conic2, gC.x); }
+                            if (gC.y != 0.0f) { trainer_atomicAddUnchecked(&g->absGrad2D, gC.y); }
+                            if (gC.z != 0.0f) { trainer_atomicAddUnchecked(&g->visAccum, gC.z); }
+                            if (gC.w != 0.0f) { trainer_atomicAddUnchecked(&g->unknownAccum, gC.w); }
+                        }
+                    }
+                }
+            }
+        } else if (inside && batchBase < groupDeepest) {
             const uint here = min(TRAINER_TILE_AREA, total - batchBase);
             for (int j = int(here) - 1; j >= 0; --j) {
                 const uint globalIndex = batchBase + uint(j) + 1u;

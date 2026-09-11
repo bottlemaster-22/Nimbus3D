@@ -1162,3 +1162,11 @@ Measured offline for (2): exact ellipse-tile culling removes 11.7 % of tile inst
 - A25 pulled back (disc prior 0.001) untested: not a speed change.
 - **Sampled stage profile**: every 250th iteration command buffer B is split five ways (sort, forward, losses, backward, optimiser) and each timed; `timings.profiledSteps`. census.py prints ms per iteration per stage.
 - **Exact tile footprint**: preprocess counts only tiles whose pixel-centre rectangle the cutoff ellipse reaches (q <= -2*cutoff + 0.12), from the stored raster record; duplicate_keys emits with slack 0.02 and pads its reserved range with sentinel keys (tile 0xFFF) that sort last; tile_ranges skips them. A splat whose box meets the screen but reaches no pixel centre keeps one padding slot so tilesTouched keeps its meaning (Adam gating, denom, maxRadius unchanged). Output identical by construction: the dropped pairs are exactly those every pixel already `continue`d past.
+
+Build 285/286 green (446d139).
+
+### BUILD 288: the backward rasteriser, SIMD-summed, with on-device calibration
+
+The backward issues up to 11 device float atomics per CONTRIBUTING (pixel, splat) pair. Variant B: the same per-pixel maths, but for each splat j the 32 lanes of a SIMD group add their contributions (simd_sum of three float4s) and one lane issues the atomics: per (splat, group) up to 32 x 11 atomics become 11. Uniform control flow: nothing in B `continue`s; the gate is batchBase < groupDeepest (uniform, a simd_max), `inside` moved into the per-lane test, simd_any skips splats no lane reaches. Same kernel source, second pipeline via function constant 1 (Apple7+, `try?`, nil means train exactly as before).
+
+Build 92's SIMD reduction was 6 % slower and its details are not in the code any more, so B is NOT trusted by reading: iterations 300-305 run A and B on the same inputs (A into splatGrad2D, read, clear, B, read), compare gradients (relative L1) and time both. If they disagree on a step, A's gradients are written back before the step continues, so a wrong B can never train a step. After the window B is used only if every step agreed (< 1e-3) and B was >= 3 % faster. Census: backwardCalibrationSteps, backwardSecondsA/B, backwardRelativeDifference (capped at 1e9 so JSON encodes), backwardSimdSumChosen.
