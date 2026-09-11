@@ -1457,3 +1457,5 @@ State: HEAD carries the sweep experiment (ten cameras per command buffer), the 2
 5. Rules that held up: opacity resets off (376), soft memory gates freeze growth only (346), caches released only on the OS headroom gate (380).
 
 LOCAL (unpushed): `TrainerTuning.filter3DOnCPU` (default false) runs the 3D-filter sweep on the CPU with the kernels' exact arithmetic (updateFilter3DOnCPU, concurrentPerform over 4,096-point chunks, no command buffers). Plan B for Monday if the batched GPU sweep still steps the memory curve: set it true and push; expect about 0.1 s a sweep at 400,000 points.
+
+DEFAULT CHANGED (local): `filter3DOnCPU = true`, so Monday's first push removes the GPU sweep entirely rather than hoping the batching helps; the batched GPU sweep stays behind `filter3DOnCPU = false`. The memory sample now also records what iOS said was still available (`available`, MB; census.py prints it as os-available), so the ceiling and the OS gate can be read against the same row.

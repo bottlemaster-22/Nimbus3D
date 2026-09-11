@@ -180,10 +180,10 @@ if 'supervisionCacheHits' in t:
     print('frame cache: %d builds served without a decode, cache peak %.0f MB'
           % (t['supervisionCacheHits'], t.get('supervisionCacheMegabytes', 0)))
 if d.get('memorySamples'):
-    print('MEMORY CURVE (MB): iteration  footprint  trainer-buffers  frame-caches  splats/capacity  instances  long-edge')
+    print('MEMORY CURVE (MB): iteration  footprint  trainer-buffers  frame-caches  splats/capacity  instances  long-edge  os-available')
     for _m in d['memorySamples']:
-        print('  %6d  %7.0f  %7.0f  %7.0f  %7d/%-7d  %9d  %5d' % (_m['iteration'], _m['footprint'], _m['trainerBuffers'],
-              _m['frameCaches'], _m['splatCount'], _m['splatCapacity'], _m['instanceCapacity'], _m['renderLongEdge']))
+        print('  %6d  %7.0f  %7.0f  %7.0f  %7d/%-7d  %9d  %5d  %7.0f' % (_m['iteration'], _m['footprint'], _m['trainerBuffers'],
+              _m['frameCaches'], _m['splatCount'], _m['splatCapacity'], _m['instanceCapacity'], _m['renderLongEdge'], _m.get('available', 0)))
 if t.get('opacityResets'):
     print('opacity resets: %d' % t['opacityResets'])
 if t.get('memoryFootprintPeakMegabytes'):

@@ -1104,7 +1104,7 @@ struct TrainerTuning: Sendable {
     /// trainer_filter3d_finalize; about 0.1 s a sweep on six cores at
     /// 400,000 points. The GPU sweep is where build 384's memory stepped up
     /// by hundreds of MB a sweep; this path submits nothing.
-    var filter3DOnCPU: Bool = false
+    var filter3DOnCPU: Bool = true
 
     // --- Exposure (F5, F8) -----------------------------------------------------
 

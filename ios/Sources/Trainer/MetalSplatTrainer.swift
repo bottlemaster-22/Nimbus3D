@@ -1471,7 +1471,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         splatCount: splatCount,
                         splatCapacity: resources.splatCapacity,
                         instanceCapacity: resources.instanceCapacity,
-                        renderLongEdge: Swift.max(renderSize.width, renderSize.height)
+                        renderLongEdge: Swift.max(renderSize.width, renderSize.height),
+                        available: Double(reading.availableBytes) / 1_048_576
                     ))
                 }
                 if iteration > 0, iteration % 1000 == 0 {

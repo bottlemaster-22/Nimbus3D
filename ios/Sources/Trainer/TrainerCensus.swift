@@ -196,6 +196,8 @@ struct TrainerCensusMemorySample: Codable {
     var splatCapacity: Int
     var instanceCapacity: Int
     var renderLongEdge: Int
+    /// What iOS said the process could still allocate, in MB (build 390).
+    var available: Double = 0
 }
 
 struct TrainerCensusDensifyPass: Codable {
