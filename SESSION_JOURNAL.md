@@ -1374,3 +1374,7 @@ Build 338 RESULT (diagnostics 2026-09-11 11:57Z): 4,500 of 4,500, no crash, no g
 ### BUILD 342: 200 training frames for a room
 
 338 trained 108 keyframes out of 868 captured frames; its eleven held-out frames scored 14.6, 14.7, 15.8, 17.7, 18.2, 18.3, 18.8, 19.9, 20.9, 22.4, 26.1 dB. That spread is coverage, not capture quality: views the training set covers score in the twenties, views it does not cover score in the teens. Room keyframe budget 120 -> 200; the full-size frame cache cap 420 -> 520 MB so all 200 stay resident (footprint estimate about 1,300 MB of the 1,463 MB ceiling). Same 4,500 rounds, so each frame is visited about 22 times instead of 41. Not measured yet; 340 (last quarter full size, cap 400k) is stacked underneath.
+
+### BUILD 344: one depth cache for all builders
+
+Memory, asked for by the owner. Each of the three level builders owned a 128-frame SmartDepthCache of the same native depth maps (245 KB a frame: about 79 MB for 108 frames, kept after the level ended), and with 200 training frames a 128-entry LRU would have missed on every visit and re-read the depth sidecar each time. Now one cache per slice, sized to the training plus held-out frames, shared by every builder (the cache is locked). Saves about 30 MB at 200 frames against three caches, avoids the thrash. The frame cache itself (RGB 3 B/px plus 49,152 depth samples at 20 B: 2.15 MB a full-size frame, 430 MB for 200) is the large item and is not changed here; bytes-per-splat and the sample layout are the next levers.

@@ -875,6 +875,14 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         let shDegree = governor.current.shDegree
         let shCoefficientCount = 1 + shDegree.restCoefficientCount
 
+        // Build 344: ONE depth cache shared by the level builders, holding
+        // every training and held-out frame. Three builders each held 128
+        // frames of the same native depth (about 79 MB for 108 frames), and
+        // at 200 frames a 128-entry cache would have missed on every visit.
+        let sharedDepthCache = SmartDepthCache(
+            capacity: slice.keyframes.count + slice.heldOutKeyframes.count + 8,
+            sampleCount: Swift.max(bundle.settings.depthWidth, 1) * Swift.max(bundle.settings.depthHeight, 1)
+        )
         // --- Render size, from the first decodable frame -----------------------
         let supervision = TrainerSupervisionBuilder(
             bundle: bundle,
@@ -886,7 +894,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             trust: smart.trust,
             authority: smart.authority,
             edges: smart.edges,
-            background: smart.background
+            background: smart.background,
+            depthCache: sharedDepthCache
         )
         // Builds the NEXT frame while the GPU works on this one. See
         // TrainerSupervisionPrefetch: supervision and gpuWait measured 24.70
@@ -926,7 +935,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 trust: smart.trust,
                 authority: smart.authority,
                 edges: smart.edges,
-                background: smart.background
+                background: smart.background,
+                depthCache: sharedDepthCache
             )
         }
         let coarsePrefetches = coarseSupervisions.map { TrainerSupervisionPrefetch(builder: $0) }

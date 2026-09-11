@@ -370,7 +370,11 @@ final class TrainerSupervisionBuilder {
         trust: TwoScaleTrustField?,
         authority: SmartAuthorityMap?,
         edges: NativeDepthEdgeClassifier?,
-        background: DirectionalBackgroundModel?
+        background: DirectionalBackgroundModel?,
+        /// Build 344: one depth cache for every builder of a run (the
+        /// native depth maps are the same at every render size), sized to
+        /// the frame set instead of 128 a builder.
+        depthCache: SmartDepthCache? = nil
     ) {
         self.bundle = bundle
         self.prePass = prePass
@@ -398,7 +402,8 @@ final class TrainerSupervisionBuilder {
         // THE DEPTH CACHE covers the cycle: a frame's samples are
         // depthWidth * depthHeight floats, about 196 KB at 256x192, so 128
         // frames is roughly 25 MB.
-        depthCache = SmartDepthCache(capacity: 128, sampleCount: depthWidth * depthHeight)
+        self.depthCache = depthCache
+            ?? SmartDepthCache(capacity: 128, sampleCount: depthWidth * depthHeight)
 
         // A third of whatever is free above 1.5 GB, at most 420 MB (108
         // training frames take about 300 MB). Nothing when the reading is a
