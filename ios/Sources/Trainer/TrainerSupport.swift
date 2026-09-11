@@ -1213,7 +1213,7 @@ struct TrainerTuning: Sendable {
     // Build 340: 330's 4,500 full-size steps scored 19.54 and 338's 2,025
     // scored 19.53, so full-size steps past about 2,000 bought nothing; the
     // last quarter is full size, the rest at 0.5 and 0.75.
-    var coarseResolutionFractions: [Float] = [0.40, 0.75]
+    var coarseResolutionFractions: [Float] = [0.30, 0.55]
     var coarseResolutionScales: [Float] = [0.5, 0.75]
     /// BUILD 338: OFF. The background preload (build 332) put a second
     /// builder to work while the active level's prefetch worker built on

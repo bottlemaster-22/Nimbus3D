@@ -1809,7 +1809,7 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
         let scaleCap: Int
         switch sceneExtentMeters {
         case ..<3: scaleCap = 150_000    // one object
-        case ..<8: scaleCap = 400_000    // a room (build 340; the 330,000 cap bound from round 700 with 420 MB of the memory ceiling unused)
+        case ..<8: scaleCap = 330_000    // a room (build 350, back from 400,000: 348 scored lower and cost 1.5 s more GPU; the 330,000 cap bound from round 700 with 420 MB of the memory ceiling unused)
         default: scaleCap = 500_000      // a floor or a house
         }
 
@@ -1875,7 +1875,7 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 // that fail, so more of the capture goes into training.
                 // Build 346: 150. 200 frames (build 344) put the run 500 MB over
                 // the memory share and the governor cut the model to 20,000.
-                keyframeCount: sceneExtentMeters < 8 ? 150 : 240,
+                keyframeCount: sceneExtentMeters < 8 ? 120 : 240,
                 memoryCeilingBytes: memoryForSplats,
                 target: .onDevice
             )
