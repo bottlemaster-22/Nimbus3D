@@ -1442,3 +1442,5 @@ The most likely shape of 368's growth: the loop is one detached task whose autor
 ### LOCAL ONLY (not pushed, allowance at 97 %): sweep batching, commit b64a038
 
 updateFilter3DInner now encodes ten cameras per command buffer (one pool per batch) instead of one command buffer per camera. Installable build is 388 (= 382's configuration). To test the experiment after the reset: push this commit, then set keyframes 200 and cap 400k (the leaking configuration) in Contracts.swift, run, and read `MEMORY CURVE` from census.py: if the steps at the sweeps are gone, the per-command-buffer theory holds and 200/400k becomes usable.
+
+LOCAL (unpushed) additions: the authority-map cache holds 256 entries for captures over 128 frames (a 200-frame set thrashed the 128-entry LRU on every build); Contracts carries the EXPERIMENT configuration (200 frames, cap 400k) so the next push tests the batched sweep directly. If the 100-iteration memory curve still steps at the sweeps, revert those two Contracts lines (120 / 330,000) and push again; 388 is the last proven build.

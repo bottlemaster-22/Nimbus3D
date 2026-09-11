@@ -5566,7 +5566,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         timings.smartLayerTrust += trust.value.seconds
 
         let authorityClock = CFAbsoluteTimeGetCurrent()
-        let authorityMap = SmartAuthorityMap(settings: settings)
+        // 256 entries when the capture is large (build 390, local): the
+        // default 128 is under a 200-frame training set plus its held-out
+        // frames, and a round-robin over more frames than the cache holds
+        // rebuilds every map on every visit.
+        let authorityMap = SmartAuthorityMap(
+            settings: settings, cacheCapacity: bundle.frames.count > 128 ? 256 : 128
+        )
         authorityMap.prepare(
             bundle: bundle,
             at: ref,
