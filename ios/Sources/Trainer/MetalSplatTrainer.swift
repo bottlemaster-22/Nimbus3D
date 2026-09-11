@@ -947,7 +947,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         if coarsePhaseOn, let first = slice.keyframes.first {
             _ = supervision.build(frame: first, iteration: 0, totalIterations: 1, includeDepthSamples: false)
         }
-        preloads.first?.start()
+        if coarsePhaseOn { preloads.first?.start() }
         defer {
             prefetch.drain()
             coarsePrefetches.forEach { $0.drain() }
@@ -1290,7 +1290,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // one starts decoding its frames now, while this level trains.
             while levelsDropped < activeLevel {
                 coarsePrefetches[levelsDropped].drain()
-                timings.supervisionCacheHits += coarseSupervisions[levelsDropped].frameCacheHits
+                // Hits are summed once, by the slice's defer, over every
+                // builder; `dropFrameCache` keeps the counter for it.
                 coarseSupervisions[levelsDropped].dropFrameCache(disable: true)
                 levelsDropped += 1
             }
@@ -1427,6 +1428,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
             if iteration % 50 == 0 {
                 var reading = governor.measureMemory(resources: resources)
+                timings.memoryFootprintPeakMegabytes = Swift.max(
+                    timings.memoryFootprintPeakMegabytes, Double(reading.footprintBytes) / 1_048_576
+                )
                 var change = governor.degradeForMemory(
                     reading: reading,
                     currentSplatCount: splatCount,
@@ -1439,11 +1443,24 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 // (build 310, up to 420 MB), so the cache could have been paid
                 // for in Gaussians. It is dropped, and stays off, before any
                 // cut is considered; the reading is then retaken.
-                if change != nil, supervision.frameCacheBytes > 0 {
+                if change != nil, supervision.frameCacheBytes > 0
+                    || coarseSupervisions.contains(where: { $0.frameCacheBytes > 0 })
+                {
+                    // BUILD 336: EVERY builder's cache, and no worker may be
+                    // inside any builder while its cache is emptied. The full
+                    // builder's background preload (started when the last
+                    // level begins, iteration 1,350 on 4,500) was writing the
+                    // very dictionary this cleared from the loop thread: a
+                    // Swift dictionary mutated from two threads is the crash
+                    // build 334 hit just past that boundary, the first poll
+                    // at which two whole caches were live at once.
                     prefetch.drain()
+                    coarsePrefetches.forEach { $0.drain() }
+                    preloads.forEach { $0.cancelAndJoin() }
                     supervision.dropFrameCache(disable: true)
+                    coarseSupervisions.forEach { $0.dropFrameCache(disable: true) }
                     TrainerLog.budget.notice(
-                        "Frame cache released for memory before any cut was considered"
+                        "Frame caches released for memory before any cut was considered"
                     )
                     reading = governor.measureMemory(resources: resources)
                     change = governor.degradeForMemory(
@@ -1496,7 +1513,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // The first iteration of the run: nothing has been prefetched, and
             // level 0's preload must hand the builder over before the loop
             // builds on it.
-            if iteration == 0, activeLevel < preloads.count { preloads[activeLevel].join() }
+            if iteration == 0, activeLevel < levelCount { preloads[activeLevel].join() }
             switch activePrefetch.take(
                 frame: frame, iteration: iteration, totalIterations: effectiveTotal
             ) {
@@ -2161,15 +2178,20 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     cameraDeltas: cameraDeltas, splatCount: splatCount,
                     shCoefficientCount: shCoefficientCount, renderSize: renderSize
                 )
-                _ = try evaluateHeldOut(
+                let alignedScore = try evaluateHeldOut(
                     gpu: gpu, resources: resources, queue: queue,
                     frames: slice.heldOutKeyframes, supervision: supervision,
                     cameraDeltas: aligned, exposures: exposures,
                     splatCount: splatCount, shCoefficientCount: shCoefficientCount,
                     renderSize: renderSize, alsoScoreExposureFitted: true
                 )
-                census.slices[censusRow].heldOutPSNRPoseAligned = lastHeldOutPSNRExposureFitted
-                census.slices[censusRow].heldOutSSIMPoseAligned = lastHeldOutSSIM
+                // Recorded only when something was scored (build 336): a
+                // second pass that skipped every frame would otherwise report
+                // the raw numbers as the aligned ones.
+                if alignedScore != nil {
+                    census.slices[censusRow].heldOutPSNRPoseAligned = lastHeldOutPSNRExposureFitted
+                    census.slices[censusRow].heldOutSSIMPoseAligned = lastHeldOutSSIM
+                }
             } catch {
                 TrainerLog.general.error(
                     "The pose-aligned held-out score could not be taken: \(error.localizedDescription, privacy: .public)"
@@ -4383,6 +4405,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     ) throws -> Float? {
 
         lastHeldOutPSNRExposureFitted = nil
+        lastHeldOutSSIM = nil
         lastHeldOutPerFrame = []
         guard splatCount > 0, !frames.isEmpty else { return nil }
         // HELD-OUT VIEWS MUST NOT REACH A DENSIFY PASS. The eval's preprocess
@@ -4711,6 +4734,12 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 && frameSupervision.backgroundFaceSize > 0
                 && !frameSupervision.backgroundTexels.isEmpty
             resources.inputSlot = 0
+            // The photo itself (build 336). The loss kernels read slot 0's
+            // ground truth, which the training loop last filled with a
+            // TRAINING frame; without this upload every loss and camera
+            // gradient below was measured against the wrong picture.
+            guard frameSupervision.groundTruthBytes.count == px * 3 else { continue }
+            _ = resources.gtColorIn.writeArray(frameSupervision.groundTruthBytes)
             if useGPUBackground {
                 _ = resources.bgCubemapIn.writeArray(frameSupervision.backgroundTexels)
             }

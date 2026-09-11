@@ -250,7 +250,13 @@ final class TrainerSupervisionPreload: @unchecked Sendable {
     func start() {
         lock.lock()
         defer { lock.unlock() }
-        guard work == nil else { return }
+        // Nothing to preload into when the cache is off (the memory governor
+        // turns it off for the rest of the run).
+        guard work == nil, builder.frameCacheEnabled else { return }
+        // The governor cancels every preload, started or not, before a
+        // budget change; one that had not started yet is still wanted
+        // (build 336).
+        cancelled = false
         let item = DispatchWorkItem { [self] in
             for frame in frames {
                 lock.lock()
@@ -347,6 +353,9 @@ final class TrainerSupervisionBuilder {
     }
     private var frameCache: [FrameID: CachedFrame] = [:]
     private var frameCacheLimitBytes = 0
+    /// Whether a build can still be kept: false once the governor has dropped
+    /// the cache for memory.
+    var frameCacheEnabled: Bool { frameCacheLimitBytes > 0 }
     private(set) var frameCacheBytes = 0
     /// Builds served from the cache, for the census.
     private(set) var frameCacheHits = 0

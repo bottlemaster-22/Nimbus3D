@@ -957,8 +957,12 @@ public final class SmartAuthorityMap {
 
         lock.lock()
         builtFrames += 1
+        // Two builders can map the same frame at once (the resolution levels
+        // decode in the background, build 336): the second must not append a
+        // second copy of the key, or the order list outgrows the map and
+        // evicts live entries.
+        if cache[frame] == nil { cacheOrder.append(frame) }
         cache[frame] = built
-        cacheOrder.append(frame)
         while cacheOrder.count > cacheCapacity {
             cache.removeValue(forKey: cacheOrder.removeFirst())
         }

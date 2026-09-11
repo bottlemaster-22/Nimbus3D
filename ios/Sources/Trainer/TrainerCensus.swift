@@ -732,6 +732,9 @@ struct TrainerTimings: Codable {
     var coarseLongEdgePixels: Int = 0
     /// Build 332: frames decoded by the background preloads (off the loop).
     var supervisionPreloaded: Int = 0
+    /// Build 336: the largest process-wide footprint the memory poll saw
+    /// (what this run had allocated since it began), in MB.
+    var memoryFootprintPeakMegabytes: Double = 0
     /// Build 330: the pose check. Photometric loss (L1 + SSIM terms) of the
     /// frame at its current camera correction and after one gradient step,
     /// on the same model; 1 if the step lowered it (full-rate refinement

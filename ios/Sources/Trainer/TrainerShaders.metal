@@ -3911,12 +3911,16 @@ kernel void trainer_adam_sh(
 
     const uint floatsPerSplat = u.shCoeffCount * 3u;
     const uint base = gid * floatsPerSplat;
-    // Only the coefficients the ramp has switched on (build 332). One that
-    // has never been active carries a zero gradient and zero moments, so the
-    // walk below would store back exactly what it read; the ramp only grows,
-    // so nothing is ever skipped that was once walked. Exact, and during the
-    // ramp (the first 35 % of the run) up to nine times less traffic.
-    const uint activeFloats = min(max(u.activeSHCoeffCount, 1u), u.shCoeffCount) * 3u;
+    // Only the coefficients the ramp has switched on (build 332). The
+    // rasteriser and preprocess_backward switch them on a DEGREE at a time
+    // (1, 4 or 9 coefficients: trainer_evalSH gates on `> 1` and `> 4`), so
+    // the walk covers the whole degree the ramp has reached (build 336): a
+    // coefficient below that bound can carry a gradient, one above it never
+    // has, and its moments are zero, so the skipped tail would store back
+    // exactly what it read. Exact; during the ramp up to nine times less
+    // optimiser traffic.
+    const uint activeCoeffs = u.activeSHCoeffCount > 4u ? 9u : (u.activeSHCoeffCount > 1u ? 4u : 1u);
+    const uint activeFloats = min(activeCoeffs, u.shCoeffCount) * 3u;
 
     for (uint i = 0; i < activeFloats; ++i) {
         const uint k = base + i;

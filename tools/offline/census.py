@@ -179,6 +179,10 @@ if t.get('mergedSteps'):    print('merged steps: %d of %d overlapped ran as one 
 if 'supervisionCacheHits' in t:
     print('frame cache: %d builds served without a decode, cache peak %.0f MB'
           % (t['supervisionCacheHits'], t.get('supervisionCacheMegabytes', 0)))
+if t.get('memoryFootprintPeakMegabytes'):
+    print('MEMORY: run footprint peaked at %.0f MB (ceiling %.0f MB)'
+          % (t['memoryFootprintPeakMegabytes'],
+             (d.get('budgetAsRun') or {}).get('memoryCeilingBytes', 0) / 1048576.0))
 
 # Densification health, which is where the quality questions live.
 p = d.get('densifyPasses', [])
