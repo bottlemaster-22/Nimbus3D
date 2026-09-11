@@ -124,6 +124,14 @@ constant float TRAINER_SH_C2_1 = -1.09254843059207900f;
 constant float TRAINER_SH_C2_2 =  0.31539156525252005f;
 constant float TRAINER_SH_C2_3 = -1.09254843059207900f;
 constant float TRAINER_SH_C2_4 =  0.54627421529603960f;
+// Degree 3 (build 366), same convention and order as the viewer's kSH_C3.
+constant float TRAINER_SH_C3_0 = -0.59004358992664350f;
+constant float TRAINER_SH_C3_1 =  2.89061144264055400f;
+constant float TRAINER_SH_C3_2 = -0.45704579946446580f;
+constant float TRAINER_SH_C3_3 =  0.37317633259011540f;
+constant float TRAINER_SH_C3_4 = -0.45704579946446580f;
+constant float TRAINER_SH_C3_5 =  1.44530572132027700f;
+constant float TRAINER_SH_C3_6 = -0.59004358992664350f;
 
 // `EdgeClass` raw values (Core/Contracts.swift).
 constant uint TRAINER_EDGE_NONE      = 0;
@@ -556,6 +564,23 @@ static inline float3 trainer_evalSH(
                     + TRAINER_SH_C2_2 * (2.0f * zz - xx - yy) * s6
                     + TRAINER_SH_C2_3 * xz * s7
                     + TRAINER_SH_C2_4 * (xx - yy) * s8;
+
+            if (activeCount > 9 && stride > 9) {
+                const float3 s9  = float3(sh[27], sh[28], sh[29]);
+                const float3 s10 = float3(sh[30], sh[31], sh[32]);
+                const float3 s11 = float3(sh[33], sh[34], sh[35]);
+                const float3 s12 = float3(sh[36], sh[37], sh[38]);
+                const float3 s13 = float3(sh[39], sh[40], sh[41]);
+                const float3 s14 = float3(sh[42], sh[43], sh[44]);
+                const float3 s15 = float3(sh[45], sh[46], sh[47]);
+                result += TRAINER_SH_C3_0 * y * (3.0f * xx - yy) * s9
+                        + TRAINER_SH_C3_1 * xy * z * s10
+                        + TRAINER_SH_C3_2 * y * (4.0f * zz - xx - yy) * s11
+                        + TRAINER_SH_C3_3 * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * s12
+                        + TRAINER_SH_C3_4 * x * (4.0f * zz - xx - yy) * s13
+                        + TRAINER_SH_C3_5 * z * (xx - yy) * s14
+                        + TRAINER_SH_C3_6 * x * (xx - 3.0f * yy) * s15;
+            }
         }
     }
     return result + 0.5f;
@@ -3354,7 +3379,7 @@ kernel void trainer_preprocess_backward(
     // tell from +0).
     {
         const uint shRow = cam.shCoeffCount * 3u;
-        const uint written = min(shRow, (active > 4u) ? 27u : ((active > 1u) ? 12u : 3u));
+        const uint written = min(shRow, (active > 9u) ? 48u : ((active > 4u) ? 27u : ((active > 1u) ? 12u : 3u)));
         for (uint k = written; k < shRow; ++k) { shGrad[shBase + k] = 0.0f; }
     }
 
@@ -3411,6 +3436,53 @@ kernel void trainer_preprocess_backward(
             dLdDir.z += dot(TRAINER_SH_C2_1 * y * s5
                             + TRAINER_SH_C2_2 * (4.0f * z) * s6
                             + TRAINER_SH_C2_3 * x * s7, dLdColor);
+
+            if (active > 9u) {
+                // Degree 3 (build 366): the basis and its direction
+                // derivatives as in the reference rasteriser's backward.
+                const float b9  = TRAINER_SH_C3_0 * y * (3.0f * xx - yy);
+                const float b10 = TRAINER_SH_C3_1 * xy * z;
+                const float b11 = TRAINER_SH_C3_2 * y * (4.0f * zz - xx - yy);
+                const float b12 = TRAINER_SH_C3_3 * z * (2.0f * zz - 3.0f * xx - 3.0f * yy);
+                const float b13 = TRAINER_SH_C3_4 * x * (4.0f * zz - xx - yy);
+                const float b14 = TRAINER_SH_C3_5 * z * (xx - yy);
+                const float b15 = TRAINER_SH_C3_6 * x * (xx - 3.0f * yy);
+                for (uint c = 0; c < 3u; ++c) {
+                    shGrad[shBase + 27u + c] = b9  * dLdColor[c];
+                    shGrad[shBase + 30u + c] = b10 * dLdColor[c];
+                    shGrad[shBase + 33u + c] = b11 * dLdColor[c];
+                    shGrad[shBase + 36u + c] = b12 * dLdColor[c];
+                    shGrad[shBase + 39u + c] = b13 * dLdColor[c];
+                    shGrad[shBase + 42u + c] = b14 * dLdColor[c];
+                    shGrad[shBase + 45u + c] = b15 * dLdColor[c];
+                }
+                const float3 s9  = float3(sh[shBase + 27u], sh[shBase + 28u], sh[shBase + 29u]);
+                const float3 s10 = float3(sh[shBase + 30u], sh[shBase + 31u], sh[shBase + 32u]);
+                const float3 s11 = float3(sh[shBase + 33u], sh[shBase + 34u], sh[shBase + 35u]);
+                const float3 s12 = float3(sh[shBase + 36u], sh[shBase + 37u], sh[shBase + 38u]);
+                const float3 s13 = float3(sh[shBase + 39u], sh[shBase + 40u], sh[shBase + 41u]);
+                const float3 s14 = float3(sh[shBase + 42u], sh[shBase + 43u], sh[shBase + 44u]);
+                const float3 s15 = float3(sh[shBase + 45u], sh[shBase + 46u], sh[shBase + 47u]);
+                dLdDir.x += dot(TRAINER_SH_C3_0 * s9 * 6.0f * xy
+                                + TRAINER_SH_C3_1 * s10 * yz
+                                + TRAINER_SH_C3_2 * s11 * (-2.0f * xy)
+                                + TRAINER_SH_C3_3 * s12 * (-6.0f * xz)
+                                + TRAINER_SH_C3_4 * s13 * (-3.0f * xx + 4.0f * zz - yy)
+                                + TRAINER_SH_C3_5 * s14 * 2.0f * xz
+                                + TRAINER_SH_C3_6 * s15 * 3.0f * (xx - yy), dLdColor);
+                dLdDir.y += dot(TRAINER_SH_C3_0 * s9 * 3.0f * (xx - yy)
+                                + TRAINER_SH_C3_1 * s10 * xz
+                                + TRAINER_SH_C3_2 * s11 * (-3.0f * yy + 4.0f * zz - xx)
+                                + TRAINER_SH_C3_3 * s12 * (-6.0f * yz)
+                                + TRAINER_SH_C3_4 * s13 * (-2.0f * xy)
+                                + TRAINER_SH_C3_5 * s14 * (-2.0f * yz)
+                                + TRAINER_SH_C3_6 * s15 * (-6.0f * xy), dLdColor);
+                dLdDir.z += dot(TRAINER_SH_C3_1 * s10 * xy
+                                + TRAINER_SH_C3_2 * s11 * 8.0f * yz
+                                + TRAINER_SH_C3_3 * s12 * 3.0f * (2.0f * zz - xx - yy)
+                                + TRAINER_SH_C3_4 * s13 * 8.0f * xz
+                                + TRAINER_SH_C3_5 * s14 * (xx - yy), dLdColor);
+            }
         }
     }
 
@@ -3919,7 +3991,8 @@ kernel void trainer_adam_sh(
     // has, and its moments are zero, so the skipped tail would store back
     // exactly what it read. Exact; during the ramp up to nine times less
     // optimiser traffic.
-    const uint activeCoeffs = u.activeSHCoeffCount > 4u ? 9u : (u.activeSHCoeffCount > 1u ? 4u : 1u);
+    const uint activeCoeffs = u.activeSHCoeffCount > 9u ? 16u
+        : (u.activeSHCoeffCount > 4u ? 9u : (u.activeSHCoeffCount > 1u ? 4u : 1u));
     const uint activeFloats = min(activeCoeffs, u.shCoeffCount) * 3u;
 
     for (uint i = 0; i < activeFloats; ++i) {

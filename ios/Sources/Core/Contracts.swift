@@ -1816,7 +1816,7 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
         switch tier {
         case .full:
             return TrainingBudget(
-                splatCap: Swift.max(50_000, Swift.min(scaleCap, capFromMemory(at: .two))),
+                splatCap: Swift.max(50_000, Swift.min(scaleCap, capFromMemory(at: .three))),
                 // 30,000 IS THE REFERENCE BUDGET, and this is deliberately
                 // the slow end of the trade so the quality CEILING can be
                 // measured before anything is optimised back down.
@@ -1876,7 +1876,8 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 // reference sits at 3.4 mm. Only the last fifth of the run renders
                 // at this size (see coarseResolutionFractions).
                 renderLongEdgePixels: 1080,
-                shDegree: .two,
+                // Build 366: degree 3, the reference's (and Scaniverse's).
+                shDegree: .three,
                 // Build 342: 200 for a room (was 120). 338 trained 108 of 868
                 // frames and its eleven held-out frames scored from 14.6 to 26.1
                 // dB: the views the training set did not cover are the ones

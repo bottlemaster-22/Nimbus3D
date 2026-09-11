@@ -1406,3 +1406,7 @@ Owner's call: the reference recipe's iteration count, quality over the clock. Ro
 ### BUILD 364: opacity reset every 3,000 iterations
 
 The reference recipe's reset, missing until now: on the densify cadence, inside the densify window, every point's opacity logit is clamped to logit(0.01) and adamM/adamV's opacity lanes are zeroed (a CPU pass over the shared buffers with the GPU idle, right after the densify pass and the stats reset). Because our faint prune sits at 0.08 (the reference's is 0.005, below the reset value), pruning waits 500 iterations after each reset so recovering points are not the ones removed. Census: `timings.opacityResets`.
+
+### BUILD 366: SH degree 3
+
+trainer_evalSH gains the degree-3 block (7 basis terms, reference constants and order, the same the viewer's kSH_C3 uses); trainer_preprocess_backward writes the 21 degree-3 gradients and their direction derivatives transcribed from the reference rasteriser's backward; the written bound is 48 floats when the ramp is past 9; trainer_adam_sh walks 16 coefficients past 9. Room budget shDegree .two -> .three, capFromMemory at .three. Memory: SH rows and their two Adam moments go 27 -> 48 floats a point (about +140 MB at 330k with the gradient rows), so memoryUseFraction 0.75 -> 0.8; the census footprint line is the check. The viewer and PLY codec already carried degree 3.
