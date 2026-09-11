@@ -671,6 +671,10 @@ struct TrainerTimings: Codable {
     var sortSecondsB: Double = 0
     var sortMismatchSteps: Int = 0
     var sortSimdScanChosen: Int = 0
+    /// Build 326: the legacy passes with the SIMD scatter (Q), timed and
+    /// checked against L like the others.
+    var sortLegacySimdSeconds: Double = 0
+    var sortLegacySimdMismatchSteps: Int = 0
 
     /// Forward calibration (build 302): the one-pixel rasteriser (A) against
     /// the two-pixel one (B) on the same frame. GPU seconds of each summed, the

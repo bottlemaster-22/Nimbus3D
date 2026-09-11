@@ -384,10 +384,12 @@ if t.get('backwardCalibrationSteps', 0):
 if t.get('sortCalibrationSteps', 0):
     _k = t['sortCalibrationSteps']
     if 'sortLegacySeconds' in t:
-        print('SORT CALIBRATION: %d steps  legacy %.2f ms  splat-order %.2f ms  +SIMD %.2f ms  '
-              'mismatched: splat-order %d, +SIMD %d  -> splat-order %s, SIMD scatter %s'
-              % (_k, 1000 * t['sortLegacySeconds'] / _k, 1000 * t['sortSecondsA'] / _k,
-                 1000 * t['sortSecondsB'] / _k, t.get('sortSplatOrderMismatchSteps', 0),
+        print('SORT CALIBRATION: %d steps  legacy %.2f ms  legacy+SIMD %.2f ms  splat-order %.2f ms  +SIMD %.2f ms  '
+              'mismatched: legacy+SIMD %d, splat-order %d, +SIMD %d  -> splat-order %s, SIMD scatter %s'
+              % (_k, 1000 * t['sortLegacySeconds'] / _k, 1000 * t.get('sortLegacySimdSeconds', 0) / _k,
+                 1000 * t['sortSecondsA'] / _k,
+                 1000 * t['sortSecondsB'] / _k, t.get('sortLegacySimdMismatchSteps', 0),
+                 t.get('sortSplatOrderMismatchSteps', 0),
                  t.get('sortMismatchSteps', 0),
                  'USED' if t.get('sortSplatOrderChosen') else 'not used',
                  'USED' if t.get('sortSimdScanChosen') else 'not used'))

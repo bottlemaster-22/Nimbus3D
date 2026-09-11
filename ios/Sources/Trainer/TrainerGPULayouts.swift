@@ -104,6 +104,10 @@ enum TrainerGPUConstants {
     /// Build 316: the GPU-written sort arguments, 16 slots of 256 bytes.
     /// See trainer_sort_setup for what each slot holds.
     static let sortArgSlotBytes = 256
+
+    /// Build 326: the far-field cubemap's face size the trainer's buffers are
+    /// sized for. DirectionalBackgroundModel's default must not exceed it.
+    static let backgroundFaceSize = 64
     static let sortArgSlots = 16
 
     /// SSIM window: 11 taps, sigma 1.5, the constants the SSIM paper and every

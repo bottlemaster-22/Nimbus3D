@@ -260,9 +260,9 @@ final class TrainerResources {
         densifyFlags = try make("densifyFlags", n)
         densifyScratch = try make("densifyScratch", shFloats * MemoryLayout<Float>.stride)
         snapshotStaging = try make("snapshotStaging", Self.snapshotStagingBytes(splats: n, shFloats: shFloats))
-        // 6 faces, 32x32, three floats each. Fixed size: it does not scale
+        // 6 faces, 64x64 (build 326), three floats each. Fixed size: it does not scale
         // with splats or pixels, so it is allocated once and never resized.
-        bgCubemap = try make("bgCubemap", 6 * 32 * 32 * 3 * 4)
+        bgCubemap = try make("bgCubemap", Self.backgroundCubemapBytes)
         centers = try make("centers", n * 3 * 4)
 
         keysA = try make("keysA", inst * 4)
@@ -333,7 +333,7 @@ final class TrainerResources {
             self.depthSampleCapacity * MemoryLayout<TrainerDepthSample>.stride
         )
         gtColorAlt = try make("gtColorAlt", px * 3)
-        bgCubemapAlt = try make("bgCubemapAlt", 6 * 32 * 32 * 3 * 4)
+        bgCubemapAlt = try make("bgCubemapAlt", Self.backgroundCubemapBytes)
         depthSamplesAlt = try make(
             "depthSamplesAlt",
             self.depthSampleCapacity * MemoryLayout<TrainerDepthSample>.stride
@@ -428,6 +428,12 @@ final class TrainerResources {
     /// renderTFinal (4).
     static func warmupStagingSlotBytes(pixelCount: Int) -> Int {
         pixelCount * 16
+    }
+
+    /// The far-field cubemap: 6 faces of backgroundFaceSize squared, 3 floats.
+    static var backgroundCubemapBytes: Int {
+        let n = TrainerGPUConstants.backgroundFaceSize
+        return 6 * n * n * 3 * 4
     }
 
     /// Bytes of one held-out staging slot: 16 for the instance counts, then

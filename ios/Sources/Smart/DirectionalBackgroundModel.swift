@@ -331,7 +331,11 @@ public final class DirectionalBackgroundModel: BackgroundModel {
 
     public init(
         settings: SmartLossSettings = .default,
-        faceSize: Int = 32,
+        // 64 since build 326 (was 32): four times the texels, so a window or a
+        // doorway keeps its shape instead of a 32-pixel-per-face smear. The
+        // trainer samples twice as many pixels per step for its gradient to
+        // match, and its GPU copy is sized to 64 (TrainerResources).
+        faceSize: Int = 64,
         midRegimeProvider: SmartMidRegimeDepthProvider = SmartMonocularDepthStub()
     ) {
         self.settings = settings

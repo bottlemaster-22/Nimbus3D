@@ -98,6 +98,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// Build 320: the densifier applies its decision on the GPU; cleared
     /// for the run if the first pass's check found a difference.
     private var densifyGatherUsable = true
+    /// Build 326: the cubemap-too-large complaint is said once per trainer.
+    private var loggedCubemapTruncation = false
     /// Set by the sort calibration (build 306): use the splat-order tile sort.
     private var splatOrderChosen = false
 
@@ -2372,7 +2374,16 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // image. `trainer_background` turns it into bgColor on the GPU in
         // command buffer A below.
         if supervision.hasBackground, !supervision.backgroundTexels.isEmpty {
-            resources.bgCubemapIn.writeArray(supervision.backgroundTexels)
+            // writeArray clamps to the buffer, so a cubemap larger than the
+            // buffer (a face size above TrainerGPUConstants.backgroundFaceSize)
+            // would upload a torn map without a word. Said out loud once.
+            let written = resources.bgCubemapIn.writeArray(supervision.backgroundTexels)
+            if written < supervision.backgroundTexels.count, !loggedCubemapTruncation {
+                loggedCubemapTruncation = true
+                TrainerLog.gpu.error(
+                    "The far-field cubemap has \(supervision.backgroundTexels.count) floats but the GPU buffer holds \(written); the far field is truncated"
+                )
+            }
         }
         let sampleCount = Swift.min(
             supervision.depthSamples.count, resources.depthSampleCapacity
@@ -2458,8 +2469,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// capacity (trainer_duplicate_keys already stops there), the count comes
     /// back with the step's other read-backs, and a step that needed more is
     /// counted (`truncatedInstanceSteps`) and grows the buffers before the
-    /// next step. The buffers hold eight instances per splat and a room peaks
-    /// near four, so this is recorded rather than expected.
+    /// step after next: the next step was already encoded when this one's
+    /// count came back, so an overflow costs TWO clamped steps, and the
+    /// census counts both. The buffers hold eight instances per splat and a
+    /// room peaks near four, so this is recorded rather than expected.
     ///
     /// Only for steps that would have been overlapped anyway (after warm-up,
     /// background frozen, not a profiled or calibration step): those read
@@ -3048,6 +3061,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     let matchS = matchesLegacy()
                     var matchP = false
                     var secondsP = 0.0
+                    var matchQ = false
+                    var secondsQ = 0.0
                     if hasSimdScatter {
                         secondsP = try stage(tag("the tile sort")) { e in
                             gpu.orderSplats(
@@ -3059,8 +3074,21 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                             gpu.radixSort(e, count: n, simdScan: true, tileOnly: true)
                         }
                         matchP = matchesLegacy()
+                        // Q: the legacy passes with the SIMD scatter (build 326,
+                        // from review). This is the combination the run uses
+                        // when the splat order is NOT chosen, and until now it
+                        // was the one combination the window never checked.
+                        secondsQ = try stage(tag("the tile sort")) { e in
+                            gpu.exclusiveScan(
+                                e, input: resources.tilesTouched, output: resources.offsets,
+                                count: splatCount
+                            )
+                            gpu.duplicateKeys(e, camera: &camera, splatCount: splatCount, ordered: false)
+                            gpu.radixSort(e, count: n, simdScan: true, tileOnly: false)
+                        }
+                        matchQ = matchesLegacy()
                     }
-                    let lastMatched = hasSimdScatter ? matchP : matchS
+                    let lastMatched = hasSimdScatter ? matchQ : matchS
                     if !lastMatched, keysL.count == n, valuesL.count == n {
                         _ = resources.keysA.writeArray(keysL)
                         _ = resources.valuesA.writeArray(valuesL)
@@ -3069,18 +3097,27 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     timings.sortLegacySeconds += secondsL
                     timings.sortSecondsA += secondsS
                     timings.sortSecondsB += secondsP
+                    timings.sortLegacySimdSeconds += secondsQ
                     if !matchS { timings.sortSplatOrderMismatchSteps += 1 }
                     if hasSimdScatter, !matchP { timings.sortMismatchSteps += 1 }
+                    if hasSimdScatter, !matchQ { timings.sortLegacySimdMismatchSteps += 1 }
                     if iteration == sortStart + tuning.sortCalibrationSteps - 1 {
                         splatOrderChosen = tuning.splatOrderSort
                             && timings.sortSplatOrderMismatchSteps == 0
                             && timings.sortSecondsA < timings.sortLegacySeconds * 0.97
                         timings.sortSplatOrderChosen = splatOrderChosen ? 1 : 0
-                        // P is S plus the SIMD scatter; its own speed-up is
-                        // judged against S, the same work with the plain one.
-                        sortSimdScanChosen = hasSimdScatter
-                            && timings.sortMismatchSteps == 0
-                            && timings.sortSecondsB < timings.sortSecondsA * 0.97
+                        // The SIMD scatter is judged on the path it will run
+                        // on: P against S when the splat order is chosen, Q
+                        // against L when it is not.
+                        if splatOrderChosen {
+                            sortSimdScanChosen = hasSimdScatter
+                                && timings.sortMismatchSteps == 0
+                                && timings.sortSecondsB < timings.sortSecondsA * 0.97
+                        } else {
+                            sortSimdScanChosen = hasSimdScatter
+                                && timings.sortLegacySimdMismatchSteps == 0
+                                && timings.sortLegacySimdSeconds < timings.sortLegacySeconds * 0.97
+                        }
                         timings.sortSimdScanChosen = sortSimdScanChosen ? 1 : 0
                     }
                     try stage(tag("the tile sort")) { e in
@@ -3971,7 +4008,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     ///
     /// The weight carries `1 - accumulatedAlpha`, because a pixel the
     /// Gaussians already cover opaquely says nothing about what is behind
-    /// them. Sampled on a stride: the field is a 32x32x6 cubemap, and every
+    /// them. Sampled on a stride: the field is a 64x64x6 cubemap, and every
     /// pixel of every frame would be a hundred samples per texel per iteration.
     /// `gradFinal` and `tFinal` are the live buffers (the synchronous path) or
     /// a warm-up step's staged copies of them at the given offsets (build 324).
@@ -3991,12 +4028,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         let k = supervision.intrinsics
 
         // Roughly two thousand samples per iteration, not every pixel. The
-        // field is a 32x32x6 cubemap: at 720p, every pixel would be several
+        // field is a 64x64x6 cubemap (4,000 samples a step since build 326,
+        // twice build 292's 2,000 for four times the texels): at 720p, every pixel would be several
         // hundred samples per texel per iteration, each one taking the
         // background model's lock, and the extra samples buy nothing because
         // the texel is an average either way. The stride is forced odd so the
         // sampled set is not a grid aligned to the image width.
-        var stride = Swift.max(pixelCount / 2_000, 1)
+        var stride = Swift.max(pixelCount / 4_000, 1)
         if stride % 2 == 0 { stride += 1 }
 
         // Read the two buffers in place. They are shared-storage, the GPU is

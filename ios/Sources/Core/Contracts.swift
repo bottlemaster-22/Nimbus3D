@@ -1809,14 +1809,14 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
         let scaleCap: Int
         switch sceneExtentMeters {
         case ..<3: scaleCap = 150_000    // one object
-        case ..<8: scaleCap = 300_000    // a room
+        case ..<8: scaleCap = 330_000    // a room (build 326; was 300,000)
         default: scaleCap = 500_000      // a floor or a house
         }
 
         switch tier {
         case .full:
             return TrainingBudget(
-                splatCap: Swift.max(50_000, Swift.min(scaleCap, capFromMemory(at: .one))),
+                splatCap: Swift.max(50_000, Swift.min(scaleCap, capFromMemory(at: .two))),
                 // 30,000 IS THE REFERENCE BUDGET, and this is deliberately
                 // the slow end of the trade so the quality CEILING can be
                 // measured before anything is optimised back down.
@@ -1855,9 +1855,20 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 // held-out peaks at or before 2,000. Early stopping stays on
                 // as the safety net that catches a capture whose peak is
                 // somewhere else.
-                iterations: sceneExtentMeters < 8 ? 4_000 : 3_000,
+                // BUILD 326: 4,500 and 330,000 points for a room. Build 320
+                // measured the whole run at 52.6 s (48 s training + 4.6 s
+                // pre-pass) with the held-out curve still rising at 3,600
+                // (19.25 -> 19.29 dB), so the owner asked for more rounds and
+                // more points at about the wall clock the campaign started
+                // from (62 to 66 s). Degree-2 colour at the same time: every
+                // kernel, the export and the viewer already carried degree 2
+                // (the ramp reaches all nine coefficients at 35 % of the run),
+                // the budget simply never asked for it. Degree 2 is where
+                // view-dependent shading (highlights, sheen) lives; degree 1
+                // can only tilt the colour along one direction.
+                iterations: sceneExtentMeters < 8 ? 4_500 : 3_500,
                 renderLongEdgePixels: 720,
-                shDegree: .one,
+                shDegree: .two,
                 keyframeCount: sceneExtentMeters < 8 ? 120 : 240,
                 memoryCeilingBytes: memoryForSplats,
                 target: .onDevice

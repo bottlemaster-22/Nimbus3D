@@ -1494,7 +1494,7 @@ kernel void trainer_sort_setup(
 /// MAIN thread with the GPU idle behind that too.
 ///
 /// Every input is already on the GPU or fits in a uniform. The cubemap is
-/// 6 * 32 * 32 texels, 72 KB, so it is uploaded whole every iteration rather
+/// 6 * 64 * 64 texels, 295 KB (build 326; was 32 x 32), uploaded whole every iteration rather
 /// than versioned: at that size the copy is noise and a version counter is one
 /// more thing to get wrong.
 ///
@@ -2423,7 +2423,10 @@ kernel void trainer_rasterize_forward2(
                     const float power = -0.5f * (co.x * delta.x * delta.x
                                                  + co.z * delta.y * delta.y)
                                         - co.y * delta.x * delta.y;
-                    if (power >= cutoff) {
+                    // `!(power < cutoff)`, not `power >= cutoff`: the one-pixel
+                    // kernel's `if (power < cutoff) continue;` keeps a NaN power
+                    // (the comparison is false), and so does this (build 326).
+                    if (!(power < cutoff)) {
                         const float alpha = min(0.99f, co.w * exp(power));
                         if (alpha >= cam.minAlpha) {
                             const float testT = TA * (1.0f - alpha);
@@ -2444,7 +2447,10 @@ kernel void trainer_rasterize_forward2(
                     const float power = -0.5f * (co.x * delta.x * delta.x
                                                  + co.z * delta.y * delta.y)
                                         - co.y * delta.x * delta.y;
-                    if (power >= cutoff) {
+                    // `!(power < cutoff)`, not `power >= cutoff`: the one-pixel
+                    // kernel's `if (power < cutoff) continue;` keeps a NaN power
+                    // (the comparison is false), and so does this (build 326).
+                    if (!(power < cutoff)) {
                         const float alpha = min(0.99f, co.w * exp(power));
                         if (alpha >= cam.minAlpha) {
                             const float testT = TB * (1.0f - alpha);
