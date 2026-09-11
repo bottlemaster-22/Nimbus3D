@@ -1867,7 +1867,13 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 // view-dependent shading (highlights, sheen) lives; degree 1
                 // can only tilt the colour along one direction.
                 iterations: sceneExtentMeters < 8 ? 4_500 : 3_500,
-                renderLongEdgePixels: 720,
+                // Build 360: 1,080 (was 720). The exported points' median long axis
+                // stayed at 7.1 mm through every size change because a point has
+                // no reason to shrink below the pixel it is trained against, and a
+                // 720-px pixel is about 7 mm at room distance; the Scaniverse
+                // reference sits at 3.4 mm. Only the last fifth of the run renders
+                // at this size (see coarseResolutionFractions).
+                renderLongEdgePixels: 1080,
                 shDegree: .two,
                 // Build 342: 200 for a room (was 120). 338 trained 108 of 868
                 // frames and its eleven held-out frames scored from 14.6 to 26.1

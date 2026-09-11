@@ -1075,7 +1075,7 @@ struct TrainerTuning: Sendable {
     /// Build 356: the share of the training-grid 3D filter width folded into
     /// the EXPORTED sizes. 0.5 is the filter of a render at twice the training
     /// long edge (1,440 px), which is the least any viewer draws at.
-    var exportFilter3DScale: Float = 0.5
+    var exportFilter3DScale: Float = 0.75
     /// Filter size, world metres, for a Gaussian no camera ever sampled.
     var filter3DFallbackMeters: Float = 0.01
     /// How often the per-Gaussian sampling-rate sweep is re-run.
@@ -1223,8 +1223,9 @@ struct TrainerTuning: Sendable {
     // Build 340: 330's 4,500 full-size steps scored 19.54 and 338's 2,025
     // scored 19.53, so full-size steps past about 2,000 bought nothing; the
     // last quarter is full size, the rest at 0.5 and 0.75.
-    var coarseResolutionFractions: [Float] = [0.30, 0.55]
-    var coarseResolutionScales: [Float] = [0.5, 0.75]
+    // Build 360: 360 px to 45 %, 720 px to 80 %, then 1,080 px.
+    var coarseResolutionFractions: [Float] = [0.45, 0.80]
+    var coarseResolutionScales: [Float] = [0.3333, 0.6667]
     /// BUILD 338: OFF. The background preload (build 332) put a second
     /// builder to work while the active level's prefetch worker built on
     /// another, the first time two frames were ever built at once for the
