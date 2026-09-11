@@ -1869,7 +1869,11 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 iterations: sceneExtentMeters < 8 ? 4_500 : 3_500,
                 renderLongEdgePixels: 720,
                 shDegree: .two,
-                keyframeCount: sceneExtentMeters < 8 ? 120 : 240,
+                // Build 342: 200 for a room (was 120). 338 trained 108 of 868
+                // frames and its eleven held-out frames scored from 14.6 to 26.1
+                // dB: the views the training set did not cover are the ones
+                // that fail, so more of the capture goes into training.
+                keyframeCount: sceneExtentMeters < 8 ? 200 : 240,
                 memoryCeilingBytes: memoryForSplats,
                 target: .onDevice
             )

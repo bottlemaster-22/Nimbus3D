@@ -407,7 +407,9 @@ final class TrainerSupervisionBuilder {
         if !memory.availableIsEstimated {
             let reserve: UInt64 = 1_536 * 1_048_576
             let spare = memory.availableBytes > reserve ? memory.availableBytes - reserve : 0
-            frameCacheLimitBytes = Int(Swift.min(spare / 3, 420 * 1_048_576))
+            // 520 MB (build 342): 200 training frames at full size are about
+            // 470 MB, and 338 peaked at 1,041 MB of a 1,463 MB ceiling.
+            frameCacheLimitBytes = Int(Swift.min(spare / 3, 520 * 1_048_576))
         }
     }
 

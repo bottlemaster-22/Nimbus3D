@@ -1370,3 +1370,7 @@ Build 338 RESULT (diagnostics 2026-09-11 11:57Z): 4,500 of 4,500, no crash, no g
 ### BUILD 340: last quarter at full size, room cap 400,000
 
 338's densify ledger: growth filled the 330,000 cap by round 700 and every later pass only relocated, so 3,800 rounds ran with no room to add detail while the footprint peaked at 1,041 MB of a 1,463 MB ceiling. Cap for a room 330,000 -> 400,000. And 330 (4,500 full-size steps) scored 19.54 against 338 (2,025) at 19.53, so the full-size share drops to the last 25 % (levels 0.5 to 40 %, 0.75 to 75 %). Expected: GPU about 32 s at 330k, plus the extra points; target under 50 s total with more detail.
+
+### BUILD 342: 200 training frames for a room
+
+338 trained 108 keyframes out of 868 captured frames; its eleven held-out frames scored 14.6, 14.7, 15.8, 17.7, 18.2, 18.3, 18.8, 19.9, 20.9, 22.4, 26.1 dB. That spread is coverage, not capture quality: views the training set covers score in the twenties, views it does not cover score in the teens. Room keyframe budget 120 -> 200; the full-size frame cache cap 420 -> 520 MB so all 200 stay resident (footprint estimate about 1,300 MB of the 1,463 MB ceiling). Same 4,500 rounds, so each frame is visited about 22 times instead of 41. Not measured yet; 340 (last quarter full size, cap 400k) is stacked underneath.
