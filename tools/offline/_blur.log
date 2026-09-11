@@ -1,0 +1,31 @@
+frequencyBlurVariance at iteration i of a 30000 denominator:
+   it  2000 -> fraction 0.0667 -> blur 2.667 px^2 (sigma 1.63 px)
+   it  3000 -> fraction 0.1000 -> blur 2.000 px^2 (sigma 1.41 px)
+   it  4000 -> fraction 0.1333 -> blur 1.333 px^2 (sigma 1.15 px)
+   it  6000 -> fraction 0.2000 -> blur 0.000 px^2 (sigma 0.00 px)
+
+PSNR (free exposure fit) vs the blur the render is done with:
+frame  trn   0.000   0.667   1.333   2.000   2.667   4.000
+    0  YES   18.73   18.83   18.86   18.87   18.87   18.85
+    1   no   16.31   16.36   16.38   16.40   16.41   16.42
+    2   no   17.49   17.56   17.61   17.64   17.66   17.69
+    3  YES   21.20   21.38   21.45   21.49   21.50   21.48
+    4   no   18.35   18.53   18.66   18.76   18.84   18.96
+    5   no   17.12   17.24   17.32   17.38   17.43   17.51
+    6   no   17.46   17.52   17.56   17.59   17.60   17.61
+    7   no   18.38   18.48   18.53   18.55   18.55   18.54
+    8  YES   21.09   21.28   21.36   21.39   21.39   21.36
+    9   no   19.80   19.98   20.06   20.09   20.11   20.09
+   10   no   17.50   17.56   17.57   17.57   17.56   17.53
+   11  YES   20.50   20.61   20.63   20.62   20.59   20.50
+   12   no   18.22   18.37   18.45   18.50   18.53   18.55
+   13   no   18.72   18.89   18.98   19.04   19.08   19.12
+   14  YES   17.98   18.11   18.18   18.22   18.25   18.29
+   15   no   16.38   16.49   16.56   16.60   16.64   16.69
+
+MEAN trained      :  19.90   20.04   20.10   20.12   20.12   20.10
+MEAN never-trained:  17.79   17.91   17.97   18.01   18.04   18.06
+
+never-trained: blur 0 (what the eval and the export use) = 17.79 dB
+              blur 1.333 (the last training step)        = 17.97 dB   delta +0.18 dB
+              best of the sweep                          = 18.06 dB at 4.000 px^2

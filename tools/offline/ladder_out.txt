@@ -1,0 +1,46 @@
+CURRENT HEAD   population 298619   split 112079  clone 42529  reloc 0
+     0 shrinks:   86187   28.86%   size   7.397 mm
+     1 shrinks:  107094   35.86%   size   4.623 mm
+     2 shrinks:  100061   33.51%   size   2.889 mm
+     3 shrinks:    5277    1.77%   size   1.806 mm
+    never shrunk:  28.86%   mean shrinks per splat: 1.082
+
+splitShare 1.0   population 298619   split 154608  clone 0  reloc 0
+     0 shrinks:   86188   28.86%   size   7.397 mm
+     1 shrinks:   68667   22.99%   size   4.623 mm
+     2 shrinks:   76830   25.73%   size   2.889 mm
+     3 shrinks:   51636   17.29%   size   1.806 mm
+     4 shrinks:   13164    4.41%   size   1.129 mm
+     5 shrinks:    1669    0.56%   size   0.705 mm
+     6 shrinks:     387    0.13%   size   0.441 mm
+     7 shrinks:      66    0.02%   size   0.276 mm
+     8 shrinks:      12    0.00%   size   0.172 mm
+    never shrunk:  28.86%   mean shrinks per splat: 1.477
+
+relocation made unconditional   population 298619   split 106633  clone 47975  reloc 328261
+     0 shrinks:   15715    5.26%   size   7.397 mm
+     1 shrinks:   37904   12.69%   size   4.623 mm
+     2 shrinks:   76464   25.61%   size   2.889 mm
+     3 shrinks:   80470   26.95%   size   1.806 mm
+     4 shrinks:   68024   22.78%   size   1.129 mm
+     5 shrinks:   18518    6.20%   size   0.705 mm
+     6 shrinks:    1492    0.50%   size   0.441 mm
+     7 shrinks:      32    0.01%   size   0.276 mm
+    never shrunk:   5.26%   mean shrinks per splat: 2.699
+
+share 1.0 + reloc unconditional + shrink 2.0   population 298619   split 154608  clone 0  reloc 328261
+     0 shrinks:   15707    5.26%   size   7.397 mm
+     1 shrinks:   21446    7.18%   size   3.698 mm
+     2 shrinks:   44276   14.83%   size   1.849 mm
+     3 shrinks:   59361   19.88%   size   0.925 mm
+     4 shrinks:   62861   21.05%   size   0.462 mm
+     5 shrinks:   53001   17.75%   size   0.231 mm
+     6 shrinks:   29028    9.72%   size   0.116 mm
+     7 shrinks:    9727    3.26%   size   0.058 mm
+     8 shrinks:    2438    0.82%   size   0.029 mm
+     9 shrinks:     570    0.19%   size   0.014 mm
+    10 shrinks:     155    0.05%   size   0.007 mm
+    11 shrinks:      37    0.01%   size   0.004 mm
+    12 shrinks:      10    0.00%   size   0.002 mm
+    never shrunk:   5.26%   mean shrinks per splat: 3.595
+
