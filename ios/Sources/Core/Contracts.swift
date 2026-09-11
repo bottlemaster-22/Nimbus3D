@@ -1813,7 +1813,7 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
         let scaleCap: Int
         switch sceneExtentMeters {
         case ..<3: scaleCap = 150_000    // one object
-        case ..<8: scaleCap = 330_000    // a room (build 380, back to 330,000: 378 peaked at 1.1 GB with the cache gone, 1.35 with it; the 330,000 cap bound from round 700 with 420 MB of the memory ceiling unused)
+        case ..<8: scaleCap = 400_000    // a room (build 384: 382 sat at the 330,000 cap for the whole 1,080-px phase at 1.05 GB, nothing could split; the 330,000 cap bound from round 700 with 420 MB of the memory ceiling unused)
         default: scaleCap = 500_000      // a floor or a house
         }
 
@@ -1888,7 +1888,10 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 // that fail, so more of the capture goes into training.
                 // Build 346: 150. 200 frames (build 344) put the run 500 MB over
                 // the memory share and the governor cut the model to 20,000.
-                keyframeCount: sceneExtentMeters < 8 ? 120 : 240,
+                // Build 384: 200 again. 344 failed on memory the governor no longer
+                // spends on deleting the model; 382 ran the 720-px level at 0.94 GB
+                // with 120 frames cached and a 7 dB train/test gap.
+                keyframeCount: sceneExtentMeters < 8 ? 200 : 240,
                 memoryCeilingBytes: memoryForSplats,
                 // Build 362: a six-minute run sits at .fair throughout; the
                 // degrade rung (a one-way resolution cut) would fire fifteen
