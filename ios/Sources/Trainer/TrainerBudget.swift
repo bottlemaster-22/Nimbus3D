@@ -290,7 +290,11 @@ final class TrainerBudgetGovernor {
     /// `initialSplatCap` sizes the very first allocation from the same
     /// fraction. Deliberately well under 1: the rasteriser's tile lists, the
     /// decoded frames and the OS's own headroom all live in the same pot.
-    private let memoryUseFraction: Float = 0.6
+    // 0.75 (build 346; was 0.6). `availableBytes` is what iOS says this
+    // process may still allocate, so 0.6 of it tripped at 1.11 GB of run
+    // footprint on a phone reporting 1.85 GB free, 70 MB above build 338's
+    // whole run; the floor gate below is the real jetsam guard.
+    private let memoryUseFraction: Float = 0.75
 
     /// The least unallocated headroom this governor will let the process run
     /// on before it starts shedding work, whatever else is true.
@@ -875,7 +879,22 @@ final class TrainerBudgetGovernor {
             // actually afford MORE than the current cap, which freed nothing,
             // returned a change, and stopped the ladder before the rungs that
             // would have freed something real.
-            let capTarget = Swift.max(Swift.min(affordable, current.splatCap), 20_000)
+            var capTarget = Swift.max(Swift.min(affordable, current.splatCap), 20_000)
+            // BUILD 346: THE SOFT GATES STOP GROWTH; THEY DO NOT DELETE THE
+            // MODEL. Build 344 crossed the share gate at iteration 200 with
+            // 200,000 points alive and was cut every 50 iterations down to
+            // 20,000: the run finished with a tenth of its model, which is
+            // worse than any memory figure the gate was protecting. The share
+            // and ceiling gates are this file's own budget, so once the frame
+            // caches are gone (the loop drops them before asking) they may
+            // freeze the cap at the live population and no lower. Only the
+            // headroom floor, which measures what the OS has left, may cut
+            // into live points.
+            if !belowFloor, currentSplatCount > 0 {
+                let alive = Swift.min(currentSplatCount, current.splatCap)
+                if capTarget < alive { capTarget = alive }
+                if capTarget >= current.splatCap { return nil }
+            }
 
             if capTarget <= currentSplatCount, currentSplatCount > 0 {
                 // This one really will delete geometry. Say so plainly here as

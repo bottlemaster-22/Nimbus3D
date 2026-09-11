@@ -1873,7 +1873,9 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 // frames and its eleven held-out frames scored from 14.6 to 26.1
                 // dB: the views the training set did not cover are the ones
                 // that fail, so more of the capture goes into training.
-                keyframeCount: sceneExtentMeters < 8 ? 200 : 240,
+                // Build 346: 150. 200 frames (build 344) put the run 500 MB over
+                // the memory share and the governor cut the model to 20,000.
+                keyframeCount: sceneExtentMeters < 8 ? 150 : 240,
                 memoryCeilingBytes: memoryForSplats,
                 target: .onDevice
             )
