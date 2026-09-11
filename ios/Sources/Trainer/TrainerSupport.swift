@@ -133,6 +133,8 @@ enum TrainerKernel {
     static let duplicateKeys = "trainer_duplicate_keys"
     static let tileRanges = "trainer_tile_ranges"
     static let rasterizeForward = "trainer_rasterize_forward"
+    /// Build 302: two pixels per thread. Optional, so not in `all`.
+    static let rasterizeForward2 = "trainer_rasterize_forward2"
     static let background = "trainer_background"
     static let lossPhotometric = "trainer_loss_photometric"
     static let blurH = "trainer_blur_h"
@@ -1074,6 +1076,11 @@ struct TrainerTuning: Sendable {
     /// so the two never share an iteration.
     var sortCalibrationStart: Int = 310
     var sortCalibrationSteps: Int = 4
+
+    /// Build 302: the same for the two-pixel forward rasteriser, after the
+    /// sort window.
+    var forwardCalibrationStart: Int = 316
+    var forwardCalibrationSteps: Int = 4
 
     /// Build 292: after warm-up, commit the next iteration's buffer A BEFORE
     /// waiting on the previous iteration's buffer B, so the GPU does not sit

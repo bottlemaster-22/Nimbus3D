@@ -647,6 +647,17 @@ struct TrainerTimings: Codable {
     var sortMismatchSteps: Int = 0
     var sortSimdScanChosen: Int = 0
 
+    /// Forward calibration (build 302): the one-pixel rasteriser (A) against
+    /// the two-pixel one (B) on the same frame. GPU seconds of each summed, the
+    /// largest absolute output difference (capped at 1e9), steps that
+    /// disagreed, and whether B was then used (1) or not (0).
+    var forwardCalibrationSteps: Int = 0
+    var forwardSecondsA: Double = 0
+    var forwardSecondsB: Double = 0
+    var forwardMaxDifference: Double = 0
+    var forwardMismatchSteps: Int = 0
+    var forwardTwoPixelChosen: Int = 0
+
     /// Build 292: steps whose buffer B was left running while the next
     /// iteration's CPU work and buffer A went ahead (completed later by
     /// drainPendingStep).

@@ -88,6 +88,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// Set by the sort calibration (build 290): use the SIMD-prefix radix
     /// scatter for the rest of the run.
     private var sortSimdScanChosen = false
+    /// Set by the forward calibration (build 302): use the two-pixel forward
+    /// rasteriser for the rest of the run.
+    private var forwardTwoPixelChosen = false
 
     /// A training step whose command buffer B was committed and left running
     /// (build 292): the CPU went on to the next iteration's supervision and
@@ -503,6 +506,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         timings = TrainerTimings()
         backwardSimdSumChosen = false
         sortSimdScanChosen = false
+        forwardTwoPixelChosen = false
         // A step left running by a run that threw cannot belong to this one.
         // Its buffer finishes on its own; its read-backs are not wanted.
         pendingStep = nil
@@ -2078,6 +2082,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
            iteration < sortStart + tuning.sortCalibrationSteps {
             return true
         }
+        let forwardStart = tuning.forwardCalibrationStart
+        if gpu.pipelines.rasterizeForward2 != nil,
+           tuning.forwardCalibrationSteps > 0,
+           iteration >= forwardStart,
+           iteration < forwardStart + tuning.forwardCalibrationSteps {
+            return true
+        }
         return false
     }
 
@@ -2434,11 +2445,22 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 && tuning.sortCalibrationSteps > 0
                 && iteration >= sortStart
                 && iteration < sortStart + tuning.sortCalibrationSteps
-            if profiling || calibrating || sortCalibrating {
+            // FORWARD CALIBRATION (build 302): the frame is rendered by the
+            // one-pixel kernel (A), read back, rendered by the two-pixel kernel
+            // (B), read back and compared; a disagreement re-renders with A so
+            // the step goes on from A's image. B is kept only if every step
+            // agreed and it was at least 3 % faster.
+            let forwardStart = tuning.forwardCalibrationStart
+            let forwardCalibrating = gpu.pipelines.rasterizeForward2 != nil
+                && tuning.forwardCalibrationSteps > 0
+                && iteration >= forwardStart
+                && iteration < forwardStart + tuning.forwardCalibrationSteps
+            if profiling || calibrating || sortCalibrating || forwardCalibrating {
                 // Calibration iterations are timed under their own label, so
                 // they never skew the stage profile.
                 func tag(_ label: String) -> String {
-                    (calibrating || sortCalibrating) ? "the backward calibration" : label
+                    (calibrating || sortCalibrating || forwardCalibrating)
+                        ? "the backward calibration" : label
                 }
                 @discardableResult
                 func stage(
@@ -2498,8 +2520,73 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         gpu.tileRanges(e, instanceCount: instanceCount)
                     }
                 }
-                try stage(tag("the forward raster")) { e in
-                    gpu.rasterizeForward(e, camera: &camera)
+                if forwardCalibrating {
+                    let pixels = resources.renderSize.pixelCount
+                    let secondsA = try stage(tag("the forward raster")) { e in
+                        gpu.rasterizeForward(e, camera: &camera, twoPixels: false)
+                    }
+                    let colorA = resources.renderColor.readArray(Float.self, count: pixels * 3)
+                    let alphaA = resources.renderAlpha.readArray(Float.self, count: pixels)
+                    let depthA = resources.renderDepth.readArray(Float.self, count: pixels)
+                    let transA = resources.renderTFinal.readArray(Float.self, count: pixels)
+                    let countA = resources.renderNContrib.readArray(UInt32.self, count: pixels)
+                    let secondsB = try stage(tag("the forward raster")) { e in
+                        gpu.rasterizeForward(e, camera: &camera, twoPixels: true)
+                    }
+                    let colorB = resources.renderColor.readArray(Float.self, count: pixels * 3)
+                    let alphaB = resources.renderAlpha.readArray(Float.self, count: pixels)
+                    let depthB = resources.renderDepth.readArray(Float.self, count: pixels)
+                    let transB = resources.renderTFinal.readArray(Float.self, count: pixels)
+                    let countB = resources.renderNContrib.readArray(UInt32.self, count: pixels)
+                    var maxDifference: Float = 0
+                    func compare(_ a: [Float], _ b: [Float]) {
+                        guard a.count == b.count, !a.isEmpty else {
+                            maxDifference = .infinity
+                            return
+                        }
+                        for i in 0..<a.count {
+                            let d = abs(a[i] - b[i])
+                            if d.isNaN {
+                                maxDifference = .infinity
+                            } else if d > maxDifference {
+                                maxDifference = d
+                            }
+                        }
+                    }
+                    compare(colorA, colorB)
+                    compare(alphaA, alphaB)
+                    compare(depthA, depthB)
+                    compare(transA, transB)
+                    var countMismatch = 0
+                    if countA.count == pixels, countB.count == pixels {
+                        for i in 0..<pixels where countA[i] != countB[i] { countMismatch += 1 }
+                    } else {
+                        countMismatch = pixels
+                    }
+                    let agreed = maxDifference <= 1e-4 && countMismatch * 10_000 <= pixels
+                    if !agreed {
+                        // The step goes on from A's image.
+                        try stage(tag("the forward raster")) { e in
+                            gpu.rasterizeForward(e, camera: &camera, twoPixels: false)
+                        }
+                        timings.forwardMismatchSteps += 1
+                    }
+                    timings.forwardCalibrationSteps += 1
+                    timings.forwardSecondsA += secondsA
+                    timings.forwardSecondsB += secondsB
+                    timings.forwardMaxDifference = Swift.max(
+                        timings.forwardMaxDifference,
+                        maxDifference.isFinite ? Double(maxDifference) : 1e9
+                    )
+                    if iteration == forwardStart + tuning.forwardCalibrationSteps - 1 {
+                        forwardTwoPixelChosen = timings.forwardMismatchSteps == 0
+                            && timings.forwardSecondsB < timings.forwardSecondsA * 0.97
+                        timings.forwardTwoPixelChosen = forwardTwoPixelChosen ? 1 : 0
+                    }
+                } else {
+                    try stage(tag("the forward raster")) { e in
+                        gpu.rasterizeForward(e, camera: &camera, twoPixels: forwardTwoPixelChosen)
+                    }
                 }
                 try stage(tag("the losses")) { e in
                     gpu.lossPhotometric(e, loss: &loss)
@@ -2596,7 +2683,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             gpu.duplicateKeys(encoderB, camera: &camera, splatCount: splatCount)
             gpu.radixSort(encoderB, count: instanceCount, simdScan: sortSimdScanChosen)
             gpu.tileRanges(encoderB, instanceCount: instanceCount)
-            gpu.rasterizeForward(encoderB, camera: &camera)
+            gpu.rasterizeForward(encoderB, camera: &camera, twoPixels: forwardTwoPixelChosen)
 
             gpu.lossPhotometric(encoderB, loss: &loss)
             gpu.ssim(encoderB, loss: &loss)
@@ -3434,7 +3521,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             gpu.duplicateKeys(encoderB, camera: &camera, splatCount: splatCount)
             gpu.radixSort(encoderB, count: instanceCount, simdScan: sortSimdScanChosen)
             gpu.tileRanges(encoderB, instanceCount: instanceCount)
-            gpu.rasterizeForward(encoderB, camera: &camera)
+            gpu.rasterizeForward(encoderB, camera: &camera, twoPixels: forwardTwoPixelChosen)
             encoderB.endEncoding()
             bufferB.commit()
             try finish(bufferB, "the held-out render")

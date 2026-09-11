@@ -1214,3 +1214,9 @@ Builds 295/297 (the push runs of 296 and 298) green.
 ### BUILD 300: held-out evaluation, cached supervision and scoring on every core
 
 earlyStopEval is 1.7 s a run (~190 ms per evaluation, 11 frames). Each frame re-built its supervision (a photo decode, about half the time) and was scored on the main thread with three Double passes over ~1.2 M values. Now: the held-out supervision is cached for the run (`evalSupervisionCache`, ~4.7 MB a frame, invalidated by a render-size change; the background is frozen before evaluations start); every frame is rendered first, then scored on every core by `scoreHeldOut`, whose body is the loop's arithmetic unchanged, and the scores are combined in frame order. Every PSNR, fitted PSNR and SSIM is the same number. Expected ~190 -> ~80 ms per evaluation.
+
+Builds 299/300 green (a246f9d).
+
+### BUILD 302: two-pixel forward rasteriser behind an output-comparing calibration
+
+`trainer_rasterize_forward2`: 16 x 8 threads per tile, each thread owning the pixel at row tPos.y and the one 8 rows below. Each staged splat is read once per thread and evaluated for both pixels, so staging, threadgroup loads and loop overhead per pixel halve. Per-pixel arithmetic is the one-pixel kernel's statement for statement (cheap reject, alpha, the saturation stop BEFORE compositing, the contributor count). Iterations 316-319 render the same frame with both, compare every output (colour, alpha, depth, T, contributor count: max abs difference <= 1e-4 and contributor mismatches <= 1 in 10,000 pixels), re-render with the one-pixel kernel on a disagreement so the step continues from its image, and keep the two-pixel kernel only if every step agreed and it was >= 3 % faster. Applied at every forward site (step, profiled step, held-out eval). Census: forwardCalibrationSteps, forwardSecondsA/B, forwardMaxDifference, forwardMismatchSteps, forwardTwoPixelChosen.

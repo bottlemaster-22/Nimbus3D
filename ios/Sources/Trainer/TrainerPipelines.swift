@@ -67,6 +67,10 @@ final class TrainerPipelines {
     /// (pre-Apple7) or failed to. Used only once the trainer's on-device
     /// calibration has shown it agrees with `rasterizeBackward` and is faster.
     let rasterizeBackwardSimdSum: MTLComputePipelineState?
+    /// The two-pixel forward rasteriser (build 302), nil if it cannot run a
+    /// 128-thread threadgroup or failed to build. Used only after the
+    /// trainer calibration has shown it renders the same image, faster.
+    let rasterizeForward2: MTLComputePipelineState?
     let preprocessBackward: MTLComputePipelineState
     let samplingRateUpdate: MTLComputePipelineState
     let filter3DFinalize: MTLComputePipelineState
@@ -166,6 +170,10 @@ final class TrainerPipelines {
         duplicateKeys = try build(TrainerKernel.duplicateKeys)
         tileRanges = try build(TrainerKernel.tileRanges)
         rasterizeForward = try build(TrainerKernel.rasterizeForward)
+        let forward2 = try? build(TrainerKernel.rasterizeForward2)
+        let forward2Threads = TrainerGPUConstants.tileWidth * TrainerGPUConstants.tileHeight / 2
+        rasterizeForward2 = (forward2?.maxTotalThreadsPerThreadgroup ?? 0) >= forward2Threads
+            ? forward2 : nil
         background = try build(TrainerKernel.background)
         lossPhotometric = try build(TrainerKernel.lossPhotometric)
         blurH = try build(TrainerKernel.blurH)
@@ -513,11 +521,16 @@ struct TrainerGPU {
 
     func rasterizeForward(
         _ encoder: MTLComputeCommandEncoder,
-        camera: inout TrainerCameraUniforms
+        camera: inout TrainerCameraUniforms,
+        twoPixels: Bool = false
     ) {
         let size = resources.renderSize
         guard size.tileCount > 0 else { return }
-        encoder.setComputePipelineState(pipelines.rasterizeForward)
+        // Same bindings for both; the two-pixel kernel runs half the threads.
+        let pipeline = twoPixels ? pipelines.rasterizeForward2 : nil
+        encoder.setComputePipelineState(pipeline ?? pipelines.rasterizeForward)
+        let rows = pipeline == nil
+            ? TrainerGPUConstants.tileHeight : TrainerGPUConstants.tileHeight / 2
         encoder.setBuffer(resources.valuesA, offset: 0, index: TrainerBind.RasterizeForward.values)
         encoder.setBuffer(
             resources.tileRanges, offset: 0, index: TrainerBind.RasterizeForward.tileRanges
@@ -547,7 +560,7 @@ struct TrainerGPU {
             MTLSize(width: size.tileCountX, height: size.tileCountY, depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: TrainerGPUConstants.tileWidth,
-                height: TrainerGPUConstants.tileHeight,
+                height: rows,
                 depth: 1
             )
         )

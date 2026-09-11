@@ -2090,6 +2090,157 @@ kernel void trainer_loss_finalize(
     trainer_atomicAdd(&exposureGrad[1], g.x + g.y + g.z);
 }
 
+
+// ============================================================================
+// MARK: - Forward: rasterise, TWO PIXELS PER THREAD (build 302)
+//
+// trainer_rasterize_forward with a 16 x 8 threadgroup, each thread owning the
+// pixel at row tPos.y and the one 8 rows below it. Every splat staged into
+// threadgroup memory is read ONCE per thread and evaluated for both pixels, so
+// the staging, the threadgroup loads and the loop overhead per pixel halve.
+// Each pixel's arithmetic is the one-pixel kernel's, statement for statement:
+// the same cheap reject, the same alpha, the same saturation test that stops
+// that pixel BEFORE compositing the saturating splat, the same contributor
+// count. The trainer renders the same frame both ways at calibration and uses
+// this one only if the outputs agree (MetalSplatTrainer, forward calibration).
+// ============================================================================
+
+kernel void trainer_rasterize_forward2(
+    const device uint*              values      [[buffer(0)]],
+    const device uint*              tileRanges  [[buffer(1)]],
+    const device TrainerSplatRaster* raster     [[buffer(2)]],
+    device float*                   outColor    [[buffer(3)]],   // 3 per pixel
+    device float*                   outAlpha    [[buffer(4)]],
+    device float*                   outDepth    [[buffer(5)]],
+    device float*                   outTFinal   [[buffer(6)]],
+    device uint*                    outNContrib [[buffer(7)]],
+    constant TrainerCameraUniforms& cam         [[buffer(8)]],
+    uint2                           tgPos       [[threadgroup_position_in_grid]],
+    uint2                           tPos        [[thread_position_in_threadgroup]],
+    uint                            tid         [[thread_index_in_threadgroup]]
+) {
+    threadgroup float2 tgXY[TRAINER_TILE_AREA];
+    threadgroup float4 tgConicOpacity[TRAINER_TILE_AREA];
+    threadgroup float4 tgColorDepth[TRAINER_TILE_AREA];
+    threadgroup half tgCutoff[TRAINER_TILE_AREA];
+
+    const uint threads = TRAINER_TILE_AREA / 2u;
+    const uint tileID = tgPos.y * cam.tileCountX + tgPos.x;
+    const uint px = tgPos.x * TRAINER_TILE_W + tPos.x;
+    const uint pyA = tgPos.y * TRAINER_TILE_H + tPos.y;
+    const uint pyB = pyA + TRAINER_TILE_H / 2u;
+    const bool insideA = (px < cam.imageWidth) && (pyA < cam.imageHeight);
+    const bool insideB = (px < cam.imageWidth) && (pyB < cam.imageHeight);
+    const float2 centerA = float2(float(px) + 0.5f, float(pyA) + 0.5f);
+    const float2 centerB = float2(float(px) + 0.5f, float(pyB) + 0.5f);
+
+    const uint rangeStart = tileRanges[2u * tileID];
+    const uint rangeEnd = tileRanges[2u * tileID + 1u];
+    const uint total = (rangeEnd > rangeStart) ? (rangeEnd - rangeStart) : 0u;
+    const uint batches = (total + TRAINER_TILE_AREA - 1u) / TRAINER_TILE_AREA;
+
+    float TA = 1.0f, TB = 1.0f;
+    float3 colorA = float3(0.0f), colorB = float3(0.0f);
+    float depthA = 0.0f, depthB = 0.0f;
+    uint contributorsA = 0u, contributorsB = 0u;
+    bool doneA = !insideA;
+    bool doneB = !insideB;
+
+    for (uint b = 0; b < batches; ++b) {
+        for (uint k = tid; k < TRAINER_TILE_AREA; k += threads) {
+            const uint load = rangeStart + b * TRAINER_TILE_AREA + k;
+            if (load < rangeEnd) {
+                const uint splatIndex = values[load];
+                const TrainerSplatRaster d = raster[splatIndex];
+                tgXY[k] = float2(d.mean2D);
+                tgConicOpacity[k] = float4(float3(d.conic), float(d.opacity));
+                tgColorDepth[k] = float4(
+                    float(d.color0), float(d.color1), float(d.color2), d.depth
+                );
+                tgCutoff[k] = d.pad0;
+            } else {
+                tgConicOpacity[k] = float4(0.0f);
+                tgCutoff[k] = 60000.0h;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (!(doneA && doneB)) {
+            const uint here = min(TRAINER_TILE_AREA, total - b * TRAINER_TILE_AREA);
+            for (uint j = 0; j < here; ++j) {
+                const float2 xy = tgXY[j];
+                const float4 co = tgConicOpacity[j];
+                const float cutoff = float(tgCutoff[j]);
+                if (!doneA) {
+                    const float2 delta = xy - centerA;
+                    const float power = -0.5f * (co.x * delta.x * delta.x
+                                                 + co.z * delta.y * delta.y)
+                                        - co.y * delta.x * delta.y;
+                    if (power >= cutoff) {
+                        const float alpha = min(0.99f, co.w * exp(power));
+                        if (alpha >= cam.minAlpha) {
+                            const float testT = TA * (1.0f - alpha);
+                            if (testT < 1e-4f) {
+                                doneA = true;
+                            } else {
+                                const float weight = alpha * TA;
+                                colorA += float3(tgColorDepth[j].xyz) * weight;
+                                if (cam.renderDepth != 0u) { depthA += tgColorDepth[j].w * weight; }
+                                TA = testT;
+                                contributorsA = b * TRAINER_TILE_AREA + j + 1u;
+                            }
+                        }
+                    }
+                }
+                if (!doneB) {
+                    const float2 delta = xy - centerB;
+                    const float power = -0.5f * (co.x * delta.x * delta.x
+                                                 + co.z * delta.y * delta.y)
+                                        - co.y * delta.x * delta.y;
+                    if (power >= cutoff) {
+                        const float alpha = min(0.99f, co.w * exp(power));
+                        if (alpha >= cam.minAlpha) {
+                            const float testT = TB * (1.0f - alpha);
+                            if (testT < 1e-4f) {
+                                doneB = true;
+                            } else {
+                                const float weight = alpha * TB;
+                                colorB += float3(tgColorDepth[j].xyz) * weight;
+                                if (cam.renderDepth != 0u) { depthB += tgColorDepth[j].w * weight; }
+                                TB = testT;
+                                contributorsB = b * TRAINER_TILE_AREA + j + 1u;
+                            }
+                        }
+                    }
+                }
+                if (doneA && doneB) { break; }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (insideA) {
+        const uint i = pyA * cam.imageWidth + px;
+        outColor[i * 3u + 0u] = colorA.x;
+        outColor[i * 3u + 1u] = colorA.y;
+        outColor[i * 3u + 2u] = colorA.z;
+        outAlpha[i] = 1.0f - TA;
+        outDepth[i] = depthA;
+        outTFinal[i] = TA;
+        outNContrib[i] = contributorsA;
+    }
+    if (insideB) {
+        const uint i = pyB * cam.imageWidth + px;
+        outColor[i * 3u + 0u] = colorB.x;
+        outColor[i * 3u + 1u] = colorB.y;
+        outColor[i * 3u + 2u] = colorB.z;
+        outAlpha[i] = 1.0f - TB;
+        outDepth[i] = depthB;
+        outTFinal[i] = TB;
+        outNContrib[i] = contributorsB;
+    }
+}
+
 // ============================================================================
 // MARK: - Backward: rasterise
 //

@@ -375,3 +375,12 @@ if t.get('sortCalibrationSteps', 0):
           % (_k, 1000 * t['sortSecondsA'] / _k, 1000 * t['sortSecondsB'] / _k,
              t['sortSecondsB'] / max(t['sortSecondsA'], 1e-12), t.get('sortMismatchSteps', 0),
              'B (SIMD-prefix) used' if t.get('sortSimdScanChosen') else 'A kept'))
+
+# Forward calibration (build 302+): one-pixel (A) against two-pixel (B).
+if t.get('forwardCalibrationSteps', 0):
+    _k = t['forwardCalibrationSteps']
+    print('FORWARD CALIBRATION: %d steps  A %.2f ms  B %.2f ms  (B/A %.3f)  max diff %.2e  mismatched steps %d  -> %s'
+          % (_k, 1000 * t['forwardSecondsA'] / _k, 1000 * t['forwardSecondsB'] / _k,
+             t['forwardSecondsB'] / max(t['forwardSecondsA'], 1e-12), t.get('forwardMaxDifference', 0),
+             t.get('forwardMismatchSteps', 0),
+             'B (two-pixel) used' if t.get('forwardTwoPixelChosen') else 'A kept'))
