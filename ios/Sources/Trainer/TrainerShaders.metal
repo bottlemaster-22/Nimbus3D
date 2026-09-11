@@ -481,7 +481,7 @@ static_assert(sizeof(TrainerSamplingTopK) == 16, "TrainerSamplingTopK must be 16
 static_assert(sizeof(TrainerDepthSample) == 32, "TrainerDepthSample must be 32 bytes");
 static_assert(sizeof(TrainerCameraUniforms) == 144, "TrainerCameraUniforms must be 144 bytes");
 static_assert(sizeof(TrainerLossUniforms) == 68, "TrainerLossUniforms must be 68 bytes");
-static_assert(sizeof(TrainerAdamUniforms) == 64, "TrainerAdamUniforms must be 64 bytes");
+static_assert(sizeof(TrainerAdamUniforms) == 68, "TrainerAdamUniforms must be 68 bytes");
 static_assert(sizeof(TrainerRegUniforms) == 36, "TrainerRegUniforms must be 36 bytes");
 static_assert(sizeof(TrainerScanUniforms) == 16, "TrainerScanUniforms must be 16 bytes");
 static_assert(sizeof(TrainerRadixUniforms) == 16, "TrainerRadixUniforms must be 16 bytes");

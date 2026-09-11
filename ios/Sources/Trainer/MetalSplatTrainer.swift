@@ -1702,6 +1702,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 // runs on the fitted score; the raw one is recorded beside it so
                 // switching selection to raw (a device A/B) can be priced from
                 // one run. See REFUTATION_LEDGER EXP-LS.
+                // Build 334: the full-size builder's background preload (started
+                // when the last level began) may still be inside the builder;
+                // the evaluation builds on it from this thread, so wait first.
+                preloads.last?.join()
                 let rawScore = try evaluateHeldOut(
                     gpu: gpu,
                     resources: resources,
@@ -2110,6 +2114,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             for frame in slice.heldOutKeyframes { heldOutFrameIndices.insert(frame.index) }
             lock.unlock()
 
+            preloads.last?.join()
             let psnr = try evaluateHeldOut(
                 gpu: gpu,
                 resources: resources,
