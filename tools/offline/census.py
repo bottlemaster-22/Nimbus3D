@@ -157,8 +157,10 @@ if pre:
           'itself waited %.1f s for supervision.' % (pre, t['supervision']))
     print('ceiling if perfectly overlapped: max(worker, gpuBusy) + rest = '
           '%.1f s' % (max(pre, t['gpuBusy']) + rest))
-if t.get('snapshotsStaged'):
-    print('preview snapshots: %d copied inside a step and converted off the loop'
+if t.get('coarseSteps'):
+    print('coarse phase: %d steps at a %d px long edge (the rest at full size)'
+          % (t['coarseSteps'], t.get('coarseLongEdgePixels', 0)))
+if t.get('snapshotsStaged'):    print('preview snapshots: %d copied inside a step and converted off the loop'
           % t['snapshotsStaged'])
 if t.get('densifyGatherChecks'):    print('densify gather: %d pass(es) checked against the CPU path, %d words differed'
           % (t['densifyGatherChecks'], t.get('densifyGatherMismatches', 0)))

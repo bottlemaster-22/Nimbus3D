@@ -1117,32 +1117,33 @@ struct TrainerTuning: Sendable {
     /// Build 288: from this iteration, for this many, run both backward
     /// rasterisers on the same inputs, compare and time them, and keep the
     /// SIMD-summed one only if it agrees (relative L1 < 1e-3) and is at least
-    /// 3 % faster. Past warm-up so the model being compared is a real one.
-    var backwardCalibrationStart: Int = 300
+    /// 3 % faster. Past warm-up and the coarse phase (build 328: 700+), so the
+    /// model being compared is a real one, at the full render size.
+    var backwardCalibrationStart: Int = 700
     var backwardCalibrationSteps: Int = 6
 
     /// Build 290: the same for the radix scatter. After the backward window,
     /// so the two never share an iteration. Build 306: this window also checks
     /// the splat-order sort against the legacy one (see `splatOrderSort`).
-    var sortCalibrationStart: Int = 310
+    var sortCalibrationStart: Int = 710
     var sortCalibrationSteps: Int = 4
 
     /// Build 302: the same for the two-pixel forward rasteriser, after the
     /// sort window.
-    var forwardCalibrationStart: Int = 316
+    var forwardCalibrationStart: Int = 716
     var forwardCalibrationSteps: Int = 4
 
     /// Build 304: the two-pixel backward against the backward the first
     /// window chose (plain or SIMD-summed), after the forward window. Kept
     /// only if its gradients agree (relative L1 < 1e-3) and it is at least
     /// 3 % faster.
-    var backwardTwoPixelCalibrationStart: Int = 322
+    var backwardTwoPixelCalibrationStart: Int = 722
     var backwardTwoPixelCalibrationSteps: Int = 6
 
     /// Build 318: the fused SSIM blur against the two-pass one, after the
     /// two-pixel backward window. Kept only if every blurred plane matched
     /// BIT FOR BIT on every step and it was at least 3 % faster.
-    var blurCalibrationStart: Int = 328
+    var blurCalibrationStart: Int = 728
     var blurCalibrationSteps: Int = 2
 
     /// Build 306: allow the splat-order tile sort (depth-sort the splats, then
@@ -1170,6 +1171,20 @@ struct TrainerTuning: Sendable {
     /// the next frame's supervision is built, so every update lands where
     /// the synchronous path landed it.
     var overlapWarmup: Bool = true
+
+    /// BUILD 328: COARSE TO FINE IN RESOLUTION. The first `coarseResolutionFraction`
+    /// of the run renders and is supervised at `coarseResolutionScale` of the
+    /// render size (720 x 540 -> 360 x 270): a quarter of the pixels, and
+    /// the Gaussians' footprints shrink with them, so a step costs about a
+    /// third. This is the same phase the trainer already low-passes with
+    /// `frequencyBlurStartVariance` (the blur is scaled by the square of the
+    /// scale so it is the same blur in the photograph), and the
+    /// densification score is a ranking, so it does not depend on the pixel
+    /// unit. The far-field warm-up (warmupFraction 0.15) is the same span.
+    /// Everything after it, including every held-out evaluation and every
+    /// calibration window, runs at the full size. 0 switches it off.
+    var coarseResolutionFraction: Float = 0.15
+    var coarseResolutionScale: Float = 0.5
 
     init() {}
 }

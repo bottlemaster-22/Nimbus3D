@@ -100,6 +100,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     private var densifyGatherUsable = true
     /// Build 326: the cubemap-too-large complaint is said once per trainer.
     private var loggedCubemapTruncation = false
+    /// Build 328: the active render size over the full one (0.5 in the
+    /// coarse phase, 1 otherwise). cameraUniforms scales the coarse-to-fine
+    /// blur by its square so the blur in the photograph is unchanged.
+    private var resolutionScale: Float = 1
     /// Set by the sort calibration (build 306): use the splat-order tile sort.
     private var splatOrderChosen = false
 
@@ -883,15 +887,58 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // and 24.69 ms per iteration on the owner's phone, one after the
         // other, with the other device idle each time.
         let prefetch = TrainerSupervisionPrefetch(builder: supervision)
+        // BUILD 328: A SECOND BUILDER FOR THE COARSE PHASE, decoding at the
+        // coarse long edge, with its own prefetch worker. The loop takes each
+        // iteration's frame from whichever pair that iteration belongs to, and
+        // the render buffers follow the frame's size as they always have.
+        let fullLongEdge = governor.current.renderLongEdgePixels
+        // Integer arithmetic on a clamped per-mille, as the densify schedule
+        // does: a NaN scale takes the else branch and switches the phase off.
+        let coarseScalePerMille = tuning.coarseResolutionScale.isFinite
+            ? Int(Swift.min(Swift.max(tuning.coarseResolutionScale, 0), 1) * 1000) : 0
+        let coarseFractionPerMille = tuning.coarseResolutionFraction.isFinite
+            ? Int(Swift.min(Swift.max(tuning.coarseResolutionFraction, 0), 1) * 1000) : 0
+        let coarseLongEdge = fullLongEdge * coarseScalePerMille / 1000
+        let coarsePhaseOn = coarseFractionPerMille > 0
+            && coarseScalePerMille > 0 && coarseScalePerMille < 1000
+            && coarseLongEdge >= 64
+        let coarseSupervision: TrainerSupervisionBuilder? = coarsePhaseOn
+            ? TrainerSupervisionBuilder(
+                bundle: bundle,
+                prePass: prePass,
+                at: ref,
+                longEdgePixels: coarseLongEdge,
+                settings: settings,
+                tuning: tuning,
+                trust: smart.trust,
+                authority: smart.authority,
+                edges: smart.edges,
+                background: smart.background
+            )
+            : nil
+        let coarsePrefetch = coarseSupervision.map { TrainerSupervisionPrefetch(builder: $0) }
+        if coarsePhaseOn { timings.coarseLongEdgePixels = coarseLongEdge }
+        // The full builder fixes its grid and intrinsics from its first
+        // decode. The 3D-filter sweep reads those intrinsics at iteration 500,
+        // inside the coarse phase, before the full builder would otherwise
+        // have decoded anything, so it decodes one frame now (no samples, not
+        // cached: about 15 ms).
+        if coarsePhaseOn, let first = slice.keyframes.first {
+            _ = supervision.build(frame: first, iteration: 0, totalIterations: 1, includeDepthSamples: false)
+        }
         defer {
             prefetch.drain()
+            coarsePrefetch?.drain()
             // Accumulated across slices: what the worker built off the
             // critical path, which `timings.supervision` no longer sees.
             timings.supervisionPrefetched += prefetch.workerSeconds
+                + (coarsePrefetch?.workerSeconds ?? 0)
             timings.supervisionCacheHits += supervision.frameCacheHits
+                + (coarseSupervision?.frameCacheHits ?? 0)
             timings.supervisionCacheMegabytes = Swift.max(
                 timings.supervisionCacheMegabytes, Double(supervision.frameCacheBytes) / 1_048_576
             )
+            resolutionScale = 1
         }
 
 
@@ -899,6 +946,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             forLongEdge: governor.current.renderLongEdgePixels,
             intrinsics: bundle.intrinsics
         )
+        // The full-size grid, for the 3D-filter sweep during the coarse phase
+        // (its sampling rates are a property of the full-size camera).
+        var fullRenderSize = renderSize
+        var coarseCacheDropped = false
 
         // --- Census: open this slice's row now ---------------------------------
         // Opened before anything can go wrong and filled in as the slice runs,
@@ -1190,6 +1241,25 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             if iteration >= effectiveTotal { break iterationLoop }
             try checkCancellation()
 
+            // Build 328: the coarse phase is the first share of the run that
+            // will actually happen (`effectiveTotal`, like every schedule).
+            let coarseEnd = coarsePhaseOn ? effectiveTotal * coarseFractionPerMille / 1000 : 0
+            func supervisionFor(_ at: Int) -> (TrainerSupervisionBuilder, TrainerSupervisionPrefetch) {
+                if at < coarseEnd, let coarseSupervision, let coarsePrefetch {
+                    return (coarseSupervision, coarsePrefetch)
+                }
+                return (supervision, prefetch)
+            }
+            let (activeSupervision, activePrefetch) = supervisionFor(iteration)
+            let activeIsCoarse = activeSupervision !== supervision
+            if !activeIsCoarse, coarsePhaseOn, !coarseCacheDropped {
+                // The coarse frames are never needed again.
+                coarseCacheDropped = true
+                coarsePrefetch?.drain()
+                timings.supervisionCacheHits += coarseSupervision?.frameCacheHits ?? 0
+                coarseSupervision?.dropFrameCache(disable: true)
+            }
+
             // Three integer stores. The governor never reads these to make a
             // decision; they are there so that every budget reduction it makes
             // below can record WHEN it happened and how many Gaussians were
@@ -1284,6 +1354,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     // The governor can swap the builder's image cache out
                     // from under a worker. Nothing may be in flight.
                     prefetch.drain()
+                    coarsePrefetch?.drain()
                     try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
                     try applyBudgetChange(
                         change,
@@ -1292,6 +1363,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         splatCount: &splatCount,
                         renderSize: &renderSize,
                         supervision: supervision,
+                        coarseSupervision: coarseSupervision,
                         bundle: bundle,
                         governor: governor
                     )
@@ -1357,6 +1429,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     // The governor can swap the builder's image cache out
                     // from under a worker. Nothing may be in flight.
                     prefetch.drain()
+                    coarsePrefetch?.drain()
                     try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
                     try applyBudgetChange(
                         change,
@@ -1365,6 +1438,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         splatCount: &splatCount,
                         renderSize: &renderSize,
                         supervision: supervision,
+                        coarseSupervision: coarseSupervision,
                         bundle: bundle,
                         governor: governor
                     )
@@ -1378,7 +1452,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
             let supervisionFrom = CFAbsoluteTimeGetCurrent()
             let builtSupervision: TrainerFrameSupervision?
-            switch prefetch.take(
+            switch activePrefetch.take(
                 frame: frame, iteration: iteration, totalIterations: effectiveTotal
             ) {
             case .hit(let ready):
@@ -1386,7 +1460,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 // whole point, and on this branch the loop pays nothing for it.
                 builtSupervision = ready
             case .miss:
-                builtSupervision = supervision.build(
+                builtSupervision = activeSupervision.build(
                     frame: frame,
                     iteration: iteration,
                     // The run that will actually happen, for the same reason
@@ -1426,7 +1500,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             }
             if !order.isEmpty {
                 let nextFrame = slice.keyframes[order[orderCursor % order.count]]
-                prefetch.start(
+                // The pair the NEXT iteration belongs to (build 328): the last
+                // coarse iteration starts the first full-size frame.
+                supervisionFor(iteration + 1).1.start(
                     frame: nextFrame,
                     iteration: iteration + 1,
                     totalIterations: effectiveTotal
@@ -1451,7 +1527,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 renderSize = frameSupervision.renderSize
                 try resources.resizeRenderSize(to: renderSize)
                 gpu = TrainerGPU(pipelines: pipelines, resources: resources)
+                if !activeIsCoarse { fullRenderSize = renderSize }
             }
+            resolutionScale = activeIsCoarse ? tuning.coarseResolutionScale : 1
+            if activeIsCoarse { timings.coarseSteps += 1 }
 
 
             let exposure = exposures[frame.index] ?? SIMD2<Float>(1, 0)
@@ -1531,6 +1610,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
                 let sweepFrom = CFAbsoluteTimeGetCurrent()
                 defer { timings.filterSweep += CFAbsoluteTimeGetCurrent() - sweepFrom }
+                // The full-size builder and grid whatever phase this is (build
+                // 328): a sampling rate is a property of the camera the model
+                // will be viewed through, and the sweep touches no pixel buffer.
                 try updateFilter3D(
                     gpu: gpu,
                     resources: resources,
@@ -1540,7 +1622,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     cameraDeltas: cameraDeltas,
                     splatCount: splatCount,
                     shCoefficientCount: shCoefficientCount,
-                    renderSize: renderSize
+                    renderSize: fullRenderSize
                 )
             }
 
@@ -3579,7 +3661,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // blurred by a leftover epsilon.
         if fraction < tuning.frequencyBlurEndFraction, tuning.frequencyBlurEndFraction > 0 {
             let t = fraction / tuning.frequencyBlurEndFraction
+            // Scaled by the square of the render scale (build 328), so the
+            // coarse phase blurs by the same amount of the photograph.
             camera.frequencyBlurVariance = tuning.frequencyBlurStartVariance * (1 - t)
+                * resolutionScale * resolutionScale
         } else {
             camera.frequencyBlurVariance = 0
         }
@@ -3673,6 +3758,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         splatCount: inout Int,
         renderSize: inout TrainerRenderSize,
         supervision: TrainerSupervisionBuilder,
+        coarseSupervision: TrainerSupervisionBuilder? = nil,
         bundle: CaptureBundle,
         governor: TrainerBudgetGovernor
     ) throws {
@@ -3697,6 +3783,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // would grow them straight back, reallocating both ways each time
             // and leaving the phone doing the very work the governor just cut.
             supervision.lowerLongEdge(to: to)
+            // The same clamped per-mille arithmetic the slice used to size it.
+            let coarsePerMille = tuning.coarseResolutionScale.isFinite
+                ? Int(Swift.min(Swift.max(tuning.coarseResolutionScale, 0), 1) * 1000) : 0
+            coarseSupervision?.lowerLongEdge(to: to * coarsePerMille / 1000)
             let size = TrainerBudgetGovernor.renderSize(
                 forLongEdge: to, intrinsics: bundle.intrinsics
             )

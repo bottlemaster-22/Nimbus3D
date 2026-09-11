@@ -718,6 +718,10 @@ struct TrainerTimings: Codable {
     /// Build 324: of the merged steps, warm-up steps (far-field gradient
     /// staged and accumulated on completion).
     var warmupOverlappedSteps: Int = 0
+    /// Build 328: steps trained at the coarse render size, and that size's
+    /// long edge in pixels (0 when the coarse phase was off).
+    var coarseSteps: Int = 0
+    var coarseLongEdgePixels: Int = 0
     var truncatedInstanceSteps: Int = 0
 
     /// How many command buffers were waited on. gpuWait divided by this is
