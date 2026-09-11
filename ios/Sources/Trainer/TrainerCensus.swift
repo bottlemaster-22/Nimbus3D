@@ -722,6 +722,13 @@ struct TrainerTimings: Codable {
     /// long edge in pixels (0 when the coarse phase was off).
     var coarseSteps: Int = 0
     var coarseLongEdgePixels: Int = 0
+    /// Build 330: the pose check. Photometric loss (L1 + SSIM terms) of the
+    /// frame at its current camera correction and after one gradient step,
+    /// on the same model; 1 if the step lowered it (full-rate refinement
+    /// from then on), 0 if not (the rate stayed inert), -1 if never run.
+    var poseCheckLossBefore: Double = 0
+    var poseCheckLossAfter: Double = 0
+    var poseCheckDescends: Int = -1
     var truncatedInstanceSteps: Int = 0
 
     /// How many command buffers were waited on. gpuWait divided by this is

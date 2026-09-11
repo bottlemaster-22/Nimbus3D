@@ -104,6 +104,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// coarse phase, 1 otherwise). cameraUniforms scales the coarse-to-fine
     /// blur by its square so the blur in the photograph is unchanged.
     private var resolutionScale: Float = 1
+    /// Build 330: the camera learning rates are multiplied by this. 0.1
+    /// (build 292's inert rate) until the pose check has passed, then 1.
+    private var poseRefinementScale: Float = 0.1
+    private var poseCheckDone = false
     /// Set by the sort calibration (build 306): use the splat-order tile sort.
     private var splatOrderChosen = false
 
@@ -551,6 +555,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         backwardTwoPixelChosen = false
         blurFusedChosen = false
         densifyGatherUsable = true
+        poseRefinementScale = tuning.poseRefinementCheck ? 0.1 : 1
+        poseCheckDone = !tuning.poseRefinementCheck
         splatOrderChosen = false
         // A step left running by a run that threw cannot belong to this one.
         // Its buffer finishes on its own; its read-backs are not wanted.
@@ -3439,6 +3445,90 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     gpu.adamSplat(e, adam: &adam)
                     gpu.adamSH(e, adam: &adam)
                 }
+                // THE POSE CHECK (build 330), once per run, on the first
+                // profiled step past warm-up and the coarse phase. The step
+                // above left this frame's camera gradient in cameraGrad and
+                // its Adam update in the model. The frame is rendered twice
+                // more on that model, at its current correction and at the
+                // correction plus one FULL-rate gradient step, and the two
+                // photometric losses are compared. Descent turns the full
+                // rate on for the rest of the run; anything else leaves the
+                // rate where build 292 had it. The check's own dispatches
+                // touch nothing the step reads back: lossAccum is put back,
+                // the per-interval stats are put back (preprocess counts an
+                // observation), and gradFinal, the render buffers and the
+                // tile lists are rebuilt by the next step before anything
+                // reads them.
+                let anyCalibration = calibrating || sortCalibrating || forwardCalibrating
+                    || backward2Calibrating || blurCalibrating
+                let checkPerMille = tuning.warmupFraction.isFinite && tuning.coarseResolutionFraction.isFinite
+                    ? Int(Swift.min(Swift.max(Swift.max(tuning.warmupFraction, tuning.coarseResolutionFraction), 0), 1) * 1000)
+                    : 1000
+                let checkAfter = totalIterations * checkPerMille / 1000
+                if profiling, !anyCalibration, !poseCheckDone, iteration > checkAfter {
+                    poseCheckDone = true
+                    let gradient = resources.cameraGrad.readArray(Float.self, count: 6)
+                    let lossStep = resources.lossAccum.readElement(Float.self, at: 0) ?? 0
+                    let statsBefore = resources.stats.readArray(TrainerSplatStats.self, count: splatCount)
+                    if gradient.count == 6, gradient.allSatisfy({ $0.isFinite }),
+                       gradient.contains(where: { $0 != 0 }) {
+                        func photometricLoss(at delta: Pose?) throws -> Float {
+                            var probe = cameraUniforms(
+                                supervision: supervision,
+                                cameraDelta: delta,
+                                size: size,
+                                splatCount: splatCount,
+                                shCoefficientCount: shCoefficientCount,
+                                iteration: iteration,
+                                totalIterations: totalIterations
+                            )
+                            _ = resources.lossAccum.writeArray([Float(0)])
+                            try stage("the pose check") { e in
+                                gpu.preprocess(e, camera: &probe, splatCount: splatCount)
+                                if splatOrderChosen {
+                                    gpu.orderSplats(
+                                        e, camera: &probe, splatCount: splatCount,
+                                        simdScan: sortSimdScanChosen
+                                    )
+                                } else {
+                                    gpu.exclusiveScan(
+                                        e, input: resources.tilesTouched,
+                                        output: resources.offsets, count: splatCount
+                                    )
+                                }
+                                gpu.sortSetup(e, camera: &probe, ordered: splatOrderChosen)
+                            }
+                            try stage("the pose check") { e in
+                                gpu.duplicateKeys(
+                                    e, camera: &probe, splatCount: splatCount, ordered: splatOrderChosen
+                                )
+                                gpu.radixSortIndirect(
+                                    e, simdScan: sortSimdScanChosen, tileOnly: splatOrderChosen
+                                )
+                                gpu.tileRangesIndirect(e)
+                                gpu.rasterizeForward(e, camera: &probe, twoPixels: forwardTwoPixelChosen)
+                                gpu.lossPhotometric(e, loss: &loss)
+                                gpu.ssim(e, loss: &loss, fused: blurFusedChosen)
+                            }
+                            return resources.lossAccum.readElement(Float.self, at: 0) ?? .nan
+                        }
+                        let before = try photometricLoss(at: cameraDelta)
+                        let stepped = updatedCameraDelta(
+                            current: cameraDelta, gradient: gradient, rateScale: 1
+                        )
+                        let after = try photometricLoss(at: stepped)
+                        let descends = before.isFinite && after.isFinite && after < before
+                        timings.poseCheckLossBefore = Double(before.isFinite ? before : 1e9)
+                        timings.poseCheckLossAfter = Double(after.isFinite ? after : 1e9)
+                        timings.poseCheckDescends = descends ? 1 : 0
+                        if descends { poseRefinementScale = 1 }
+                        TrainerLog.general.info(
+                            "Pose check at iteration \(iteration): loss \(before) -> \(after) after one step; full-rate refinement \(descends ? "on" : "off")"
+                        )
+                    }
+                    _ = resources.lossAccum.writeArray([lossStep])
+                    if statsBefore.count == splatCount { _ = resources.stats.writeArray(statsBefore) }
+                }
                 timings.encodeStep += CFAbsoluteTimeGetCurrent() - encodeStepFrom
                 if profiling && !calibrating { timings.profiledSteps += 1 }
                 return
@@ -4063,9 +4153,14 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// both rotation and translation before it is composed, so a single bad
     /// frame cannot throw a camera across the room no matter how large its
     /// gradient was.
-    private func updatedCameraDelta(current: Pose?, gradient: [Float]) -> Pose {
-        let omega = SIMD3<Float>(gradient[0], gradient[1], gradient[2]) * -tuning.cameraRotationLR
-        let nu = SIMD3<Float>(gradient[3], gradient[4], gradient[5]) * -tuning.cameraTranslationLR
+    private func updatedCameraDelta(
+        current: Pose?, gradient: [Float], rateScale: Float? = nil
+    ) -> Pose {
+        let scale = rateScale ?? poseRefinementScale
+        let omega = SIMD3<Float>(gradient[0], gradient[1], gradient[2])
+            * -(tuning.cameraRotationLR * scale)
+        let nu = SIMD3<Float>(gradient[3], gradient[4], gradient[5])
+            * -(tuning.cameraTranslationLR * scale)
 
         let omegaLength = simd_length(omega)
         let clampedOmega = omegaLength > tuning.cameraMaxRotationStepRadians

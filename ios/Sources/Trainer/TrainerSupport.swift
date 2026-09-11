@@ -1082,8 +1082,23 @@ struct TrainerTuning: Sendable {
 
     // --- Camera pose deltas (F1) ------------------------------------------------
 
-    var cameraRotationLR: Float = 1e-5
-    var cameraTranslationLR: Float = 1e-5
+    /// BUILD 330: 1e-4, ten times build 292's 1e-5. At 1e-5 the census
+    /// measured the corrections at a median 0.01 cm and a maximum 0.13 cm
+    /// over a whole run: the refinement was switched off in all but name,
+    /// while the pose graph's own residual is about 3 cm. These rates are
+    /// only used in full after the pose check (`poseRefinementCheck`) has
+    /// shown on device that one step along the gradient lowers the
+    /// photometric loss; until then the trainer multiplies them by 0.1, the
+    /// inert value.
+    var cameraRotationLR: Float = 1e-4
+    var cameraTranslationLR: Float = 1e-4
+    /// Build 330: at the first profiled step past warm-up and the coarse
+    /// phase, render the frame at its current camera correction and at that
+    /// correction plus one gradient step, both after the step's own Adam
+    /// update, and compare the photometric losses. The refinement runs at
+    /// its full rate only if the second is lower. Off means the full rate
+    /// from the start.
+    var poseRefinementCheck: Bool = true
     /// Hard per-step clamp so a single bad frame cannot throw a camera.
     var cameraMaxRotationStepRadians: Float = 0.0005
     var cameraMaxTranslationStepMeters: Float = 0.002

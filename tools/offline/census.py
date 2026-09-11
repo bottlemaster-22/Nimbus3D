@@ -157,8 +157,11 @@ if pre:
           'itself waited %.1f s for supervision.' % (pre, t['supervision']))
     print('ceiling if perfectly overlapped: max(worker, gpuBusy) + rest = '
           '%.1f s' % (max(pre, t['gpuBusy']) + rest))
-if t.get('coarseSteps'):
-    print('coarse phase: %d steps at a %d px long edge (the rest at full size)'
+if t.get('poseCheckDescends', -1) >= 0:
+    print('POSE CHECK: photometric loss %.5f -> %.5f after one full-rate step  -> %s'
+          % (t['poseCheckLossBefore'], t['poseCheckLossAfter'],
+             'full-rate refinement ON' if t['poseCheckDescends'] else 'rate left inert'))
+if t.get('coarseSteps'):    print('coarse phase: %d steps at a %d px long edge (the rest at full size)'
           % (t['coarseSteps'], t.get('coarseLongEdgePixels', 0)))
 if t.get('snapshotsStaged'):    print('preview snapshots: %d copied inside a step and converted off the loop'
           % t['snapshotsStaged'])
