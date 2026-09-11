@@ -107,8 +107,15 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         let exposure: SIMD2<Float>
         let iteration: Int
         let totalIterations: Int
+        let splatCount: Int
+        /// Build 316: one command buffer with the sort sized on the GPU; its
+        /// staging slot also carries the instance count (needed, used).
+        let merged: Bool
     }
     private var pendingStep: PendingStep?
+    /// Build 316: a merged step ran short of instance slots and needs this
+    /// many; the buffers grow before the next merged step is encoded.
+    private var pendingInstanceGrowth: Int?
 
     /// Held-out (and trained-view) supervision built by evaluateHeldOut, kept
     /// for the run (build 300). ~1.2 MB a frame (bytes since 314), 11 or 12 frames.
@@ -529,6 +536,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // A step left running by a run that threw cannot belong to this one.
         // Its buffer finishes on its own; its read-backs are not wanted.
         pendingStep = nil
+        pendingInstanceGrowth = nil
         evalSupervisionCache.removeAll()
         heldOutPSNRSum = 0
         heldOutPSNRCount = 0
@@ -2139,6 +2147,22 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     ) throws {
         guard let pending = pendingStep else { return }
         pendingStep = nil
+        try completeStep(
+            pending, resources: resources, lossEMA: &lossEMA,
+            exposures: &exposures, cameraDeltas: &cameraDeltas
+        )
+    }
+
+    /// Waits for one left-running step and applies its read-backs. Split out
+    /// of drainPendingStep (build 316) so a merged iteration can complete the
+    /// PREVIOUS step after it has committed its own.
+    private func completeStep(
+        _ pending: PendingStep,
+        resources: TrainerResources,
+        lossEMA: inout Float?,
+        exposures: inout [FrameID: SIMD2<Float>],
+        cameraDeltas: inout [FrameID: Pose]
+    ) throws {
         try finish(pending.buffer, "the training step")
         let staged = resources.readbackStaging.readArray(Float.self, count: 32)
         guard staged.count == 32 else { return }
@@ -2172,6 +2196,317 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 )
             }
         }
+
+        // Build 316: the instance count the setup kernel found, one step late.
+        // `needed` is what the frame produced, `used` what the sort was given;
+        // they differ only when the buffers were too small, and then this step
+        // trained with some splats missing tiles. Counted, and the buffers grow
+        // before the next merged step (runMergedIteration).
+        if pending.merged {
+            let words = resources.readbackStaging.readArray(UInt32.self, count: 32)
+            if words.count == 32 {
+                let needed = Int(words[base + 14])
+                let used = Int(words[base + 15])
+                if needed > peakTileInstances {
+                    peakTileInstances = needed
+                    splatCountAtPeakTileInstances = pending.splatCount
+                }
+                if needed > used {
+                    timings.truncatedInstanceSteps += 1
+                    pendingInstanceGrowth = Swift.max(pendingInstanceGrowth ?? 0, needed)
+                }
+            }
+        }
+    }
+
+    /// This frame's supervision into the GPU's input slot, and the camera and
+    /// loss uniforms for the step. Shared by the two-buffer and the merged
+    /// paths (build 316); the arithmetic is the one runIteration carried.
+    private func stageInputs(
+        supervision: TrainerFrameSupervision,
+        resources: TrainerResources,
+        size: TrainerRenderSize,
+        cameraDelta: Pose?,
+        exposure: SIMD2<Float>,
+        splatCount: Int,
+        iteration: Int,
+        totalIterations: Int,
+        shCoefficientCount: Int,
+        trust: TwoScaleTrustField?
+    ) -> (camera: TrainerCameraUniforms, loss: TrainerLossUniforms, sampleCount: Int) {
+        let pixelCount = size.pixelCount
+        // --- Upload this frame's supervision -------------------------------------
+        let uploadFrom = CFAbsoluteTimeGetCurrent()
+        resources.gtColorIn.writeArray(supervision.groundTruthBytes)
+        // The far field is 72 KB of cubemap now, not a 4.67 MB rasterised
+        // image. `trainer_background` turns it into bgColor on the GPU in
+        // command buffer A below.
+        if supervision.hasBackground, !supervision.backgroundTexels.isEmpty {
+            resources.bgCubemapIn.writeArray(supervision.backgroundTexels)
+        }
+        let sampleCount = Swift.min(
+            supervision.depthSamples.count, resources.depthSampleCapacity
+        )
+        if sampleCount > 0 {
+            // NOT `Array(...prefix(sampleCount))`. That allocated and copied
+            // 1.57 MB every iteration to produce exactly what writeArray
+            // would have written anyway: it clamps to `length / stride`,
+            // which IS `sampleCount`, since sampleCount is already
+            // min(count, depthSampleCapacity).
+            resources.depthSamplesIn.writeArray(supervision.depthSamples)
+        }
+        timings.upload += CFAbsoluteTimeGetCurrent() - uploadFrom
+
+        // --- Uniforms --------------------------------------------------------------
+        let camera = cameraUniforms(
+            supervision: supervision,
+            cameraDelta: cameraDelta,
+            size: size,
+            splatCount: splatCount,
+            shCoefficientCount: shCoefficientCount,
+            iteration: iteration,
+            totalIterations: totalIterations
+        )
+
+        var loss = TrainerLossUniforms()
+        loss.pixelCount = UInt32(pixelCount)
+        loss.width = UInt32(size.width)
+        loss.height = UInt32(size.height)
+        loss.lambdaSSIM = tuning.lambdaSSIM
+        loss.frameWeight = supervision.qcWeight
+        loss.exposureGain = exposure.x
+        loss.exposureBias = exposure.y
+        loss.depthScale = trust?.depthLossScale(iteration: iteration, of: totalIterations)
+            ?? TwoScaleTrustField.depthLossScale(
+                iteration: iteration, of: totalIterations, floor: settings.depthScheduleFloor
+            )
+        loss.depthSampleCount = UInt32(sampleCount)
+        // The divisor that turns the five geometry terms in `trainer_loss_depth`
+        // into per-sample MEANS, so they sit on the same scale as the two
+        // photometric terms instead of ~10^4 above them.
+        //
+        // `supervisedSampleCount` counts the WHOLE sample array. `sampleCount`
+        // above is the prefix that fitted in the GPU buffer, and the two are
+        // the same number on every normal frame. When capacity truncates, the
+        // count is retaken over exactly the prefix that was uploaded: dividing
+        // by samples the GPU never saw would quietly weaken the geometry terms
+        // on precisely the densest frames.
+        let supervisedCount: Int
+        if sampleCount == supervision.depthSamples.count {
+            supervisedCount = supervision.supervisedSampleCount
+        } else {
+            supervisedCount = supervision.depthSamples.prefix(sampleCount)
+                .reduce(into: 0) { $0 += ($1.weight > 0 ? 1 : 0) }
+        }
+        loss.depthSupervisedCount = UInt32(supervisedCount)
+        loss.bimodalWeight = settings.bimodalWeight
+        loss.transitionWidthWeight = settings.transitionWidthWeight
+        loss.freeSpaceWeight = settings.freeSpaceLowerBoundWeight
+        loss.alphaSupervisionWeight = tuning.alphaSupervisionWeight
+        loss.hasBackground = supervision.hasBackground ? 1 : 0
+
+        return (camera, loss, sampleCount)
+    }
+
+    /// BUILD 316: ONE COMMAND BUFFER PER STEP, WITH THE SORT SIZED ON THE GPU.
+    ///
+    /// The step was two command buffers with the CPU between them: A (clear,
+    /// far field, preprocess, tile scan), a wait, a read of two integers to
+    /// size the sort, then B (everything else). That wait and B's encode sat
+    /// between the two on every iteration with the GPU idle, and the CPU could
+    /// never be more than half a step ahead.
+    ///
+    /// Now `trainer_sort_setup` reads the two integers on the GPU and writes
+    /// every count, uniform block and indirect dispatch argument the sort
+    /// needs into `sortArgs`; the sort's dispatches take their threadgroup
+    /// counts from that buffer and their uniforms from it too. The step is one
+    /// command buffer, and this iteration commits its step BEFORE completing
+    /// the previous one, so the GPU always has the next step queued.
+    ///
+    /// The one thing the CPU did with the count, growing the instance buffers
+    /// and retrying the frame, is lagged: the kernel clamps the sort to the
+    /// capacity (trainer_duplicate_keys already stops there), the count comes
+    /// back with the step's other read-backs, and a step that needed more is
+    /// counted (`truncatedInstanceSteps`) and grows the buffers before the
+    /// next step. The buffers hold eight instances per splat and a room peaks
+    /// near four, so this is recorded rather than expected.
+    ///
+    /// Only for steps that would have been overlapped anyway (after warm-up,
+    /// background frozen, not a profiled or calibration step): those read
+    /// nothing off the GPU between A and B except that count.
+    private func runMergedIteration(
+        gpu: TrainerGPU,
+        resources: TrainerResources,
+        queue: MTLCommandQueue,
+        supervision: TrainerFrameSupervision,
+        cameraDelta: Pose?,
+        exposure: SIMD2<Float>,
+        splatCount: Int,
+        iteration: Int,
+        totalIterations: Int,
+        sceneExtent: Float,
+        shCoefficientCount: Int,
+        trust: TwoScaleTrustField?,
+        lossEMA: inout Float?,
+        exposures: inout [FrameID: SIMD2<Float>],
+        cameraDeltas: inout [FrameID: Pose],
+        frame: CaptureFrame
+    ) throws -> StepResult {
+        let size = resources.renderSize
+
+        // Growth asked for by a completed step. The step still running keeps
+        // the buffers it was encoded with (a command buffer holds its
+        // resources); only steps encoded from here on see the new ones.
+        if let needed = pendingInstanceGrowth {
+            pendingInstanceGrowth = nil
+            if needed > resources.instanceCapacity {
+                TrainerLog.gpu.notice(
+                    "Tile instances needed \(needed), had \(resources.instanceCapacity); growing"
+                )
+                try resources.growInstanceCapacity(to: needed + needed / 4)
+            }
+        }
+        // The splat-order sort ranks the splats in the instance buffers.
+        if resources.instanceCapacity < splatCount {
+            try resources.growInstanceCapacity(to: splatCount + splatCount / 4)
+        }
+
+        let previous = pendingStep
+        pendingStep = nil
+        resources.inputSlot = previous.map { 1 - $0.slot } ?? 0
+        let slot = resources.inputSlot
+
+        let inputs = stageInputs(
+            supervision: supervision, resources: resources, size: size,
+            cameraDelta: cameraDelta, exposure: exposure, splatCount: splatCount,
+            iteration: iteration, totalIterations: totalIterations,
+            shCoefficientCount: shCoefficientCount, trust: trust
+        )
+        var camera = inputs.camera
+        var loss = inputs.loss
+        let sampleCount = inputs.sampleCount
+
+        let encodeFrom = CFAbsoluteTimeGetCurrent()
+        // Pooled for the reason runIteration's buffers are; the committed
+        // buffer itself is kept, as build 292 kept buffer B.
+        let committed: MTLCommandBuffer = try autoreleasepool { () throws -> MTLCommandBuffer in
+            guard let buffer = queue.makeCommandBuffer(),
+                  let blit = buffer.makeBlitCommandEncoder()
+            else { throw TrainerError.noMetalDevice }
+            blit.label = "trainer.clear"
+            gpu.clearPerIteration(blit, splatCount: splatCount)
+            blit.endEncoding()
+
+            guard let front = buffer.makeComputeCommandEncoder()
+            else { throw TrainerError.noMetalDevice }
+            front.label = "trainer.preprocess"
+            if supervision.hasBackground, supervision.backgroundFaceSize > 0 {
+                let q = supervision.pose.rotation.simd.inverse
+                var bg = TrainerBackgroundUniforms(
+                    rotationInverse: SIMD4<Float>(q.imag.x, q.imag.y, q.imag.z, q.real),
+                    fx: supervision.intrinsics.fx,
+                    fy: supervision.intrinsics.fy,
+                    cx: supervision.intrinsics.cx,
+                    cy: supervision.intrinsics.cy,
+                    width: UInt32(size.width),
+                    height: UInt32(size.height),
+                    faceSize: UInt32(supervision.backgroundFaceSize),
+                    pad: 0
+                )
+                gpu.background(front, uniforms: &bg)
+            }
+            gpu.preprocess(front, camera: &camera, splatCount: splatCount)
+            if splatOrderChosen {
+                gpu.orderSplats(
+                    front, camera: &camera, splatCount: splatCount,
+                    simdScan: sortSimdScanChosen
+                )
+            } else {
+                gpu.exclusiveScan(
+                    front,
+                    input: resources.tilesTouched,
+                    output: resources.offsets,
+                    count: splatCount
+                )
+            }
+            gpu.sortSetup(front, camera: &camera, ordered: splatOrderChosen)
+            // Its own encoder ends here, so the arguments the setup kernel
+            // wrote are complete before the first dispatch that reads them.
+            front.endEncoding()
+
+            guard let step = buffer.makeComputeCommandEncoder()
+            else { throw TrainerError.noMetalDevice }
+            step.label = "trainer.step"
+            gpu.duplicateKeys(
+                step, camera: &camera, splatCount: splatCount, ordered: splatOrderChosen
+            )
+            gpu.radixSortIndirect(step, simdScan: sortSimdScanChosen, tileOnly: splatOrderChosen)
+            gpu.tileRangesIndirect(step)
+            gpu.rasterizeForward(step, camera: &camera, twoPixels: forwardTwoPixelChosen)
+
+            gpu.lossPhotometric(step, loss: &loss)
+            gpu.ssim(step, loss: &loss)
+            gpu.lossFinalize(step, loss: &loss)
+            gpu.lossDepth(step, loss: &loss, sampleCount: sampleCount)
+
+            gpu.rasterizeBackward(
+                step, camera: &camera, loss: &loss, simdSum: backwardSimdSumChosen,
+                twoPixels: backwardTwoPixelChosen
+            )
+            gpu.preprocessBackward(step, camera: &camera, splatCount: splatCount)
+
+            var reg = regularizerUniforms(
+                splatCount: splatCount, iteration: iteration, totalIterations: totalIterations
+            )
+            gpu.regularizer(step, reg: &reg)
+            var adam = adamUniforms(
+                splatCount: splatCount,
+                shCoefficientCount: shCoefficientCount,
+                iteration: iteration,
+                totalIterations: totalIterations,
+                sceneExtent: sceneExtent
+            )
+            gpu.adamSplat(step, adam: &adam)
+            gpu.adamSH(step, adam: &adam)
+            step.endEncoding()
+
+            // The read-backs into this step's staging slot, after everything
+            // that writes them: loss, exposure and camera gradients as in
+            // build 292, then the instance count (needed, used).
+            guard let copy = buffer.makeBlitCommandEncoder()
+            else { throw TrainerError.noMetalDevice }
+            let base = slot * 64
+            copy.copy(from: resources.lossAccum, sourceOffset: 0,
+                      to: resources.readbackStaging, destinationOffset: base, size: 4)
+            copy.copy(from: resources.exposureGrad, sourceOffset: 0,
+                      to: resources.readbackStaging, destinationOffset: base + 16, size: 8)
+            copy.copy(from: resources.cameraGrad, sourceOffset: 0,
+                      to: resources.readbackStaging, destinationOffset: base + 32, size: 24)
+            copy.copy(from: resources.sortArgs, sourceOffset: 0,
+                      to: resources.readbackStaging, destinationOffset: base + 56, size: 8)
+            copy.endEncoding()
+            buffer.commit()
+            return buffer
+        }
+        timings.encodeStep += CFAbsoluteTimeGetCurrent() - encodeFrom
+        pendingStep = PendingStep(
+            buffer: committed, slot: slot, frame: frame,
+            exposure: exposure, iteration: iteration,
+            totalIterations: totalIterations, splatCount: splatCount, merged: true
+        )
+        timings.overlappedSteps += 1
+        timings.mergedSteps += 1
+
+        // The previous step is queued in front of this one; complete it now.
+        // Its read-backs land one iteration late, as build 292's did, and its
+        // input slot is the one the NEXT step takes.
+        if let previous {
+            try completeStep(
+                previous, resources: resources, lossEMA: &lossEMA,
+                exposures: &exposures, cameraDeltas: &cameraDeltas
+            )
+        }
+        return .stepped
     }
 
     private func runIteration(
@@ -2223,6 +2558,16 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             && iteration > overlapWarmupEnd
             && !backgroundStillLearning
             && !stepIsSplit(iteration, gpu: gpu)
+        if deferCompletion, tuning.mergedCommandBuffer {
+            return try runMergedIteration(
+                gpu: gpu, resources: resources, queue: queue, supervision: supervision,
+                cameraDelta: cameraDelta, exposure: exposure, splatCount: splatCount,
+                iteration: iteration, totalIterations: totalIterations,
+                sceneExtent: sceneExtent, shCoefficientCount: shCoefficientCount,
+                trust: trust, lossEMA: &lossEMA, exposures: &exposures,
+                cameraDeltas: &cameraDeltas, frame: frame
+            )
+        }
         if !deferCompletion {
             try drainPendingStep(
                 resources: resources, lossEMA: &lossEMA,
@@ -2231,75 +2576,15 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         }
         resources.inputSlot = pendingStep.map { 1 - $0.slot } ?? 0
 
-        // --- Upload this frame's supervision -------------------------------------
-        let uploadFrom = CFAbsoluteTimeGetCurrent()
-        resources.gtColorIn.writeArray(supervision.groundTruthBytes)
-        // The far field is 72 KB of cubemap now, not a 4.67 MB rasterised
-        // image. `trainer_background` turns it into bgColor on the GPU in
-        // command buffer A below.
-        if supervision.hasBackground, !supervision.backgroundTexels.isEmpty {
-            resources.bgCubemapIn.writeArray(supervision.backgroundTexels)
-        }
-        let sampleCount = Swift.min(
-            supervision.depthSamples.count, resources.depthSampleCapacity
+        let inputs = stageInputs(
+            supervision: supervision, resources: resources, size: size,
+            cameraDelta: cameraDelta, exposure: exposure, splatCount: splatCount,
+            iteration: iteration, totalIterations: totalIterations,
+            shCoefficientCount: shCoefficientCount, trust: trust
         )
-        if sampleCount > 0 {
-            // NOT `Array(...prefix(sampleCount))`. That allocated and copied
-            // 1.57 MB every iteration to produce exactly what writeArray
-            // would have written anyway: it clamps to `length / stride`,
-            // which IS `sampleCount`, since sampleCount is already
-            // min(count, depthSampleCapacity).
-            resources.depthSamplesIn.writeArray(supervision.depthSamples)
-        }
-        timings.upload += CFAbsoluteTimeGetCurrent() - uploadFrom
-
-        // --- Uniforms --------------------------------------------------------------
-        var camera = cameraUniforms(
-            supervision: supervision,
-            cameraDelta: cameraDelta,
-            size: size,
-            splatCount: splatCount,
-            shCoefficientCount: shCoefficientCount,
-            iteration: iteration,
-            totalIterations: totalIterations
-        )
-
-        var loss = TrainerLossUniforms()
-        loss.pixelCount = UInt32(pixelCount)
-        loss.width = UInt32(size.width)
-        loss.height = UInt32(size.height)
-        loss.lambdaSSIM = tuning.lambdaSSIM
-        loss.frameWeight = supervision.qcWeight
-        loss.exposureGain = exposure.x
-        loss.exposureBias = exposure.y
-        loss.depthScale = trust?.depthLossScale(iteration: iteration, of: totalIterations)
-            ?? TwoScaleTrustField.depthLossScale(
-                iteration: iteration, of: totalIterations, floor: settings.depthScheduleFloor
-            )
-        loss.depthSampleCount = UInt32(sampleCount)
-        // The divisor that turns the five geometry terms in `trainer_loss_depth`
-        // into per-sample MEANS, so they sit on the same scale as the two
-        // photometric terms instead of ~10^4 above them.
-        //
-        // `supervisedSampleCount` counts the WHOLE sample array. `sampleCount`
-        // above is the prefix that fitted in the GPU buffer, and the two are
-        // the same number on every normal frame. When capacity truncates, the
-        // count is retaken over exactly the prefix that was uploaded: dividing
-        // by samples the GPU never saw would quietly weaken the geometry terms
-        // on precisely the densest frames.
-        let supervisedCount: Int
-        if sampleCount == supervision.depthSamples.count {
-            supervisedCount = supervision.supervisedSampleCount
-        } else {
-            supervisedCount = supervision.depthSamples.prefix(sampleCount)
-                .reduce(into: 0) { $0 += ($1.weight > 0 ? 1 : 0) }
-        }
-        loss.depthSupervisedCount = UInt32(supervisedCount)
-        loss.bimodalWeight = settings.bimodalWeight
-        loss.transitionWidthWeight = settings.transitionWidthWeight
-        loss.freeSpaceWeight = settings.freeSpaceLowerBoundWeight
-        loss.alphaSupervisionWeight = tuning.alphaSupervisionWeight
-        loss.hasBackground = supervision.hasBackground ? 1 : 0
+        var camera = inputs.camera
+        var loss = inputs.loss
+        let sampleCount = inputs.sampleCount
 
         // --- Command buffer A: preprocess and size the sort -------------------------
         //
@@ -2863,7 +3148,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 pendingStep = PendingStep(
                     buffer: bufferB, slot: resources.inputSlot, frame: frame,
                     exposure: exposure, iteration: iteration,
-                    totalIterations: totalIterations
+                    totalIterations: totalIterations, splatCount: splatCount, merged: false
                 )
                 timings.overlappedSteps += 1
                 return

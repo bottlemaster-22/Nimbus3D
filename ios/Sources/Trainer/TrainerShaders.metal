@@ -1425,6 +1425,65 @@ kernel void trainer_gather_touched(
     sortedTouched[gid] = tilesTouched[order[gid]];
 }
 
+// ============================================================================
+// MARK: - Build 316: the tile sort sized on the GPU
+//
+// The step used to be two command buffers with the CPU between them, reading
+// two integers (the last offset and the last count) to size the sort's
+// dispatches. This kernel reads them instead and writes everything the sort
+// needs into one small argument buffer, in 256-byte slots:
+//
+//   slot 0        needed, used (clamped to the capacity), blocks
+//   slots 1..6    TrainerRadixUniforms for pass p, bit shift 4p
+//   slot 7        TrainerScanUniforms, histogram scan level 0
+//   slot 8        TrainerScanUniforms, histogram scan level 1
+//   slot 9        the instance count, for trainer_tile_ranges
+//   slot 10..14   dispatchThreadgroups indirect arguments {x, 1, 1}:
+//                 10 sort passes, 11 scan level 0, 12 scan level 1,
+//                 13 scan add, 14 tile ranges
+//
+// `groupWidth` is the threads-per-threadgroup the 1D indirect dispatches use
+// (TrainerGPU.indirectGroupWidth), so the kernel and the encoder agree.
+// ============================================================================
+
+constant uint kTrainerSortArgStride = 64u;   // uints per slot: 256 bytes
+
+kernel void trainer_sort_setup(
+    const device uint*              offsets     [[buffer(0)]],
+    const device uint*              touched     [[buffer(1)]],
+    device uint*                    args        [[buffer(2)]],
+    constant TrainerCameraUniforms& cam         [[buffer(3)]],
+    constant uint&                  instanceCap [[buffer(4)]],
+    constant uint&                  groupWidth  [[buffer(5)]],
+    uint                            gid         [[thread_position_in_grid]]
+) {
+    if (gid != 0u) { return; }
+    const uint n = cam.splatCount;
+    const uint needed = (n > 0u) ? (offsets[n - 1u] + touched[n - 1u]) : 0u;
+    const uint used = min(needed, instanceCap);
+    const uint blocks = (used + TRAINER_SCAN_BLOCK - 1u) / TRAINER_SCAN_BLOCK;
+    const uint histEntries = TRAINER_RADIX_BINS * blocks;
+    const uint histBlocks = (histEntries + TRAINER_SCAN_BLOCK - 1u) / TRAINER_SCAN_BLOCK;
+    const uint width = max(groupWidth, 1u);
+    const uint S = kTrainerSortArgStride;
+
+    args[0] = needed;
+    args[1] = used;
+    args[2] = blocks;
+    for (uint p = 0; p < 6u; ++p) {
+        device uint* u = args + (1u + p) * S;
+        u[0] = used; u[1] = blocks; u[2] = 4u * p; u[3] = 0u;
+    }
+    { device uint* u = args + 7u * S; u[0] = histEntries; u[1] = histBlocks; u[2] = 0u; u[3] = 0u; }
+    { device uint* u = args + 8u * S; u[0] = histBlocks;  u[1] = 1u;         u[2] = 0u; u[3] = 0u; }
+    args[9u * S] = used;
+    { device uint* a = args + 10u * S; a[0] = blocks;                         a[1] = 1u; a[2] = 1u; }
+    { device uint* a = args + 11u * S; a[0] = histBlocks;                     a[1] = 1u; a[2] = 1u; }
+    { device uint* a = args + 12u * S; a[0] = 1u;                             a[1] = 1u; a[2] = 1u; }
+    { device uint* a = args + 13u * S; a[0] = (histEntries + width - 1u) / width; a[1] = 1u; a[2] = 1u; }
+    { device uint* a = args + 14u * S; a[0] = (used + width - 1u) / width;    a[1] = 1u; a[2] = 1u; }
+}
+
 /// THE FAR FIELD, RASTERISED ON THE GPU INSTEAD OF THE CPU.
 ///
 /// This was a Swift loop over all 388,800 pixels, run once per iteration on

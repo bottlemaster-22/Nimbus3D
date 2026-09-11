@@ -101,6 +101,11 @@ enum TrainerGPUConstants {
     /// so outgrowing it fails loudly instead of corrupting the sort.
     static let maxTileCount = 4_096
 
+    /// Build 316: the GPU-written sort arguments, 16 slots of 256 bytes.
+    /// See trainer_sort_setup for what each slot holds.
+    static let sortArgSlotBytes = 256
+    static let sortArgSlots = 16
+
     /// SSIM window: 11 taps, sigma 1.5, the constants the SSIM paper and every
     /// 3DGS implementation use.
     ///

@@ -140,6 +140,8 @@ enum TrainerKernel {
     /// Build 306: the splat-order tile sort.
     static let depthKeys = "trainer_depth_keys"
     static let gatherTouched = "trainer_gather_touched"
+    /// Build 316: sizes the sort on the GPU.
+    static let sortSetup = "trainer_sort_setup"
     static let background = "trainer_background"
     static let lossPhotometric = "trainer_loss_photometric"
     static let blurH = "trainer_blur_h"
@@ -160,7 +162,7 @@ enum TrainerKernel {
     static let all: [String] = [
         fillUInt, fillFloat, resetDensifyStats,
         scanBlock, scanAdd, radixHistogram, radixScatter,
-        preprocess, duplicateKeys, depthKeys, gatherTouched, tileRanges, rasterizeForward,
+        preprocess, duplicateKeys, depthKeys, gatherTouched, sortSetup, tileRanges, rasterizeForward,
         lossPhotometric, blurH, blurV, ssimStats,
         lossDepth, lossFinalize, rasterizeBackward, preprocessBackward,
         samplingRateUpdate, filter3DFinalize, regularizer,
@@ -259,6 +261,15 @@ enum TrainerBind {
         static let tilesTouched = 1
         static let sortedTouched = 2
         static let count = 3         // constant uint&
+    }
+
+    enum SortSetup {
+        static let offsets = 0
+        static let touched = 1
+        static let args = 2          // TrainerGPUConstants.sortArgSlots x 256 bytes
+        static let camera = 3
+        static let instanceCap = 4   // constant uint&
+        static let groupWidth = 5    // constant uint&
     }
 
     enum TileRanges {
@@ -1123,6 +1134,13 @@ struct TrainerTuning: Sendable {
     /// waiting on the previous iteration's buffer B, so the GPU does not sit
     /// idle through the CPU's per-iteration work. See `drainPendingStep`.
     var overlapIterations: Bool = true
+
+    /// Build 316: an overlapped step is ONE command buffer, with the sort
+    /// sized by a kernel and dispatched indirectly, so the CPU never waits
+    /// between the tile scan and the rest of the step. See
+    /// MetalSplatTrainer.runMergedIteration. Off means build 292's two
+    /// buffers with the count read back in between.
+    var mergedCommandBuffer: Bool = true
 
     init() {}
 }

@@ -157,6 +157,9 @@ if pre:
           'itself waited %.1f s for supervision.' % (pre, t['supervision']))
     print('ceiling if perfectly overlapped: max(worker, gpuBusy) + rest = '
           '%.1f s' % (max(pre, t['gpuBusy']) + rest))
+if t.get('mergedSteps'):
+    print('merged steps: %d of %d overlapped ran as one command buffer; %d ran short of instance slots'
+          % (t['mergedSteps'], t.get('overlappedSteps', 0), t.get('truncatedInstanceSteps', 0)))
 if 'supervisionCacheHits' in t:
     print('frame cache: %d builds served without a decode, cache peak %.0f MB'
           % (t['supervisionCacheHits'], t.get('supervisionCacheMegabytes', 0)))

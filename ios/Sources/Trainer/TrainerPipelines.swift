@@ -56,6 +56,7 @@ final class TrainerPipelines {
     let depthKeys: MTLComputePipelineState
     let gatherTouched: MTLComputePipelineState
     let tileRanges: MTLComputePipelineState
+    let sortSetup: MTLComputePipelineState
     let rasterizeForward: MTLComputePipelineState
     let background: MTLComputePipelineState
     let lossPhotometric: MTLComputePipelineState
@@ -177,6 +178,7 @@ final class TrainerPipelines {
         depthKeys = try build(TrainerKernel.depthKeys)
         gatherTouched = try build(TrainerKernel.gatherTouched)
         tileRanges = try build(TrainerKernel.tileRanges)
+        sortSetup = try build(TrainerKernel.sortSetup)
         rasterizeForward = try build(TrainerKernel.rasterizeForward)
         let forward2 = try? build(TrainerKernel.rasterizeForward2)
         let forward2Threads = TrainerGPUConstants.tileWidth * TrainerGPUConstants.tileHeight / 2
@@ -538,6 +540,157 @@ struct TrainerGPU {
         dispatch1D(encoder, pipelines.gatherTouched, count: splatCount)
 
         exclusiveScan(encoder, input: resources.keysA, output: resources.offsets, count: splatCount)
+    }
+
+    // MARK: Build 316: the sort sized on the GPU
+    //
+    // trainer_sort_setup writes the counts, the uniform blocks and the
+    // indirect dispatch arguments for the whole sort into `sortArgs`; the
+    // functions below bind those slots instead of CPU-side values, so the
+    // step needs no read-back between the tile scan and the sort. Integer
+    // work throughout: the sorted order is the one radixSort produces.
+
+    /// Threads per threadgroup for the two 1D indirect dispatches (scan add
+    /// and tile ranges). The setup kernel is handed the same number.
+    private var indirectGroupWidth: Int {
+        Swift.max(1, Swift.min(
+            pipelines.scanAdd.maxTotalThreadsPerThreadgroup,
+            pipelines.tileRanges.maxTotalThreadsPerThreadgroup,
+            256
+        ))
+    }
+
+    func sortSetup(
+        _ encoder: MTLComputeCommandEncoder,
+        camera: inout TrainerCameraUniforms,
+        ordered: Bool
+    ) {
+        encoder.setComputePipelineState(pipelines.sortSetup)
+        encoder.setBuffer(resources.offsets, offset: 0, index: TrainerBind.SortSetup.offsets)
+        // Splat-order mode keeps the per-position counts in keysA (orderSplats).
+        encoder.setBuffer(
+            ordered ? resources.keysA : resources.tilesTouched,
+            offset: 0, index: TrainerBind.SortSetup.touched
+        )
+        encoder.setBuffer(resources.sortArgs, offset: 0, index: TrainerBind.SortSetup.args)
+        encoder.setBytes(
+            &camera,
+            length: MemoryLayout<TrainerCameraUniforms>.stride,
+            index: TrainerBind.SortSetup.camera
+        )
+        var cap = UInt32(resources.instanceCapacity)
+        encoder.setBytes(&cap, length: MemoryLayout<UInt32>.size, index: TrainerBind.SortSetup.instanceCap)
+        var width = UInt32(indirectGroupWidth)
+        encoder.setBytes(&width, length: MemoryLayout<UInt32>.size, index: TrainerBind.SortSetup.groupWidth)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: 1, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+        )
+    }
+
+    /// `radixSort` with every count taken from `sortArgs`. Same passes, same
+    /// buffers, same ping-pong (legacy: six passes from keysA; tile-only:
+    /// three from keysB), so the result lands in keysA either way.
+    func radixSortIndirect(_ encoder: MTLComputeCommandEncoder, simdScan: Bool, tileOnly: Bool) {
+        let passes = tileOnly ? [3, 4, 5] : [0, 1, 2, 3, 4, 5]
+        let scatter = (simdScan ? pipelines.radixScatterSimdScan : nil) ?? pipelines.radixScatter
+        let args = resources.sortArgs
+        let stride = TrainerGPUConstants.sortArgSlotBytes
+        let blockGroup = MTLSize(width: TrainerGPUConstants.scanThreads, height: 1, depth: 1)
+        let addGroup = MTLSize(width: indirectGroupWidth, height: 1, depth: 1)
+        guard let sums0 = resources.scanBlockSums.first,
+              let scanned0 = resources.scanBlockSumsScanned.first
+        else { return }
+        let sums1 = resources.scanBlockSums.count > 1 ? resources.scanBlockSums[1] : nil
+
+        var keysIn = tileOnly ? resources.keysB : resources.keysA
+        var keysOut = tileOnly ? resources.keysA : resources.keysB
+        var valuesIn = tileOnly ? resources.valuesB : resources.valuesA
+        var valuesOut = tileOnly ? resources.valuesA : resources.valuesB
+
+        for pass in passes {
+            let uniforms = (1 + pass) * stride
+
+            encoder.setComputePipelineState(pipelines.radixHistogram)
+            encoder.setBuffer(keysIn, offset: 0, index: TrainerBind.RadixHistogram.keys)
+            encoder.setBuffer(
+                resources.radixHistogram, offset: 0, index: TrainerBind.RadixHistogram.histogram
+            )
+            encoder.setBuffer(args, offset: uniforms, index: TrainerBind.RadixHistogram.uniforms)
+            encoder.dispatchThreadgroups(
+                indirectBuffer: args, indirectBufferOffset: 10 * stride,
+                threadsPerThreadgroup: blockGroup
+            )
+
+            // The histogram's exclusive scan, always two levels. With one
+            // level-0 block the level-1 scan of that single total is 0 and
+            // the add adds nothing, which is what the CPU version's early
+            // return produced. A histogram needing a third level would need
+            // over sixty-seven million instances.
+            encoder.setComputePipelineState(pipelines.scanBlock)
+            encoder.setBuffer(resources.radixHistogram, offset: 0, index: TrainerBind.ScanBlock.input)
+            encoder.setBuffer(
+                resources.radixHistogramScan, offset: 0, index: TrainerBind.ScanBlock.output
+            )
+            encoder.setBuffer(sums0, offset: 0, index: TrainerBind.ScanBlock.blockSums)
+            encoder.setBuffer(args, offset: 7 * stride, index: TrainerBind.ScanBlock.uniforms)
+            encoder.dispatchThreadgroups(
+                indirectBuffer: args, indirectBufferOffset: 11 * stride,
+                threadsPerThreadgroup: blockGroup
+            )
+            encoder.setBuffer(sums0, offset: 0, index: TrainerBind.ScanBlock.input)
+            encoder.setBuffer(scanned0, offset: 0, index: TrainerBind.ScanBlock.output)
+            encoder.setBuffer(sums1, offset: 0, index: TrainerBind.ScanBlock.blockSums)
+            encoder.setBuffer(args, offset: 8 * stride, index: TrainerBind.ScanBlock.uniforms)
+            encoder.dispatchThreadgroups(
+                indirectBuffer: args, indirectBufferOffset: 12 * stride,
+                threadsPerThreadgroup: blockGroup
+            )
+            encoder.setComputePipelineState(pipelines.scanAdd)
+            encoder.setBuffer(resources.radixHistogramScan, offset: 0, index: TrainerBind.ScanAdd.output)
+            encoder.setBuffer(scanned0, offset: 0, index: TrainerBind.ScanAdd.blockOffsets)
+            encoder.setBuffer(args, offset: 7 * stride, index: TrainerBind.ScanAdd.uniforms)
+            encoder.dispatchThreadgroups(
+                indirectBuffer: args, indirectBufferOffset: 13 * stride,
+                threadsPerThreadgroup: addGroup
+            )
+
+            encoder.setComputePipelineState(scatter)
+            encoder.setBuffer(keysIn, offset: 0, index: TrainerBind.RadixScatter.keysIn)
+            encoder.setBuffer(valuesIn, offset: 0, index: TrainerBind.RadixScatter.valuesIn)
+            encoder.setBuffer(keysOut, offset: 0, index: TrainerBind.RadixScatter.keysOut)
+            encoder.setBuffer(valuesOut, offset: 0, index: TrainerBind.RadixScatter.valuesOut)
+            encoder.setBuffer(
+                resources.radixHistogramScan, offset: 0, index: TrainerBind.RadixScatter.histogramScan
+            )
+            encoder.setBuffer(args, offset: uniforms, index: TrainerBind.RadixScatter.uniforms)
+            encoder.dispatchThreadgroups(
+                indirectBuffer: args, indirectBufferOffset: 10 * stride,
+                threadsPerThreadgroup: blockGroup
+            )
+
+            swap(&keysIn, &keysOut)
+            swap(&valuesIn, &valuesOut)
+        }
+    }
+
+    /// `tileRanges` with the count taken from `sortArgs`.
+    func tileRangesIndirect(_ encoder: MTLComputeCommandEncoder) {
+        fillUInt(
+            encoder,
+            buffer: resources.tileRanges,
+            count: resources.renderSize.tileCount * 2,
+            value: 0
+        )
+        let stride = TrainerGPUConstants.sortArgSlotBytes
+        encoder.setComputePipelineState(pipelines.tileRanges)
+        encoder.setBuffer(resources.keysA, offset: 0, index: TrainerBind.TileRanges.keys)
+        encoder.setBuffer(resources.tileRanges, offset: 0, index: TrainerBind.TileRanges.tileRanges)
+        encoder.setBuffer(resources.sortArgs, offset: 9 * stride, index: TrainerBind.TileRanges.count)
+        encoder.dispatchThreadgroups(
+            indirectBuffer: resources.sortArgs, indirectBufferOffset: 14 * stride,
+            threadsPerThreadgroup: MTLSize(width: indirectGroupWidth, height: 1, depth: 1)
+        )
     }
 
     // MARK: Forward

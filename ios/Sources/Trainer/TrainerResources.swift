@@ -154,6 +154,10 @@ final class TrainerResources {
     /// of command buffer B so the CPU can read them after the NEXT iteration's
     /// buffer A has already cleared the originals.
     private(set) var readbackStaging: MTLBuffer
+    /// Build 316: the sort's counts, uniforms and indirect dispatch
+    /// arguments, written by trainer_sort_setup. GPU-only; the counts reach
+    /// the CPU through `readbackStaging`.
+    let sortArgs: MTLBuffer
 
     // MARK: Accounting
 
@@ -314,6 +318,9 @@ final class TrainerResources {
         )
         readbackStaging = try make("readbackStaging", 128)
         gtLevels = try make("gtLevels", 256 * 4)
+        sortArgs = try make(
+            "sortArgs", TrainerGPUConstants.sortArgSlots * TrainerGPUConstants.sortArgSlotBytes
+        )
 
         recomputeResidentBytes()
         _ = gtLevels.writeArray((0..<256).map { Float($0) / 255 })
@@ -339,7 +346,7 @@ final class TrainerResources {
             gradDepthRend, gradTFinal, unknownMask,
             ssimSrc, ssimMid, ssimTmp,
             lossAccum, exposureGrad, cameraGrad, depthSamples,
-            gtColorAlt, bgCubemapAlt, depthSamplesAlt, readbackStaging, gtLevels
+            gtColorAlt, bgCubemapAlt, depthSamplesAlt, readbackStaging, gtLevels, sortArgs
         ]
         list.append(contentsOf: scanBlockSums)
         list.append(contentsOf: scanBlockSumsScanned)

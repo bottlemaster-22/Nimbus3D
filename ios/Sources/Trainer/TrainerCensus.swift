@@ -689,6 +689,12 @@ struct TrainerTimings: Codable {
     /// iteration's CPU work and buffer A went ahead (completed later by
     /// drainPendingStep).
     var overlappedSteps: Int = 0
+    /// Build 316: of those, steps run as ONE command buffer with the sort
+    /// sized on the GPU, and how many of them ran short of instance slots
+    /// (the sort was clamped to the capacity that step; the buffers grew
+    /// before the next). Expected 0.
+    var mergedSteps: Int = 0
+    var truncatedInstanceSteps: Int = 0
 
     /// How many command buffers were waited on. gpuWait divided by this is
     /// the average round-trip cost, which is the number that says whether
