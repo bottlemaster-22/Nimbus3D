@@ -1443,6 +1443,29 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 timings.memoryFootprintPeakMegabytes = Swift.max(
                     timings.memoryFootprintPeakMegabytes, Double(reading.footprintBytes) / 1_048_576
                 )
+                // Build 370: a memory sample every 500 iterations, and the census
+                // written to disk every 1,000, so a run the OS kills for memory
+                // (368: 2.8 GB, dead past iteration 10,000, nothing on disk)
+                // leaves the curve behind.
+                if iteration % 500 == 0 {
+                    census.memorySamples.append(TrainerCensusMemorySample(
+                        iteration: iterationsRunSoFar + iteration,
+                        footprint: Double(reading.footprintBytes) / 1_048_576,
+                        trainerBuffers: Double(reading.trainerBufferBytes) / 1_048_576,
+                        frameCaches: Double(
+                            supervision.frameCacheBytes
+                                + coarseSupervisions.reduce(0) { $0 + $1.frameCacheBytes }
+                        ) / 1_048_576,
+                        splatCount: splatCount,
+                        splatCapacity: resources.splatCapacity,
+                        instanceCapacity: resources.instanceCapacity,
+                        renderLongEdge: Swift.max(renderSize.width, renderSize.height)
+                    ))
+                }
+                if iteration > 0, iteration % 1000 == 0 {
+                    census.iterationsCompleted = iterationsRunSoFar + iteration
+                    TrainerCensusWriter.write(census, at: ref)
+                }
                 var change = governor.degradeForMemory(
                     reading: reading,
                     currentSplatCount: splatCount,

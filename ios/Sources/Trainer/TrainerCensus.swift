@@ -182,6 +182,22 @@ struct TrainerCensusGates: Codable {
 /// is exact rather than estimated: a split replaces its parent in place and
 /// appends one child, and a clone appends one, so the population after growth
 /// is always `splatCountBefore + addedBySplit + addedByClone`.
+/// Build 370: one memory reading, taken every 500 iterations, so a run that
+/// dies of memory still says where the memory went. All in MB.
+struct TrainerCensusMemorySample: Codable {
+    var iteration: Int
+    /// What the process has allocated since the run began.
+    var footprint: Double
+    /// Every Metal buffer the trainer holds.
+    var trainerBuffers: Double
+    /// The frame caches of every builder together.
+    var frameCaches: Double
+    var splatCount: Int
+    var splatCapacity: Int
+    var instanceCapacity: Int
+    var renderLongEdge: Int
+}
+
 struct TrainerCensusDensifyPass: Codable {
     var sliceIndex: Int
     /// Iteration within this slice, which is what the windows are measured
@@ -840,6 +856,8 @@ struct TrainerCensus: Codable {
     var sliceCount: Int = 0
     var slices: [TrainerCensusSlice] = []
     var densifyPasses: [TrainerCensusDensifyPass] = []
+    /// Build 370: see TrainerCensusMemorySample.
+    var memorySamples: [TrainerCensusMemorySample] = []
     var merge: TrainerCensusMerge?
 
     var iterationsRequested: Int

@@ -1410,3 +1410,7 @@ The reference recipe's reset, missing until now: on the densify cadence, inside 
 ### BUILD 366: SH degree 3
 
 trainer_evalSH gains the degree-3 block (7 basis terms, reference constants and order, the same the viewer's kSH_C3 uses); trainer_preprocess_backward writes the 21 degree-3 gradients and their direction derivatives transcribed from the reference rasteriser's backward; the written bound is 48 floats when the ramp is past 9; trainer_adam_sh walks 16 coefficients past 9. Room budget shDegree .two -> .three, capFromMemory at .three. Memory: SH rows and their two Adam moments go 27 -> 48 floats a point (about +140 MB at 330k with the gradient rows), so memoryUseFraction 0.75 -> 0.8; the census footprint line is the check. The viewer and PLY codec already carried degree 3.
+
+### BUILD 370: the census survives a memory kill
+
+368 (30k, 1,080 px, SH3, resets) reached 2.8 GB of process memory and was killed past iteration 10,000, inside level 0 (360 px); the owner says the preview looked good at 9,000-10,000. Nothing was on disk because the census is written at the end. Now: a memory sample every 500 iterations (footprint, trainer buffers, frame caches, population, capacity, instance capacity, long edge) and the census file rewritten every 1,000 iterations, so the next kill leaves the curve. census.py prints it. No mitigation yet: the growth is not identified (candidates: something per densify pass or per preview at degree 3, instance-capacity growth, or the reset's effect on per-pixel work is not memory at all).
