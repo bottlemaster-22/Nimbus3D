@@ -1075,6 +1075,11 @@ struct TrainerTuning: Sendable {
     var sortCalibrationStart: Int = 310
     var sortCalibrationSteps: Int = 4
 
+    /// Build 292: after warm-up, commit the next iteration's buffer A BEFORE
+    /// waiting on the previous iteration's buffer B, so the GPU does not sit
+    /// idle through the CPU's per-iteration work. See `drainPendingStep`.
+    var overlapIterations: Bool = true
+
     init() {}
 }
 

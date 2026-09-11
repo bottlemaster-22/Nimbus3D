@@ -134,6 +134,24 @@ final class TrainerResources {
     private(set) var cameraGrad: MTLBuffer
     private(set) var depthSamples: MTLBuffer
 
+    // OVERLAPPED ITERATIONS (build 292). The three buffers the CPU writes a
+    // frame's inputs into have a twin, so the next iteration's inputs can be
+    // uploaded while the previous iteration's command buffer B is still
+    // reading its own. `inputSlot` picks which pair every write and every
+    // binding uses; the trainer flips it only between steps.
+    private(set) var gtColorAlt: MTLBuffer
+    private(set) var bgCubemapAlt: MTLBuffer
+    private(set) var depthSamplesAlt: MTLBuffer
+    var inputSlot: Int = 0
+    var gtColorIn: MTLBuffer { inputSlot == 0 ? gtColor : gtColorAlt }
+    var bgCubemapIn: MTLBuffer { inputSlot == 0 ? bgCubemap : bgCubemapAlt }
+    var depthSamplesIn: MTLBuffer { inputSlot == 0 ? depthSamples : depthSamplesAlt }
+    /// 2 x 64 bytes: per input slot, the loss (float 0), the exposure gradient
+    /// (floats 4..5) and the camera gradient (floats 8..13), copied at the end
+    /// of command buffer B so the CPU can read them after the NEXT iteration's
+    /// buffer A has already cleared the originals.
+    private(set) var readbackStaging: MTLBuffer
+
     // MARK: Accounting
 
     /// Every allocation this object holds, in bytes, as Metal reports it.
@@ -285,6 +303,13 @@ final class TrainerResources {
             "depthSamples",
             self.depthSampleCapacity * MemoryLayout<TrainerDepthSample>.stride
         )
+        gtColorAlt = try make("gtColorAlt", px * 3 * 4)
+        bgCubemapAlt = try make("bgCubemapAlt", 6 * 32 * 32 * 3 * 4)
+        depthSamplesAlt = try make(
+            "depthSamplesAlt",
+            self.depthSampleCapacity * MemoryLayout<TrainerDepthSample>.stride
+        )
+        readbackStaging = try make("readbackStaging", 128)
 
         recomputeResidentBytes()
     }
@@ -308,7 +333,8 @@ final class TrainerResources {
             gtColor, bgColor, composited, gradFinal, gradSplatColor,
             gradDepthRend, gradTFinal, unknownMask,
             ssimSrc, ssimMid, ssimTmp,
-            lossAccum, exposureGrad, cameraGrad, depthSamples
+            lossAccum, exposureGrad, cameraGrad, depthSamples,
+            gtColorAlt, bgCubemapAlt, depthSamplesAlt, readbackStaging
         ]
         list.append(contentsOf: scanBlockSums)
         list.append(contentsOf: scanBlockSumsScanned)
@@ -668,6 +694,7 @@ final class TrainerResources {
         renderTFinal = placeholder
         renderNContrib = placeholder
         gtColor = placeholder
+        gtColorAlt = placeholder
         bgColor = placeholder
         composited = placeholder
         gradFinal = placeholder
@@ -688,6 +715,7 @@ final class TrainerResources {
         renderNContrib = try makeBuffer("renderNContrib", px * 4)
 
         gtColor = try makeBuffer("gtColor", px * 3 * 4)
+        gtColorAlt = try makeBuffer("gtColorAlt", px * 3 * 4)
         bgColor = try makeBuffer("bgColor", px * 3 * 4)
         composited = try makeBuffer("composited", px * 3 * 4)
         gradFinal = try makeBuffer("gradFinal", px * 3 * 4)

@@ -568,7 +568,7 @@ struct TrainerGPU {
         encoder.setBuffer(
             resources.renderTFinal, offset: 0, index: TrainerBind.LossPhotometric.renderTFinal
         )
-        encoder.setBuffer(resources.gtColor, offset: 0, index: TrainerBind.LossPhotometric.gtColor)
+        encoder.setBuffer(resources.gtColorIn, offset: 0, index: TrainerBind.LossPhotometric.gtColor)
         encoder.setBuffer(resources.bgColor, offset: 0, index: TrainerBind.LossPhotometric.bgColor)
         encoder.setBuffer(
             resources.composited, offset: 0, index: TrainerBind.LossPhotometric.composited
@@ -711,7 +711,7 @@ struct TrainerGPU {
     ) {
         guard sampleCount > 0 else { return }
         encoder.setComputePipelineState(pipelines.lossDepth)
-        encoder.setBuffer(resources.depthSamples, offset: 0, index: TrainerBind.LossDepth.samples)
+        encoder.setBuffer(resources.depthSamplesIn, offset: 0, index: TrainerBind.LossDepth.samples)
         encoder.setBuffer(
             resources.renderDepth, offset: 0, index: TrainerBind.LossDepth.renderDepth
         )
@@ -1027,7 +1027,7 @@ struct TrainerGPU {
         guard px > 0 else { return }
         encoder.setComputePipelineState(pipelines.background)
         encoder.setBuffer(
-            resources.bgCubemap, offset: 0, index: TrainerBind.Background.texels
+            resources.bgCubemapIn, offset: 0, index: TrainerBind.Background.texels
         )
         encoder.setBuffer(
             resources.bgColor, offset: 0, index: TrainerBind.Background.bgColor

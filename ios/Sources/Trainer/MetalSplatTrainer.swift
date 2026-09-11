@@ -88,6 +88,20 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// Set by the sort calibration (build 290): use the SIMD-prefix radix
     /// scatter for the rest of the run.
     private var sortSimdScanChosen = false
+
+    /// A training step whose command buffer B was committed and left running
+    /// (build 292): the CPU went on to the next iteration's supervision and
+    /// buffer A instead of idling the GPU through that work. Completed by
+    /// `drainPendingStep`.
+    private struct PendingStep {
+        let buffer: MTLCommandBuffer
+        let slot: Int
+        let frame: CaptureFrame
+        let exposure: SIMD2<Float>
+        let iteration: Int
+        let totalIterations: Int
+    }
+    private var pendingStep: PendingStep?
     private var heldOutPSNRSum: Double = 0
     private var heldOutPSNRCount: Int = 0
 
@@ -467,6 +481,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         timings = TrainerTimings()
         backwardSimdSumChosen = false
         sortSimdScanChosen = false
+        // A step left running by a run that threw cannot belong to this one.
+        // Its buffer finishes on its own; its read-backs are not wanted.
+        pendingStep = nil
         heldOutPSNRSum = 0
         heldOutPSNRCount = 0
         thermals = TrainerCensus.Thermals()
@@ -1190,6 +1207,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     // The governor can swap the builder's image cache out
                     // from under a worker. Nothing may be in flight.
                     prefetch.drain()
+                    try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
                     try applyBudgetChange(
                         change,
                         resources: resources,
@@ -1241,6 +1259,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     // The governor can swap the builder's image cache out
                     // from under a worker. Nothing may be in flight.
                     prefetch.drain()
+                    try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
                     try applyBudgetChange(
                         change,
                         resources: resources,
@@ -1323,6 +1342,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // If that is not the grid the buffers were made at, the buffers are
             // rebuilt once rather than every frame being resampled.
             if frameSupervision.renderSize != renderSize {
+                try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
                 renderSize = frameSupervision.renderSize
                 try resources.resizeRenderSize(to: renderSize)
                 gpu = TrainerGPU(pipelines: pipelines, resources: resources)
@@ -1403,6 +1423,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             if iteration > 0,
                iteration % Swift.max(tuning.filter3DIntervalIterations, 1) == 0
             {
+                try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
                 let sweepFrom = CFAbsoluteTimeGetCurrent()
                 defer { timings.filterSweep += CFAbsoluteTimeGetCurrent() - sweepFrom }
                 try updateFilter3D(
@@ -1435,6 +1456,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                iteration % evalEvery == 0,
                !slice.heldOutKeyframes.isEmpty
             {
+                try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
                 let evalFrom = CFAbsoluteTimeGetCurrent()
                 // Raw AND fitted from the same renders (alsoScoreExposureFitted
                 // computes the fitted MSE with the same expression fitExposure
@@ -1534,6 +1556,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             if iteration > 0,
                iteration % Swift.max(tuning.densifyIntervalIterations, 1) == 0
             {
+                try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
                 let carveDue = iteration % Swift.max(tuning.carveIntervalIterations, 1) == 0
                 let densifyFrom = CFAbsoluteTimeGetCurrent()
                 defer { timings.densify += CFAbsoluteTimeGetCurrent() - densifyFrom }
@@ -1675,6 +1698,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             }
 
             if iteration % Swift.max(tuning.snapshotIntervalIterations, 1) == 0 {
+                try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
                 let snapshotFrom = CFAbsoluteTimeGetCurrent()
                 let cloud = readCloud(
                     resources: resources, count: splatCount, shDegree: shDegree
@@ -1734,6 +1758,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
             iteration += 1
         }
+        // Nothing after the loop may see a step still running (build 292).
+        try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
 
         iterationsRunSoFar += iteration
 
@@ -2009,6 +2035,82 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     }
 
     // swiftlint:disable:next function_body_length function_parameter_count
+    /// True on the iterations whose step is split into timed stages or runs a
+    /// calibration (builds 286 to 290). Those wait on every buffer they commit
+    /// and are never overlapped.
+    private func stepIsSplit(_ iteration: Int, gpu: TrainerGPU) -> Bool {
+        let every = tuning.stageProfileEvery
+        if every > 0, iteration % every == every / 2 { return true }
+        let backwardStart = tuning.backwardCalibrationStart
+        if gpu.pipelines.rasterizeBackwardSimdSum != nil,
+           tuning.backwardCalibrationSteps > 0,
+           iteration >= backwardStart,
+           iteration < backwardStart + tuning.backwardCalibrationSteps {
+            return true
+        }
+        let sortStart = tuning.sortCalibrationStart
+        if gpu.pipelines.radixScatterSimdScan != nil,
+           tuning.sortCalibrationSteps > 0,
+           iteration >= sortStart,
+           iteration < sortStart + tuning.sortCalibrationSteps {
+            return true
+        }
+        return false
+    }
+
+    /// Completes the overlapped step, if there is one: waits for its buffer B,
+    /// then applies its read-backs from the staging slot, with the same
+    /// arithmetic in the same order as runIteration's synchronous path applies
+    /// them from the live buffers. KEEP THE TWO IN STEP.
+    ///
+    /// MUST run before anything reads or reshapes GPU state between
+    /// iterations: densify, the held-out evaluation, the 3D-filter sweep, the
+    /// preview snapshot, a budget change, a render-size change, and the end of
+    /// the slice. Each of those calls it first, and runIteration calls it
+    /// before any step it will not overlap.
+    private func drainPendingStep(
+        resources: TrainerResources,
+        lossEMA: inout Float?,
+        exposures: inout [FrameID: SIMD2<Float>],
+        cameraDeltas: inout [FrameID: Pose]
+    ) throws {
+        guard let pending = pendingStep else { return }
+        pendingStep = nil
+        try finish(pending.buffer, "the training step")
+        let staged = resources.readbackStaging.readArray(Float.self, count: 32)
+        guard staged.count == 32 else { return }
+        let base = pending.slot * 16
+
+        let lossValue = staged[base]
+        if lossValue.isFinite {
+            lossEMA = lossEMA.map { $0 * 0.98 + lossValue * 0.02 } ?? lossValue
+        }
+
+        let gainGradient = staged[base + 4]
+        let biasGradient = staged[base + 5]
+        if gainGradient.isFinite, biasGradient.isFinite {
+            var gain = pending.exposure.x - tuning.exposureLearningRate * gainGradient
+            var bias = pending.exposure.y - tuning.exposureLearningRate * biasGradient
+            gain = TrainerMath.clamp(
+                gain, tuning.exposureGainRange.lowerBound, tuning.exposureGainRange.upperBound
+            )
+            bias = TrainerMath.clamp(
+                bias, tuning.exposureBiasRange.lowerBound, tuning.exposureBiasRange.upperBound
+            )
+            exposures[pending.frame.index] = SIMD2<Float>(gain, bias)
+        }
+
+        let warmupEnd = Int(Float(pending.totalIterations) * tuning.warmupFraction)
+        if pending.iteration > warmupEnd {
+            let gradient = Array(staged[(base + 8)..<(base + 14)])
+            if gradient.allSatisfy({ $0.isFinite }) {
+                cameraDeltas[pending.frame.index] = updatedCameraDelta(
+                    current: cameraDeltas[pending.frame.index], gradient: gradient
+                )
+            }
+        }
+    }
+
     private func runIteration(
         gpu: TrainerGPU,
         resources: TrainerResources,
@@ -2033,14 +2135,47 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         let pixelCount = size.pixelCount
         guard pixelCount > 0, splatCount > 0 else { return .skippedNothingToRender }
 
+        // OVERLAPPED ITERATIONS (build 292). After warm-up, with the
+        // background frozen, a normal step's buffer B is committed and LEFT
+        // RUNNING: the next iteration's CPU work (supervision, upload,
+        // uniforms) and its buffer A go ahead while B executes, and B is
+        // completed just after that A is committed (see drainPendingStep).
+        // What makes it safe:
+        //  - the model parameters are only touched by the GPU, in queue order,
+        //    so A(n+1) sees B(n)'s Adam step exactly as before;
+        //  - the three buffers the CPU writes inputs into are doubled and the
+        //    next step takes the slot the running step is NOT using;
+        //  - B copies its read-backs (loss, exposure and camera gradients) into
+        //    a staging slot, because A(n+1) clears the originals;
+        //  - exposure and camera updates are per frame and applied before that
+        //    frame is next visited, and the loss EMA only feeds progress, so
+        //    applying them one iteration later changes nothing that trains;
+        //  - everything that reads GPU state between iterations drains first.
+        // Warm-up reads the background gradient off the GPU every iteration,
+        // and the split and calibration steps wait on every buffer, so none of
+        // those are overlapped.
+        let overlapWarmupEnd = Int(Float(totalIterations) * tuning.warmupFraction)
+        let backgroundStillLearning = background.map { !$0.isFrozen } ?? false
+        let deferCompletion = tuning.overlapIterations
+            && iteration > overlapWarmupEnd
+            && !backgroundStillLearning
+            && !stepIsSplit(iteration, gpu: gpu)
+        if !deferCompletion {
+            try drainPendingStep(
+                resources: resources, lossEMA: &lossEMA,
+                exposures: &exposures, cameraDeltas: &cameraDeltas
+            )
+        }
+        resources.inputSlot = pendingStep.map { 1 - $0.slot } ?? 0
+
         // --- Upload this frame's supervision -------------------------------------
         let uploadFrom = CFAbsoluteTimeGetCurrent()
-        resources.gtColor.writeArray(supervision.groundTruth)
+        resources.gtColorIn.writeArray(supervision.groundTruth)
         // The far field is 72 KB of cubemap now, not a 4.67 MB rasterised
         // image. `trainer_background` turns it into bgColor on the GPU in
         // command buffer A below.
         if supervision.hasBackground, !supervision.backgroundTexels.isEmpty {
-            resources.bgCubemap.writeArray(supervision.backgroundTexels)
+            resources.bgCubemapIn.writeArray(supervision.backgroundTexels)
         }
         let sampleCount = Swift.min(
             supervision.depthSamples.count, resources.depthSampleCapacity
@@ -2051,7 +2186,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // would have written anyway: it clamps to `length / stride`,
             // which IS `sampleCount`, since sampleCount is already
             // min(count, depthSampleCapacity).
-            resources.depthSamples.writeArray(supervision.depthSamples)
+            resources.depthSamplesIn.writeArray(supervision.depthSamples)
         }
         timings.upload += CFAbsoluteTimeGetCurrent() - uploadFrom
 
@@ -2172,6 +2307,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             )
             encoderA.endEncoding()
             bufferA.commit()
+            // The previous step's buffer B ran while this iteration's CPU work
+            // happened; this A is queued behind it. Complete it now, before
+            // waiting on A. No-op when nothing is pending.
+            try drainPendingStep(
+                resources: resources, lossEMA: &lossEMA,
+                exposures: &exposures, cameraDeltas: &cameraDeltas
+            )
             try finish(bufferA, "the tile scan")
         }
 
@@ -2459,8 +2601,32 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             gpu.adamSH(encoderB, adam: &adam)
 
             encoderB.endEncoding()
+            // Snapshot the read-backs into this step's staging slot, in the same
+            // buffer, after everything that writes them. Only for a step that
+            // will be left running; a synchronous step reads the originals.
+            var staged = false
+            if deferCompletion, let blit = bufferB.makeBlitCommandEncoder() {
+                let base = resources.inputSlot * 64
+                blit.copy(from: resources.lossAccum, sourceOffset: 0,
+                          to: resources.readbackStaging, destinationOffset: base, size: 4)
+                blit.copy(from: resources.exposureGrad, sourceOffset: 0,
+                          to: resources.readbackStaging, destinationOffset: base + 16, size: 8)
+                blit.copy(from: resources.cameraGrad, sourceOffset: 0,
+                          to: resources.readbackStaging, destinationOffset: base + 32, size: 24)
+                blit.endEncoding()
+                staged = true
+            }
             bufferB.commit()
             timings.encodeStep += CFAbsoluteTimeGetCurrent() - encodeStepFrom
+            if staged {
+                pendingStep = PendingStep(
+                    buffer: bufferB, slot: resources.inputSlot, frame: frame,
+                    exposure: exposure, iteration: iteration,
+                    totalIterations: totalIterations
+                )
+                timings.overlappedSteps += 1
+                return
+            }
             // NOT "the tile sort". This one command buffer holds the
             // sort, the forward raster, the losses, the backward raster and
             // the optimiser, so labelling it as the sort credited all five
@@ -2469,6 +2635,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // every remaining speed decision unreadable.
             try finish(bufferB, "the training step")
         }
+
+        // A step left running (build 292) applies its read-backs in drainPendingStep.
+        if pendingStep != nil { return .stepped }
 
         // --- Readbacks ------------------------------------------------------------------
         let lossValue = resources.lossAccum.readElement(Float.self, at: 0) ?? 0
@@ -3162,7 +3331,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             ) else { continue }
             guard frameSupervision.renderSize == renderSize else { continue }
 
-            resources.gtColor.writeArray(frameSupervision.groundTruth)
+            resources.gtColorIn.writeArray(frameSupervision.groundTruth)
             // The far field comes from the SAME trainer_background kernel the
             // training path uses, encoded into buffer A below and read back
             // after buffer B. It was the CPU loop backgroundImage, 6 to 10 ms a
@@ -3173,7 +3342,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 && frameSupervision.backgroundFaceSize > 0
                 && !frameSupervision.backgroundTexels.isEmpty
             if useGPUBackground {
-                resources.bgCubemap.writeArray(frameSupervision.backgroundTexels)
+                resources.bgCubemapIn.writeArray(frameSupervision.backgroundTexels)
             }
 
             var camera = cameraUniforms(

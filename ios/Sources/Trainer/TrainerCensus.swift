@@ -647,6 +647,11 @@ struct TrainerTimings: Codable {
     var sortMismatchSteps: Int = 0
     var sortSimdScanChosen: Int = 0
 
+    /// Build 292: steps whose buffer B was left running while the next
+    /// iteration's CPU work and buffer A went ahead (completed later by
+    /// drainPendingStep).
+    var overlappedSteps: Int = 0
+
     /// How many command buffers were waited on. gpuWait divided by this is
     /// the average round-trip cost, which is the number that says whether
     /// merging command buffers would be worth anything.

@@ -1178,3 +1178,13 @@ Build 287/288 green (23f3099).
 The scatter ranked keys with a Hillis-Steele scan across 256 threads for all 16 bins: 8 rounds of 16 threadgroup stores, 16 loads and two barriers per pass, six passes, plus a 16 KB tgScratch (half a threadgroup's memory). Variant B: simd_prefix_exclusive_sum per bin within the 32-lane group plus the totals of earlier groups (512 B), one barrier. Integer ranking in tid order, so the output order is IDENTICAL, which the calibration checks exactly: iterations 310-313 generate the keys once, sort with A, restore, sort with B, compare keys and values element for element; a mismatch restores A's order; B is kept only with zero mismatches and >= 3 % faster. Applied at all three sort sites (step, profiled step, held-out eval). B is built only on Apple7 with a 32-wide SIMD group.
 
 Risk found and closed in 288's code: the plain backward pipeline set constant 0 and left constant 1 unset. The `is_function_constant_defined ? : false` pattern makes that legal, but no device has tested it, so both backward pipelines and both scatter pipelines now set every constant they read explicitly.
+
+Build 289/290 green (6cff394).
+
+### BUILD 292: overlapped iterations
+
+The GPU idled ~1.4 ms an iteration (~5.6 s a run): after each buffer B the CPU did the read-backs, the loop's bookkeeping, supervision take and prefetch start, the 4.7 MB upload, the uniforms and buffer A's encode, all with the GPU empty. Now, after warm-up and with the background frozen, a step's buffer B is committed and LEFT RUNNING; the next iteration's CPU work and buffer A proceed, and B is completed (`drainPendingStep`) right after that A is committed, before waiting on it.
+
+Why it is exact for training: parameters are only touched by the GPU, in queue order, so A(n+1) sees B(n)'s Adam step as before. gtColor, bgCubemap and depthSamples are doubled (`inputSlot`, and the next step always takes the slot the running one is not using, so a skipped iteration cannot collide). B copies its read-backs (loss, exposure gradient, camera gradient) into a staging slot, because A(n+1)'s clear wipes the originals. Exposure and camera updates are per frame and land before that frame is next visited; the loss EMA only feeds progress. Everything that reads GPU state between iterations drains first: both budget-change paths, a render-size change, the 3D-filter sweep, the held-out eval, densify, the preview snapshot and the end of the slice (11 call sites). Warm-up (the background gradient is read every iteration), the split profile steps and both calibrations are never overlapped. Census: `overlappedSteps`.
+
+Expected: most of the ~1.4 ms/iteration GPU idle, about 3 to 5 s a run. The A-to-B gap (count read-back, B encode) remains.
