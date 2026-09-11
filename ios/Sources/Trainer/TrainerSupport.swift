@@ -845,18 +845,7 @@ struct TrainerTuning: Sendable {
     /// p1 to p99, because the spacing floor wins for every sample. Copying a
     /// ratio tuned for a varied starting population onto a perfectly uniform
     /// one was the wrong reference class.
-    ///
-    /// NOW 1.0 (A54, build 280, together with splitShrink 2.0). 0.8 / 1.6
-    /// ended at p50 7.5 mm and spread 4.6x on 274/276 against Scaniverse's
-    /// 3.39 mm and 8.9x. sizesim266.py, reproducing 266's split and clone
-    /// counts exactly, predicts p50 5.4 to 6.5 mm and spread 5.1 to 8.8x IF
-    /// the optimiser keeps what densification does, and no change if it
-    /// reverts within ~1,000 iterations; the device run decides. At 1.0 the
-    /// cut below is the smallest considered scale, so every candidate splits
-    /// and clones go to 0. Disc face area against the seed set falls from
-    /// 3.83x to 2.87x in that model, still above 1. Revert if best held-out
-    /// falls more than 0.4 dB below the 276/278 baseline on the fixed set.
-    var splitShareOfGrowth: Float = 1.0
+    var splitShareOfGrowth: Float = 0.8
 
     /// SPLIT ON SCREEN SIZE. WITHDRAWN, MEASURED WRONG, LEFT AT 0.
     ///
@@ -926,13 +915,7 @@ struct TrainerTuning: Sendable {
     var splitShrinkAllAxes: Bool = true
 
     var splitOffsetSigma: Float = 0.8
-    /// 2.0 (A54, build 280, with splitShareOfGrowth 1.0). ALSO the relocation
-    /// path's one-axis shrink (splitGeometry, preserveCoverage true), which
-    /// does ~20k of the moves a run: relocated pairs become 1/2 rather than
-    /// 1/1.6 along the split axis at +/-0.8 sigma, so each child's density at
-    /// the old centre drops from 0.44 to 0.28 of its peak under the same
-    /// opacity correction. Watch prunedLowOpacity (69-97 on 266-276).
-    var splitShrink: Float = 2.0
+    var splitShrink: Float = 1.6
     /// Opacity below which a Gaussian is pruned, as a probability.
     /// WAS 0.005, which is 1/196, against a minAlpha of 1/255 = 0.00392.
     /// Those are the same number to within a rounding error, so a Gaussian

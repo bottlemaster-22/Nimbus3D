@@ -1128,3 +1128,19 @@ Same held-out set, same poses and seeds (846,971) as 278, so this is a clean A/B
 Densification persisted (sizesim's "optimiser keeps it" branch, even past its 5.4-6.5 mm band). Quality fell 0.70 dB, past the 0.4 dB revert line, BUT trained-view fell 0.82 dB too: the model fits its own training views worse, which is under-coverage at a fixed 300,000 cap, not overfitting. Each split now leaves two children at a quarter of the parent's volume and clones (which add coverage) went to zero. Scaniverse holds ~427,000 splats for this room.
 
 **Build 282: A54 kept, room cap 300,000 -> 350,000** (Contracts.swift scaleCap). One variable against 280. The GPU time the small splats saved should pay for it (36.9 s x 350/300 ~ 43 s, 278's figure). The live preview still strides down to 300k for display only; GPU buffers follow the budget. Decision rule: if best held-out gets back to about 19.2 (278) at a training time near 60 s, the size change stands; if not, revert A54 and cap, and move to A25.
+
+---
+
+## 2026-09-11 : Build 282 measured: the cap was not the reason; A54 reverted
+
+| | 278 | 280 (A54) | 282 (A54 + cap 350k) |
+|---|---|---|---|
+| best held-out / SSIM | **19.26 / 0.623** | 18.56 / 0.588 | 18.60 / 0.590 |
+| trained-view | 21.55 | 20.73 | 20.78 |
+| p50 / spread | 7.40 mm / 4.6x | 5.24 / 7.9x | 4.88 / 7.9x |
+| gpuStep | 43.6 | 36.9 | 40.9 |
+| seeds | 846,971 | 846,971 | 949,032 (spacing 14.6 -> 13.5 mm; NOT at the floor, my "at its minimum" was wrong) |
+
+50,000 more splats and 100,000 more seeds bought 0.04 dB. The under-coverage reading is refuted: the loss is the split geometry itself (children at 1/2 on all axes, no clones), not the cap. A54 and the cap go back to 278's values. Open, untested: share 0.8 with shrink 2.0 (sizesim put most of the p50 effect there, and it keeps clones).
+
+**Build 284: 278 exactly, plus A25 (disc prior weight 0.001 -> 0).** Never run. The kernel gate `if (u.discWeight > 0)` switches off the rank term and the onEdge needle target together. Watch needles (8.7 % on 278) and p90, and the owner's eye on cluttered regions (0.005 artefacted there in 240).
