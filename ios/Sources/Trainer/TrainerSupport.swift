@@ -665,7 +665,9 @@ struct TrainerTuning: Sendable {
     /// Four evaluations at 500 iterations is 2,000 iterations of patience,
     /// which is enough to ride out a dip caused by a densification pass
     /// injecting new geometry that has not settled yet.
-    var earlyStopPatienceEvals: Int = 4
+    // 8 (build 380; was 4): 378 stopped at 25,600 on a curve rising by
+    // 0.01 dB an eval; quality mode waits 3,200 iterations of flat.
+    var earlyStopPatienceEvals: Int = 8
 
     /// Never stop before this many iterations, whatever the score does. Early
     /// training is noisy and the densify window has not even opened at 10 per
@@ -1241,7 +1243,9 @@ struct TrainerTuning: Sendable {
     // scored 19.53, so full-size steps past about 2,000 bought nothing; the
     // last quarter is full size, the rest at 0.5 and 0.75.
     // Build 360: 360 px to 45 %, 720 px to 80 %, then 1,080 px.
-    var coarseResolutionFractions: [Float] = [0.45, 0.80]
+    // Build 380: 1,080 px for the last 30 % (378's 1,080 phase was 1,600
+    // iterations before early stop, with growth frozen and no cache).
+    var coarseResolutionFractions: [Float] = [0.40, 0.70]
     var coarseResolutionScales: [Float] = [0.3333, 0.6667]
     /// BUILD 338: OFF. The background preload (build 332) put a second
     /// builder to work while the active level's prefetch worker built on

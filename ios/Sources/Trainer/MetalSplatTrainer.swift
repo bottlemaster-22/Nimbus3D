@@ -1480,7 +1480,16 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 // (build 310, up to 420 MB), so the cache could have been paid
                 // for in Gaussians. It is dropped, and stays off, before any
                 // cut is considered; the reading is then retaken.
-                if change != nil, supervision.frameCacheBytes > 0
+                // BUILD 380: THE CACHES GO ONLY WHEN THE OS IS SHORT, not on
+                // this file's own gates. The soft gates freeze growth (build
+                // 346), which costs nothing at the end of a run; losing the
+                // cache costs every later iteration a decode (378: the
+                // 1,080-px level ran decode-bound, 87 s on the worker, for a
+                // 60-point cap freeze). The headroom floor is the OS's own
+                // number and keeps the release.
+                var osIsShort = false
+                if let change, case .memoryHeadroom = change.reason { osIsShort = true }
+                if osIsShort, supervision.frameCacheBytes > 0
                     || coarseSupervisions.contains(where: { $0.frameCacheBytes > 0 })
                 {
                     // BUILD 336: EVERY builder's cache, and no worker may be
