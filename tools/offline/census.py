@@ -335,7 +335,7 @@ for s_ in (d.get('slices') or []):
     pf = s_.get('heldOutPerFrame')
     if pf:
         print('HELD-OUT PER FRAME: ' + '  '.join('%d:%.2f' % (e['frameIndex'], e['psnr']) for e in pf))
-curve = [e for s_ in (d.get('slices') or []) for e in (s_.get('heldOutCurve') or []) if 'psnrRaw' in e]
+curve = [e for e in (d.get('heldOutCurve') or []) if 'psnrRaw' in e]
 if curve:
     print('HELD-OUT CURVE raw vs fitted: ' + '  '.join(
         '%d:%.2f/%.2f' % (e['iteration'], e['psnrRaw'], e.get('psnrExposureFitted') or 0) for e in curve))
