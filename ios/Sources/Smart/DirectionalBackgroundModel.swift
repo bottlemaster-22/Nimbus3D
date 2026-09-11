@@ -435,74 +435,101 @@ public final class DirectionalBackgroundModel: BackgroundModel {
             bundle.intrinsics, depthWidth: width, depthHeight: height
         )
 
-        var visited = 0
+        // THE PER-FRAME PREPARATION ON EVERY CORE (build 298). Each visited
+        // frame needs a photo decode, a luma and an RGB resample and its
+        // authority map (built on a miss), 120 frames one at a time inside
+        // the trainer's smartLayer (1.3 s on 276). Those are pure functions of
+        // the frame (the image cache and authority map lock their own tables),
+        // so they run 12 frames at a time on every core, and the accumulation
+        // below walks the prepared frames STRICTLY in the old order: the same
+        // frames visited, the same pixels, the same float sums in the same
+        // order, the same cubemap to the bit.
+        var visitFrames: [CaptureFrame] = []
         var frameCursor = 0
         while frameCursor < bundle.frames.count {
-            if Task.isCancelled { throw NimbusError.cancelled }
             let frame = bundle.frames[frameCursor]
             frameCursor += frameStride
-
-            // A deliberately darker bracketed frame is the WRONG evidence for
-            // an absolute background radiance: it is the right evidence for a
-            // window's interior, which is why it was captured, but folding it
-            // into the mean would drag the whole sky dark.
             guard frame.bracket == .normal else { continue }
-            let pose = frame.refinedPose ?? frame.rawPose
-            guard let image = images.image(for: frame, at: ref) else { continue }
-            visited += 1
+            visitFrames.append(frame)
+        }
 
-            let luma = SmartAuthorityMap.resampleLuma(image, width: width, height: height)
-            let rgb = Self.resampleRGB(image, width: width, height: height)
-            let qcWeight = SmartMath.clamp(frame.qc.weight, 0, 1)
-            guard qcWeight > 0.05 else { continue }
+        struct PreparedFrame {
+            let luma: [Float]
+            let rgb: [SIMD3<Float>]
+            let qcWeight: Float
+            let authority: SmartFrameAuthority?
+            let rotationInverse: simd_quatf
+        }
 
-            // Once per frame, not once per sample. `authority(frame:sampleIndex:)`
-            // is `map(for:)` then an index, and `map(for:)` takes the map's lock
-            // and does a dictionary lookup: about 5.9 million round trips for
-            // ~120 frames of 49,152 samples, for one object per frame. Same
-            // object, same values. The rotation inverse was likewise rebuilt
-            // per sample from a pose that is constant within the frame.
-            let frameAuthority = map?.map(for: frame.index)
-            let rotationInverse = pose.rotation.simd.inverse
-
-            for v in 0..<height {
-                for u in 0..<width {
-                    let i = v * width + u
-
-                    // A pixel belongs to the far field exactly when nothing
-                    // nearer has authority over it.
-                    let authority = frameAuthority?.value(sampleIndex: i) ?? 0
-                    let farness = 1 - SmartMath.clamp(authority, 0, 1)
-                    guard farness > 0.5 else { continue }
-
-                    // A saturated pixel says "at least this bright" and
-                    // nothing more; averaging it in biases the field towards
-                    // white exactly where the sky is brightest.
-                    guard luma[i] < settings.saturationLuma else { continue }
-
-                    let pixel = SIMD2<Float>(Float(u) + 0.5, Float(v) + 0.5)
-                    let rayCamera = SmartCamera.ray(pixel, nativeK)
-                    let direction = rotationInverse.act(rayCamera)
-
-                    let w = farness * qcWeight
-                    let colour = rgb[i]
-                    let footprint = SmartBackgroundCubemap.bilinearFootprint(
-                        direction, faceSize: faceSize
+        var visited = 0
+        var next = 0
+        let prepareChunk = 12
+        let frameList = visitFrames
+        while next < frameList.count {
+            if Task.isCancelled { throw NimbusError.cancelled }
+            let base = next
+            let chunk = Swift.min(prepareChunk, frameList.count - base)
+            var prepared = [PreparedFrame?](repeating: nil, count: chunk)
+            prepared.withUnsafeMutableBufferPointer { out in
+                DispatchQueue.concurrentPerform(iterations: chunk) { c in
+                    let frame = frameList[base + c]
+                    let pose = frame.refinedPose ?? frame.rawPose
+                    guard let image = images.image(for: frame, at: ref) else { return }
+                    let qcWeight = SmartMath.clamp(frame.qc.weight, 0, 1)
+                    out[c] = PreparedFrame(
+                        luma: SmartAuthorityMap.resampleLuma(image, width: width, height: height),
+                        rgb: Self.resampleRGB(image, width: width, height: height),
+                        qcWeight: qcWeight,
+                        // Only where the serial loop asked for it (past the QC
+                        // gate), so the authority cache fills exactly as before.
+                        authority: qcWeight > 0.05 ? map?.map(for: frame.index) : nil,
+                        rotationInverse: pose.rotation.simd.inverse
                     )
-                    for (index, footprintWeight) in footprint {
-                        guard index < texelCount else { continue }
-                        let contribution = w * footprintWeight
-                        sums[index] += colour * contribution
-                        weights[index] += contribution
+                }
+            }
+            next += chunk
+
+            for c in 0..<chunk {
+                guard let frameData = prepared[c] else { continue }
+                visited += 1
+                let luma = frameData.luma
+                let rgb = frameData.rgb
+                let qcWeight = frameData.qcWeight
+                guard qcWeight > 0.05 else { continue }
+                let frameAuthority = frameData.authority
+                let rotationInverse = frameData.rotationInverse
+
+                for v in 0..<height {
+                    for u in 0..<width {
+                        let i = v * width + u
+
+                        let authority = frameAuthority?.value(sampleIndex: i) ?? 0
+                        let farness = 1 - SmartMath.clamp(authority, 0, 1)
+                        guard farness > 0.5 else { continue }
+
+                        guard luma[i] < settings.saturationLuma else { continue }
+
+                        let pixel = SIMD2<Float>(Float(u) + 0.5, Float(v) + 0.5)
+                        let rayCamera = SmartCamera.ray(pixel, nativeK)
+                        let direction = rotationInverse.act(rayCamera)
+
+                        let w = farness * qcWeight
+                        let colour = rgb[i]
+                        let footprint = SmartBackgroundCubemap.bilinearFootprint(
+                            direction, faceSize: faceSize
+                        )
+                        for (index, footprintWeight) in footprint {
+                            guard index < texelCount else { continue }
+                            let contribution = w * footprintWeight
+                            sums[index] += colour * contribution
+                            weights[index] += contribution
+                        }
+                        contributed += 1
                     }
-                    contributed += 1
                 }
             }
         }
 
-        // Normalise. A texel nothing looked at keeps its neutral prior rather
-        // than becoming black, and `observedDirections` in the model index is
-        // what tells the viewer to hatch it (F9).
         var texels = [SIMD3<Float>](repeating: SIMD3<Float>(repeating: 0.5), count: texelCount)
         var filled = 0
         for i in 0..<texelCount where weights[i] > 1e-4 {

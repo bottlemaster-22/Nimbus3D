@@ -1202,3 +1202,9 @@ The serial prefix was 1.2 s for 13 slots (20,000 sweeps, one at a time). Per bud
 ### BUILD 296: seeding loads four keyframes ahead, concurrently
 
 The seeding sample loop (1.07 s on 276) spent 0.57 s waiting on its one-frame-ahead prefetch: a load (depth sidecar, unprojection, photo decode) takes ~6 ms against ~3 ms of sample work. PrePassSeedPrefetch now keeps `lookahead` (4) loads in flight on a concurrent queue, each writing its own entry under a lock; take waits for that frame's item; a frame never started still loads inline. Each load is a pure function of its frame, so the inputs, the loop and init_splats.ply are byte-identical. Census: seeding.secondsPrefetchWait should fall toward 0.
+
+Build 293 (the push run of aa9f549, build 294's code) green; the PR run was cancelled by the next push, which is harmless.
+
+### BUILD 298: background warm-up preparation on every core
+
+smartLayer is 1.3 s of training's one-off time; most of it is DirectionalBackgroundModel.warmUp visiting ~120 frames one at a time: a photo decode, a luma and an RGB resample and the frame's authority map (built on a miss) per frame, then a per-pixel accumulation into the cubemap. The preparation is a pure function of the frame (the image cache and the authority map lock their own tables), so it now runs 12 frames at a time on every core, and the accumulation walks the prepared frames strictly in the old order: same frames, same pixels, same float sums in the same order, the same cubemap to the bit. The authority map is fetched only past the QC gate, as before, so its cache fills identically.
