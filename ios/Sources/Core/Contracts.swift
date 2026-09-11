@@ -1809,7 +1809,14 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
         let scaleCap: Int
         switch sceneExtentMeters {
         case ..<3: scaleCap = 150_000    // one object
-        case ..<8: scaleCap = 300_000    // a room
+        // A room: 350,000 since build 282. Build 280's smaller splits (split
+        // share 1.0, shrink 2.0) took p50 7.40 to 5.24 mm and spread 4.6x to
+        // 7.9x, toward Scaniverse's 3.39 mm / 8.9x, and cut gpuStep 43.6 to
+        // 36.9 s, but at the same 300,000 cap held-out fell 0.70 dB and
+        // trained-view fell 0.82 dB: under-coverage, not overfitting.
+        // Scaniverse's model of the same room has ~427,000 splats. The GPU
+        // time the smaller splats saved pays for ~17% more of them.
+        case ..<8: scaleCap = 350_000    // a room
         default: scaleCap = 500_000      // a floor or a house
         }
 

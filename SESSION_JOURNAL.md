@@ -1106,3 +1106,25 @@ Per frame 276 -> 278: 20 15.50->15.24, **60 12.03->14.29**, 100 16.05->14.95, 14
 The raw curve rises to the end (17.64 at 800 to 18.61 at 3600); fitted sits ~0.6 dB above. exposure.bin on 276: gain 0.988-1.008, bias -0.024..+0.023 (gain inert, bias moving, as the exposure workflow predicted).
 
 **Build 280: A54 alone** (split share 1.0, split shrink 2.0), against 278 on the same set. Signatures: addedByClone 0, addedBySplit ~152k, relocated ~19k; p50 at or below 6.5 mm with spread >= 5x means densification persists, p50 7.3-7.6 mm means the optimiser erases it; prunedLowOpacity in the thousands means relocation holes (130 on 278). Revert if best held-out falls more than 0.4 dB below 19.26.
+
+---
+
+## 2026-09-11 : Build 280 measured (A54), and 282: the same small splits with room for more of them
+
+Same held-out set, same poses and seeds (846,971) as 278, so this is a clean A/B.
+
+| | 278 | 280 (share 1.0, shrink 2.0) |
+|---|---|---|
+| p10 / p50 / p90 size | 3.54 / 7.40 / 16.13 mm | **1.86 / 5.24 / 14.60 mm** |
+| spread p90/p10 | 4.56x | **7.85x** (Scaniverse 8.9x) |
+| split / clone | 121,552 / 30,380 | 151,682 / 0 |
+| relocated | 18,841 | 14,928 |
+| prunedLowOpacity | 130 | 143 (no relocation holes) |
+| gpuStep | 43.6 s | **36.9 s** |
+| training | 60 s | **54 s** (total ~59.5 s) |
+| best held-out / raw end / SSIM | 19.26 / 18.63 / 0.623 | **18.56 / 18.00 / 0.588** |
+| trained-view | 21.55 | 20.73 |
+
+Densification persisted (sizesim's "optimiser keeps it" branch, even past its 5.4-6.5 mm band). Quality fell 0.70 dB, past the 0.4 dB revert line, BUT trained-view fell 0.82 dB too: the model fits its own training views worse, which is under-coverage at a fixed 300,000 cap, not overfitting. Each split now leaves two children at a quarter of the parent's volume and clones (which add coverage) went to zero. Scaniverse holds ~427,000 splats for this room.
+
+**Build 282: A54 kept, room cap 300,000 -> 350,000** (Contracts.swift scaleCap). One variable against 280. The GPU time the small splats saved should pay for it (36.9 s x 350/300 ~ 43 s, 278's figure). The live preview still strides down to 300k for display only; GPU buffers follow the budget. Decision rule: if best held-out gets back to about 19.2 (278) at a training time near 60 s, the size change stands; if not, revert A54 and cap, and move to A25.
