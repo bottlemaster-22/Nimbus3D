@@ -1,0 +1,22 @@
+SCANIVERSE (target)
+    p1   0.710 p10   1.327 p25   2.055 p50   3.388 p75   5.946 p90   11.825 p99  7389.056
+    spread   8.913x  sd 0.6361  pop  427710  below 1 mm  4.01%
+
+CURRENT HEAD                              
+    p1   4.962 p10   6.716 p25   8.121 p50  10.002 p75  12.139 p90   14.322 p99    18.821
+    spread   2.132x  sd 0.1271  pop  298619  below 1 mm  0.00%  coverage  4.21x  mean shrinks 0.293
+splitShare 1.0 only                       
+    p1   1.252 p10   2.426 p25   3.605 p50   5.882 p75   9.458 p90   12.573 p99    17.743
+    spread   5.183x  sd 0.2743  pop  298619  below 1 mm  0.40%  coverage  2.27x  mean shrinks 1.477
+splitShrink 2.0 only                      
+    p1   3.985 p10   5.539 p25   7.206 p50   9.719 p75  12.062 p90   14.295 p99    18.816
+    spread   2.581x  sd 0.1564  pop  298619  below 1 mm  0.00%  coverage  3.96x  mean shrinks 0.293
+splitShare 1.0 + splitShrink 2.0          
+    p1   0.497 p10   1.234 p25   2.162 p50   4.328 p75   8.883 p90   12.509 p99    17.734
+    spread  10.140x  sd 0.3877  pop  298619  below 1 mm  6.11%  coverage  1.93x  mean shrinks 1.477
+splitShare 0.8 + splitShrink 2.2          
+    p1   0.759 p10   1.617 p25   2.380 p50   4.649 p75   9.289 p90   12.673 p99    17.798
+    spread   7.835x  sd 0.3487  pop  298619  below 1 mm  3.13%  coverage  2.03x  mean shrinks 1.178
+splitShare 0.6 + relocation unconditional 
+    p1   0.836 p10   1.479 p25   2.169 p50   3.536 p75   5.710 p90    8.349 p99    14.464
+    spread   5.645x  sd 0.2866  pop  298619  below 1 mm  2.40%  coverage  0.89x  mean shrinks 4.668

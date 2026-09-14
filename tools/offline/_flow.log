@@ -1,0 +1,27 @@
+block 48px, search +/-10px, blocks kept only where the photo has real texture
+
+frame  trn   blocks   median|d| px    p75    p90   |  median |d| in cm at 1.22 m
+    0  YES      88      10.02    11.18  13.66  |  2.36 cm
+    1   no      77       5.83    10.77  12.81  |  1.37 cm
+    2   no      79       6.71    10.61  14.14  |  1.58 cm
+    3  YES      82       2.24     7.72  11.18  |  0.53 cm
+    4   no      88       6.08    10.01  12.39  |  1.43 cm
+    5   no      72       6.08     9.01  10.77  |  1.43 cm
+    6   no      68       4.47     8.31  11.66  |  1.05 cm
+    7   no      76       3.16    10.05  10.98  |  0.74 cm
+    8  YES      84       2.53     9.58  10.44  |  0.60 cm
+    9   no      81       2.24    10.05  10.44  |  0.53 cm
+   10   no      84       3.16    10.05  10.44  |  0.74 cm
+   11  YES      83       3.00    10.00  10.20  |  0.71 cm
+   12   no      92       3.80    10.05  11.11  |  0.90 cm
+   13   no     101       5.39    10.20  11.18  |  1.27 cm
+   14  YES     107       6.40    10.12  11.37  |  1.51 cm
+   15   no     121       7.62    10.44  12.81  |  1.79 cm
+
+=== LOCAL REGISTRATION ERROR OF THE MODEL AGAINST EACH VIEW ===
+TRAINED (5 frames)      : median |d| = 4.84 px  = 1.14 cm at 1.22 m
+NEVER-TRAINED (11 frames): median |d| = 4.96 px  = 1.17 cm at 1.22 m
+
+prepass poseGraph finalResidualMedianCentimeters = 2.78 (converged: false)
+prepass qcCard driftCentimeters = 10.47
+model Gaussian largest axis at 1.22 m = 3.88 px (1 sigma)

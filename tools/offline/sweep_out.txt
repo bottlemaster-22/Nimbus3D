@@ -1,0 +1,83 @@
+optimiser term carried into every row: drift +0.00006 dec/pass, diffusion 0.00195 dec/pass  (calibrated on build 182)
+TARGET (Scaniverse, same room): p10 1.327 p50 3.388 p90 11.825 spread 8.913x sd 0.6361
+
+CURRENT HEAD (baseline)            p10   6.716 p50  10.002 p90   14.322  spread  2.132x  sd 0.1271  pop  298619  split   30937 clone  123671 reloc       0  3x@  never  8.9x@  never 
+
+--- THE FOUR LEVERS ASKED ABOUT, one at a time --------------------
+densifyInterval 100 -> 50          p10   6.645 p50   9.939 p90   14.284  spread  2.150x  sd 0.1282  pop  297703  split   31974 clone  127728 reloc       0  3x@  never  8.9x@  never 
+maxRelocationFraction .05 -> .10   p10   6.716 p50  10.002 p90   14.322  spread  2.132x  sd 0.1271  pop  298619  split   30937 clone  123671 reloc       0  3x@  never  8.9x@  never 
+splitShrink 1.6 -> 2.0             p10   5.539 p50   9.719 p90   14.295  spread  2.581x  sd 0.1564  pop  298619  split   30937 clone  123671 reloc       0  3x@  never  8.9x@  never 
+splatCap 300k -> 400k              p10   6.362 p50   9.435 p90   13.782  spread  2.166x  sd 0.1294  pop  398158  split   51227 clone  204871 reloc       0  3x@  never  8.9x@  never 
+
+--- all four together ---------------------------------------------
+all four                           p10   5.081 p50   8.745 p90   13.711  spread  2.698x  sd 0.1644  pop  396935  split   52602 clone  210326 reloc       0  3x@  never  8.9x@  never 
+
+--- levers the model says actually bind ---------------------------
+splitShare 0.2 -> 1.0              p10   2.426 p50   5.882 p90   12.573  spread  5.183x  sd 0.2743  pop  298619  split  154608 clone       0 reloc       0  3x@500  8.9x@  never 
+splitScreenRadiusPx back on (b182) p10   2.450 p50   5.911 p90   12.590  spread  5.139x  sd 0.2737  pop  298619  split  153536 clone    1072 reloc       0  3x@500  8.9x@  never 
+seeds 150k -> 60k (more headroom)  p10   5.848 p50   8.440 p90   12.600  spread  2.155x  sd 0.1286  pop  298619  split   48910 clone  195570 reloc       0  3x@  never  8.9x@  never 
+seeds 150k -> 30k                  p10   5.436 p50   7.671 p90   11.352  spread  2.088x  sd 0.1244  pop  298619  split   54886 clone  219478 reloc       0  3x@  never  8.9x@  never 
+densifyEnd 0.85 -> 1.0             p10   6.705 p50   9.986 p90   14.310  spread  2.134x  sd 0.1271  pop  299769  split   31172 clone  124591 reloc       0  3x@  never  8.9x@  never 
+densifyStart 0.10 -> 0.02          p10   5.216 p50   7.748 p90   12.619  spread  2.419x  sd 0.1475  pop  298619  split   66940 clone   87680 reloc   15000  3x@  never  8.9x@  never 
+prune 0.00077 -> 0.01 of pop/pass  p10   6.231 p50   9.287 p90   13.837  spread  2.221x  sd 0.1329  pop  282447  split   41970 clone  167880 reloc       0  3x@  never  8.9x@  never 
+prune -> 0.05 of pop/pass          p10   4.960 p50   6.901 p90   11.545  spread  2.328x  sd 0.1400  pop  220530  split   89850 clone  359400 reloc       0  3x@  never  8.9x@  never 
+scorePersistence 0.5 -> 0.0        p10   6.921 p50  10.183 p90   14.381  spread  2.078x  sd 0.1231  pop  298619  split   30937 clone  123671 reloc       0  3x@  never  8.9x@  never 
+scorePersistence 0.5 -> 1.0        p10   6.397 p50   9.828 p90   14.276  spread  2.232x  sd 0.1412  pop  298619  split   30937 clone  123671 reloc       0  3x@  never  8.9x@  never 
+
+--- splitShareOfGrowth sweep, everything else at head defaults ----
+  splitShare 0.0                   p10   8.293 p50  11.369 p90   15.567  spread  1.877x  sd 0.1067  pop  298619  split       0 clone  154608 reloc       0  3x@  never  8.9x@  never 
+  splitShare 0.2                   p10   6.716 p50  10.002 p90   14.322  spread  2.132x  sd 0.1271  pop  298619  split   30937 clone  123671 reloc       0  3x@  never  8.9x@  never 
+  splitShare 0.4                   p10   5.590 p50   8.599 p90   13.409  spread  2.399x  sd 0.1462  pop  298619  split   61855 clone   92753 reloc       0  3x@  never  8.9x@  never 
+  splitShare 0.6                   p10   4.348 p50   7.518 p90   12.932  spread  2.974x  sd 0.1794  pop  298619  split   92772 clone   61836 reloc       0  3x@  never  8.9x@  never 
+  splitShare 0.8                   p10   3.333 p50   6.575 p90   12.733  spread  3.820x  sd 0.2225  pop  298619  split  123690 clone   30918 reloc       0  3x@600  8.9x@  never 
+  splitShare 1.0                   p10   2.426 p50   5.882 p90   12.573  spread  5.183x  sd 0.2743  pop  298619  split  154608 clone       0 reloc       0  3x@500  8.9x@  never 
+
+--- splitShrink sweep at splitShare 1.0 ---------------------------
+  share 1.0, shrink 1.4            p10   3.619 p50   7.086 p90   12.729  spread  3.518x  sd 0.2099  pop  298619  split  154608 clone       0 reloc       0  3x@800  8.9x@  never 
+  share 1.0, shrink 1.6            p10   2.426 p50   5.882 p90   12.573  spread  5.183x  sd 0.2743  pop  298619  split  154608 clone       0 reloc       0  3x@500  8.9x@  never 
+  share 1.0, shrink 2.0            p10   1.234 p50   4.328 p90   12.509  spread 10.140x  sd 0.3877  pop  298619  split  154608 clone       0 reloc       0  3x@400  8.9x@1000 
+  share 1.0, shrink 2.5            p10   0.630 p50   3.289 p90   12.503  spread 19.837x  sd 0.5042  pop  298619  split  154608 clone       0 reloc       0  3x@400  8.9x@500 
+  share 1.0, shrink 3.0            p10   0.365 p50   2.710 p90   12.503  spread 34.282x  sd 0.6005  pop  298619  split  154608 clone       0 reloc       0  3x@300  8.9x@400 
+
+--- interval sweep at splitShare 1.0 ------------------------------
+  share 1.0, interval 100          p10   2.426 p50   5.882 p90   12.573  spread  5.183x  sd 0.2743  pop  298619  split  154608 clone       0 reloc       0  3x@500  8.9x@  never 
+  share 1.0, interval 50           p10   2.278 p50   5.755 p90   12.536  spread  5.504x  sd 0.2947  pop  297703  split  159702 clone       0 reloc       0  3x@400  8.9x@  never 
+  share 1.0, interval 25           p10   1.717 p50   4.793 p90   11.790  spread  6.865x  sd 0.3428  pop  295650  split  169404 clone       0 reloc   45000  3x@350  8.9x@  never 
+
+--- the combination that actually gets there ----------------------
+seeds 30k + share 1.0 + prune .01  p10   0.339 p50   1.258 p90    4.235  spread 12.504x  sd 0.4212  pop  282447  split  326592 clone       0 reloc       0  3x@600  8.9x@1800 
+  + interval 50                    p10   0.106 p50   0.911 p90    3.815  spread 35.989x  sd 0.5887  pop  271319  split  394136 clone       0 reloc       0  3x@500  8.9x@1050 
+  + shrink 2.0                     p10   0.012 p50   0.284 p90    2.267  spread 195.721x  sd 0.8605  pop  271319  split  394136 clone       0 reloc       0  3x@450  8.9x@550 
+  + start 0.02, end 1.0            p10   0.006 p50   0.196 p90    1.930  spread 319.078x  sd 0.9515  pop  297000  split  423000 clone       0 reloc   15000  3x@250  8.9x@350 
+
+--- baseline trace, so the plateau is visible ---------------------
+  it  100 pop  150000 alw      0 rl      0  p10   7.084 p50   7.505 p90   7.949  spread  1.122x sd 0.0195
+  it  200 pop  150000 alw      0 rl      0  p10   7.019 p50   7.611 p90   8.258  spread  1.176x sd 0.0275
+  it  300 pop  195000 alw  45000 rl      0  p10   6.399 p50   7.586 p90   8.364  spread  1.307x sd 0.0563
+  it  400 pop  240000 alw  45000 rl      0  p10   5.361 p50   7.523 p90   8.471  spread  1.580x sd 0.0705
+  it  500 pop  284781 alw  45000 rl      0  p10   5.243 p50   7.426 p90   8.568  spread  1.634x sd 0.0794
+  it  600 pop  299769 alw  15219 rl      0  p10   5.240 p50   7.419 p90   8.752  spread  1.670x sd 0.0836
+  it  700 pop  299769 alw    231 rl      0  p10   5.297 p50   7.488 p90   8.967  spread  1.693x sd 0.0858
+  it  800 pop  299769 alw    231 rl      0  p10   5.352 p50   7.559 p90   9.181  spread  1.715x sd 0.0881
+  it  900 pop  299769 alw    231 rl      0  p10   5.409 p50   7.638 p90   9.391  spread  1.736x sd 0.0902
+  it 1000 pop  299769 alw    231 rl      0  p10   5.466 p50   7.721 p90   9.608  spread  1.758x sd 0.0923
+  it 1100 pop  299769 alw    231 rl      0  p10   5.524 p50   7.808 p90   9.818  spread  1.778x sd 0.0944
+  it 1200 pop  299769 alw    231 rl      0  p10   5.584 p50   7.899 p90  10.038  spread  1.798x sd 0.0964
+  it 1300 pop  299769 alw    231 rl      0  p10   5.642 p50   7.991 p90  10.253  spread  1.817x sd 0.0983
+  it 1400 pop  299769 alw    231 rl      0  p10   5.703 p50   8.090 p90  10.465  spread  1.835x sd 0.1002
+  it 1500 pop  299769 alw    231 rl      0  p10   5.760 p50   8.188 p90  10.680  spread  1.854x sd 0.1021
+  it 1600 pop  299769 alw    231 rl      0  p10   5.819 p50   8.290 p90  10.901  spread  1.874x sd 0.1040
+  it 1700 pop  299769 alw    231 rl      0  p10   5.878 p50   8.399 p90  11.125  spread  1.893x sd 0.1059
+  it 1800 pop  299769 alw    231 rl      0  p10   5.940 p50   8.508 p90  11.350  spread  1.911x sd 0.1076
+  it 1900 pop  299769 alw    231 rl      0  p10   6.002 p50   8.620 p90  11.579  spread  1.929x sd 0.1094
+  it 2000 pop  299769 alw    231 rl      0  p10   6.063 p50   8.734 p90  11.806  spread  1.947x sd 0.1111
+  it 2100 pop  299769 alw    231 rl      0  p10   6.122 p50   8.850 p90  12.040  spread  1.967x sd 0.1129
+  it 2200 pop  299769 alw    231 rl      0  p10   6.183 p50   8.970 p90  12.285  spread  1.987x sd 0.1146
+  it 2300 pop  299769 alw    231 rl      0  p10   6.251 p50   9.093 p90  12.522  spread  2.003x sd 0.1162
+  it 2400 pop  299769 alw    231 rl      0  p10   6.316 p50   9.208 p90  12.764  spread  2.021x sd 0.1178
+  it 2500 pop  299769 alw    231 rl      0  p10   6.378 p50   9.334 p90  13.004  spread  2.039x sd 0.1194
+  it 2600 pop  299539 alw      0 rl      0  p10   6.442 p50   9.462 p90  13.261  spread  2.058x sd 0.1210
+  it 2700 pop  299309 alw      0 rl      0  p10   6.509 p50   9.593 p90  13.513  spread  2.076x sd 0.1225
+  it 2800 pop  299079 alw      0 rl      0  p10   6.577 p50   9.727 p90  13.784  spread  2.096x sd 0.1241
+  it 2900 pop  298849 alw      0 rl      0  p10   6.649 p50   9.864 p90  14.053  spread  2.114x sd 0.1256
+  it 3000 pop  298619 alw      0 rl      0  p10   6.716 p50  10.002 p90  14.322  spread  2.132x sd 0.1271

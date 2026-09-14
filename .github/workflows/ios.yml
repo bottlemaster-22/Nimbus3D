@@ -1,22 +1,40 @@
 # Nimbus3D iOS CI
 #
-# Builds an UNSIGNED Nimbus3D.ipa on a macOS runner:
-#   1. Install XcodeGen, generate Nimbus3D.xcodeproj from app/project.yml
-#   2. Build the Rust core (Brush engine) into Frameworks/NimbusSplatCore.xcframework
-#      via the SplatEngine module's build script
-#   3. xcodebuild archive with CODE_SIGNING_ALLOWED=NO (no Apple certs anywhere in CI;
-#      the Bottle stack re-signs the IPA with the user's free Apple ID at install time)
-#   4. Package Payload/Nimbus3D.app into Nimbus3D.ipa by hand
-#      (xcodebuild -exportArchive requires signing, so we zip the archive output instead)
-#   5. Upload the IPA as a build artifact on every run, and as a Release asset on v* tags
-#      (that Release asset URL is what Bottle's source.json points at; see
-#       BOTTLE_HOOKS.md at the repo root)
+# Builds an UNSIGNED .ipa on a macOS runner:
+#   1. Install XcodeGen, generate App.xcodeproj from ios/project.yml
+#      (Xcode PROJECT/TARGET/SCHEME are the brand-neutral name "App"; the
+#      user-visible product name comes from the settingGroups.brand block in
+#      ios/project.yml, so a rename never touches this workflow)
+#   2. xcodebuild archive with CODE_SIGNING_ALLOWED=NO (no Apple certs anywhere
+#      in CI; the Bottle stack re-signs the IPA with the user's free Apple ID
+#      at install time)
+#   3. Package Payload/<Product>.app into <Product>.ipa by hand, discovering
+#      the product name by globbing Products/Applications/*.app instead of
+#      hardcoding it (xcodebuild -exportArchive requires signing, so we zip
+#      the archive output instead)
+#   4. Upload the IPA as a build artifact on every run, and as a Release asset
+#      on v* tags (that Release asset URL is what Bottle's source.json points
+#      at; see BOTTLE_HOOKS.md at the repo root)
+#
+# NO Rust step. Pure Swift + Metal + Apple system frameworks (ios/project.yml
+# `packages: {}`) — nothing here to cross-compile, nothing to fail on target
+# triples. That was the previous attempt's failure mode; do not reintroduce it.
+#
+# A second, independent job (booster-check) sanity-checks the Python PC
+# Booster companion under booster/ on a cheap ubuntu runner. It does not
+# gate or depend on the iOS build.
 
 name: iOS build (unsigned IPA)
 
 on:
   push:
-    branches: [main]
+    # EVERY branch, not just main. This is here for the `deadwire` job below,
+    # which is cheap and must see every push. The expensive macOS archive is
+    # NOT widened with it: the `build` job carries an `if:` that reproduces the
+    # old trigger exactly (push to main, a v* tag, any PR, manual dispatch), so
+    # a push to a feature branch runs the checks and skips the 90-minute
+    # archive. Nothing about when an IPA gets built has changed.
+    branches: ["**"]
     tags: ["v*"]
   pull_request:
     branches: [main]
@@ -30,14 +48,120 @@ permissions:
   contents: write # needed only by the Release step on tag builds
 
 jobs:
+  # ===========================================================================
+  #  THE DEAD-WIRE GATE
+  #
+  #  Four scan-destroying bugs in this project were all the same bug: code that
+  #  was written, looked configured, compiled, and was never called. Pruning
+  #  ran ungated. Densification could never add a splat. Loop closure never ran
+  #  in any scan. Every export was drawn at the wrong opacity. All four were
+  #  found by accident.
+  #
+  #  `tools/deadwire.py` reports every declaration whose name appears nowhere
+  #  else in the module. Roughly 113 of those are known-harmless - scanner
+  #  false positives (a local used only inside a string literal, a Swift mirror
+  #  of a Metal struct) and genuine spare helpers. Each one is listed with a
+  #  reason in `tools/deadwire_allowlist.txt` and excluded here.
+  #
+  #  So this job goes red for exactly one reason: somebody wrote NEW code that
+  #  nothing calls. That is the signal, and it is the reason this is not just
+  #  "print the count and move on" - a check that is always red is a check
+  #  everybody learns to scroll past.
+  #
+  #  IT DOES NOT BLOCK THE IPA. The archive job does not depend on this one, on
+  #  purpose: the phone build is how the owner gets a working app, and a lint
+  #  finding must never be the reason he cannot install one. Red check, IPA
+  #  still produced.
+  # ===========================================================================
+  # ===========================================================================
+  #  THE TRAPPING-CONVERSION GATE (second step in the same job)
+  #
+  #  This is the one that has actually been crashing the owner's phone.
+  #
+  #  `Int64(someFloat)`, `Int32(...)`, `Int(...)` and `UInt8(...)` are TRAPPING
+  #  conversions in Swift. They kill the process, in release as well as debug,
+  #  on NaN, on infinity, and on any finite value outside the destination type.
+  #  ARKit published a camera transform that did not invert, `simd_inverse` of
+  #  a singular matrix is silently NaN in every element, every world position
+  #  from that frame was NaN, and the first of roughly half a million
+  #  conversions per second killed the app. Memory was never involved, which is
+  #  why "it crashes with RAM free" was the clue that cracked it.
+  #
+  #  The same three lines were found in FIVE separate files. That is what makes
+  #  this a tool and not a code review: the shape spreads by copy and paste,
+  #  and clamping does not necessarily save you, because Swift's `min`/`max`
+  #  absorb their SECOND argument and propagate their first, so
+  #  `UInt8(max(0, min(255, x)))` is safe and `UInt8(min(max(x*255, 0), 255))`
+  #  traps, and the two look identical.
+  #
+  #  Every conversion in the tree today is listed with a written reason in
+  #  tools/trapconv_allowlist.txt, so this goes red for exactly one reason:
+  #  somebody added a NEW untriaged one.
+  #
+  #  Same deal as the dead-wire gate above: it does NOT block the IPA.
+  # ===========================================================================
+  deadwire:
+    name: Static gates (dead code, trapping conversions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Look for code that was written and never wired
+        run: |
+          set -euo pipefail
+          if [ ! -f tools/deadwire.py ]; then
+            echo "::error::tools/deadwire.py is missing. It is the only automated guard against the bug class that cost this project four scan-destroying faults; do not delete it."
+            exit 1
+          fi
+          if [ ! -f tools/deadwire_allowlist.txt ]; then
+            echo "::error::tools/deadwire_allowlist.txt is missing. Without it every known-harmless candidate is reported and this check is useless noise. Restore it from git history rather than deleting the check."
+            exit 1
+          fi
+          # The script resolves ios/Sources from its own location, so it needs
+          # no path argument and works the same here as on a Windows checkout.
+          python tools/deadwire.py
+
+      - name: Look for trapping float-to-integer conversions
+        run: |
+          set -euo pipefail
+          if [ ! -f tools/trapconv.py ]; then
+            echo "::error::tools/trapconv.py is missing. It is the only automated guard against the crash the owner reported as 'crashing quite a bit, even with RAM free' - a trapping Int(someFloat) on a NaN world position. Restore it rather than deleting the check."
+            exit 1
+          fi
+          if [ ! -f tools/trapconv_allowlist.txt ]; then
+            echo "::error::tools/trapconv_allowlist.txt is missing. Without it every already-triaged conversion is reported and this check is useless noise. Restore it from git history rather than deleting the check."
+            exit 1
+          fi
+          # Resolves ios/Sources from its own location, like deadwire.py, so it
+          # needs no path argument and behaves identically on a Windows
+          # checkout. Exit 1 means somebody added a conversion that nobody has
+          # written a reason for; the failure output names the file and line.
+          python tools/trapconv.py
+
   build:
-    name: Archive unsigned Nimbus3D.ipa
+    name: Archive unsigned IPA
     runs-on: macos-15
     timeout-minutes: 90
+    # Reproduces the pre-existing trigger exactly, now that `on.push` matches
+    # every branch for the deadwire job: main, a v* tag, any pull request, or a
+    # manual run. A push to a feature branch skips the macOS runner.
+    if: >-
+      github.event_name != 'push'
+      || github.ref == 'refs/heads/main'
+      || startsWith(github.ref, 'refs/tags/v')
 
     env:
-      APP_DIR: app
-      SCHEME: Nimbus3D
+      IOS_DIR: ios
+      PROJECT: App.xcodeproj
+      SCHEME: App
       CONFIGURATION: Release
 
     steps:
@@ -48,105 +172,314 @@ jobs:
         run: |
           sw_vers
           xcodebuild -version
-          rustc --version || echo "rustc not on PATH yet (installed below)"
 
       - name: Install XcodeGen
         run: brew install xcodegen
 
-      - name: Install Rust iOS targets
-        run: |
-          # Rust (rustup) is preinstalled on GitHub macOS runners; we only add the
-          # device/simulator targets the xcframework build needs.
-          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
-
-      - name: Cache cargo registry and Rust build output
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ${{ env.APP_DIR }}/Sources/SplatEngine/**/target
-          key: cargo-ios-${{ runner.os }}-${{ hashFiles('app/Sources/SplatEngine/**/Cargo.lock') }}
-          restore-keys: |
-            cargo-ios-${{ runner.os }}-
-
-      - name: Build Rust core (NimbusSplatCore.xcframework)
-        working-directory: ${{ env.APP_DIR }}
-        run: |
-          set -euo pipefail
-          # Contract (NIMBUS_CONTRACTS.md "Build rules"): the SplatEngine module owns the
-          # Rust crate and a build script that must produce Frameworks/NimbusSplatCore.xcframework.
-          # Conventional location: Sources/SplatEngine/build-xcframework.sh
-          SCRIPT="Sources/SplatEngine/build-xcframework.sh"
-          if [ ! -f "$SCRIPT" ]; then
-            echo "::error file=app/Sources/SplatEngine/build-xcframework.sh::Missing $SCRIPT. The SplatEngine module must provide this script (it builds the Brush-based Rust core into Frameworks/NimbusSplatCore.xcframework). The app cannot link without it; see app/NIMBUS_CONTRACTS.md, Build rules."
-            exit 1
-          fi
-          bash "$SCRIPT"
-          if [ ! -d "Frameworks/NimbusSplatCore.xcframework" ]; then
-            echo "::error::$SCRIPT completed but Frameworks/NimbusSplatCore.xcframework was not produced. Fix the SplatEngine build script so it emits the xcframework at that exact path (project.yml links it from there)."
-            exit 1
-          fi
-          echo "xcframework contents:"
-          find Frameworks/NimbusSplatCore.xcframework -maxdepth 2
-
       - name: Generate Xcode project (XcodeGen)
-        working-directory: ${{ env.APP_DIR }}
+        working-directory: ${{ env.IOS_DIR }}
         run: |
           set -euo pipefail
           xcodegen generate
-          test -d Nimbus3D.xcodeproj
+          test -d "$PROJECT"
 
       - name: Archive (unsigned)
-        working-directory: ${{ env.APP_DIR }}
+        working-directory: ${{ env.IOS_DIR }}
         run: |
           set -euo pipefail
+
+          # The commit the binary is built from, stamped into the
+          # Info.plist and shown at the bottom of the Scans tab. Seven
+          # builds shipped indistinguishable from each other and a bug
+          # got reported against a build three releases behind its fix;
+          # identifying it afterwards meant matching Mach-O UUIDs to
+          # release artefacts. This makes the running app say so itself.
+          # NOT `git rev-parse HEAD`, for two separate reasons that both
+          # broke the archive when it was written that way.
+          #
+          # One: for a pull_request event the checkout is an ephemeral
+          # MERGE commit that exists in no branch, so HEAD names a commit
+          # thrown away when the run ends. The whole point of this field is
+          # tracing a build on a phone back to source, and an unresolvable
+          # SHA does not do that.
+          #
+          # Two: actions/checkout fetches depth 1, so on a pull request the
+          # head commit is not even in the local object store and asking
+          # git for it fails with "Needed a single revision".
+          #
+          # GitHub already hands us the SHA, so no git call is needed at
+          # all. Shortening it is a substring.
+          REVISION_FULL="${{ github.event.pull_request.head.sha || github.sha }}"
+          REVISION="${REVISION_FULL:0:7}"
+
+          # Development self-update. Both empty unless the secrets exist,
+          # and empty means BrandConfig.selfUpdate is nil and the app has
+          # no update UI at all, so a fork build or a secretless build is
+          # not a broken build, it is a build without the feature.
+          #
+          # Read into shell variables rather than interpolated straight
+          # into the xcodebuild line, so the token is never part of the
+          # command text that Actions echoes into the log.
+          SELFUPDATE_URL="${{ secrets.BOTTLE_SELFUPDATE_URL }}"
+          SELFUPDATE_TOKEN="${{ secrets.BOTTLE_SELFUPDATE_TOKEN }}"
+          if [ -z "$SELFUPDATE_URL" ] || [ -z "$SELFUPDATE_TOKEN" ]; then
+            echo "::notice::Self-update not configured; building without it."
+            SELFUPDATE_URL=""
+            SELFUPDATE_TOKEN=""
+          fi
+
           xcodebuild archive \
-            -project Nimbus3D.xcodeproj \
+            -project "$PROJECT" \
             -scheme "$SCHEME" \
             -configuration "$CONFIGURATION" \
             -destination 'generic/platform=iOS' \
-            -archivePath build/Nimbus3D.xcarchive \
+            -archivePath build/App.xcarchive \
             -derivedDataPath build/DerivedData \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
             DEVELOPMENT_TEAM="" \
-            PROVISIONING_PROFILE_SPECIFIER=""
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            NIMBUS_SOURCE_REVISION="$REVISION" \
+            NIMBUS_SELFUPDATE_URL="${SELFUPDATE_URL}" \
+            NIMBUS_SELFUPDATE_TOKEN="${SELFUPDATE_TOKEN}"
 
-      - name: Package Nimbus3D.ipa (Payload zip, still unsigned)
-        working-directory: ${{ env.APP_DIR }}
+      - name: Package .ipa (Payload zip, still unsigned)
+        working-directory: ${{ env.IOS_DIR }}
         run: |
           set -euo pipefail
-          APP="build/Nimbus3D.xcarchive/Products/Applications/Nimbus3D.app"
-          if [ ! -d "$APP" ]; then
-            echo "::error::Archive did not contain $APP. xcodebuild archive output layout changed or the archive failed silently."
+          # The built product is named after ios/project.yml's
+          # settingGroups.brand.NIMBUS_PRODUCT_NAME (currently "Nimbus3D"), NOT
+          # after the xcodeproj/target/scheme name "App". Discover it by
+          # globbing rather than hardcoding, so a rename never breaks CI.
+          APPS_DIR="build/App.xcarchive/Products/Applications"
+          if [ ! -d "$APPS_DIR" ]; then
+            echo "::error::Archive did not contain $APPS_DIR. xcodebuild archive output layout changed or the archive failed silently."
             exit 1
           fi
+          APP_PATH="$(find "$APPS_DIR" -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app bundle found under $APPS_DIR. Check the archive step output above."
+            exit 1
+          fi
+          APP_NAME="$(basename "$APP_PATH" .app)"
+          echo "Discovered product: $APP_NAME"
+          echo "APP_NAME=$APP_NAME" >> "$GITHUB_ENV"
+
           rm -rf build/ipa
           mkdir -p build/ipa/Payload
-          cp -R "$APP" build/ipa/Payload/
-          (cd build/ipa && zip -qry ../Nimbus3D.ipa Payload)
-          ls -lh build/Nimbus3D.ipa
-          # Bottle's agent enforces MAX_IPA_BYTES (512 MB). Warn early if we blow past it.
-          SIZE=$(stat -f%z build/Nimbus3D.ipa)
+          cp -R "$APP_PATH" build/ipa/Payload/
+          (cd build/ipa && zip -qry "../${APP_NAME}.ipa" Payload)
+          ls -lh "build/${APP_NAME}.ipa"
+
+          # Bottle's agent enforces MAX_IPA_BYTES (512 MB). Warn early if we
+          # blow past it; see BOTTLE_HOOKS.md "Signing notes for the Bottle side".
+          SIZE=$(stat -f%z "build/${APP_NAME}.ipa")
           if [ "$SIZE" -gt 536870912 ]; then
-            echo "::warning::Nimbus3D.ipa is $SIZE bytes (> 512 MB). Bottle's sideload agent will reject it; see Nimbus3D/BOTTLE_INTEGRATION.md 'Honest limits'."
+            echo "::warning::${APP_NAME}.ipa is $SIZE bytes (> 512 MB). Bottle's sideload agent will reject it; see Nimbus3D/BOTTLE_INTEGRATION.md 'Honest limits'."
           fi
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Nimbus3D-unsigned-ipa
-          path: ${{ env.APP_DIR }}/build/Nimbus3D.ipa
+          name: ${{ env.APP_NAME }}-unsigned-ipa
+          path: ${{ env.IOS_DIR }}/build/${{ env.APP_NAME }}.ipa
           if-no-files-found: error
           retention-days: 30
+
+      # =====================================================================
+      #  PUBLISH TO THE BOTTLE SIDELOAD BROKER
+      #
+      #  TEMPORARY DEVELOPMENT FEATURE. Delete this one step to remove it
+      #  entirely; nothing else in this workflow depends on it. It exists so a
+      #  green build reaches the owner's phone without him shuttling .ipa files
+      #  by hand, and it should go away once there is a paid developer account
+      #  and TestFlight.
+      #
+      #  WHAT LEAVES CI, AND NOTHING ELSE: the unsigned .ipa. That is the same
+      #  app binary that is already installed on the owner's phone. No source,
+      #  no secrets, no scans, no logs, no user data. This app has no account,
+      #  no analytics and no telemetry, so there is no user data in CI to leak
+      #  even by accident.
+      #
+      #  WHY IT IS SAFE TO FAIL: `--fail-with-body` makes a rejected upload a
+      #  RED BUILD rather than a silent no-op, so a broken token or a changed
+      #  endpoint is visible immediately instead of quietly serving a stale
+      #  build to the phone for a week.
+      #
+      #  WHY IT CANNOT LEAK THE TOKEN: it is read from the environment, never
+      #  interpolated into the command line (where it would appear in `set -x`
+      #  output and in process listings), and GitHub masks registered secrets
+      #  in logs. `-sS` keeps curl quiet except on error.
+      #
+      #  WHY IT IS INERT UNTIL PROVISIONED: if the secret is absent the step
+      #  skips with a notice. So this can sit in the workflow doing nothing
+      #  until the owner adds the secret, and REMOVING the secret disables it
+      #  again without touching the repository.
+      #
+      #  NEVER ON PULL REQUESTS. Fork PRs cannot read secrets anyway, but the
+      #  condition is explicit so a future workflow trigger cannot widen this
+      #  by accident.
+      # =====================================================================
+      - name: Publish to Bottle sideload broker (development only)
+        # Publish whenever this job actually produced an IPA, which is NOT
+        # the same as "on a push".
+        #
+        # The `build` job above is skipped for a push to a feature branch,
+        # to keep the 90-minute macOS runner off every commit. So the old
+        # condition here, `github.event_name == 'push'`, could only ever be
+        # true at the same time as the job running for a push to main or to
+        # a v* tag. On the branch where the app is actually being developed
+        # the archive is built by the PULL REQUEST run, where event_name is
+        # 'pull_request', so the publish step never ran once. It was written
+        # and never called: the same defect class this repo has a CI gate
+        # for, in the CI file itself.
+        #
+        # The fork check is the security boundary. A pull request from a
+        # fork must never reach the publish token, and GitHub does not hand
+        # secrets to fork PRs anyway, so this makes that explicit rather
+        # than relying on it. gh-pages is excluded as before.
+        if: >-
+          github.ref != 'refs/heads/gh-pages'
+          && (github.event_name != 'pull_request'
+              || github.event.pull_request.head.repo.full_name == github.repository)
+        working-directory: ${{ env.IOS_DIR }}
+        env:
+          BOTTLE_PUBLISH_URL: ${{ secrets.BOTTLE_PUBLISH_URL }}
+          BOTTLE_PUBLISH_TOKEN: ${{ secrets.BOTTLE_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BOTTLE_PUBLISH_TOKEN:-}" ] || [ -z "${BOTTLE_PUBLISH_URL:-}" ]; then
+            echo "::notice::Bottle publish not configured (BOTTLE_PUBLISH_URL / BOTTLE_PUBLISH_TOKEN unset). Skipping."
+            exit 0
+          fi
+
+          IPA="build/${APP_NAME}.ipa"
+          SIZE=$(stat -f%z "$IPA")
+          SHA=$(shasum -a 256 "$IPA" | cut -d' ' -f1)
+
+          # Read the versions back out of the BUILT Info.plist rather than
+          # trusting what we think we passed in. If the CURRENT_PROJECT_VERSION
+          # override on the xcodebuild line is ever lost, this reports the
+          # stale value and the mismatch is visible, instead of the phone
+          # silently receiving another build numbered like the last one.
+          PLIST="build/ipa/Payload/${APP_NAME}.app/Info.plist"
+          SHORT_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")
+          BUILD_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")
+          REVISION=$(/usr/libexec/PlistBuddy -c 'Print :NBSourceRevision' "$PLIST")
+
+          if [ "$BUILD_VERSION" = "1" ] && [ "${{ github.run_number }}" != "1" ]; then
+            echo "::error::CFBundleVersion is 1 but this is CI run ${{ github.run_number }}. The version override has been lost and update detection is broken. Refusing to publish."
+            exit 1
+          fi
+
+          # Same defect, second field. "dev" is the local default, so a
+          # published build carrying it means the stamp never happened
+          # and the app on the phone cannot name its own source.
+          if [ "$REVISION" = "dev" ]; then
+            echo "::error::NBSourceRevision is dev in a CI build. The NIMBUS_SOURCE_REVISION override has been lost, so the installed app cannot identify which commit it came from. Refusing to publish."
+            exit 1
+          fi
+
+          # The values Bottle needs for the manifest entry. It recomputes
+          # sha256 over the bytes it actually receives and requires BOTH
+          # size and sha256 to match, so a corrupted upload is a 400 rather
+          # than a silently bad publish. It also opens the IPA and checks
+          # the real CFBundleIdentifier equals the one declared here.
+          #
+          # EIGHT PARTS, and that is the tested contract. Do not add a
+          # ninth without agreeing it with the broker first: a
+          # sourceRevision part was added here and removed again for
+          # exactly that reason, and it was redundant anyway because
+          # commit carries the same identity in full.
+          echo "Publishing $IPA"
+          echo "  bundle id : $BUNDLE_ID"
+          echo "  version   : $SHORT_VERSION"
+          echo "  build     : $BUILD_VERSION"
+          echo "  revision  : $REVISION"
+          echo "  size      : $SIZE bytes"
+          echo "  sha256    : $SHA"
+
+          curl -sS --fail-with-body -X POST "$BOTTLE_PUBLISH_URL" \
+            -H "Authorization: Bearer $BOTTLE_PUBLISH_TOKEN" \
+            -F "bundleIdentifier=$BUNDLE_ID" \
+            -F "version=$SHORT_VERSION" \
+            -F "buildVersion=$BUILD_VERSION" \
+            -F "minOSVersion=17.0" \
+            -F "size=$SIZE" \
+            -F "sha256=$SHA" \
+            -F "commit=${{ github.event.pull_request.head.sha || github.sha }}" \
+            -F "ipa=@$IPA;type=application/octet-stream"
+
+          echo "Published."
 
       - name: Attach IPA to GitHub Release (tags only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.APP_DIR }}/build/Nimbus3D.ipa
+          files: ${{ env.IOS_DIR }}/build/${{ env.APP_NAME }}.ipa
           fail_on_unmatched_files: true
           generate_release_notes: true
+
+  booster-check:
+    name: PC Booster sanity check (booster/)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Same trigger as the archive job, for the same reason: `on.push` now
+    # matches every branch so the deadwire gate sees every push, and this job
+    # should keep the cadence it had.
+    if: >-
+      github.event_name != 'push'
+      || github.ref == 'refs/heads/main'
+      || startsWith(github.ref, 'refs/tags/v')
+    # Independent of the iOS archive job: the Booster is an optional PC-side
+    # companion (Python, PySide6 GUI), never required for the phone app to
+    # work. This job just proves booster/ parses and lints clean; it does not
+    # build or sign anything.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check booster/ exists
+        run: |
+          set -euo pipefail
+          if [ ! -d booster ]; then
+            echo "::error::booster/ does not exist at the repo root. The PC Booster module must live at booster/ (see SESSION_JOURNAL.md and BOTTLE_HOOKS.md); this CI job has nothing to check."
+            exit 1
+          fi
+
+      - name: Install pyflakes
+        run: python -m pip install --upgrade pip pyflakes
+
+      - name: Phone and Booster agree about the brand
+        run: |
+          # Compiling and linting cannot notice that two constants in two
+          # languages have drifted apart. Renaming the app to LiKOVA edited
+          # only the Swift brand block, so the phone browsed for
+          # _likovaboost._tcp while the Booster kept registering
+          # _nimbusboost._tcp, and discovery silently stopped working.
+          python tools/brandmatch.py
+
+      - name: Compile check (py_compile)
+        run: |
+          set -euo pipefail
+          echo "Byte-compiling every .py file under booster/ ..."
+          python -m compileall -q booster
+          echo "OK: booster/ compiles."
+
+      - name: Lint (pyflakes)
+        run: |
+          set -euo pipefail
+          echo "Running pyflakes over booster/ ..."
+          python -m pyflakes booster
+          echo "OK: pyflakes found nothing to report."

@@ -1,0 +1,40 @@
+266 shipped N=120                  n 120 ( 91 dist) tr 108 ( 85 dist) ho 12 leak 6 | span   0..439 | views/G 11.21 <=3 10.19% 0v  0.00% | ang med  25.4 | visits/kf  37.0 per distinct  47.1 | visits/G mean    558 p10   185 | slices 1
+264 replica (blur key)             n 120 ( 91 dist) tr 108 ( 85 dist) ho 12 leak 6 | span   0..548 | views/G 10.96 <=3  7.60% 0v  0.07% | ang med  27.6 | visits/kf  37.0 per distinct  47.1 | visits/G mean    504 p10   148 | slices 1
+lookahead 0 N=120                  n 120 (120 dist) tr 108 (108 dist) ho 12 leak 0 | span   0..485 | views/G 14.19 <=3  5.96% 0v  0.05% | ang med  27.1 | visits/kf  37.0 per distinct  37.0 | visits/G mean    525 p10   185 | slices 1
+shipped code N=150                 n 150 (116 dist) tr 135 (106 dist) ho 15 leak 5 | span   0..599 | views/G 13.14 <=3  7.25% 0v  0.00% | ang med  28.1 | visits/kf  29.6 per distinct  37.7 | visits/G mean    522 p10   178 | slices 1
+shipped code N=180                 n 180 (139 dist) tr 162 (132 dist) ho 18 leak 11 | span   0..710 | views/G 16.03 <=3  4.88% 0v  0.00% | ang med  29.3 | visits/kf  24.7 per distinct  30.3 | visits/G mean    508 p10   198 | slices 1
+shipped code N=204                 n 204 (158 dist) tr 184 (144 dist) ho 20 leak 6 | span   0..804 | views/G 18.25 <=3  3.39% 0v  0.00% | ang med  28.5 | visits/kf  21.7 per distinct  27.8 | visits/G mean    535 p10   174 | slices 1
+shipped code N=240                 n 240 (175 dist) tr 216 (169 dist) ho 24 leak 18 | span   0..833 | views/G 21.12 <=3  3.03% 0v  0.00% | ang med  27.3 | visits/kf  18.5 per distinct  23.7 | visits/G mean    529 p10   167 | slices 19
+resume only N=120                  n 120 (120 dist) tr 108 (108 dist) ho 12 leak 0 | span   0..837 | views/G 12.38 <=3  7.72% 0v  0.04% | ang med  29.2 | visits/kf  37.0 per distinct  37.0 | visits/G mean    459 p10   148 | slices 1
+resume only N=150 STRIDE-FALLBACK  n 174 (174 dist) tr 157 (157 dist) ho 17 leak 0 | span   0..865 | views/G 17.64 <=3  3.31% 0v  0.00% | ang med  28.9 | visits/kf  25.5 per distinct  25.5 | visits/G mean    449 p10   153 | slices 1
+resume only N=204 STRIDE-FALLBACK  n 217 (217 dist) tr 195 (195 dist) ho 22 leak 0 | span   0..864 | views/G 21.56 <=3  1.10% 0v  0.00% | ang med  28.1 | visits/kf  20.5 per distinct  20.5 | visits/G mean    442 p10   164 | slices 1
+resume, gates of 120, whole walk   n 125 (125 dist) tr 113 (113 dist) ho 12 leak 0 | span   0..867 | views/G 12.69 <=3  7.39% 0v  0.04% | ang med  28.8 | visits/kf  35.4 per distinct  35.4 | visits/G mean    449 p10   142 | slices 1
+  calibrated spacing at N=120: x1.3543 of path/N = 0.4485 m
+resume+spacing x1.354 N=120        n 120 (120 dist) tr 108 (108 dist) ho 12 leak 0 | span   0..867 | views/G 12.73 <=3  8.77% 0v  0.22% | ang med  29.8 | visits/kf  37.0 per distinct  37.0 | visits/G mean    471 p10   148 | slices 1
+  calibrated spacing at N=150: x0.6370 of path/N = 0.1688 m
+resume+spacing x0.637 N=150        n 150 (150 dist) tr 135 (135 dist) ho 15 leak 0 | span   0..867 | views/G 15.29 <=3  4.89% 0v  0.00% | ang med  27.4 | visits/kf  29.6 per distinct  29.6 | visits/G mean    453 p10   148 | slices 1
+  calibrated spacing at N=180: x0.4742 of path/N = 0.1047 m
+resume+spacing x0.474 N=180        n 180 (180 dist) tr 162 (162 dist) ho 18 leak 0 | span   0..867 | views/G 18.44 <=3  2.91% 0v  0.00% | ang med  27.2 | visits/kf  24.7 per distinct  24.7 | visits/G mean    455 p10   173 | slices 1
+  calibrated spacing at N=204: x0.3207 of path/N = 0.0625 m
+resume+spacing x0.321 N=204        n 204 (204 dist) tr 184 (184 dist) ho 20 leak 0 | span   0..867 | views/G 21.16 <=3  2.36% 0v  0.00% | ang med  27.0 | visits/kf  21.7 per distinct  21.7 | visits/G mean    460 p10   152 | slices 1
+  calibrated spacing at N=227: x0.3102 of path/N = 0.0543 m
+resume+spacing x0.310 N=227        n 227 (227 dist) tr 204 (204 dist) ho 23 leak 0 | span   0..866 | views/G 23.90 <=3  1.59% 0v  0.04% | ang med  26.0 | visits/kf  19.6 per distinct  19.6 | visits/G mean    469 p10   157 | slices 1
+  calibrated turn at N=120: 0.0246 (12.7 deg)
+resume+turn 0.0246 N=120           n 120 (120 dist) tr 108 (108 dist) ho 12 leak 0 | span   0..866 | views/G 11.87 <=3  8.32% 0v  0.04% | ang med  31.4 | visits/kf  37.0 per distinct  37.0 | visits/G mean    440 p10   148 | slices 1
+  calibrated turn at N=150: 0.0108 (8.4 deg)
+resume+turn 0.0108 N=150           n 150 (150 dist) tr 135 (135 dist) ho 15 leak 0 | span   0..867 | views/G 15.45 <=3  3.86% 0v  0.00% | ang med  28.4 | visits/kf  29.6 per distinct  29.6 | visits/G mean    458 p10   148 | slices 1
+  calibrated turn at N=180: 0.0043 (5.3 deg)
+resume+turn 0.0043 N=180           n 180 (180 dist) tr 162 (162 dist) ho 18 leak 0 | span   0..867 | views/G 18.00 <=3  3.40% 0v  0.00% | ang med  28.2 | visits/kf  24.7 per distinct  24.7 | visits/G mean    444 p10   148 | slices 1
+  calibrated turn at N=204: 0.0025 (4.0 deg)
+resume+turn 0.0025 N=204           n 204 (204 dist) tr 184 (184 dist) ho 20 leak 0 | span   0..867 | views/G 20.31 <=3  3.69% 0v  0.00% | ang med  27.9 | visits/kf  21.7 per distinct  21.7 | visits/G mean    441 p10   152 | slices 1
+  shipped-code calibrated turn at 120: 0.0382 (15.9 deg)
+shipped+turn 0.0382 N=120          n 120 (114 dist) tr 108 (104 dist) ho 12 leak 2 | span   0..867 | views/G 11.78 <=3  7.10% 0v  0.26% | ang med  30.0 | visits/kf  37.0 per distinct  38.5 | visits/G mean    455 p10   148 | slices 1
+  calibrated time gate at N=120: 1.334 s
+resume+dist|time 1.33s N=120       n 120 (120 dist) tr 108 (108 dist) ho 12 leak 0 | span   0..867 | views/G 12.20 <=3  7.91% 0v  0.03% | ang med  26.8 | visits/kf  37.0 per distinct  37.0 | visits/G mean    452 p10   148 | slices 1
+  calibrated time gate at N=150: 0.934 s
+resume+dist|time 0.93s N=150       n 150 (150 dist) tr 135 (135 dist) ho 15 leak 0 | span   0..867 | views/G 15.25 <=3  4.22% 0v  0.03% | ang med  29.1 | visits/kf  29.6 per distinct  29.6 | visits/G mean    452 p10   148 | slices 1
+  calibrated time gate at N=180: 0.667 s
+resume+dist|time 0.67s N=180       n 180 (180 dist) tr 162 (162 dist) ho 18 leak 0 | span   0..867 | views/G 17.92 <=3  4.26% 0v  0.00% | ang med  30.0 | visits/kf  24.7 per distinct  24.7 | visits/G mean    443 p10   123 | slices 1
+  calibrated time gate at N=204: 0.467 s
+resume+dist|time 0.47s N=204       n 204 (204 dist) tr 184 (184 dist) ho 20 leak 0 | span   0..867 | views/G 20.66 <=3  2.46% 0v  0.00% | ang med  28.2 | visits/kf  21.7 per distinct  21.7 | visits/G mean    449 p10   152 | slices 1
+done in 840 s, 584 frames projected
