@@ -147,6 +147,24 @@ struct TrainerDensifyGather {
     }
 }
 
+/// Build 404: Morton order of the kept points' centres (21 bits an axis
+/// over their bounding box). Non-finite centres sort as the origin.
+enum TrainerSpatialOrder {
+    @inline(__always)
+    static func axis(_ value: Float) -> UInt64 {
+        guard value.isFinite else { return 0 }
+        let clamped = Swift.min(Swift.max(value, 0), 2_097_151)
+        let cell = UInt32(clamped)
+        var x = UInt64(cell & 0x1F_FFFF)
+        x = (x | (x << 32)) & 0x1F00000000FFFF
+        x = (x | (x << 16)) & 0x1F0000FF0000FF
+        x = (x | (x << 8)) & 0x100F00F00F00F00F
+        x = (x | (x << 4)) & 0x10C30C30C30C30C3
+        x = (x | (x << 2)) & 0x1249249249249249
+        return x
+    }
+}
+
 struct TrainerDensifyOutcome {
     var splatCountBefore = 0
     var splatCountAfter = 0
@@ -348,7 +366,9 @@ final class TrainerDensifier {
         /// Build 320: applies the index map on the GPU. nil keeps the CPU path.
         gather: TrainerDensifyGather? = nil,
         /// Run the CPU path beside the gather and compare the results.
-        checkGather: Bool = false
+        checkGather: Bool = false,
+        /// Build 404: also put the survivors in spatial (Morton) order.
+        reorder: Bool = false
     ) throws -> TrainerDensifyOutcome {
         // Build 372: every Metal object this pass makes (command buffers,
         // encoders, temporary buffers) is autoreleased, and the training
@@ -359,7 +379,8 @@ final class TrainerDensifier {
             try runInner(
                 resources: resources, splatCount: splatCount, splatCap: splatCap,
                 sceneExtentMeters: sceneExtentMeters, allowGrowth: allowGrowth,
-                allowPrune: allowPrune, carver: carver, gather: gather, checkGather: checkGather
+                allowPrune: allowPrune, carver: carver, gather: gather, checkGather: checkGather,
+                reorder: reorder
             )
         }
     }
@@ -373,7 +394,8 @@ final class TrainerDensifier {
         allowPrune: Bool,
         carver: FreeSpaceCarver?,
         gather: TrainerDensifyGather?,
-        checkGather: Bool
+        checkGather: Bool,
+        reorder: Bool
     ) throws -> TrainerDensifyOutcome {
 
         var outcome = TrainerDensifyOutcome()
@@ -1036,7 +1058,21 @@ final class TrainerDensifier {
         }
 
         // --- 7. Compact --------------------------------------------------------
-        if survivorCount != liveCount {
+        // BUILD 404: SPATIAL ORDER, EVERY 1,000 ITERATIONS. The per-point
+        // kernels (preprocess backward, regularizer, both Adams) dispatch over
+        // every point and return early for the ones this view did not draw,
+        // but a GPU runs them 32 at a time in lockstep, so a group pays in
+        // full if any one of its points is drawn. Splits and clones are
+        // appended at the end, which scatters the drawn points through the
+        // index order until almost every group has one. Survivors written in
+        // Morton order keep the points one view sees next to each other.
+        // Only the order changes: every array moves through the same
+        // `source` map the compaction already uses.
+        let reorderNow = reorder && survivorCount > 1
+        if survivorCount != liveCount || reorderNow {
+            let order: [Int] = reorderNow
+                ? Self.spatialOrder(splats, keep: keep, count: liveCount)
+                : (0..<liveCount).filter { keep[$0] }
             var outSplats: [TrainerSplat] = []
             var outStats: [TrainerSplatStats] = []
             var outSource: [UInt32] = []
@@ -1045,7 +1081,7 @@ final class TrainerDensifier {
             outStats.reserveCapacity(survivorCount)
             outSource.reserveCapacity(survivorCount)
             outFlags.reserveCapacity(survivorCount)
-            for i in 0..<liveCount where keep[i] {
+            for i in order {
                 outSplats.append(splats[i])
                 outStats.append(i < stats.count ? stats[i] : TrainerSplatStats())
                 outSource.append(source[i])
@@ -1068,7 +1104,7 @@ final class TrainerDensifier {
                 outSHM.reserveCapacity(survivorCount * shPerSplat)
                 outSHV.reserveCapacity(survivorCount * shPerSplat)
                 outTopK.reserveCapacity(survivorCount)
-                for i in 0..<liveCount where keep[i] {
+                for i in order {
                     outM.append(i < adamM.count ? adamM[i] : TrainerSplatGrad())
                     outV.append(i < adamV.count ? adamV[i] : TrainerSplatGrad())
                     outTopK.append(i < topK.count ? topK[i] : TrainerSamplingTopK())
@@ -1208,6 +1244,30 @@ final class TrainerDensifier {
     /// coming out badly, the remaining range is sorted outright rather than
     /// allowed to run quadratic on a phone. It has to be an explicit fallback
     /// and not a promise, because "expected linear" is not a bound.
+    static func spatialOrder(_ splats: [TrainerSplat], keep: [Bool], count: Int) -> [Int] {
+        var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var hi = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        for i in 0..<count where keep[i] {
+            let m = splats[i].mean
+            guard m.x.isFinite, m.y.isFinite, m.z.isFinite else { continue }
+            lo = simd_min(lo, m)
+            hi = simd_max(hi, m)
+        }
+        let span = simd_max(hi - lo, SIMD3<Float>(repeating: 1e-6))
+        let scale = SIMD3<Float>(repeating: 2_097_151) / span
+        var keyed: [(key: UInt64, index: Int)] = []
+        keyed.reserveCapacity(count)
+        for i in 0..<count where keep[i] {
+            let q = (splats[i].mean - lo) * scale
+            let key = TrainerSpatialOrder.axis(q.x)
+                | (TrainerSpatialOrder.axis(q.y) << 1)
+                | (TrainerSpatialOrder.axis(q.z) << 2)
+            keyed.append((key, i))
+        }
+        keyed.sort { $0.key < $1.key }
+        return keyed.map { $0.index }
+    }
+
     private static func partitionHighest(
         _ a: inout [Int], by score: [Float], count k: Int
     ) {

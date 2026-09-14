@@ -1925,7 +1925,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     // difference switches the run back to the CPU path.
                     gather: densifyGatherUsable
                         ? TrainerDensifyGather(gpu: gpu, queue: queue) : nil,
-                    checkGather: densifyPassesRun == 0
+                    checkGather: densifyPassesRun == 0,
+                    // Build 404: spatial order every 1,000 iterations.
+                    reorder: iteration % 1000 == 0
                 )
                 splatCount = outcome.splatCountAfter
                 if outcome.availableAfterCPUWorkMB > 0 {
