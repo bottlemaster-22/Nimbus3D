@@ -1147,12 +1147,12 @@ final class TrainerDensifier {
                 to: liveCount, keeping: gather == nil ? 0 : splatCount
             )
         }
-        outcome.availableAfterCPUWorkMB = Double(DeviceMemoryFacts.probe().availableBytes) / 1_048_576
+        outcome.availableAfterCPUWorkMB = Double(DeviceMemoryFacts.probeMemoryOnly().availableBytes) / 1_048_576
         resources.splats.writeArray(splats)
         resources.stats.writeArray(stats)
         if let gather {
             try gather.apply(resources: resources, source: source, flags: flags, count: liveCount)
-            outcome.availableAfterGatherMB = Double(DeviceMemoryFacts.probe().availableBytes) / 1_048_576
+            outcome.availableAfterGatherMB = Double(DeviceMemoryFacts.probeMemoryOnly().availableBytes) / 1_048_576
             if bulkOnCPU {
                 // The checking pass: the old copy path's arrays against what
                 // the kernel wrote, bit for bit.

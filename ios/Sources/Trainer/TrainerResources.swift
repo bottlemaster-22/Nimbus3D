@@ -845,7 +845,7 @@ final class TrainerResources {
         // with the instances that fit (counted as truncated) instead of the
         // app being killed.
         var wanted = Swift.min(newCapacity, 64_000_000)
-        let facts = DeviceMemoryFacts.probe()
+        let facts = DeviceMemoryFacts.probeMemoryOnly()
         if !facts.availableIsEstimated, wanted > instanceCapacity {
             let reserve: UInt64 = 384 * 1_048_576
             let affordable = facts.availableBytes > reserve ? Int((facts.availableBytes - reserve) / 16) : 0

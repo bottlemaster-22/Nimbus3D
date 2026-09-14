@@ -1934,7 +1934,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         ? TrainerDensifyGather(gpu: gpu, queue: queue) : nil,
                     checkGather: densifyPassesRun == 0,
                     // Build 404: spatial order every 1,000 iterations.
-                    reorder: iteration % 1000 == 0
+                    // Build 412: off. Build 408 on the same scan as 382: gpuStep
+                    // 304.5 s against 306.6 s, so the SIMD-group theory did not pay.
+                    reorder: false
                 )
                 splatCount = outcome.splatCountAfter
                 timings.spatialReorderSeconds += outcome.reorderSeconds
@@ -4258,7 +4260,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     private func memoryEvent(_ stage: String, iteration: Int) -> TrainerCensusMemoryEvent {
         TrainerCensusMemoryEvent(
             iteration: iteration, stage: stage,
-            availableMB: Double(DeviceMemoryFacts.probe().availableBytes) / 1_048_576
+            availableMB: Double(DeviceMemoryFacts.probeMemoryOnly().availableBytes) / 1_048_576
         )
     }
 

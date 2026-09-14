@@ -256,6 +256,17 @@ public struct DeviceMemoryFacts: Codable, Hashable, Sendable {
     public var freeDiskBytes: Int64?
 
     public static func probe() -> DeviceMemoryFacts {
+        var facts = probeMemoryOnly()
+        facts.freeDiskBytes = freeDiskBytes()
+        return facts
+    }
+
+    /// Build 412: the memory figures without the free-disk query. That query
+    /// (volumeAvailableCapacityForImportantUsage) costs about 14 ms on the
+    /// phone, and the trainer read memory about 1,500 times a run (governor
+    /// polls, census memory events): 14 s of densify time and 7 s of polls
+    /// spent asking for disk space nobody read.
+    public static func probeMemoryOnly() -> DeviceMemoryFacts {
         let info = ProcessInfo.processInfo
         let total = info.physicalMemory
 
@@ -281,7 +292,7 @@ public struct DeviceMemoryFacts: Codable, Hashable, Sendable {
             totalBytes: total,
             availableBytes: available,
             availableIsEstimated: estimated,
-            freeDiskBytes: freeDiskBytes()
+            freeDiskBytes: nil
         )
     }
 

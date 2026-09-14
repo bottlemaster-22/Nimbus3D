@@ -692,7 +692,7 @@ final class TrainerBudgetGovernor {
     }
 
     func measureMemory(resources: TrainerResources?) -> MemoryReading {
-        let facts = DeviceMemoryFacts.probe()
+        let facts = DeviceMemoryFacts.probeMemoryOnly()
         let trainerBuffers = resources?.residentBytes ?? 0
         return MemoryReading(
             trainerBufferBytes: trainerBuffers,
