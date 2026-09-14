@@ -752,7 +752,9 @@ struct TrainerTuning: Sendable {
     /// 0.068 s per iteration, 200 iterations is a preview that refreshes about
     /// every 14 seconds, which for watching a model converge is often enough.
     /// If it feels dead, this is the number to lower.
-    var snapshotIntervalIterations: Int = 200
+    // 500 (build 400; was 200): 150 previews a 30,000-round run was CPU the
+    // prefetch worker wanted; every 500 is about every 6 s on a room.
+    var snapshotIntervalIterations: Int = 500
     /// How often the loss accumulator WOULD be read back, if anything read
     /// this.
     ///

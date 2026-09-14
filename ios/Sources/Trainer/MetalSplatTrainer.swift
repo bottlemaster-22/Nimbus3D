@@ -2084,9 +2084,19 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 } else {
                     try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
                     let snapshotFrom = CFAbsoluteTimeGetCurrent()
-                    let cloud = readCloud(
-                        resources: resources, count: splatCount, shDegree: shDegree
-                    )
+                    // Build 400: base colour only for a single-slice preview.
+                    let cloud = completedParts.isEmpty
+                        ? Self.buildCloud(
+                            splats: resources.splats.readArray(TrainerSplat.self, count: splatCount),
+                            sh: Self.baseColour(
+                                from: resources.sh, byteOffset: 0, count: splatCount,
+                                shPerSplat: resources.shFloatsPerSplat
+                            ),
+                            shPerSplat: 3,
+                            stats: resources.stats.readArray(TrainerSplatStats.self, count: splatCount),
+                            shDegree: .zero
+                        )
+                        : readCloud(resources: resources, count: splatCount, shDegree: shDegree)
                     lock.lock()
                     latestSnapshot = mergePreview(completedParts: completedParts, current: cloud)
                     lock.unlock()
@@ -2620,6 +2630,27 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// so a later step's copy can never overtake the read; only the
     /// conversion runs elsewhere. A conversion still running when the next
     /// snapshot lands makes that one wait for the following interval.
+    /// The first three SH floats of every point (the base colour), read
+    /// straight out of a shared buffer. Empty when the buffer is short.
+    private static func baseColour(
+        from buffer: MTLBuffer, byteOffset: Int, count: Int, shPerSplat: Int
+    ) -> [Float] {
+        guard count > 0, shPerSplat >= 3,
+              buffer.length >= byteOffset + count * shPerSplat * MemoryLayout<Float>.stride
+        else { return [] }
+        let source = buffer.contents().advanced(by: byteOffset)
+            .bindMemory(to: Float.self, capacity: count * shPerSplat)
+        return [Float](unsafeUninitializedCapacity: count * 3) { destination, initialized in
+            for i in 0..<count {
+                let b = i * shPerSplat
+                destination[i * 3] = source[b]
+                destination[i * 3 + 1] = source[b + 1]
+                destination[i * 3 + 2] = source[b + 2]
+            }
+            initialized = count * 3
+        }
+    }
+
     private func startSnapshotConversion(resources: TrainerResources, count: Int) {
         lock.lock()
         let busy = snapshotConverting
@@ -2633,13 +2664,24 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         let splatBytes = count * MemoryLayout<TrainerSplat>.stride
         let shBytes = count * shPerSplat * MemoryLayout<Float>.stride
         let splats = staging.readArray(TrainerSplat.self, count: count, byteOffset: 0)
-        let sh = staging.readArray(Float.self, count: count * shPerSplat, byteOffset: splatBytes)
+        // BUILD 400: THE PREVIEW TAKES BASE COLOUR ONLY. TrainingPreview
+        // reduces every snapshot to degree 0 before drawing it, yet this
+        // copied all 48 SH floats a point (63 MB at 330,000) and built a
+        // degree-3 cloud (about 100 MB of per-point arrays) every 200
+        // iterations, and kept the last one. A single-slice run now copies
+        // the three base-colour floats (4 MB). A multi-slice run keeps the
+        // full path, because the merged preview takes parts of one degree.
+        let previewOnly = parts.isEmpty
+        let sh = previewOnly
+            ? Self.baseColour(from: staging, byteOffset: splatBytes, count: count, shPerSplat: shPerSplat)
+            : staging.readArray(Float.self, count: count * shPerSplat, byteOffset: splatBytes)
         let stats = staging.readArray(
             TrainerSplatStats.self, count: count, byteOffset: splatBytes + shBytes
         )
         DispatchQueue.global(qos: .utility).async { [self] in
             let cloud = Self.buildCloud(
-                splats: splats, sh: sh, shPerSplat: shPerSplat, stats: stats, shDegree: degree
+                splats: splats, sh: sh, shPerSplat: previewOnly ? 3 : shPerSplat, stats: stats,
+                shDegree: previewOnly ? .zero : degree
             )
             let merged = mergePreview(completedParts: parts, current: cloud)
             lock.lock()
