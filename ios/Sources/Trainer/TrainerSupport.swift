@@ -657,7 +657,11 @@ struct TrainerTuning: Sendable {
     /// 20.463 on 244; on 246 the signs reverse, 3,800 at 20.662 against 3,600
     /// at 20.632. Both differences are inside the +/-0.4 dB noise band and the
     /// sign flips between builds, which is the definition of noise.
-    var earlyStopEvalIntervalIterations: Int = 400
+    // 1,200 (build 414; was 400). With early stopping off (410) an eval only
+    // records the curve and a best checkpoint that ships only if it beats
+    // the end state by 0.3 dB; a 0.35 s eval every 400 rounds of the 1,080-px
+    // level was about 8 s a run for that.
+    var earlyStopEvalIntervalIterations: Int = 1200
 
     /// Stop after this many consecutive evaluations fail to beat the best
     /// held-out score by `earlyStopMinImprovementDB`.
