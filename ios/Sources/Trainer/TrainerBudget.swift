@@ -336,7 +336,13 @@ final class TrainerBudgetGovernor {
     /// moment that scales with either of those, so the floor is tied to it.
     /// Erring high costs a slightly earlier cut; erring low costs the scan.
     static func headroomFloor(trainerBufferBytes: UInt64) -> UInt64 {
-        Swift.max(minimumHeadroomBytes, trainerBufferBytes)
+        // BUILD 400: a quarter of the trainer's buffers, not all of them. The
+        // floor was the whole 530-710 MB, so the gate deleted points while
+        // iOS still offered the app 700 MB, which is every run with another
+        // app open (390: cut to 152,000 at 440 MB free, and killed anyway).
+        // A cut rebuilds the per-point buffers at the smaller size beside
+        // the old ones, which needs the new size, well under a quarter.
+        Swift.max(minimumHeadroomBytes, trainerBufferBytes / 4)
     }
 
     /// What `os_proc_available_memory()` said before this run had allocated
