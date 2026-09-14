@@ -758,7 +758,11 @@ final class TrainerResources {
     /// Each old allocation is released before its replacement is requested,
     /// which is safe because nothing here carries data forward and because this
     /// only ever runs between command buffers.
-    func resizeRenderSize(to newSize: TrainerRenderSize) throws {
+    /// `keepWarmupStaging` false (build 406) leaves the far-field warm-up
+    /// staging as a placeholder: only merged warm-up steps write or read it,
+    /// and a resize past warm-up (every resolution level after the first)
+    /// never needs it again. 27 MB at 1,080 px.
+    func resizeRenderSize(to newSize: TrainerRenderSize, keepWarmupStaging: Bool = true) throws {
         guard newSize != renderSize, newSize.pixelCount > 0 else { return }
 
         let px = Swift.max(newSize.pixelCount, 1)
@@ -795,7 +799,9 @@ final class TrainerResources {
         renderTFinal = try makeBuffer("renderTFinal", px * 4)
         renderNContrib = try makeBuffer("renderNContrib", px * 4)
         evalStaging = try makeBuffer("evalStaging", 2 * Self.evalStagingSlotBytes(pixelCount: px))
-        warmupStaging = try makeBuffer("warmupStaging", 2 * Self.warmupStagingSlotBytes(pixelCount: px))
+        if keepWarmupStaging {
+            warmupStaging = try makeBuffer("warmupStaging", 2 * Self.warmupStagingSlotBytes(pixelCount: px))
+        }
 
         gtColor = try makeBuffer("gtColor", px * 3)
         gtColorAlt = try makeBuffer("gtColorAlt", px * 3)

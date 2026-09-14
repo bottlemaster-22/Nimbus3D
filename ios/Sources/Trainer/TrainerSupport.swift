@@ -1175,31 +1175,34 @@ struct TrainerTuning: Sendable {
     /// 3 % faster. Past the resolution levels (build 332: 2,500+, full size
     /// begins at 55 % of a 4,500-round run), so the kernels are compared at
     /// the size they will run at for the rest of the run.
-    var backwardCalibrationStart: Int = 24200
+    // Build 406: 12,300, early in the 720-px level (40 % of 30,000), so
+    // the kernels a window keeps run for the last 60 % of the run instead of
+    // the last 20 %. Away from profiled steps (iteration % 250 == 125).
+    var backwardCalibrationStart: Int = 12300
     var backwardCalibrationSteps: Int = 6
 
     /// Build 290: the same for the radix scatter. After the backward window,
     /// so the two never share an iteration. Build 306: this window also checks
     /// the splat-order sort against the legacy one (see `splatOrderSort`).
-    var sortCalibrationStart: Int = 24210
+    var sortCalibrationStart: Int = 12310
     var sortCalibrationSteps: Int = 4
 
     /// Build 302: the same for the two-pixel forward rasteriser, after the
     /// sort window.
-    var forwardCalibrationStart: Int = 24216
+    var forwardCalibrationStart: Int = 12316
     var forwardCalibrationSteps: Int = 4
 
     /// Build 304: the two-pixel backward against the backward the first
     /// window chose (plain or SIMD-summed), after the forward window. Kept
     /// only if its gradients agree (relative L1 < 1e-3) and it is at least
     /// 3 % faster.
-    var backwardTwoPixelCalibrationStart: Int = 24222
+    var backwardTwoPixelCalibrationStart: Int = 12322
     var backwardTwoPixelCalibrationSteps: Int = 6
 
     /// Build 318: the fused SSIM blur against the two-pass one, after the
     /// two-pixel backward window. Kept only if every blurred plane matched
     /// BIT FOR BIT on every step and it was at least 3 % faster.
-    var blurCalibrationStart: Int = 24228
+    var blurCalibrationStart: Int = 12328
     var blurCalibrationSteps: Int = 2
 
     /// Build 306: allow the splat-order tile sort (depth-sort the splats, then

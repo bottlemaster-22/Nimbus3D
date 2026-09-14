@@ -1657,7 +1657,14 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             if frameSupervision.renderSize != renderSize {
                 try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
                 renderSize = frameSupervision.renderSize
-                try resources.resizeRenderSize(to: renderSize)
+                // Build 406: past warm-up the far field's staging is never used.
+                let warmupPerMille = tuning.warmupFraction.isFinite
+                    ? Int(Swift.min(Swift.max(tuning.warmupFraction, 0), 1) * 1000)
+                    : 1000
+                try resources.resizeRenderSize(
+                    to: renderSize,
+                    keepWarmupStaging: iteration <= effectiveTotal * warmupPerMille / 1000
+                )
                 gpu = TrainerGPU(pipelines: pipelines, resources: resources)
                 if !activeIsCoarse { fullRenderSize = renderSize }
             }
