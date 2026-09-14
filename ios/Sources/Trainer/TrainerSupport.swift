@@ -667,7 +667,10 @@ struct TrainerTuning: Sendable {
     /// injecting new geometry that has not settled yet.
     // 8 (build 380; was 4): 378 stopped at 25,600 on a curve rising by
     // 0.01 dB an eval; quality mode waits 3,200 iterations of flat.
-    var earlyStopPatienceEvals: Int = 8
+    // Build 410: effectively off. The owner wants every scan to run all
+    // 30,000 rounds; scan_20260912 stopped at 24,400 on a held-out curve
+    // flat to 0.01 dB while the trained views were still improving.
+    var earlyStopPatienceEvals: Int = 1_000_000
 
     /// Never stop before this many iterations, whatever the score does. Early
     /// training is noisy and the densify window has not even opened at 10 per

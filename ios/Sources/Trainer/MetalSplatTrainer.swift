@@ -1937,6 +1937,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     reorder: iteration % 1000 == 0
                 )
                 splatCount = outcome.splatCountAfter
+                timings.spatialReorderSeconds += outcome.reorderSeconds
                 if outcome.availableAfterCPUWorkMB > 0 {
                     census.memoryEvents.append(TrainerCensusMemoryEvent(
                         iteration: iterationsRunSoFar + iteration, stage: "densify.afterCPU",
@@ -2434,7 +2435,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // shipping it keeps the bundle consistent.
         let endScore = census.slices[censusRow].heldOutPSNRExposureFitted
         var shipBest = bestCheckpoint != nil
-        if shipBest, let endScore, endScore.isFinite, endScore >= bestHeldOut {
+        // Build 410: the end state ships unless the best checkpoint beat it by
+        // 0.3 dB or more, so a run that goes the full 30,000 rounds exports
+        // what those rounds made instead of a checkpoint 0.05 dB higher.
+        if shipBest, let endScore, endScore.isFinite, endScore >= bestHeldOut - 0.3 {
             shipBest = false
         }
         let bestCloud = shipBest

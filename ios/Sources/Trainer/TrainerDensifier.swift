@@ -179,6 +179,8 @@ struct TrainerDensifyOutcome {
     /// Build 392: iOS's available-memory figure (MB) at points inside the pass.
     var availableAfterCPUWorkMB: Double = 0
     var availableAfterGatherMB: Double = 0
+    /// Build 410: seconds spent building the spatial order this pass.
+    var reorderSeconds: Double = 0
     /// Build 320: on a pass that ran the CPU copy path beside the GPU gather,
     /// how many 32-bit words of the six bulk arrays differed (expected 0);
     /// nil when the pass was not checked.
@@ -1070,9 +1072,11 @@ final class TrainerDensifier {
         // `source` map the compaction already uses.
         let reorderNow = reorder && survivorCount > 1
         if survivorCount != liveCount || reorderNow {
+            let orderFrom = CFAbsoluteTimeGetCurrent()
             let order: [Int] = reorderNow
                 ? Self.spatialOrder(splats, keep: keep, count: liveCount)
                 : (0..<liveCount).filter { keep[$0] }
+            if reorderNow { outcome.reorderSeconds = CFAbsoluteTimeGetCurrent() - orderFrom }
             var outSplats: [TrainerSplat] = []
             var outStats: [TrainerSplatStats] = []
             var outSource: [UInt32] = []

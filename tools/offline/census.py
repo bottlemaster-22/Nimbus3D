@@ -192,6 +192,8 @@ if d.get('memoryEvents'):
             print('  %6d %-22s %7.0f   (%+.0f since %s @ %d)' % (_e['iteration'], _e['stage'], _e['availableMB'],
                   _e['availableMB'] - _prev['availableMB'], _prev['stage'], _prev['iteration']))
         _prev = _e
+if t.get('spatialReorderSeconds'):
+    print('spatial reorder: %.2f s of densify %.2f s' % (t['spatialReorderSeconds'], t.get('densify', 0)))
 if t.get('opacityResets'):
     print('opacity resets: %d' % t['opacityResets'])
 if t.get('memoryFootprintPeakMegabytes'):

@@ -765,6 +765,8 @@ struct TrainerTimings: Codable {
     var memoryFootprintPeakMegabytes: Double = 0
     /// Build 364: opacity resets performed (the reference recipe's, every 3,000).
     var opacityResets: Int = 0
+    /// Build 410: CPU seconds building the densify pass's spatial order.
+    var spatialReorderSeconds: Double = 0
     /// Build 330: the pose check. Photometric loss (L1 + SSIM terms) of the
     /// frame at its current camera correction and after one gradient step,
     /// on the same model; 1 if the step lowered it (full-rate refinement
