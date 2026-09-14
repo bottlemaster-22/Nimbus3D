@@ -1268,7 +1268,11 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         /// nothing. Reading the cloud costs about the same as one preview
         /// snapshot, which this loop already does every 200 iterations, and it
         /// only happens when the score actually improves.
-        var bestCloud: SplatCloud?
+        // Build 398: the best checkpoint is a file, not a CPU copy of the model
+        // (a SplatCloud of 330,000 points with per-point SH arrays was about
+        // 100 MB resident for the whole final level, doubled while replaced).
+        var bestCheckpoint: URL?
+        defer { if let bestCheckpoint { try? FileManager.default.removeItem(at: bestCheckpoint) } }
         var sinceBest = 0
         var stoppedEarly = false
         // Rounded UP to a whole number of densify intervals, because the
@@ -1475,8 +1479,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         available: Double(reading.availableBytes) / 1_048_576
                     ))
                 }
-                if iteration > 0, iteration % 1000 == 0 {
+                if iteration > 0, iteration % 1000 == 0 || (iteration < 1000 && iteration % 100 == 0) {
                     // A copy: the slice adds its count to the census at its end.
+                    // Every 100 for the first 1,000 (build 398): object scans
+                    // die early and left nothing.
                     var partial = census
                     partial.iterationsCompleted = iterationsRunSoFar + iteration
                     TrainerCensusWriter.write(partial, at: ref)
@@ -1844,9 +1850,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                         bestHeldOut = score
                         bestHeldOutIteration = iteration
                         sinceBest = 0
-                        bestCloud = readCloud(
-                            resources: resources, count: splatCount, shDegree: shDegree
-                        )
+                        if let old = bestCheckpoint { try? FileManager.default.removeItem(at: old) }
+                        bestCheckpoint = writeCheckpoint(resources: resources, count: splatCount)
                     } else if settled {
                         sinceBest += 1
                         if sinceBest >= Swift.max(tuning.earlyStopPatienceEvals, 1) {
@@ -2402,11 +2407,15 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // exposure.bin, the refined poses and heldOutSSIM describe, so
         // shipping it keeps the bundle consistent.
         let endScore = census.slices[censusRow].heldOutPSNRExposureFitted
-        var shipBest = bestCloud != nil
+        var shipBest = bestCheckpoint != nil
         if shipBest, let endScore, endScore.isFinite, endScore >= bestHeldOut {
             shipBest = false
         }
-        let cloud = (shipBest ? bestCloud : nil) ?? readCloud(
+        let bestCloud = shipBest
+            ? bestCheckpoint.flatMap { readCheckpoint($0, resources: resources, shDegree: shDegree) }
+            : nil
+        if shipBest, bestCloud == nil { shipBest = false }
+        let cloud = bestCloud ?? readCloud(
             resources: resources, count: splatCount, shDegree: shDegree
         )
         if shipBest {
@@ -5258,6 +5267,73 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             psnrFitted: fittedPSNR,
             ssim: ssimBlocks > 0 ? ssimSum / Double(ssimBlocks) : nil
         )
+    }
+
+    /// Build 398: the live splats, SH rows and stats written straight from the
+    /// shared Metal buffers to a temporary file (no CPU copy). The GPU must be
+    /// idle. nil when the write fails, in which case no checkpoint is kept.
+    private func writeCheckpoint(resources: TrainerResources, count: Int) -> URL? {
+        guard count > 0 else { return nil }
+        let shPerSplat = resources.shFloatsPerSplat
+        let parts: [(MTLBuffer, Int)] = [
+            (resources.splats, count * MemoryLayout<TrainerSplat>.stride),
+            (resources.sh, count * shPerSplat * MemoryLayout<Float>.stride),
+            (resources.stats, count * MemoryLayout<TrainerSplatStats>.stride)
+        ]
+        for (buffer, bytes) in parts where buffer.length < bytes { return nil }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "\(BrandConfig.bundleIdentifier).best-\(UUID().uuidString).bin"
+        )
+        guard FileManager.default.createFile(atPath: url.path, contents: nil),
+              let handle = try? FileHandle(forWritingTo: url)
+        else { return nil }
+        defer { try? handle.close() }
+        var header = [Int64(count), Int64(shPerSplat)]
+        let headerData = header.withUnsafeMutableBytes { Data($0) }
+        do {
+            try handle.write(contentsOf: headerData)
+            for (buffer, bytes) in parts {
+                try handle.write(contentsOf: Data(
+                    bytesNoCopy: buffer.contents(), count: bytes, deallocator: .none
+                ))
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+        return url
+    }
+
+    /// Reads a `writeCheckpoint` file back into a cloud. nil when the file is
+    /// missing, short, or from a different SH layout.
+    private func readCheckpoint(_ url: URL, resources: TrainerResources, shDegree: SHDegree) -> SplatCloud? {
+        guard let data = try? Data(contentsOf: url, options: .alwaysMapped), data.count >= 16 else { return nil }
+        return data.withUnsafeBytes { raw -> SplatCloud? in
+            guard let base = raw.baseAddress else { return nil }
+            let count = Int(base.loadUnaligned(as: Int64.self))
+            let shPerSplat = Int(base.loadUnaligned(fromByteOffset: 8, as: Int64.self))
+            guard count > 0, shPerSplat == resources.shFloatsPerSplat else { return nil }
+            let splatBytes = count * MemoryLayout<TrainerSplat>.stride
+            let shBytes = count * shPerSplat * MemoryLayout<Float>.stride
+            let statBytes = count * MemoryLayout<TrainerSplatStats>.stride
+            guard raw.count == 16 + splatBytes + shBytes + statBytes else { return nil }
+            func array<T>(_ type: T.Type, _ n: Int, at offset: Int) -> [T] {
+                [T](unsafeUninitializedCapacity: n) { buffer, initialized in
+                    if let destination = buffer.baseAddress {
+                        memcpy(destination, base.advanced(by: offset), n * MemoryLayout<T>.stride)
+                    }
+                    initialized = n
+                }
+            }
+            return Self.buildCloud(
+                splats: array(TrainerSplat.self, count, at: 16),
+                sh: array(Float.self, count * shPerSplat, at: 16 + splatBytes),
+                shPerSplat: shPerSplat,
+                stats: array(TrainerSplatStats.self, count, at: 16 + splatBytes + shBytes),
+                shDegree: shDegree,
+                filter3DScale: tuning.exportFilter3DScale
+            )
+        }
     }
 
     private func readCloud(

@@ -350,15 +350,25 @@ final class TrainerSupervisionBuilder {
         /// Build 378: the photo is kept as full-resolution luma plus chroma at
         /// half resolution (4:2:0, interleaved Cb Cr), half the bytes of RGB.
         /// Luma is exact; chroma is what the phone's JPEG carried anyway.
+        ///
+        /// BUILD 398: THE BYTES LIVE ON DISK, NOT IN MEMORY. Each entry is a
+        /// file (luma, then chroma, then the raw depth samples) read back
+        /// memory-mapped on a hit. Mapped file pages are clean and file-backed:
+        /// iOS does not count them toward the app's footprint and can drop them
+        /// under pressure instead of killing the app. The caches were 177 to
+        /// 295 MB of resident memory on every room run.
+        let url: URL
         let width: Int
         let height: Int
-        let luma: [UInt8]
-        let chroma: [UInt8]
-        let samples: [TrainerDepthSample]
+        let sampleCount: Int
         let supervised: Int
     }
     private var frameCache: [FrameID: CachedFrame] = [:]
     private var frameCacheLimitBytes = 0
+    private var frameCacheDirectory: URL?
+    /// Frame-cache directories left by a run that did not end (build 398).
+    private static var sweptStaleFrameCaches = false
+    private static let frameCachePrefix = "\(BrandConfig.bundleIdentifier).frames-"
     /// Whether a build can still be kept: false once the governor has dropped
     /// the cache for memory.
     var frameCacheEnabled: Bool { frameCacheLimitBytes > 0 }
@@ -411,16 +421,38 @@ final class TrainerSupervisionBuilder {
         self.depthCache = depthCache
             ?? SmartDepthCache(capacity: 128, sampleCount: depthWidth * depthHeight)
 
-        // A third of whatever is free above 1.5 GB, at most 420 MB (108
-        // training frames take about 300 MB). Nothing when the reading is a
-        // stand-in rather than a measurement.
-        let memory = DeviceMemoryFacts.probe()
-        if !memory.availableIsEstimated {
-            let reserve: UInt64 = 1_536 * 1_048_576
-            let spare = memory.availableBytes > reserve ? memory.availableBytes - reserve : 0
-            // 520 MB (build 342): 200 training frames at full size are about
-            // 470 MB, and 338 peaked at 1,041 MB of a 1,463 MB ceiling.
-            frameCacheLimitBytes = Int(Swift.min(spare / 3, 420 * 1_048_576))
+        // Build 398: on disk, so sized from free storage, not memory: a quarter
+        // of what the volume can give important work, at most 1 GB, nothing
+        // under 2 GB free. 120 frames at 1,080 px are about 280 MB.
+        let files = FileManager.default
+        if !Self.sweptStaleFrameCaches {
+            Self.sweptStaleFrameCaches = true
+            if let entries = try? files.contentsOfDirectory(
+                at: files.temporaryDirectory, includingPropertiesForKeys: nil
+            ) {
+                for entry in entries where entry.lastPathComponent.hasPrefix(Self.frameCachePrefix) {
+                    try? files.removeItem(at: entry)
+                }
+            }
+        }
+        let directory = files.temporaryDirectory.appendingPathComponent(
+            Self.frameCachePrefix + UUID().uuidString, isDirectory: true
+        )
+        if (try? files.createDirectory(at: directory, withIntermediateDirectories: true)) != nil {
+            frameCacheDirectory = directory
+            let values = try? directory.resourceValues(
+                forKeys: [.volumeAvailableCapacityForImportantUsageKey]
+            )
+            let freeBytes = Int(values?.volumeAvailableCapacityForImportantUsage ?? 0)
+            if freeBytes >= 2 * 1_073_741_824 {
+                frameCacheLimitBytes = Swift.min(freeBytes / 4, 1_073_741_824)
+            }
+        }
+    }
+
+    deinit {
+        if let frameCacheDirectory {
+            try? FileManager.default.removeItem(at: frameCacheDirectory)
         }
     }
 
@@ -462,6 +494,7 @@ final class TrainerSupervisionBuilder {
     /// again at the next poll, and a decode storm every fifty iterations is
     /// worse than no cache (build 318).
     func dropFrameCache(disable: Bool) {
+        for entry in frameCache.values { try? FileManager.default.removeItem(at: entry.url) }
         frameCache.removeAll()
         frameCacheBytes = 0
         if disable { frameCacheLimitBytes = 0 }
@@ -487,16 +520,17 @@ final class TrainerSupervisionBuilder {
         if includeDepthSamples,
            let fixedSize = renderSize, let k = renderIntrinsics,
            let cached = frameCache[frame.index],
-           cached.width == fixedSize.width, cached.height == fixedSize.height {
+           cached.width == fixedSize.width, cached.height == fixedSize.height,
+           let restored = Self.readCachedFrame(cached) {
             frameCacheHits += 1
             let far = backgroundCubemap()
             return TrainerFrameSupervision(
                 frame: frame.index,
-                groundTruthBytes: Self.expandYCbCr(cached),
+                groundTruthBytes: restored.rgb,
                 backgroundTexels: far.texels,
                 backgroundFaceSize: far.faceSize,
                 hasBackground: far.present,
-                depthSamples: cached.samples,
+                depthSamples: restored.samples,
                 renderSize: fixedSize,
                 intrinsics: k,
                 pose: pose(for: frame),
@@ -645,16 +679,50 @@ final class TrainerSupervisionBuilder {
         samples: [TrainerDepthSample], supervised: Int
     ) {
         guard frameCacheLimitBytes > 0, frameCache[id] == nil,
-              width > 0, height > 0, bytes.count == width * height * 3
+              width > 0, height > 0, bytes.count == width * height * 3,
+              let directory = frameCacheDirectory
         else { return }
         let (luma, chroma) = Self.compressYCbCr(bytes, width: width, height: height)
         let cost = luma.count + chroma.count + samples.count * MemoryLayout<TrainerDepthSample>.stride
         guard frameCacheBytes + cost <= frameCacheLimitBytes else { return }
+        var data = Data(capacity: cost)
+        data.append(contentsOf: luma)
+        data.append(contentsOf: chroma)
+        samples.withUnsafeBufferPointer { data.append($0) }
+        let url = directory.appendingPathComponent("\(id)-\(width)x\(height).bin")
+        guard (try? data.write(to: url)) != nil else { return }
         frameCache[id] = CachedFrame(
-            width: width, height: height, luma: luma, chroma: chroma,
-            samples: samples, supervised: supervised
+            url: url, width: width, height: height,
+            sampleCount: samples.count, supervised: supervised
         )
         frameCacheBytes += cost
+    }
+
+    /// Reads a cached frame back: memory-mapped, expanded to RGB, samples
+    /// copied out. nil when the file is gone or the wrong size, and the caller
+    /// then decodes the photo as on a first visit (build 398).
+    private static func readCachedFrame(
+        _ cached: CachedFrame
+    ) -> (rgb: [UInt8], samples: [TrainerDepthSample])? {
+        guard let data = try? Data(contentsOf: cached.url, options: .alwaysMapped) else { return nil }
+        let lumaCount = cached.width * cached.height
+        let chromaCount = ((cached.width + 1) / 2) * ((cached.height + 1) / 2) * 2
+        let stride = MemoryLayout<TrainerDepthSample>.stride
+        guard data.count == lumaCount + chromaCount + cached.sampleCount * stride else { return nil }
+        return data.withUnsafeBytes { raw -> (rgb: [UInt8], samples: [TrainerDepthSample])? in
+            guard let base = raw.baseAddress else { return nil }
+            let luma = base.assumingMemoryBound(to: UInt8.self)
+            let chroma = base.advanced(by: lumaCount).assumingMemoryBound(to: UInt8.self)
+            let rgb = expandYCbCr(luma: luma, chroma: chroma, width: cached.width, height: cached.height)
+            let count = cached.sampleCount
+            let samples = [TrainerDepthSample](unsafeUninitializedCapacity: count) { buffer, initialized in
+                if count > 0, let destination = buffer.baseAddress {
+                    memcpy(destination, base.advanced(by: lumaCount + chromaCount), count * stride)
+                }
+                initialized = count
+            }
+            return (rgb, samples)
+        }
     }
 
     /// RGB -> luma at full resolution plus interleaved Cb, Cr averaged over
@@ -697,28 +765,22 @@ final class TrainerSupervisionBuilder {
     }
 
     /// The inverse of `compressYCbCr`: each 2x2 block takes its stored chroma.
-    private static func expandYCbCr(_ cached: CachedFrame) -> [UInt8] {
-        let width = cached.width, height = cached.height
+    private static func expandYCbCr(
+        luma y: UnsafePointer<UInt8>, chroma c: UnsafePointer<UInt8>, width: Int, height: Int
+    ) -> [UInt8] {
         let cw = (width + 1) / 2
         let count = width * height * 3
-        guard cached.luma.count == width * height, cached.chroma.count >= cw * ((height + 1) / 2) * 2 else {
-            return [UInt8](repeating: 0, count: count)
-        }
         return [UInt8](unsafeUninitializedCapacity: count) { dst, initialized in
-            cached.luma.withUnsafeBufferPointer { y in
-                cached.chroma.withUnsafeBufferPointer { c in
-                    for py in 0..<height {
-                        let crow = (py / 2) * cw
-                        for px in 0..<width {
-                            let k = (crow + px / 2) * 2
-                            let cb = Int(c[k]) - 128, cr = Int(c[k + 1]) - 128
-                            let l = Int(y[py * width + px])
-                            let o = (py * width + px) * 3
-                            dst[o] = UInt8(clamping: l + ((359 * cr + 128) >> 8))
-                            dst[o + 1] = UInt8(clamping: l - ((88 * cb + 183 * cr + 128) >> 8))
-                            dst[o + 2] = UInt8(clamping: l + ((454 * cb + 128) >> 8))
-                        }
-                    }
+            for py in 0..<height {
+                let crow = (py / 2) * cw
+                for px in 0..<width {
+                    let k = (crow + px / 2) * 2
+                    let cb = Int(c[k]) - 128, cr = Int(c[k + 1]) - 128
+                    let l = Int(y[py * width + px])
+                    let o = (py * width + px) * 3
+                    dst[o] = UInt8(clamping: l + ((359 * cr + 128) >> 8))
+                    dst[o + 1] = UInt8(clamping: l - ((88 * cb + 183 * cr + 128) >> 8))
+                    dst[o + 2] = UInt8(clamping: l + ((454 * cb + 128) >> 8))
                 }
             }
             initialized = count

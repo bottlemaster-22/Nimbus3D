@@ -341,7 +341,9 @@ enum ProcessingBudgetPlanner {
         if let suggested = prePass?.suggestedBudget {
             usedPrePassSuggestion = true
             budget.splatCap = Swift.min(budget.splatCap, suggested.splatCap)
-            budget.iterations = Swift.min(budget.iterations, suggested.iterations)
+            // Build 398: rounds are NOT taken from the pre-pass. Its extent comes
+            // from a different box, and a scan measured at 8 m there was cut
+            // to a few thousand rounds while the plan asked for 30,000.
             budget.renderLongEdgePixels = Swift.min(
                 budget.renderLongEdgePixels, suggested.renderLongEdgePixels
             )
