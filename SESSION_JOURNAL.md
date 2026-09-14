@@ -1487,3 +1487,7 @@ From the research workflow's speed report (Opus), checked in the code: preproces
 ### BUILD 406: calibration windows at 12,300; warm-up staging released past warm-up
 
 The kernel calibration windows (backward SIMD sum, sort, two-pixel forward, two-pixel backward, fused blur) sat at 24,200, so whatever they chose ran for the last 20 % of a 30,000-round run; build 330 measured forward2 0.94x, fused blur 0.90x, SIMD scatter 0.59/0.67 at 720 px. Now 12,300-12,329: early in the 720-px level (40 %), past warm-up and the pose check, clear of profiled steps, so the chosen kernels run for 60 % of the run. warmupStaging (2 x 16 B/px) is only written by merged warm-up steps (`background: warmupOverlap ? background : nil`) and read by completeStep while `pending.iteration <= warmupEnd`; the level-switch resize past warm-up now leaves it a placeholder (12 MB at 720 px, 27 MB at 1,080).
+
+### BUILD 408: no snapshot staging buffer
+
+snapshotStaging (splat + 48 SH floats + stats, 272 B a point, 86 MB at 330k, resident at every level) existed only so a merged step could copy the model for the live preview. Single-slice runs now take the synchronous branch every 500 iterations: drain, read splats and stats, extract base colour (build 400), degree-0 cloud; about 60 drains a 30,000-round run. The buffer is a 16-byte placeholder in init and resizeSplatCapacity and leaves bytesPerSplat; the merged encoder's `snapshotStaging.length >= snapshotBytes` guard skips the copy, so a multi-slice run simply has no mid-slice preview.

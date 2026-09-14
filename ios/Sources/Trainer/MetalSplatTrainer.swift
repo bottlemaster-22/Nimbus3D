@@ -2087,7 +2087,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             }
 
             if iteration % Swift.max(tuning.snapshotIntervalIterations, 1) == 0 {
-                if let running = pendingStep, running.merged {
+                if let running = pendingStep, running.merged, !completedParts.isEmpty {
+                    // Build 408: multi-slice only (single-slice reads below).
                     // Build 322: the next merged step copies the model in its
                     // own command buffer and the copy is converted off the
                     // loop (startSnapshotConversion). Nothing waits here.

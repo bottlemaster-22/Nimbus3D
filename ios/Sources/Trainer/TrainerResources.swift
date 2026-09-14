@@ -263,7 +263,11 @@ final class TrainerResources {
         splatGrad2D = try make("splatGrad2D", n * 64)
         densifySource = try make("densifySource", n * 4)
         densifyFlags = try make("densifyFlags", n)
-        snapshotStaging = try make("snapshotStaging", Self.snapshotStagingBytes(splats: n, shFloats: shFloats))
+        // Build 408: a placeholder. A single-slice preview reads the live
+        // buffers after a drain (base colour only); only a multi-slice run
+        // staged a copy, and its preview now waits for the slice to end.
+        // 272 B a point, 86 MB at 330,000.
+        snapshotStaging = try make("snapshotStaging", 16)
         // 6 faces, 64x64 (build 326), three floats each. Fixed size: it does not scale
         // with splats or pixels, so it is allocated once and never resized.
         bgCubemap = try make("bgCubemap", Self.backgroundCubemapBytes)
@@ -398,9 +402,6 @@ final class TrainerResources {
             + MemoryLayout<TrainerSplatGrad>.stride * 3    // gradient + Adam m + v
             + shFloats * 4 * 4                             // sh + grad + m + v
             + 4 + 1                                        // densify source, flags (scratch is shGrad)
-            + MemoryLayout<TrainerSplat>.stride            // snapshot staging: splat,
-            + shFloats * 4                                 //   sh,
-            + MemoryLayout<TrainerSplatStats>.stride       //   stats
             + 4 * 2                                        // tilesTouched, offsets
             + 4 * (2 + 3 + 3 + 1)                          // mean2D, conic, colour, opacity
             + 4 * 3                                        // extracted centres
@@ -717,9 +718,7 @@ final class TrainerResources {
         centers = try makeBuffer("centers", n * 3 * 4)
         densifySource = try makeBuffer("densifySource", n * 4)
         densifyFlags = try makeBuffer("densifyFlags", n)
-        snapshotStaging = try makeBuffer(
-            "snapshotStaging", Self.snapshotStagingBytes(splats: n, shFloats: shFloats)
-        )
+        // Build 408: stays the placeholder set above (see init).
 
         // Level zero of the scan scratch is sized from the padded splat array,
         // so it moves with the capacity even though the sort capacity has not.
