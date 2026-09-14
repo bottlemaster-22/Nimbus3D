@@ -1783,8 +1783,14 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // has no fitted exposure of its own and the raw number therefore
             // moves when the capture's auto-exposure drifted. The stopping
             // decision must not turn on that.
+            // Build 402: not inside a coarse level. Held-out frames are full
+            // size, so such an eval drained the step, copied the stats out
+            // and back, decoded every held-out photo at 1,080 px, skipped
+            // each one on the size check and returned nil: 51 evals and
+            // about 10 s of a 30,000-round room run that recorded nothing.
             if evalEvery > 0,
                iteration > 0,
+               !activeIsCoarse,
                iteration >= tuning.earlyStopMinIterations,
                iteration % evalEvery == 0,
                !slice.heldOutKeyframes.isEmpty
@@ -4752,7 +4758,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         let scoreTuning = tuning
         let scorePixelCount = renderSize.pixelCount
         let bw = renderSize.width, bh = renderSize.height
-        let scoreChunk = Swift.max(ProcessInfo.processInfo.activeProcessorCount, 1)
+        // At most four frames of renders held at once (build 402; was one per
+        // core, about 140 MB at 1,080 px on a six-core phone).
+        let scoreChunk = Swift.max(Swift.min(ProcessInfo.processInfo.activeProcessorCount, 4), 1)
         func scoreCollected() {
             let renders = collected
             collected.removeAll(keepingCapacity: true)
@@ -5801,7 +5809,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // frames, and a round-robin over more frames than the cache holds
         // rebuilds every map on every visit.
         let authorityMap = SmartAuthorityMap(
-            settings: settings, cacheCapacity: bundle.frames.count > 128 ? 256 : 128
+            settings: settings, cacheCapacity: 160
         )
         authorityMap.prepare(
             bundle: bundle,

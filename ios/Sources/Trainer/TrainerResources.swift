@@ -831,7 +831,27 @@ final class TrainerResources {
     /// (`.grewTileBufferAndRetried`), so nothing that was mid-computation when
     /// it was called needs to survive.
     func growInstanceCapacity(to newCapacity: Int) throws {
-        let target = Swift.max(newCapacity, instanceCapacity)
+        // BUILD 402: THE ONE POOL THAT GREW WITHOUT A LIMIT. Tile instances
+        // scale with how much of the screen each point covers, so a small
+        // object filmed close up can ask for many times a room's count, and
+        // every growth was granted whatever memory was left. Now: never past
+        // the sort's two-level histogram ceiling (67.1 M), and never into the
+        // last 384 MB iOS says the app has. A frame that needs more renders
+        // with the instances that fit (counted as truncated) instead of the
+        // app being killed.
+        var wanted = Swift.min(newCapacity, 64_000_000)
+        let facts = DeviceMemoryFacts.probe()
+        if !facts.availableIsEstimated, wanted > instanceCapacity {
+            let reserve: UInt64 = 384 * 1_048_576
+            let affordable = facts.availableBytes > reserve ? Int((facts.availableBytes - reserve) / 16) : 0
+            if wanted - instanceCapacity > affordable {
+                wanted = instanceCapacity + affordable
+                TrainerLog.gpu.error(
+                    "Tile instances limited to \(wanted) (asked for \(newCapacity)) by the memory iOS reports free"
+                )
+            }
+        }
+        let target = Swift.max(wanted, instanceCapacity)
         guard target > instanceCapacity else { return }
 
         let inst = target

@@ -344,16 +344,14 @@ enum ProcessingBudgetPlanner {
             // Build 398: rounds are NOT taken from the pre-pass. Its extent comes
             // from a different box, and a scan measured at 8 m there was cut
             // to a few thousand rounds while the plan asked for 30,000.
-            budget.renderLongEdgePixels = Swift.min(
-                budget.renderLongEdgePixels, suggested.renderLongEdgePixels
-            )
-            budget.keyframeCount = Swift.min(budget.keyframeCount, suggested.keyframeCount)
+            // Build 402: resolution, photo count and colour degree are not taken
+            // from it either. A saved pre-pass is reused by default and its
+            // format version has never changed, so a scan checked over by an
+            // older build silently trained at that build's 720 px, fewer photos
+            // or lower colour degree. Only the memory-bound fields stay.
             budget.memoryCeilingBytes = Swift.min(
                 budget.memoryCeilingBytes, suggested.memoryCeilingBytes
             )
-            budget.shDegree = SHDegree(
-                rawValue: Swift.min(budget.shDegree.rawValue, suggested.shDegree.rawValue)
-            ) ?? budget.shDegree
         }
 
         // Whatever else was decided, the ceiling never goes above half of what
