@@ -15,9 +15,9 @@ import UIKit
 
 enum AppActivity {
     private static let lock = NSLock()
-    nonisolated(unsafe) private static var background = false
-    nonisolated(unsafe) private static var observers: [NSObjectProtocol] = []
-    nonisolated(unsafe) private static var task: UIBackgroundTaskIdentifier = .invalid
+    private nonisolated(unsafe) static var background = false
+    private nonisolated(unsafe) static var observers: [NSObjectProtocol] = []
+    private nonisolated(unsafe) static var task: UIBackgroundTaskIdentifier = .invalid
 
     static var isInBackground: Bool {
         lock.lock()
@@ -39,17 +39,19 @@ enum AppActivity {
         observers.append(center.addObserver(
             forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
         ) { _ in
-            set(true)
+            AppActivity.set(true)
             MainActor.assumeIsolated {
-                endTask()
-                task = UIApplication.shared.beginBackgroundTask { endTask() }
+                AppActivity.endTask()
+                AppActivity.task = UIApplication.shared.beginBackgroundTask {
+                    MainActor.assumeIsolated { AppActivity.endTask() }
+                }
             }
         })
         observers.append(center.addObserver(
             forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
         ) { _ in
-            set(false)
-            MainActor.assumeIsolated { endTask() }
+            AppActivity.set(false)
+            MainActor.assumeIsolated { AppActivity.endTask() }
         })
     }
 

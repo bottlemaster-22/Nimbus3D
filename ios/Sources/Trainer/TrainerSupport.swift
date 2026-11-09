@@ -534,7 +534,11 @@ struct TrainerTuning: Sendable {
     var frequencyBlurStartVariance: Float = 4.0
     var frequencyBlurEndFraction: Float = 0.2
     /// Fraction of the run after which every SH coefficient is enabled.
-    var shFullyEnabledFraction: Float = 0.35
+    /// Build 424: 0.15 (was 0.35). The reference recipe opens one degree every
+    /// 1,000 rounds (degree 3 by 3,000 of 30,000); at 0.35 degree 3 opened
+    /// at round 6,300 and the coefficients behind view-dependent shine
+    /// measured 6x weaker than Scaniverse's on the same room.
+    var shFullyEnabledFraction: Float = 0.15
 
     // --- Schedule ------------------------------------------------------------
 
