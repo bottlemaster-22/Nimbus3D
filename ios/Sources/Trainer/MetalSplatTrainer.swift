@@ -2901,7 +2901,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // resources); only steps encoded from here on see the new ones.
         if let needed = pendingInstanceGrowth {
             pendingInstanceGrowth = nil
-            if needed > resources.instanceCapacity {
+            // Build 430: nothing to ask for once at the 24 M ceiling.
+            if needed > resources.instanceCapacity, resources.instanceCapacity < 24_000_000 {
                 TrainerLog.gpu.notice(
                     "Tile instances needed \(needed), had \(resources.instanceCapacity); growing"
                 )

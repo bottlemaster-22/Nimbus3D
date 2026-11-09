@@ -176,6 +176,8 @@ final class TrainerResources {
     /// (counts, colour, transmittance, background), so the next frame
     /// renders while this one is read back. See evalStagingSlotBytes.
     private(set) var evalStaging: MTLBuffer
+    /// Build 430: the memory limit on tile instances is logged once.
+    private var loggedInstanceLimit = false
     /// Build 324: two slots a warm-up step copies gradFinal and renderTFinal
     /// into for the far field's update. See warmupStagingSlotBytes.
     private(set) var warmupStaging: MTLBuffer
@@ -870,9 +872,12 @@ final class TrainerResources {
             let affordable = facts.availableBytes > reserve ? Int((facts.availableBytes - reserve) / 16) : 0
             if wanted - instanceCapacity > affordable {
                 wanted = instanceCapacity + affordable
-                TrainerLog.gpu.error(
-                    "Tile instances limited to \(wanted) (asked for \(newCapacity)) by the memory iOS reports free"
-                )
+                if !loggedInstanceLimit {
+                    loggedInstanceLimit = true
+                    TrainerLog.gpu.error(
+                        "Tile instances limited to \(wanted) (asked for \(newCapacity)) by the memory iOS reports free"
+                    )
+                }
             }
         }
         let target = Swift.max(wanted, instanceCapacity)
