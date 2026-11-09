@@ -216,6 +216,7 @@ struct NimbusApp: App {
         BrandConfig.assertConsistent()
         NimbusBootstrap.registerAvailableModules()
         CrashReportCollector.shared.start()
+        AppActivity.start()
     }
 
     var body: some Scene {

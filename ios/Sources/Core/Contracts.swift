@@ -2062,6 +2062,9 @@ public enum TrainerStage: String, Codable, Sendable {
     /// checkpoint: nothing has been written to disk, and nothing is rewound.
     /// See `ThermalPolicy.pauseAt`.
     case pausedMemory
+    /// Build 422: waiting while the app is in the background (iOS refuses
+    /// GPU work there); carries on when the app comes back.
+    case pausedBackground
 
     public var isTerminal: Bool {
         self == .done || self == .failed || self == .cancelled

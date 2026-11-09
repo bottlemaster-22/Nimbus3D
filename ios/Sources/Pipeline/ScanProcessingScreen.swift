@@ -420,6 +420,7 @@ struct ScanProcessingScreen: View {
         case .cancelled: return "Stopped"
         case .pausedThermal: return "Paused while your phone cools down"
         case .pausedMemory: return "Making the model smaller so it fits"
+        case .pausedBackground: return "Paused while LiKOVA is in the background"
         }
     }
 

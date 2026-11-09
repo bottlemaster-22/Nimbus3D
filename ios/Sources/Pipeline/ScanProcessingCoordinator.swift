@@ -616,6 +616,12 @@ final class ScanProcessingCoordinator: ObservableObject {
                 "Your phone got warm, so this paused itself. It carries on by itself "
                 + "once it cools down, and nothing that was already built is lost."
             )
+        case .pausedBackground:
+            note(
+                .paused,
+                "LiKOVA was sent to the background, where iOS does not let it use the "
+                + "graphics chip, so this paused. It carried on when you came back."
+            )
         case .pausedMemory:
             note(
                 .paused,

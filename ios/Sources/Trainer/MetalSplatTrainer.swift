@@ -1340,6 +1340,30 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             )
 
             // --- Heat and memory, measured -------------------------------------
+            // Build 422: iOS refuses GPU work from a backgrounded app, which
+            // used to fail the whole run. Finish the step already on the GPU,
+            // wait for the app to come back, then carry on from here.
+            if AppActivity.isInBackground {
+                try drainPendingStep(resources: resources, lossEMA: &lossEMA, exposures: &exposures, cameraDeltas: &cameraDeltas)
+                emit(
+                    progressTick(
+                        stage: .pausedBackground,
+                        iteration: iterationsRunSoFar + iteration,
+                        total: governor.current.iterations,
+                        splatCount: splatCount,
+                        loss: lossEMA,
+                        thermal: ThermalLevel(ProcessInfo.processInfo.thermalState),
+                        message: "Paused while LiKOVA is in the background. It carries on when you come back.",
+                        previewAvailable: true
+                    )
+                )
+                while AppActivity.isInBackground {
+                    try checkCancellation()
+                    try await Task.sleep(nanoseconds: 300_000_000)
+                }
+                continue
+            }
+
             let thermal = governor.thermalVerdict()
             switch thermal.verdict {
             case .abort:

@@ -1515,3 +1515,7 @@ Small-object scans still fail on 416 (414 code). No data came back, so three cha
 ### BUILD 420: 450k points and 200 keyframes for rooms
 
 The living room on 408 trained its own views to only 25.9 dB with the population at the 330k cap from round ~700 of 30,000: capacity-limited, not round-limited. Builds 398-412 freed about 300 MB (frame caches and best checkpoint on disk, no snapshot staging, preview copies base colour), peak 948-961 MB with 2.0 GB available. Room/house cap 330k -> 450k (about +136 MB at 1,133 B a point), keyframes 120 -> 200 (captures had 868 and 1,396 photos; 108 were trained; a frame now costs about 0.5 MB of memory: depth cache plus authority map), authority cache 240 entries so the 1,080-px level does not rebuild maps every step. Expected peak about 1.15 GB; the soft gates only freeze growth. The exact ellipse-tile test (an idea considered for speed) was already shipped.
+
+### BUILD 422: training pauses in the background instead of failing
+
+iOS refuses GPU command buffers from a backgrounded app, so switching apps or a lock during a 6-8 minute run failed it. `AppActivity` (App/AppActivity.swift) tracks didEnterBackground / willEnterForeground and asks for a few seconds of background time; the training loop drains the step already on the GPU, emits the new `TrainerStage.pausedBackground`, sleeps until the app is back, and continues from the same iteration. A commit racing the notification can still fail (small window).
