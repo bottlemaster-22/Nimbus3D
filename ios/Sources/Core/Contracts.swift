@@ -1815,7 +1815,9 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
             // app 2.6 GB instead of 3.0 started every run over the gate and was
             // cut straight away. About 260k points at 2.6 GB, 400k at 3.0 GB.
             let shareLimit = availableMemoryBytes / 100 * 41
-            let overhead: UInt64 = 760 * 1_048_576
+            // 300 MB (build 436; was 760, measured with the 422 leak in it):
+            // the 424 room run peaked at 641 MB with 391k points.
+            let overhead: UInt64 = 300 * 1_048_576
             let forSplats = shareLimit > overhead ? shareLimit - overhead : 0
             return Int(Swift.min(forSplats, memoryForSplats) / perSplat)
         }

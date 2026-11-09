@@ -968,7 +968,12 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // full-size path and not yet found. Until it is, the last level
         // decodes each photo on the prefetch worker (about 40 ms, mostly
         // hidden behind a 25 ms GPU step).
-        if coarsePhaseOn { supervision.dropFrameCache(disable: true) }
+        // BUILD 436: THE WORKAROUND IS OFF. The growth it avoided was the
+        // undrained autorelease pool (fixed in 434: the 424 room run peaked at
+        // 641 MB), and the cache lives on disk since 398. Without it the
+        // 1,080-px level decoded every photo every round and the loop waited
+        // 63 s of an 8.5-minute run for them. 4:2:0 chroma at 1,080 px is the
+        // chroma resolution the 1,920-px JPEG carried.
         if coarsePhaseOn, tuning.supervisionPreload { preloads.first?.start() }
         defer {
             prefetch.drain()
