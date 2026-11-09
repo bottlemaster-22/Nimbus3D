@@ -999,6 +999,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // this index; preloads started up to this index.
         var levelsDropped = 0
         var preloadsStarted = 1
+        // Build 426: per-level wall time for the census.
+        var levelTick = CFAbsoluteTimeGetCurrent()
         // Build 364: the iteration of the last opacity reset, for the prune grace.
         var lastOpacityReset = Int.min / 2
 
@@ -1313,6 +1315,14 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             let activeLevel = levelFor(iteration)
             let (activeSupervision, activePrefetch) = supervisionFor(iteration)
             let activeIsCoarse = activeLevel < levelCount
+            if timings.levelSeconds.count < levelCount + 1 {
+                timings.levelSeconds += Array(repeating: 0, count: levelCount + 1 - timings.levelSeconds.count)
+                timings.levelIterations += Array(repeating: 0, count: levelCount + 1 - timings.levelIterations.count)
+            }
+            let levelNow = CFAbsoluteTimeGetCurrent()
+            timings.levelSeconds[activeLevel] += levelNow - levelTick
+            timings.levelIterations[activeLevel] += 1
+            levelTick = levelNow
             // A level that has ended is never needed again: its worker is
             // joined and its frames released. And the level after the active
             // one starts decoding its frames now, while this level trains.

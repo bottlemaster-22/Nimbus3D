@@ -763,6 +763,10 @@ struct TrainerTimings: Codable {
     /// Build 336: the largest process-wide footprint the memory poll saw
     /// (what this run had allocated since it began), in MB.
     var memoryFootprintPeakMegabytes: Double = 0
+    /// Build 426: wall seconds spent in each resolution level, coarsest
+    /// first, the full size last (index = level).
+    var levelSeconds: [Double] = []
+    var levelIterations: [Int] = []
     /// Build 364: opacity resets performed (the reference recipe's, every 3,000).
     var opacityResets: Int = 0
     /// Build 410: CPU seconds building the densify pass's spatial order.
