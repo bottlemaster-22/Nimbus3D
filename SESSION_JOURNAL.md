@@ -1503,3 +1503,7 @@ Bedroom scan (scan_20260906, the same capture as 382) on build 408, stopped earl
 ### BUILD 414: eval every 1,200 iterations
 
 Living room (scan_20260912) on 408: trained view 25.88 (406: 25.85), held-out fitted 22.95 / SSIM 0.6629 (406: 22.95 / 0.6635), aligned 23.24 / 0.676; peak 948 MB (406: about 1,224), per level 509-831 / 620-735 / 744-918 MB, OS available never under 2,018 MB; 5 m 22 s (406: 5 m 25 s), densify 25.5 s. With early stopping off, evals feed only the curve and a checkpoint that must beat the end state by 0.3 dB, so the interval goes 400 -> 1,200 (about 7 evals in the 1,080-px level instead of 22). A45 (backward p/q accumulation) left alone: a rewrite of the SIMD-summed backward with no on-device check before the deadline.
+
+### Nov 9: installs via Sideloadly
+
+The Bottle sideload server (AWS) is down and the 414 IPA expired (30-day artifact retention). New path: CI builds the IPA (PR or manual runs only), `tools/get_ipa.ps1` downloads the newest one to Documents\LiKOVA\IPA\LiKOVA-build<N>.ipa, the owner installs it with Sideloadly. Owner is now on a Pro plan: test builds only for large changes, batch small tweaks.
