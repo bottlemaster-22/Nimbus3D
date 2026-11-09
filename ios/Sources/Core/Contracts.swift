@@ -1906,7 +1906,7 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 // Build 384: 200 again. 344 failed on memory the governor no longer
                 // spends on deleting the model; 382 ran the 720-px level at 0.94 GB
                 // with 120 frames cached and a 7 dB train/test gap.
-                keyframeCount: 200,  // build 420: captures run to 868-1,396 photos and 108 were trained; frame caches are on disk since 398, so a frame costs about 0.5 MB of memory. build 398: every scene (240 at 8 m and over never fitted in memory); 200 needs about 600 MB more than the phone gives
+                keyframeCount: 400,  // build 440: 360 trained + 40 held out; the owner's captures run to 1,257-1,396 photos and the frame caches are on disk. build 420: captures run to 868-1,396 photos and 108 were trained; frame caches are on disk since 398, so a frame costs about 0.5 MB of memory. build 398: every scene (240 at 8 m and over never fitted in memory); 200 needs about 600 MB more than the phone gives
                 memoryCeilingBytes: memoryForSplats,
                 // Build 362: a six-minute run sits at .fair throughout; the
                 // degrade rung (a one-way resolution cut) would fire fifteen

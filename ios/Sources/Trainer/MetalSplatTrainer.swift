@@ -880,7 +880,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // frames of the same native depth (about 79 MB for 108 frames), and
         // at 200 frames a 128-entry cache would have missed on every visit.
         let sharedDepthCache = SmartDepthCache(
-            capacity: slice.keyframes.count + slice.heldOutKeyframes.count + 8,
+            // Build 440: at most 64. Depth is read only on a frame's first visit
+            // per level; after that the (disk) frame cache carries the samples.
+            capacity: Swift.min(slice.keyframes.count + slice.heldOutKeyframes.count + 8, 64),
             sampleCount: Swift.max(bundle.settings.depthWidth, 1) * Swift.max(bundle.settings.depthHeight, 1)
         )
         // --- Render size, from the first decodable frame -----------------------

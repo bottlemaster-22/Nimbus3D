@@ -1535,3 +1535,7 @@ scan_20261109_223238 (1,257 frames, 200 keyframes, cap 450k) on 422: the governo
 ### BUILD 438: adaptive SIMD-group summing in the backward (calibrated)
 
 The kBackwardSimdSum variant of trainer_rasterize_backward always ran three float4 simd_sum reductions per (splat, SIMD group) when any lane contributed; the 424 calibration at 12,300 (720 px) measured it 7.9 ms against 5.2 for per-lane atomics, so it was never chosen. Now it reduces only when `simd_sum(contributes ? 1 : 0) >= 8` (uniform per group) and otherwise each contributing lane adds its own record, as the plain loop does (shared helper `trainer_addGrad2D`). The existing backward calibration still decides: used only if its gradients agree (relative L1 < 1e-3) and it is at least 3% faster. Profile on 424 (120 profiled rounds, all levels): backward 7.42 ms, losses 1.78, forward 1.76, optimiser 1.27, scan 1.26, sort 0.62.
+
+### BUILD 440: 400 keyframes
+
+Owner's call: more training photos. keyframeCount 200 -> 400 (heldOutFraction 0.10, so 360 trained + 40 held out; the 424 run trained 180 of 1,257). Per-frame memory is now the shared depth cache, capped at 64 entries (it is read only on a frame's first visit per level); frame caches are on disk (about 6.5 MB a frame across the three levels, about 2.3 GB of writes a run; the 1,080 builder's 1 GB cap leaves a few frames uncached). Each frame gets about 75 visits instead of 165. The held-out candidates are fixed by frame index, so held-out scores stay comparable.
