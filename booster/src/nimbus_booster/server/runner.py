@@ -171,13 +171,25 @@ class BoosterRunner:
         try:
             await site.start()
         except OSError as error:
-            await runner.cleanup()
-            self._runner = None
-            raise OSError(
-                "Another program is already using port {port} on this PC, so "
-                "the Booster could not start. Change the port in the Booster "
-                "settings and try again.".format(port=self.config.port)
-            ) from error
+            # A saved address this PC no longer has (the router handed out a
+            # new one) fails to bind too. Every address is the safe fallback.
+            if self.config.bindHost not in ("0.0.0.0", "", None):
+                self._log("Could not listen on {h}; listening on every address instead.".format(
+                    h=self.config.bindHost))
+                site = web.TCPSite(runner, "0.0.0.0", int(self.config.port))
+                try:
+                    await site.start()
+                    error = None
+                except OSError as retry_error:
+                    error = retry_error
+            if error is not None:
+                await runner.cleanup()
+                self._runner = None
+                raise OSError(
+                    "The Booster could not listen on port {port} ({why}). Another "
+                    "program may be using it; change the port in the Booster "
+                    "settings and try again.".format(port=self.config.port, why=error)
+                ) from error
 
         self.queue.start()
         resumed = self.queue.resume_queued()
