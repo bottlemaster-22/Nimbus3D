@@ -1539,3 +1539,7 @@ The kBackwardSimdSum variant of trainer_rasterize_backward always ran three floa
 ### BUILD 440: 400 keyframes
 
 Owner's call: more training photos. keyframeCount 200 -> 400 (heldOutFraction 0.10, so 360 trained + 40 held out; the 424 run trained 180 of 1,257). Per-frame memory is now the shared depth cache, capped at 64 entries (it is read only on a frame's first visit per level); frame caches are on disk (about 6.5 MB a frame across the three levels, about 2.3 GB of writes a run; the 1,080 builder's 1 GB cap leaves a few frames uncached). Each frame gets about 75 visits instead of 165. The held-out candidates are fixed by frame index, so held-out scores stay comparable.
+
+### BUILD 442: 428 result; keyframes back to 200
+
+428 (CI#428: 400 keyframes -> 360 trained, cap 450k, 1,080 cache on, adaptive SIMD backward) on scan_20261109_223238, same 28 held-out frames (index % 40 == 20, scored 24): held-out 19.37 raw / 19.73 fitted / SSIM 0.672, aligned 20.57 / 0.701, trained 22.82 (424 with 180 trained, cap 391k: 20.45 / 0.680, aligned 20.95 / 0.700, trained 24.12). 541 s train (424: 510). Memory 877 MB peak. Level ms/round: 10.18 / 17.12 / 28.50 (1,080 cache on: loop wait 18.8 s, was 63). Backward calibration: adaptive SIMD B 14.31 ms vs plain 9.57: rejected again (Apple GPU simd_sum is the cost, not the atomics). Keyframes back to 200; cap stays 450k.
