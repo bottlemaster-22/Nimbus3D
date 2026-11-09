@@ -4180,6 +4180,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         governor: TrainerBudgetGovernor
     ) throws {
         guard let pipelines else { return }
+        // Build 432: anything autoreleased while the buffers are swapped is
+        // released here, not at the end of the run.
+        try autoreleasepool {
         switch change.kind {
         case .splatCap(_, let to):
             if splatCount > to {
@@ -4188,9 +4191,14 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                 // survives a heat cut is the one that would have survived a
                 // budget cut, and the two never disagree.
                 splatCount = try trimSplats(resources: resources, from: splatCount, to: to)
+                try resources.resizeSplatCapacity(to: to, keeping: splatCount)
+                gpu = TrainerGPU(pipelines: pipelines, resources: resources)
             }
-            try resources.resizeSplatCapacity(to: to, keeping: splatCount)
-            gpu = TrainerGPU(pipelines: pipelines, resources: resources)
+            // Build 432: a cap at or above the live population only stops
+            // growth (the densifier reads governor.current.splatCap), so the
+            // buffers are left as they are. Reallocating them on every soft
+            // gate is what the 422 room run did at rounds 0, 50, 100 and 550,
+            // and its memory grew by roughly the old buffers' size each time.
 
         case .resolution(_, let to):
             // The supervision builder decodes the photos and fixes the pixel
@@ -4215,6 +4223,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             // Nothing to reallocate; the loop reads `governor.current.iterations`
             // on every pass and simply stops sooner.
             _ = governor
+        }
         }
     }
 
@@ -4740,7 +4749,37 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// Reported whatever it says. A bad number here is the most useful thing
     /// this trainer can tell anybody, and hiding it would make every other
     /// quality claim in the app unfalsifiable.
+    /// Build 432: the evaluation's command buffers are autoreleased, and the
+    /// training loop is one long task whose pool never drains, so every
+    /// buffer they touched (since 428 a fresh 47 MB evalStaging each time)
+    /// stayed alive for the rest of the run. Each evaluation now runs in its
+    /// own pool.
     private func evaluateHeldOut(
+        gpu: TrainerGPU,
+        resources: TrainerResources,
+        queue: MTLCommandQueue,
+        frames: [CaptureFrame],
+        supervision: TrainerSupervisionBuilder,
+        cameraDeltas: [FrameID: Pose],
+        exposures: [FrameID: SIMD2<Float>],
+        splatCount: Int,
+        shCoefficientCount: Int,
+        renderSize: TrainerRenderSize,
+        fitExposure: Bool = false,
+        alsoScoreExposureFitted: Bool = false
+    ) throws -> Float? {
+        try autoreleasepool {
+            try evaluateHeldOutInner(
+                gpu: gpu, resources: resources, queue: queue, frames: frames,
+                supervision: supervision, cameraDeltas: cameraDeltas, exposures: exposures,
+                splatCount: splatCount, shCoefficientCount: shCoefficientCount,
+                renderSize: renderSize, fitExposure: fitExposure,
+                alsoScoreExposureFitted: alsoScoreExposureFitted
+            )
+        }
+    }
+
+    private func evaluateHeldOutInner(
         gpu: TrainerGPU,
         resources: TrainerResources,
         queue: MTLCommandQueue,
@@ -5060,6 +5099,27 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// stats it folds are put back, and every other buffer it touches is
     /// per-step scratch.
     private func alignHeldOutPoses(
+        gpu: TrainerGPU,
+        resources: TrainerResources,
+        queue: MTLCommandQueue,
+        frames: [CaptureFrame],
+        supervision: TrainerSupervisionBuilder,
+        cameraDeltas: [FrameID: Pose],
+        splatCount: Int,
+        shCoefficientCount: Int,
+        renderSize: TrainerRenderSize
+    ) throws -> [FrameID: Pose] {
+        // Build 432: in its own pool, as evaluateHeldOut.
+        try autoreleasepool {
+            try alignHeldOutPosesInner(
+                gpu: gpu, resources: resources, queue: queue, frames: frames,
+                supervision: supervision, cameraDeltas: cameraDeltas, splatCount: splatCount,
+                shCoefficientCount: shCoefficientCount, renderSize: renderSize
+            )
+        }
+    }
+
+    private func alignHeldOutPosesInner(
         gpu: TrainerGPU,
         resources: TrainerResources,
         queue: MTLCommandQueue,
@@ -5864,7 +5924,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // frames, and a round-robin over more frames than the cache holds
         // rebuilds every map on every visit.
         let authorityMap = SmartAuthorityMap(
-            settings: settings, cacheCapacity: 240
+            settings: settings, cacheCapacity: 160
         )
         authorityMap.prepare(
             bundle: bundle,

@@ -1807,7 +1807,17 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
             let perSplat = UInt64(Swift.max(1, TrainerResources.bytesPerSplat(
                 shCoefficientCount: 1 + shDegree.restCoefficientCount
             )))
-            return Int(memoryForSplats / perSplat)
+            // Build 432: sized to stay under the governor's share gate, which
+            // trips once a run has consumed f / (1 + f) of what was free at its
+            // start (f = 0.85: 46 %), with 10 % margin, after about 760 MB that
+            // is not points (pixel buffers at 1,080 px, caches, the Smart
+            // layers). It used 60 % of free memory, so a phone that offered the
+            // app 2.6 GB instead of 3.0 started every run over the gate and was
+            // cut straight away. About 260k points at 2.6 GB, 400k at 3.0 GB.
+            let shareLimit = availableMemoryBytes / 100 * 41
+            let overhead: UInt64 = 760 * 1_048_576
+            let forSplats = shareLimit > overhead ? shareLimit - overhead : 0
+            return Int(Swift.min(forSplats, memoryForSplats) / perSplat)
         }
 
         let scaleCap: Int
@@ -1820,7 +1830,7 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
         switch tier {
         case .full:
             return TrainingBudget(
-                splatCap: Swift.max(50_000, Swift.min(scaleCap, capFromMemory(at: .three))),
+                splatCap: Swift.max(150_000, Swift.min(scaleCap, capFromMemory(at: .three))),
                 // 30,000 IS THE REFERENCE BUDGET, and this is deliberately
                 // the slow end of the trade so the quality CEILING can be
                 // measured before anything is optimised back down.
