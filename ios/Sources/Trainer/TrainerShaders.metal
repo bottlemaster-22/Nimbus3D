@@ -646,6 +646,26 @@ static inline void trainer_atomicAddUnchecked(device atomic_float* target, float
     atomic_fetch_add_explicit(target, value, memory_order_relaxed);
 }
 
+/// Build 438: one (splat, pixel-or-group) contribution to the 2D gradient
+/// record: colour, opacity, mean, conic, AbsGS magnitude, visibility and
+/// unknown-region weight, skipping exact zeros as the callers always did.
+static inline void trainer_addGrad2D(
+    device TrainerSplatGrad2DAtomic* g, float4 gA, float4 gB, float4 gC
+) {
+    if (gA.x != 0.0f) { trainer_atomicAddUnchecked(&g->color0, gA.x); }
+    if (gA.y != 0.0f) { trainer_atomicAddUnchecked(&g->color1, gA.y); }
+    if (gA.z != 0.0f) { trainer_atomicAddUnchecked(&g->color2, gA.z); }
+    if (gA.w != 0.0f) { trainer_atomicAddUnchecked(&g->opacity, gA.w); }
+    if (gB.x != 0.0f) { trainer_atomicAddUnchecked(&g->mean2D0, gB.x); }
+    if (gB.y != 0.0f) { trainer_atomicAddUnchecked(&g->mean2D1, gB.y); }
+    if (gB.z != 0.0f) { trainer_atomicAddUnchecked(&g->conic0, gB.z); }
+    if (gB.w != 0.0f) { trainer_atomicAddUnchecked(&g->conic1, gB.w); }
+    if (gC.x != 0.0f) { trainer_atomicAddUnchecked(&g->conic2, gC.x); }
+    if (gC.y != 0.0f) { trainer_atomicAddUnchecked(&g->absGrad2D, gC.y); }
+    if (gC.z != 0.0f) { trainer_atomicAddUnchecked(&g->visAccum, gC.z); }
+    if (gC.w != 0.0f) { trainer_atomicAddUnchecked(&g->unknownAccum, gC.w); }
+}
+
 /// Build 308: trainer_atomicAdd for ONE SHARED ADDRESS (a loss total, the
 /// per-frame exposure or camera gradient). Every thread of a kernel adding into
 /// the same float is up to 32 atomics per SIMD group queueing on one address,
@@ -2803,25 +2823,24 @@ kernel void trainer_rasterize_backward(
                             }
                         }
                     }
-                    if (simd_any(contributes)) {
+                    // BUILD 438: ADAPTIVE. Summing across the group costs three
+                    // float4 reductions whether 2 lanes or 30 contributed, and
+                    // the phone measured the always-summing version 1.5x slower
+                    // than per-lane atomics (424: 7.9 vs 5.2 ms). The group sums
+                    // only when at least 8 lanes contributed; otherwise each
+                    // contributing lane adds its own, as the plain loop does.
+                    // `contributors` is uniform across the group, so both
+                    // branches keep the uniform control flow simd_sum needs.
+                    const uint contributors = simd_sum(contributes ? 1u : 0u);
+                    if (contributors >= 8u) {
                         gA = simd_sum(gA);
                         gB = simd_sum(gB);
                         gC = simd_sum(gC);
                         if (simd_is_first()) {
-                            device TrainerSplatGrad2DAtomic* g = &splatGrad2D[tgIndex[j]];
-                            if (gA.x != 0.0f) { trainer_atomicAddUnchecked(&g->color0, gA.x); }
-                            if (gA.y != 0.0f) { trainer_atomicAddUnchecked(&g->color1, gA.y); }
-                            if (gA.z != 0.0f) { trainer_atomicAddUnchecked(&g->color2, gA.z); }
-                            if (gA.w != 0.0f) { trainer_atomicAddUnchecked(&g->opacity, gA.w); }
-                            if (gB.x != 0.0f) { trainer_atomicAddUnchecked(&g->mean2D0, gB.x); }
-                            if (gB.y != 0.0f) { trainer_atomicAddUnchecked(&g->mean2D1, gB.y); }
-                            if (gB.z != 0.0f) { trainer_atomicAddUnchecked(&g->conic0, gB.z); }
-                            if (gB.w != 0.0f) { trainer_atomicAddUnchecked(&g->conic1, gB.w); }
-                            if (gC.x != 0.0f) { trainer_atomicAddUnchecked(&g->conic2, gC.x); }
-                            if (gC.y != 0.0f) { trainer_atomicAddUnchecked(&g->absGrad2D, gC.y); }
-                            if (gC.z != 0.0f) { trainer_atomicAddUnchecked(&g->visAccum, gC.z); }
-                            if (gC.w != 0.0f) { trainer_atomicAddUnchecked(&g->unknownAccum, gC.w); }
+                            trainer_addGrad2D(&splatGrad2D[tgIndex[j]], gA, gB, gC);
                         }
+                    } else if (contributes) {
+                        trainer_addGrad2D(&splatGrad2D[tgIndex[j]], gA, gB, gC);
                     }
                 }
             }
