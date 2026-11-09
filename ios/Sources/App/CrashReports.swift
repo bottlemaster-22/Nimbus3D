@@ -41,11 +41,17 @@ enum CrashReportStore {
         return dated.sorted { $0.1 > $1.1 }.prefix(limit).map { $0.0 }
     }
 
+    /// Named by a hash of the report, so the same report delivered again
+    /// (iOS re-offers past payloads on every launch) is written once.
     static func save(_ data: Data, kind: String) {
-        guard let directory = directory() else { return }
-        let stamp = ISO8601DateFormatter().string(from: Date())
-            .replacingOccurrences(of: ":", with: "-")
-        let url = directory.appendingPathComponent("\(kind)-\(stamp)-\(UUID().uuidString.prefix(6)).json")
+        guard let directory = directory(), !data.isEmpty else { return }
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01b3
+        }
+        let url = directory.appendingPathComponent("\(kind)-\(String(hash, radix: 16)).json")
+        guard !FileManager.default.fileExists(atPath: url.path) else { return }
         try? data.write(to: url)
     }
 }
