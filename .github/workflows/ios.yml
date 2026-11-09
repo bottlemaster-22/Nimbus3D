@@ -324,6 +324,9 @@ jobs:
       #  by accident.
       # =====================================================================
       - name: Publish to Bottle sideload broker (development only)
+        # Nov 2026: the Bottle server is down; the IPA artifact above is what
+        # gets installed (Sideloadly), so a failed publish must not fail the run.
+        continue-on-error: true
         # Publish whenever this job actually produced an IPA, which is NOT
         # the same as "on a push".
         #
