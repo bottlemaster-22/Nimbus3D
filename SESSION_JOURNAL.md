@@ -1543,3 +1543,7 @@ Owner's call: more training photos. keyframeCount 200 -> 400 (heldOutFraction 0.
 ### BUILD 442: 428 result; keyframes back to 200
 
 428 (CI#428: 400 keyframes -> 360 trained, cap 450k, 1,080 cache on, adaptive SIMD backward) on scan_20261109_223238, same 28 held-out frames (index % 40 == 20, scored 24): held-out 19.37 raw / 19.73 fitted / SSIM 0.672, aligned 20.57 / 0.701, trained 22.82 (424 with 180 trained, cap 391k: 20.45 / 0.680, aligned 20.95 / 0.700, trained 24.12). 541 s train (424: 510). Memory 877 MB peak. Level ms/round: 10.18 / 17.12 / 28.50 (1,080 cache on: loop wait 18.8 s, was 63). Backward calibration: adaptive SIMD B 14.31 ms vs plain 9.57: rejected again (Apple GPU simd_sum is the cost, not the atomics). Keyframes back to 200; cap stays 450k.
+
+### BUILD 444: Look Around fixed; 360-px level cut to 15 %
+
+Owner: Look Around shows a grey screen. Cause: MetalSplatRenderer.prepare framed the camera on the bounds of every point, and since 352 the exported PLY carries the far-field shell (24,576 points of ~5 m at 50 scene extents), so free look backed off hundreds of metres and showed the outside of the shell. The framing box now uses only points under 1 m across (falls back to all points). Schedule: coarseResolutionFractions [0.40, 0.70] -> [0.15, 0.70]; 428 measured 10.18 ms/round at 360 px vs 17.12 at 720 with 450k points, so the low-res level no longer buys much; estimated +50 s.

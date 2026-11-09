@@ -1102,6 +1102,14 @@ struct ViewerCloudUpload: Sendable {
         var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
         var hi = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
         var sawFinite = false
+        // Build 444: the exported PLY carries the far field as a shell of
+        // metres-wide points about fifty scene-widths out (build 352). Framing
+        // "Look around" on a box that includes it put the camera hundreds of
+        // metres away, looking at the grey outside of the shell. The framing
+        // box is the scene's own points: anything under a metre across.
+        var sceneLo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var sceneHi = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        var sawScene = false
 
         let order = bitReversedOrder(count: count)
 
@@ -1143,11 +1151,18 @@ struct ViewerCloudUpload: Sendable {
                 lo = simd_min(lo, p)
                 hi = simd_max(hi, p)
                 sawFinite = true
+                if Swift.max(s.x, Swift.max(s.y, s.z)) < 0 {
+                    sceneLo = simd_min(sceneLo, p)
+                    sceneHi = simd_max(sceneHi, p)
+                    sawScene = true
+                }
             }
         }
 
         let bounds: BoundingBox
-        if sawFinite {
+        if sawScene {
+            bounds = BoundingBox(min: Vector3(sceneLo), max: Vector3(sceneHi))
+        } else if sawFinite {
             bounds = BoundingBox(min: Vector3(lo), max: Vector3(hi))
         } else {
             bounds = BoundingBox(min: Vector3(-1, -1, -1), max: Vector3(1, 1, 1))

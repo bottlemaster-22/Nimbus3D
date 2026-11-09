@@ -1275,7 +1275,12 @@ struct TrainerTuning: Sendable {
     // Build 360: 360 px to 45 %, 720 px to 80 %, then 1,080 px.
     // Build 380: 1,080 px for the last 30 % (378's 1,080 phase was 1,600
     // iterations before early stop, with growth frozen and no cache).
-    var coarseResolutionFractions: [Float] = [0.40, 0.70]
+    // Build 444: 360 px to 15 %, 720 px to 70 %, 1,080 px after (was 40 / 70).
+    // The 360-px rounds were added when they cost 3.7 ms against 12.5 at full
+    // size; with 450k points and SH3 they cost 10.2 ms against 17.1 at 720 px
+    // (the per-point work dominates), so 7,500 of them move to 720 px for
+    // about +50 s, and all growth now happens closer to working resolution.
+    var coarseResolutionFractions: [Float] = [0.15, 0.70]
     var coarseResolutionScales: [Float] = [0.3333, 0.6667]
     /// BUILD 338: OFF. The background preload (build 332) put a second
     /// builder to work while the active level's prefetch worker built on
