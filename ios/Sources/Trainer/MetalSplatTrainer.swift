@@ -4765,6 +4765,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         lastHeldOutSSIM = nil
         lastHeldOutPerFrame = []
         guard splatCount > 0, !frames.isEmpty else { return nil }
+        // Build 428: released last (defers run in reverse), after the frame
+        // still rendering has been waited for.
+        try resources.acquireEvalStaging()
+        defer { resources.releaseEvalStaging() }
         // HELD-OUT VIEWS MUST NOT REACH A DENSIFY PASS. The eval's preprocess
         // writes denom, visibleFlag and maxRadiusPxBits into the live stats
         // buffer, and the loop runs eval, THEN densifier.run (which reads

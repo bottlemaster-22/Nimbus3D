@@ -316,7 +316,8 @@ final class TrainerResources {
         renderDepth = try make("renderDepth", px * 4)
         renderTFinal = try make("renderTFinal", px * 4)
         renderNContrib = try make("renderNContrib", px * 4)
-        evalStaging = try make("evalStaging", 2 * Self.evalStagingSlotBytes(pixelCount: px))
+        // Build 428: allocated only for an evaluation (acquireEvalStaging).
+        evalStaging = try make("evalStaging", 16)
         warmupStaging = try make("warmupStaging", 2 * Self.warmupStagingSlotBytes(pixelCount: px))
 
         gtColor = try make("gtColor", px * 3)
@@ -491,6 +492,21 @@ final class TrainerResources {
     /// `waitUntilCompleted` has already returned, and `TrainerGPU` reads
     /// `resources.<buffer>` at encode time rather than holding references of
     /// its own, so there is no observer of the intermediate state.
+    /// Build 428: the held-out evaluation's read-back buffer (47 MB at 1,080
+    /// px) exists only while an evaluation runs, not for the whole run.
+    func acquireEvalStaging() throws {
+        let want = 2 * Self.evalStagingSlotBytes(pixelCount: Swift.max(renderSize.pixelCount, 1))
+        guard evalStaging.length < want else { return }
+        evalStaging = try makeBuffer("evalStaging", want)
+        recomputeResidentBytes()
+    }
+
+    func releaseEvalStaging() {
+        guard evalStaging.length > 16, let placeholder = try? makePlaceholder() else { return }
+        evalStaging = placeholder
+        recomputeResidentBytes()
+    }
+
     private func makePlaceholder() throws -> MTLBuffer {
         return try makeBuffer("reshapePlaceholder", 16)
     }
@@ -797,7 +813,6 @@ final class TrainerResources {
         renderDepth = try makeBuffer("renderDepth", px * 4)
         renderTFinal = try makeBuffer("renderTFinal", px * 4)
         renderNContrib = try makeBuffer("renderNContrib", px * 4)
-        evalStaging = try makeBuffer("evalStaging", 2 * Self.evalStagingSlotBytes(pixelCount: px))
         if keepWarmupStaging {
             warmupStaging = try makeBuffer("warmupStaging", 2 * Self.warmupStagingSlotBytes(pixelCount: px))
         }

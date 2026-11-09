@@ -1519,3 +1519,7 @@ The living room on 408 trained its own views to only 25.9 dB with the population
 ### BUILD 422: training pauses in the background instead of failing
 
 iOS refuses GPU command buffers from a backgrounded app, so switching apps or a lock during a 6-8 minute run failed it. `AppActivity` (App/AppActivity.swift) tracks didEnterBackground / willEnterForeground and asks for a few seconds of background time; the training loop drains the step already on the GPU, emits the new `TrainerStage.pausedBackground`, sleeps until the app is back, and continues from the same iteration. A commit racing the notification can still fail (small window).
+
+### BUILDS 424-428 (local, one batch with 420-422)
+
+424: SH degree 3 opens by 15 % of the run (was 35 %; reference pace is a degree every 1,000 rounds). Crash reports named by content hash (iOS re-offers past payloads every launch). 426: census `levelSeconds` / `levelIterations` (wall time and rounds per resolution level; census.py prints ms per round per level). 428: evalStaging (2 x (16 + 28 B/px), 47 MB at 1,080 px) is a placeholder except inside evaluateHeldOut (acquireEvalStaging / releaseEvalStaging, released after the in-flight frame is waited for).
