@@ -440,7 +440,7 @@ struct TrainerCameraUniforms {
     var imageHeight: UInt32 = 0          // offset  84
     var tileCountX: UInt32 = 0           // offset  88
     var tileCountY: UInt32 = 0           // offset  92
-    var nearPlane: Float = 0.05          // offset  96
+    var nearPlane: Float = 0.15          // offset  96
     var farPlane: Float = 100            // offset 100
     var splatCount: UInt32 = 0           // offset 104
     /// `1 + shDegree.restCoefficientCount`: how many SH coefficients each

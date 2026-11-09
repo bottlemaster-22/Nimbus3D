@@ -1507,3 +1507,7 @@ Living room (scan_20260912) on 408: trained view 25.88 (406: 25.85), held-out fi
 ### Nov 9: installs via Sideloadly
 
 The Bottle sideload server (AWS) is down and the 414 IPA expired (30-day artifact retention). New path: CI builds the IPA (PR or manual runs only), `tools/get_ipa.ps1` downloads the newest one to Documents\LiKOVA\IPA\LiKOVA-build<N>.ipa, the owner installs it with Sideloadly. Owner is now on a Pro plan: test builds only for large changes, batch small tweaks.
+
+### BUILD 418: near cull 0.15 m, instance ceiling 24 M, MetricKit crash reports
+
+Small-object scans still fail on 416 (414 code). No data came back, so three changes at once: (1) points nearer than 0.15 m are not drawn from that view (was 0.05; reference 0.2): LiDAR cannot measure that close and such points cover most of the screen, the mechanism behind the 94-shot desk scan that reached 3 GB of Metal with 55,000 points; (2) tile instances capped at 24 M absolute (a room peaks at 2.6 M) and 640 MB kept free; (3) `CrashReportCollector` (MetricKit) saves iOS crash, hang and exit reports to Documents/LiKOVA/crash_reports at the next launch and DiagnosticsSender uploads them under crash/, so the next failure arrives with a call stack.

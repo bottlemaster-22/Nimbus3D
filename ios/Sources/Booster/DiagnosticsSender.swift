@@ -116,6 +116,19 @@ public final class DiagnosticsSender: ObservableObject {
                 )
             }
 
+            // Build 418: iOS's own crash and hang reports (CrashReports.swift).
+            for report in CrashReportStore.files() {
+                guard let data = try? Data(contentsOf: report) else { continue }
+                try await BoosterHTTP.putFile(
+                    address,
+                    path: BoosterAPI.diagnosticsFile(
+                        scanID: scanID, relativePath: "crash/\(report.lastPathComponent)"
+                    ),
+                    data: data
+                )
+                sent += 1
+                bytes += data.count
+            }
             let megabytes = Double(bytes) / 1_000_000
             message = String(
                 format: "Sent %d file%@ (%.1f MB) to %@.%@",

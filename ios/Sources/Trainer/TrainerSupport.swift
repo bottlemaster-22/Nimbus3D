@@ -1108,6 +1108,14 @@ struct TrainerTuning: Sendable {
     var filter3DFallbackMeters: Float = 0.01
     /// How often the per-Gaussian sampling-rate sweep is re-run.
     var filter3DIntervalIterations: Int = 500
+    /// Build 418: points nearer the camera than this are not drawn from that
+    /// view (was 0.05 m; the reference rasteriser uses 0.2 m). The LiDAR
+    /// cannot measure that close, so nothing there is real surface, and a
+    /// point a few centimetres from the lens covers most of the screen: an
+    /// object scan filmed close up turned such points into hundreds of
+    /// millions of tile pairs (a 94-shot desk scan reached 3 GB of Metal with
+    /// 55,000 points) and the app was killed.
+    static let nearPlaneMeters: Float = 0.15
     /// Build 390 (local): run the 3D-filter sweep on the CPU instead of as
     /// command buffers. Same arithmetic as trainer_sampling_rate_update and
     /// trainer_filter3d_finalize; about 0.1 s a sweep on six cores at

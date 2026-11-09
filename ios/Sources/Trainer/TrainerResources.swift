@@ -844,10 +844,14 @@ final class TrainerResources {
         // last 384 MB iOS says the app has. A frame that needs more renders
         // with the instances that fit (counted as truncated) instead of the
         // app being killed.
-        var wanted = Swift.min(newCapacity, 64_000_000)
+        // Build 418: an absolute ceiling of 24 M (384 MB; a room peaks near
+        // 2.6 M) and 640 MB kept free for everything else, not 384: the
+        // level switch, an evaluation and a densify pass all allocate after a
+        // growth, and the old reserve let instances take memory those needed.
+        var wanted = Swift.min(newCapacity, 24_000_000)
         let facts = DeviceMemoryFacts.probeMemoryOnly()
         if !facts.availableIsEstimated, wanted > instanceCapacity {
-            let reserve: UInt64 = 384 * 1_048_576
+            let reserve: UInt64 = 640 * 1_048_576
             let affordable = facts.availableBytes > reserve ? Int((facts.availableBytes - reserve) / 16) : 0
             if wanted - instanceCapacity > affordable {
                 wanted = instanceCapacity + affordable

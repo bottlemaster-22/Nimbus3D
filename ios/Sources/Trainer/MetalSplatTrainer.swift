@@ -3982,7 +3982,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         camera.imageHeight = UInt32(size.height)
         camera.tileCountX = UInt32(size.tileCountX)
         camera.tileCountY = UInt32(size.tileCountY)
-        camera.nearPlane = 0.05
+        camera.nearPlane = TrainerTuning.nearPlaneMeters
         camera.farPlane = 100
         camera.splatCount = UInt32(splatCount)
         camera.shCoeffCount = UInt32(shCoefficientCount)
@@ -4415,7 +4415,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         let fx = intrinsics.fx, fy = intrinsics.fy, cx = intrinsics.cx, cy = intrinsics.cy
         let width = Float(renderSize.width), height = Float(renderSize.height)
         let focal = Swift.max(fx, fy)
-        let near: Float = 0.05, far: Float = 100
+        let near: Float = TrainerTuning.nearPlaneMeters, far: Float = 100
         let filterScale = tuning.filter3DScale
         let fallback = tuning.filter3DFallbackMeters
         let splatStride = MemoryLayout<TrainerSplat>.stride
@@ -4542,7 +4542,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             camera.imageHeight = UInt32(renderSize.height)
             camera.tileCountX = UInt32(renderSize.tileCountX)
             camera.tileCountY = UInt32(renderSize.tileCountY)
-            camera.nearPlane = 0.05
+            camera.nearPlane = TrainerTuning.nearPlaneMeters
             camera.farPlane = 100
             camera.splatCount = UInt32(splatCount)
             camera.shCoeffCount = UInt32(shCoefficientCount)
