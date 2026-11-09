@@ -1547,3 +1547,7 @@ Owner's call: more training photos. keyframeCount 200 -> 400 (heldOutFraction 0.
 ### BUILD 444: Look Around fixed; 360-px level cut to 15 %
 
 Owner: Look Around shows a grey screen. Cause: MetalSplatRenderer.prepare framed the camera on the bounds of every point, and since 352 the exported PLY carries the far-field shell (24,576 points of ~5 m at 50 scene extents), so free look backed off hundreds of metres and showed the outside of the shell. The framing box now uses only points under 1 m across (falls back to all points). Schedule: coarseResolutionFractions [0.40, 0.70] -> [0.15, 0.70]; 428 measured 10.18 ms/round at 360 px vs 17.12 at 720 with 450k points, so the low-res level no longer buys much; estimated +50 s.
+
+### BUILD 446: growth paced to the halfway point
+
+maxGrowthFractionPerPass 0.15 filled the 450k cap by round ~700 of 30,000 (four passes at 360 px), after which only relocation (about 1,000 points a pass, donor-limited) could move capacity. Now the densifier is handed a paced cap: from the population at the first densify pass to the full cap on a straight line ending at growthPacedUntilPerMille (500: round 15,000, the reference densify_until), never below the live count, so growth continues through the 720-px level and early rounds carry fewer points (faster). Relocation runs whenever growth is under its per-pass allowance, as before.

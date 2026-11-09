@@ -1005,6 +1005,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // Levels whose phase has ended have had their caches dropped up to
         // this index; preloads started up to this index.
         var levelsDropped = 0
+        // Build 446: the population at the first densify pass, for growth pacing.
+        var growthBase: Int?
         var preloadsStarted = 1
         // Build 426: per-level wall time for the census.
         var levelTick = CFAbsoluteTimeGetCurrent()
@@ -1966,10 +1968,17 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     // The wall is whichever is lowest right now: what this
                     // slice was allotted, what the device measured it could
                     // hold, and whatever the governor has since cut it to.
-                    splatCap: Swift.min(
-                        Swift.min(effectiveCap, governor.current.splatCap),
-                        resources.splatCapacity
-                    ),
+                    splatCap: { () -> Int in
+                        let wall = Swift.min(
+                            Swift.min(effectiveCap, governor.current.splatCap),
+                            resources.splatCapacity
+                        )
+                        // Build 446: paced growth (see growthPacedUntilPerMille).
+                        let base = growthBase ?? splatCount
+                        let pacedEnd = effectiveTotal * Swift.max(tuning.growthPacedUntilPerMille, 0) / 1000
+                        guard pacedEnd > 0, iteration < pacedEnd, wall > base else { return wall }
+                        return Swift.max(base + (wall - base) * iteration / pacedEnd, splatCount)
+                    }(),
                     sceneExtentMeters: sceneExtent,
                     allowGrowth: inDensifyWindow,
                     allowPrune: inPruneWindow,
@@ -1985,6 +1994,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
                     // 304.5 s against 306.6 s, so the SIMD-group theory did not pay.
                     reorder: false
                 )
+                if growthBase == nil { growthBase = outcome.splatCountBefore }
                 splatCount = outcome.splatCountAfter
                 timings.spatialReorderSeconds += outcome.reorderSeconds
                 if outcome.availableAfterCPUWorkMB > 0 {

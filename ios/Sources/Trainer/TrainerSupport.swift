@@ -1042,6 +1042,13 @@ struct TrainerTuning: Sendable {
     /// `densifyIntervalIterations` for the whole run on a phone that is
     /// already thermally limited.
     var maxGrowthFractionPerPass: Float = 0.15
+    /// Build 446: the population may grow only along a straight line from the
+    /// seeds to the cap, reaching it at this share of the run (per mille). At
+    /// 15 % a pass the 450k cap was full by round ~700 of 30,000, so where
+    /// every point lives was decided at 360 px and only relocation (about
+    /// 1,000 a pass) could move capacity to detail the higher resolutions
+    /// reveal. The reference recipe densifies until halfway. 0 turns pacing off.
+    var growthPacedUntilPerMille: Int = 500
     /// Once the cap is reached, this fraction of the population may be
     /// RELOCATED per pass (MCMC style: a dead Gaussian is moved onto a
     /// high-gradient one, so the count never changes). See the cost note on
