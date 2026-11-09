@@ -5825,7 +5825,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // frames, and a round-robin over more frames than the cache holds
         // rebuilds every map on every visit.
         let authorityMap = SmartAuthorityMap(
-            settings: settings, cacheCapacity: 160
+            settings: settings, cacheCapacity: 240
         )
         authorityMap.prepare(
             bundle: bundle,

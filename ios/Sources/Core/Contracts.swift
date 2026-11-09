@@ -1813,8 +1813,8 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
         let scaleCap: Int
         switch sceneExtentMeters {
         case ..<3: scaleCap = 150_000    // one object
-        case ..<8: scaleCap = 330_000    // a room (build 396: the proven value; 400,000 with 200 frames ran out of memory in ordinary rounds, see the journal; 382 sat at the 330,000 cap for the whole 1,080-px phase at 1.05 GB, nothing could split; the 330,000 cap bound from round 700 with 420 MB of the memory ceiling unused)
-        default: scaleCap = 330_000      // a floor or a house (build 398: the proven room envelope; 500,000 was never run at SH3 / 1,080 px)
+        case ..<8: scaleCap = 450_000    // a room (build 420: 330,000 bound from round 700 of 30,000 and the trained views stopped at 26 dB, the model was short of points; builds 398-412 freed about 300 MB; previously: build 396: the proven value; 400,000 with 200 frames ran out of memory in ordinary rounds, see the journal; 382 sat at the 330,000 cap for the whole 1,080-px phase at 1.05 GB, nothing could split; the 330,000 cap bound from round 700 with 420 MB of the memory ceiling unused)
+        default: scaleCap = 450_000      // a floor or a house (build 420; previously build 398: the proven room envelope; 500,000 was never run at SH3 / 1,080 px)
         }
 
         switch tier {
@@ -1894,7 +1894,7 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 // Build 384: 200 again. 344 failed on memory the governor no longer
                 // spends on deleting the model; 382 ran the 720-px level at 0.94 GB
                 // with 120 frames cached and a 7 dB train/test gap.
-                keyframeCount: 120,  // build 398: every scene (240 at 8 m and over never fitted in memory); 200 needs about 600 MB more than the phone gives
+                keyframeCount: 200,  // build 420: captures run to 868-1,396 photos and 108 were trained; frame caches are on disk since 398, so a frame costs about 0.5 MB of memory. build 398: every scene (240 at 8 m and over never fitted in memory); 200 needs about 600 MB more than the phone gives
                 memoryCeilingBytes: memoryForSplats,
                 // Build 362: a six-minute run sits at .fair throughout; the
                 // degrade rung (a one-way resolution cut) would fire fifteen
