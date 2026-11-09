@@ -176,9 +176,13 @@ final class TrainerSupervisionPrefetch: @unchecked Sendable {
         drain()
         let item = DispatchWorkItem { [self] in
             let from = CFAbsoluteTimeGetCurrent()
-            built = builder.build(
-                frame: frame, iteration: iteration, totalIterations: totalIterations
-            )
+            // Build 434: one pool per build (a custom serial queue does not
+            // drain per work item by default).
+            built = autoreleasepool {
+                builder.build(
+                    frame: frame, iteration: iteration, totalIterations: totalIterations
+                )
+            }
             didBuild = true
             workerSeconds += CFAbsoluteTimeGetCurrent() - from
         }

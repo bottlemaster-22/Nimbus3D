@@ -1288,6 +1288,12 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         }()
 
         iterationLoop: while true {
+            // Build 434: the loop is one synchronous stretch inside an async
+            // function, so anything autoreleased in it (command buffers and the
+            // buffers they retain, Foundation temporaries) waited for the end
+            // of the run. Suspending ends the job, and Swift drains the
+            // autorelease pool around every job. Nothing else changes.
+            if iteration % 25 == 0 { await Task.yield() }
             let effectiveTotal = Swift.max(
                 Swift.min(
                     totalIterations,
