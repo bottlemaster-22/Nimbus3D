@@ -50,6 +50,7 @@
 //  honestly state about itself.
 //
 
+import ARKit
 import Combine
 import Metal
 import MetalKit
@@ -81,6 +82,23 @@ public struct CaptureScreen: View {
                     cameraLayer
                 }
 
+                // Build 452: focus pins, and the double-tap that places one.
+                if model.stage == .recording {
+                    // Full screen, like the camera layer, so a tap and a pin
+                    // use the same coordinates as the picture under them.
+                    FocusPinsOverlay(store: model.focusPins)
+                        .allowsHitTesting(false)
+                        .ignoresSafeArea()
+                    if model.focusMode {
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .ignoresSafeArea()
+                            .onTapGesture(count: 2) { location in
+                                model.placeFocus(at: location)
+                            }
+                    }
+                }
+
                 switch model.stage {
                 case .ready, .starting:
                     CaptureStartPanel(model: model)
@@ -107,10 +125,14 @@ public struct CaptureScreen: View {
                     )
                 }
             }
-            .onChange(of: geometry.size) { _, newValue in
-                model.viewportSize = newValue
+            // Build 452: the FULL screen, safe areas included. The camera
+            // layer ignores the safe area, so the size it is mapped with has
+            // to as well; the inset size stretched the picture slightly and
+            // would have put focus pins off their targets.
+            .onChange(of: geometry.size) { _, _ in
+                model.viewportSize = Self.fullScreenSize(geometry)
             }
-            .onAppear { model.viewportSize = geometry.size }
+            .onAppear { model.viewportSize = Self.fullScreenSize(geometry) }
         }
         .task { await model.prepare() }
         .onAppear {
@@ -132,6 +154,14 @@ public struct CaptureScreen: View {
         ) { _ in
             model.refreshOrientation()
         }
+    }
+
+    private static func fullScreenSize(_ geometry: GeometryProxy) -> CGSize {
+        let insets = geometry.safeAreaInsets
+        return CGSize(
+            width: geometry.size.width + insets.leading + insets.trailing,
+            height: geometry.size.height + insets.top + insets.bottom
+        )
     }
 
     @ViewBuilder
@@ -158,6 +188,24 @@ public struct CaptureScreen: View {
     private var recordingOverlay: some View {
         VStack(spacing: 0) {
             CaptureTopBar(model: model)
+
+            // Build 452: the focus menu, top right.
+            HStack {
+                Spacer()
+                CaptureFocusMenu(model: model)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+
+            if model.focusMode {
+                Text("Double-tap something detailed to give it extra attention.")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.black)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Capsule().fill(Color.yellow))
+                    .padding(.top, 8)
+            }
 
             if let reason = model.stopReason {
                 CaptureBanner(text: reason, tone: .problem)
@@ -244,6 +292,29 @@ final class CaptureScreenModel: ObservableObject {
 
     private var service: ARCaptureService?
     private var interfaceOrientation: UIInterfaceOrientation = .portrait
+    /// Build 452: focus points.
+    @Published var focusMode = false
+    @Published private(set) var focusCount = 0
+    let focusPins = FocusPinStore()
+
+    func placeFocus(at location: CGPoint) {
+        guard let service,
+              service.addFocusPoint(
+                viewPoint: location, viewportSize: viewportSize, orientation: interfaceOrientation
+              ) != nil
+        else {
+            UINotificationFeedbackGenerator().notificationOccurred(.warning)
+            return
+        }
+        focusCount = service.focusPoints.count
+        focusMode = false
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+    }
+
+    func removeLastFocus() {
+        service?.removeLastFocusPoint()
+        focusCount = service?.focusPoints.count ?? 0
+    }
     private var liveTask: Task<Void, Never>?
     private var bundleRef: CaptureBundleRef?
     private var bytesAtFinish: Int64 = 0
@@ -299,6 +370,14 @@ final class CaptureScreenModel: ObservableObject {
                 viewportSize: self.viewportSize,
                 orientation: self.interfaceOrientation
             )
+            if let service = self.service, !service.focusPoints.isEmpty {
+                self.focusPins.update(
+                    frame: frame, points: service.focusPoints,
+                    viewportSize: self.viewportSize, orientation: self.interfaceOrientation
+                )
+            } else if !self.focusPins.points.isEmpty {
+                self.focusPins.points = []
+            }
         }
     }
 
@@ -591,4 +670,90 @@ struct CaptureCoverageMetalView: UIViewRepresentable {
 
 #Preview("Capture") {
     CaptureScreen()
+}
+
+// =============================================================================
+//  MARK: - Focus points (build 452)
+// =============================================================================
+
+/// Where the focus pins are on screen this frame. Separate from the screen
+/// model so a 60 Hz update redraws only the pins.
+@MainActor
+final class FocusPinStore: ObservableObject {
+    @Published var points: [CGPoint] = []
+
+    func update(
+        frame: ARFrame, points world: [FocusPoint],
+        viewportSize: CGSize, orientation: UIInterfaceOrientation
+    ) {
+        let view = frame.camera.viewMatrix(for: orientation)
+        var visible: [CGPoint] = []
+        for point in world {
+            let p = SIMD3<Float>(point.position.x, point.position.y, point.position.z)
+            // ARKit's view space looks down -Z: in front means z < 0.
+            let inView = view * SIMD4<Float>(p, 1)
+            guard inView.z < -0.05 else { continue }
+            let screen = frame.camera.projectPoint(p, orientation: orientation, viewportSize: viewportSize)
+            guard screen.x.isFinite, screen.y.isFinite else { continue }
+            visible.append(screen)
+        }
+        if visible != points { points = visible }
+    }
+}
+
+struct FocusPinsOverlay: View {
+    @ObservedObject var store: FocusPinStore
+
+    var body: some View {
+        ZStack {
+            ForEach(Array(store.points.enumerated()), id: \.offset) { _, point in
+                ZStack {
+                    Circle()
+                        .stroke(Color.white, lineWidth: 2)
+                        .frame(width: 34, height: 34)
+                    Circle()
+                        .fill(Color.yellow)
+                        .frame(width: 10, height: 10)
+                }
+                .shadow(color: .black.opacity(0.5), radius: 3)
+                .position(point)
+            }
+        }
+    }
+}
+
+struct CaptureFocusMenu: View {
+    @ObservedObject var model: CaptureScreenModel
+
+    var body: some View {
+        Menu {
+            Button {
+                model.focusMode.toggle()
+            } label: {
+                Label(
+                    model.focusMode ? "Cancel focus point" : "Add focus point",
+                    systemImage: "scope"
+                )
+            }
+            if model.focusCount > 0 {
+                Button(role: .destructive) {
+                    model.removeLastFocus()
+                } label: {
+                    Label("Remove last focus point", systemImage: "arrow.uturn.backward")
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "scope")
+                if model.focusCount > 0 { Text("\(model.focusCount)") }
+            }
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(model.focusMode ? Color.black : Color.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(
+                Capsule().fill(model.focusMode ? Color.yellow : Color.black.opacity(0.45))
+            )
+        }
+    }
 }

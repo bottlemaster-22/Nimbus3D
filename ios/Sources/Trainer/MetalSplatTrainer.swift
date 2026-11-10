@@ -1170,6 +1170,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
         // --- Per-run state --------------------------------------------------------
         let densifier = TrainerDensifier(tuning: tuning, settings: settings)
+        densifier.focus = (bundle.focusPoints ?? []).map { (center: $0.position.simd, radius: $0.radiusMeters) }
         let sceneExtent = Swift.max(
             bundle.sceneBounds?.longestEdgeMeters ?? slice.bounds.longestEdgeMeters, 0.5
         )
@@ -1187,6 +1188,37 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // the run-to-run noise every A/B is read against.
         var orderRNG = TrainerSplitMix64(seed: 0x4C69_4B4F_5641)
         order.shuffle(using: &orderRNG)
+        // FOCUS (build 452): keyframes that see a focus point are visited
+        // twice per epoch. The second visits are spread evenly through the
+        // epoch rather than bunched at the end.
+        if let focus = bundle.focusPoints, !focus.isEmpty {
+            var extra: [Int] = []
+            for (k, frame) in slice.keyframes.enumerated() {
+                let pose = prePass.refinedPose(for: frame.index) ?? frame.refinedPose ?? frame.rawPose
+                if Self.seesFocus(pose: pose, intrinsics: bundle.intrinsics, focus: focus) {
+                    extra.append(k)
+                }
+            }
+            extra.shuffle(using: &orderRNG)
+            if !extra.isEmpty {
+                let every = Swift.max(order.count / extra.count, 1)
+                var merged: [Int] = []
+                merged.reserveCapacity(order.count + extra.count)
+                var e = 0
+                for (n, k) in order.enumerated() {
+                    merged.append(k)
+                    if (n + 1) % every == 0, e < extra.count {
+                        merged.append(extra[e])
+                        e += 1
+                    }
+                }
+                if e < extra.count { merged.append(contentsOf: extra[e...]) }
+                order = merged
+            }
+            TrainerLog.general.info(
+                "Focus: \(extra.count) of \(slice.keyframes.count) keyframes visited twice per epoch"
+            )
+        }
 
         let totalIterations = Swift.max(slice.iterationBudget, 1)
         // This slice's share of the whole run. When the governor lowers the
@@ -6159,13 +6191,70 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             chosen = Swift.stride(from: 0, to: walk.count, by: step).map { walk[$0] }
         }
 
-        guard !heldOutCandidates.isEmpty,
-              let low = chosen.map(\.index).min(), let high = chosen.map(\.index).max()
+        // The held-out span is taken BEFORE focus frames are added, so a scan
+        // with focus points is scored on exactly the frames it would have
+        // been scored on without them.
+        let spanLow = chosen.map(\.index).min()
+        let spanHigh = chosen.map(\.index).max()
+
+        // FOCUS POINTS (build 452). The owner pins detailed things during
+        // capture. Every walk frame that sees a pin up close and was not
+        // already chosen is a candidate; up to a quarter of the training set
+        // (at most 40) is added on top, spread evenly over the candidates and
+        // the sharpest of each stretch. Held-out frames are never candidates:
+        // `walk` already excludes them.
+        if let focus = bundle.focusPoints, !focus.isEmpty {
+            let taken = Set(chosen.map(\.index))
+            let candidates = walk.filter { frame in
+                guard !taken.contains(frame.index) else { return false }
+                let pose = prePass.refinedPose(for: frame.index) ?? frame.refinedPose ?? frame.rawPose
+                return Self.seesFocus(pose: pose, intrinsics: bundle.intrinsics, focus: focus)
+            }
+            let room = Swift.min(trainTarget / 4, 40)
+            var extras: [CaptureFrame] = []
+            if candidates.count <= room {
+                extras = candidates
+            } else if room > 0 {
+                for k in 0..<room {
+                    let from = k * candidates.count / room
+                    let to = Swift.max((k + 1) * candidates.count / room, from + 1)
+                    if let best = candidates[from..<to].max(by: { $0.qc.weight < $1.qc.weight }) {
+                        extras.append(best)
+                    }
+                }
+            }
+            if !extras.isEmpty {
+                chosen = (chosen + extras).sorted { $0.index < $1.index }
+            }
+            TrainerLog.general.info(
+                "Focus: \(extras.count) extra keyframe(s) for \(focus.count) focus point(s), \(candidates.count) candidate(s)"
+            )
+        }
+
+        guard !heldOutCandidates.isEmpty, let low = spanLow, let high = spanHigh
         else { return (chosen, nil) }
         let heldOut = pool.filter {
             heldOutCandidates.contains($0.index) && $0.index >= low && $0.index <= high
         }
         return (chosen, heldOut.isEmpty ? nil : heldOut)
+    }
+
+    /// Build 452: true when a focus point sits in the central 80 % of this
+    /// view, in front of the camera and within 2.5 m, close enough for the
+    /// frame to carry real detail of it. There is no occlusion test: a pin
+    /// behind a wall can pull in a frame that does not see it, which costs a
+    /// visit, not quality.
+    static func seesFocus(pose: Pose, intrinsics k: CameraIntrinsics, focus: [FocusPoint]) -> Bool {
+        let m = pose.matrix
+        let w = Float(k.width), h = Float(k.height)
+        for point in focus {
+            let c = m * SIMD4<Float>(point.position.simd, 1)
+            guard c.z > 0.1, c.z < 2.5 else { continue }
+            let u = k.fx * c.x / c.z + k.cx
+            let v = k.fy * c.y / c.z + k.cy
+            if u > 0.1 * w, u < 0.9 * w, v > 0.1 * h, v < 0.9 * h { return true }
+        }
+        return false
     }
 
     // MARK: - Progress

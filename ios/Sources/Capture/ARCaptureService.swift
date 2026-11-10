@@ -300,6 +300,34 @@ public final class ARCaptureService: NSObject, CaptureService {
     /// see, and this app has already lost a day to exactly that kind of
     /// silence. Both are reported in the capture summary.
     private var framesSkippedNoTracking = 0
+    /// Build 452: focus points pinned this session (see FocusPoint).
+    private(set) var focusPoints: [FocusPoint] = []
+
+    /// Build 452: hit-tests the surface under a point on screen and pins a
+    /// focus point there. nil when nothing solid is under the finger.
+    func addFocusPoint(
+        viewPoint: CGPoint, viewportSize: CGSize, orientation: UIInterfaceOrientation
+    ) -> FocusPoint? {
+        guard phase == .recording, let frame = session.currentFrame,
+              viewportSize.width > 1, viewportSize.height > 1
+        else { return nil }
+        let normalized = CGPoint(
+            x: viewPoint.x / viewportSize.width, y: viewPoint.y / viewportSize.height
+        )
+        let toImage = frame.displayTransform(for: orientation, viewportSize: viewportSize).inverted()
+        let imagePoint = normalized.applying(toImage)
+        let query = frame.raycastQuery(from: imagePoint, allowing: .estimatedPlane, alignment: .any)
+        guard let hit = session.raycast(query).first else { return nil }
+        let t = hit.worldTransform.columns.3
+        let point = FocusPoint(position: Vector3(t.x, t.y, t.z))
+        focusPoints.append(point)
+        return point
+    }
+
+    /// Build 452: removes the most recent focus point.
+    func removeLastFocusPoint() {
+        if !focusPoints.isEmpty { focusPoints.removeLast() }
+    }
     private var framesSkippedBadPose = 0
     private var lastQC: FrameQC?
     /// Shutter length of the last frame that was measured, seconds. Half of
@@ -399,6 +427,7 @@ public final class ARCaptureService: NSObject, CaptureService {
         guidance.start()
 
         UIApplication.shared.isIdleTimerDisabled = true
+        focusPoints = []
         phase = .recording
         startLiveTick()
 
@@ -499,6 +528,7 @@ public final class ARCaptureService: NSObject, CaptureService {
 
         let frames = recorded.snapshot()
         let pointCloud = self.pointCloud
+        let focus = self.focusPoints
 
         // The tracking gate counts what it drops "so the census can say how
         // many were dropped and why", and until now nothing read
@@ -538,7 +568,8 @@ public final class ARCaptureService: NSObject, CaptureService {
                             pointCloud: pointCloud,
                             sceneBoundsFallback: meshBounds,
                             revisitPairs: revisits,
-                            cameraToIMUTimeOffsetSeconds: timeOffset
+                            cameraToIMUTimeOffsetSeconds: timeOffset,
+                            focusPoints: focus
                         )
                         writer.close()
                         continuation.resume(returning: bundle)

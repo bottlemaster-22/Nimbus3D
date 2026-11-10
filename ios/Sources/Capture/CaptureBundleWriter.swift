@@ -58,7 +58,8 @@ enum CaptureBundleWriter {
         pointCloud: CapturePointCloudAccumulator,
         sceneBoundsFallback: BoundingBox?,
         revisitPairs: [RevisitPair] = [],
-        cameraToIMUTimeOffsetSeconds: Double? = nil
+        cameraToIMUTimeOffsetSeconds: Double? = nil,
+        focusPoints: [FocusPoint] = []
     ) throws -> CaptureBundle {
 
         // 1. COLMAP model.
@@ -114,7 +115,8 @@ enum CaptureBundleWriter {
             // into measurements (F1).
             revisitPairs: revisitPairs,
             sceneBounds: pointCloud.bounds() ?? sceneBoundsFallback,
-            pointCloudPath: CaptureScanFolder.pointCloudRelativePath
+            pointCloudPath: CaptureScanFolder.pointCloudRelativePath,
+            focusPoints: focusPoints.isEmpty ? nil : focusPoints
         )
 
         let data = try ContractsJSON.encoder().encode(bundle)

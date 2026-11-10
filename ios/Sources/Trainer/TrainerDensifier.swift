@@ -331,6 +331,10 @@ final class TrainerDensifier {
 
     private let tuning: TrainerTuning
     private let settings: SmartLossSettings
+    /// Build 452: focus points (centre, radius in metres). Splats inside a
+    /// radius score double, so they split and clone sooner and the area
+    /// ends up with more, smaller points.
+    var focus: [(center: SIMD3<Float>, radius: Float)] = []
 
     init(tuning: TrainerTuning, settings: SmartLossSettings) {
         self.tuning = tuning
@@ -461,6 +465,15 @@ final class TrainerDensifier {
             let denominator = Swift.max(stats[i].denom, 1)
             let value = stats[i].absGrad2D / denominator
             score[i] = value.isFinite ? value : 0
+        }
+        if !focus.isEmpty {
+            for i in 0..<splatCount where score[i] > 0 {
+                let m = splats[i].mean
+                for spot in focus where simd_distance_squared(m, spot.center) <= spot.radius * spot.radius {
+                    score[i] *= 2
+                    break
+                }
+            }
         }
 
         let maxWorldScale = Swift.max(

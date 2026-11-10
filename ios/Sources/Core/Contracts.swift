@@ -1087,6 +1087,9 @@ public struct CaptureBundle: Codable, Sendable {
     public var sceneBounds: BoundingBox?
     /// Path to the baked LiDAR cloud, `sparse/0/points3D.txt`.
     public var pointCloudPath: String
+    /// Build 452: places the user pinned during capture for extra detail.
+    /// Absent in older bundles.
+    public var focusPoints: [FocusPoint]?
 
     public init(
         formatVersion: Int = CaptureBundle.currentFormatVersion,
@@ -1104,7 +1107,8 @@ public struct CaptureBundle: Codable, Sendable {
         meshChunks: [MeshChunkRef] = [],
         revisitPairs: [RevisitPair] = [],
         sceneBounds: BoundingBox? = nil,
-        pointCloudPath: String
+        pointCloudPath: String,
+        focusPoints: [FocusPoint]? = nil
     ) {
         self.formatVersion = formatVersion
         self.scanID = scanID
@@ -1122,6 +1126,20 @@ public struct CaptureBundle: Codable, Sendable {
         self.revisitPairs = revisitPairs
         self.sceneBounds = sceneBounds
         self.pointCloudPath = pointCloudPath
+        self.focusPoints = focusPoints
+    }
+}
+
+/// Build 452: a FOCUS point, double-tapped on a surface during capture.
+/// Processing gives the area around it more photos, more visits and more
+/// points. World coordinates, the same frame as the capture's poses.
+public struct FocusPoint: Codable, Hashable, Sendable {
+    public var position: Vector3
+    public var radiusMeters: Float
+
+    public init(position: Vector3, radiusMeters: Float = 0.35) {
+        self.position = position
+        self.radiusMeters = radiusMeters
     }
 }
 
