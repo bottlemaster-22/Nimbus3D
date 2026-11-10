@@ -1825,8 +1825,8 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
         let scaleCap: Int
         switch sceneExtentMeters {
         case ..<3: scaleCap = 150_000    // one object
-        case ..<8: scaleCap = 450_000    // a room (build 420: 330,000 bound from round 700 of 30,000 and the trained views stopped at 26 dB, the model was short of points; builds 398-412 freed about 300 MB; previously: build 396: the proven value; 400,000 with 200 frames ran out of memory in ordinary rounds, see the journal; 382 sat at the 330,000 cap for the whole 1,080-px phase at 1.05 GB, nothing could split; the 330,000 cap bound from round 700 with 420 MB of the memory ceiling unused)
-        default: scaleCap = 450_000      // a floor or a house (build 420; previously build 398: the proven room envelope; 500,000 was never run at SH3 / 1,080 px)
+        case ..<8: scaleCap = 600_000    // a room (build 448: 450k filled by round 15,000 under paced growth with points still 5.3 mm against Scaniverse's 3.4; 821 MB peak; previously build 420: 330,000 bound from round 700 of 30,000 and the trained views stopped at 26 dB, the model was short of points; builds 398-412 freed about 300 MB; previously: build 396: the proven value; 400,000 with 200 frames ran out of memory in ordinary rounds, see the journal; 382 sat at the 330,000 cap for the whole 1,080-px phase at 1.05 GB, nothing could split; the 330,000 cap bound from round 700 with 420 MB of the memory ceiling unused)
+        default: scaleCap = 600_000      // a floor or a house (build 448; previously build 420; previously build 398: the proven room envelope; 500,000 was never run at SH3 / 1,080 px)
         }
 
         switch tier {

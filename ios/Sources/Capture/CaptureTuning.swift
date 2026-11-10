@@ -300,7 +300,13 @@ public enum CaptureTuning {
     /// away across the many photographs that see the same surface. Motion
     /// blur is not: it destroys the high-frequency detail in every frame
     /// that has it, and no amount of averaging brings it back.
-    public static let maxExposureDurationSeconds: Double = 1.0 / 60.0
+    ///
+    /// Build 448: 1/150 s (was 1/60). A dim-room capture (scan_20261109,
+    /// 22:32) ran at 1/100 s with ISO up to 7,900 and motion blur from 1.6 to
+    /// 11.5 px, and its blurriest held-out frames scored lowest. 1/150 cuts
+    /// blur by a third in the same light and costs ISO, which the trainer
+    /// averages away. Bright rooms already run far faster and are unchanged.
+    public static let maxExposureDurationSeconds: Double = 1.0 / 150.0
 
     // MARK: - Exposure bracketing (F5)
 

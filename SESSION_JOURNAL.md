@@ -1551,3 +1551,7 @@ Owner: Look Around shows a grey screen. Cause: MetalSplatRenderer.prepare framed
 ### BUILD 446: growth paced to the halfway point
 
 maxGrowthFractionPerPass 0.15 filled the 450k cap by round ~700 of 30,000 (four passes at 360 px), after which only relocation (about 1,000 points a pass, donor-limited) could move capacity. Now the densifier is handed a paced cap: from the population at the first densify pass to the full cap on a straight line ending at growthPacedUntilPerMille (500: round 15,000, the reference densify_until), never below the live count, so growth continues through the 720-px level and early rounds carry fewer points (faster). Relocation runs whenever growth is under its per-pass allowance, as before.
+
+### BUILD 448: 434 result; 600k for rooms; shutter cap 1/150 s
+
+434 (CI#434: Look Around fix, 360 px to 15 %, growth paced to 50 %) on scan_20261109_223238: 30,000 rounds, 510 s (same as 424), 448k points (cap reached at 15,100 as paced), held-out 20.00 raw / 20.35 fitted / SSIM 0.682, aligned 20.87 / 0.706 (424: 20.45 / 0.680, 20.95 / 0.700), trained 24.01; exported median long axis 5.3 mm (424: 7.0); peak 821 MB. Level ms/round 6.88 / 14.72 / 25.67. The capture is dim (22:32): shutter 1/100 on nearly every frame, ISO 334-7,901, motion blur 1.6-11.5 px; held-out frames range 15.0-28.6 dB and the worst include the blurriest (180: 11.5 px, 16.2 dB) but also sharp ones (340: 1.6 px, 16.6 dB). Changes: room/house cap 450k -> 600k (plan formula gives about 640k at 2.6 GB available), capture shutter cap 1/60 -> 1/150 s (new scans only).
