@@ -4030,6 +4030,57 @@ kernel void trainer_adam_sh(
     }
 }
 
+/// BUILD 456: THE SAME UPDATE, ONE THREAD PER COEFFICIENT FLOAT.
+///
+/// trainer_adam_sh gives each thread one Gaussian's whole 48-float run, so a
+/// SIMD group's load of coefficient i touches 32 different cache lines 192 B
+/// apart, in four arrays at once (sh, grad, m, v). Here adjacent threads take
+/// adjacent floats, so every load and store is contiguous across the group.
+/// The arithmetic per float is identical, statement for statement: the same
+/// gates (count, visibility, active degree, zero learning rate), the same
+/// bias correction from the same stepCount, the same clamp. Only which thread
+/// does each float changes, and no float depends on another, so the result is
+/// the same bits. Build 442 measured the optimiser at 2.94 ms a round, 15 % of
+/// the step, in a room where each photo sees most of the 450k points.
+kernel void trainer_adam_sh_flat(
+    device float*                 sh    [[buffer(0)]],
+    const device float*           grad  [[buffer(1)]],
+    device float*                 mBuf  [[buffer(2)]],
+    device float*                 vBuf  [[buffer(3)]],
+    const device TrainerSplatStats* stats [[buffer(4)]],
+    constant TrainerAdamUniforms& u     [[buffer(5)]],
+    const device uint*            tilesTouched [[buffer(6)]],
+    uint                          k     [[thread_position_in_grid]]
+) {
+    const uint floatsPerSplat = u.shCoeffCount * 3u;
+    if (floatsPerSplat == 0u) { return; }
+    const uint gid = k / floatsPerSplat;
+    if (gid >= u.count) { return; }
+    const uint i = k - gid * floatsPerSplat;
+
+    const uint activeCoeffs = u.activeSHCoeffCount > 9u ? 16u
+        : (u.activeSHCoeffCount > 4u ? 9u : (u.activeSHCoeffCount > 1u ? 4u : 1u));
+    const uint activeFloats = min(activeCoeffs, u.shCoeffCount) * 3u;
+    if (i >= activeFloats) { return; }
+    if (u.sparse != 0u && tilesTouched[gid] == 0u) { return; }
+    const float lr = (i < 3u) ? u.lrSHDC : u.lrSHRest;
+    if (lr == 0.0f) { return; }
+
+    const uint step = max(stats[gid].stepCount, 1u);
+    const float bc1 = 1.0f - pow(u.beta1, float(step));
+    const float bc2 = 1.0f - pow(u.beta2, float(step));
+
+    float g = grad[k];
+    if (!isfinite(g)) { g = 0.0f; }
+    const float m = u.beta1 * mBuf[k] + (1.0f - u.beta1) * g;
+    const float v = u.beta2 * vBuf[k] + (1.0f - u.beta2) * g * g;
+    mBuf[k] = m;
+    vBuf[k] = v;
+    const float upd = lr * (m / bc1) / (sqrt(max(v / bc2, 0.0f)) + u.epsilon);
+    const float next = sh[k] - upd;
+    sh[k] = isfinite(next) ? clamp(next, -30.0f, 30.0f) : sh[k];
+}
+
 // ============================================================================
 // MARK: - Preview / snapshot support
 // ============================================================================

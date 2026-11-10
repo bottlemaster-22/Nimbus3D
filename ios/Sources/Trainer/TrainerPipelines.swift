@@ -88,6 +88,8 @@ final class TrainerPipelines {
     let regularizer: MTLComputePipelineState
     let adamSplat: MTLComputePipelineState
     let adamSH: MTLComputePipelineState
+    /// Build 456: the same SH update with one thread per float (coalesced).
+    let adamSHFlat: MTLComputePipelineState
     let extractCenters: MTLComputePipelineState
 
     init(device: MTLDevice, library: MTLLibrary) throws {
@@ -223,6 +225,7 @@ final class TrainerPipelines {
         regularizer = try build(TrainerKernel.regularizer, simdReduce: simdAtomics)
         adamSplat = try build(TrainerKernel.adamSplat)
         adamSH = try build(TrainerKernel.adamSH)
+        adamSHFlat = try build(TrainerKernel.adamSHFlat)
         extractCenters = try build(TrainerKernel.extractCenters)
 
         // The block kernels are not merely "faster with 256 threads": their
@@ -1291,7 +1294,10 @@ struct TrainerGPU {
     func adamSH(_ encoder: MTLComputeCommandEncoder, adam: inout TrainerAdamUniforms) {
         let count = Int(adam.count)
         guard count > 0 else { return }
-        encoder.setComputePipelineState(pipelines.adamSH)
+        // Build 456: per-float by default; the per-Gaussian kernel stays as
+        // the switch-back (`TrainerGPU.adamSHPerFloat`).
+        let state = Self.adamSHPerFloat ? pipelines.adamSHFlat : pipelines.adamSH
+        encoder.setComputePipelineState(state)
         encoder.setBuffer(resources.sh, offset: 0, index: TrainerBind.AdamSH.sh)
         encoder.setBuffer(resources.shGrad, offset: 0, index: TrainerBind.AdamSH.grad)
         encoder.setBuffer(resources.shAdamM, offset: 0, index: TrainerBind.AdamSH.m)
@@ -1305,8 +1311,16 @@ struct TrainerGPU {
             length: MemoryLayout<TrainerAdamUniforms>.stride,
             index: TrainerBind.AdamSH.uniforms
         )
-        dispatch1D(encoder, pipelines.adamSH, count: count)
+        if Self.adamSHPerFloat {
+            dispatch1D(encoder, state, count: count * Int(adam.shCoeffCount) * 3)
+        } else {
+            dispatch1D(encoder, state, count: count)
+        }
     }
+
+    /// Build 456: one thread per SH float (coalesced) instead of one per
+    /// Gaussian. Same arithmetic; false switches back.
+    static let adamSHPerFloat = true
 
     // MARK: Snapshot support
 

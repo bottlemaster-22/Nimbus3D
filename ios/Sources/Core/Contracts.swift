@@ -1918,7 +1918,9 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 // 4.5 minutes in all. The quality cost of the shorter middle
                 // is NOT measured yet: compare against 434 on
                 // scan_20261109_223238 (held-out 20.35 / 0.682, 5.3 mm).
-                iterations: 18_000,
+                // Build 456: 16,500. The 1,500 rounds removed are all from the
+                // 1,080-px tail (see coarseResolutionFractions).
+                iterations: 16_500,
                 // Build 360: 1,080 (was 720). The exported points' median long axis
                 // stayed at 7.1 mm through every size change because a point has
                 // no reason to shrink below the pixel it is trained against, and a

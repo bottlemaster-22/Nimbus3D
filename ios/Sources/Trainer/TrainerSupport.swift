@@ -160,6 +160,7 @@ enum TrainerKernel {
     static let regularizer = "trainer_regularizer"
     static let adamSplat = "trainer_adam_splat"
     static let adamSH = "trainer_adam_sh"
+    static let adamSHFlat = "trainer_adam_sh_flat"
     static let extractCenters = "trainer_extract_centers"
 
     /// All 25, for the compile loop and for the "did we miss one" check.
@@ -171,7 +172,7 @@ enum TrainerKernel {
         lossPhotometric, blurH, blurV, ssimStats,
         lossDepth, lossFinalize, rasterizeBackward, preprocessBackward,
         samplingRateUpdate, filter3DFinalize, regularizer,
-        adamSplat, adamSH, extractCenters
+        adamSplat, adamSH, adamSHFlat, extractCenters
     ]
 }
 
@@ -1292,7 +1293,12 @@ struct TrainerTuning: Sendable {
     // each round costs what its stage needs: measured 6.9 / 14.7 / 25.7 ms
     // a round at 360 / 720 / 1,080 px (434), about 10 at 540 by the same
     // per-point plus per-pixel split.
-    var coarseResolutionFractions: [Float] = [0.20, 0.45, 0.82]
+    // Build 456: 22 / 49 / 89 % of 16,500, so 3,630 / 4,455 / 6,600 rounds at
+    // 360 / 540 / 720 px (as 454) and 1,815 at 1,080 (454: 3,240). Both
+    // measured curves flatten inside the first few hundred full-size rounds:
+    // 434 +0.04 dB over its last 7,200, 442 +0.014 dB from 240 rounds in to
+    // 2,640 rounds in.
+    var coarseResolutionFractions: [Float] = [0.22, 0.49, 0.89]
     var coarseResolutionScales: [Float] = [0.3333, 0.5, 0.6667]
     /// BUILD 338: OFF. The background preload (build 332) put a second
     /// builder to work while the active level's prefetch worker built on
