@@ -156,3 +156,8 @@ Trainer/MetalSplatTrainer.swift :: let f = Int(Swift.min(Swift.max(fraction, 0),
 Trainer/MetalSplatTrainer.swift :: let sc = Int(Swift.min(Swift.max(scale, 0), 1) * 1000)  # SAFE: same guard as the line above it; clamped to 0...1 before the multiply.
 Trainer/MetalSplatTrainer.swift :: ? Int(Swift.min(Swift.max(tuning.warmupFraction, 0), 1) * 1000)  # SAFE: the ternary's condition is `warmupFraction.isFinite`, so NaN and infinity take the else branch, and the value is clamped to 0...1 before the multiply.
 Core/Contracts.swift :: return Int(Swift.min(forSplats, memoryForSplats) / perSplat)  # SAFE: UInt64 integer division, not a float conversion; both operands are byte counts under 1 TB and perSplat is at least 1, so the quotient fits in Int.
+Trainer/MetalSplatTrainer.swift :: return SIMD3<Int32>(Int32(q.x), Int32(q.y), Int32(q.z))  # SAFE: the guard above requires all three finite and under 1,000,000 in magnitude, inside Int32.
+Trainer/TrainerNormalField.swift :: Swift.max(Int(cellsPerAxis.x), 1),  # SAFE: extent is clamped to 0...40 m and voxel is at least 0.01 m, so the value is finite and at most 4,000.
+Trainer/TrainerNormalField.swift :: Swift.max(Int(cellsPerAxis.y), 1),  # SAFE: extent is clamped to 0...40 m and voxel is at least 0.01 m, so the value is finite and at most 4,000.
+Trainer/TrainerNormalField.swift :: Swift.max(Int(cellsPerAxis.z), 1)  # SAFE: extent is clamped to 0...40 m and voxel is at least 0.01 m, so the value is finite and at most 4,000.
+Trainer/TrainerNormalField.swift :: let cx = Int(r.x), cy = Int(r.y), cz = Int(r.z)  # SAFE: the guard above requires each component >= 0 and below its dimension (at most 4,000); the positions were checked finite when collected.

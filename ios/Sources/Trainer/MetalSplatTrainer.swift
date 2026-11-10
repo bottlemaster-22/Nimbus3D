@@ -107,6 +107,13 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// Build 330: the camera learning rates are multiplied by this. 0.1
     /// (build 292's inert rate) until the pose check has passed, then 1.
     private var poseRefinementScale: Float = 0.1
+    /// Build 464: where the uploaded surface-direction field sits.
+    private struct NormalFieldGeometry {
+        var origin: SIMD3<Float>
+        var voxel: Float
+        var dims: SIMD3<UInt32>
+    }
+    private var normalFieldGeometry: NormalFieldGeometry?
     /// Build 460: per-frame Adam state for the camera corrections (see
     /// `adamCameraDelta`). Reset per slice, with the corrections themselves.
     private struct CameraAdamState {
@@ -1163,6 +1170,24 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         var gpu = TrainerGPU(pipelines: pipelines, resources: resources)
 
         var splatCount = TrainerInitializer.upload(seedResult.seeds, into: resources)
+        // Build 464: the LiDAR surface-direction field for trainer_regularizer.
+        resources.normalField = nil
+        normalFieldGeometry = nil
+        if tuning.normalPriorWeight > 0, let field = seedResult.normalField {
+            let length = field.cells.count * MemoryLayout<SIMD4<Float16>>.stride
+            let buffer = field.cells.withUnsafeBytes { raw -> MTLBuffer? in
+                guard let base = raw.baseAddress, length > 0 else { return nil }
+                return resources.device.makeBuffer(bytes: base, length: length, options: .storageModeShared)
+            }
+            if let buffer {
+                resources.normalField = buffer
+                normalFieldGeometry = NormalFieldGeometry(
+                    origin: field.origin, voxel: field.voxel,
+                    dims: SIMD3<UInt32>(UInt32(field.dimX), UInt32(field.dimY), UInt32(field.dimZ))
+                )
+                census.slices[censusRow].normalFieldCells = field.confidentCells
+            }
+        }
         // Recorded BEFORE the guard: "the seeder built 180,000 and 0 reached
         // the GPU" is a different fault from "the seeder built 0", and the
         // throw below cannot tell them apart on its own.
@@ -4165,6 +4190,20 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         reg.binarizeUnknownCutoff = 0.5
         reg.maxScaleMeters = 0.5
         reg.maxScaleWeight = 0.05
+        // Build 464: lie ON the surface, and no needles.
+        if let field = normalFieldGeometry, resources?.normalField != nil {
+            reg.normalWeight = tuning.normalPriorWeight
+            reg.fieldOriginX = field.origin.x
+            reg.fieldOriginY = field.origin.y
+            reg.fieldOriginZ = field.origin.z
+            reg.fieldVoxel = field.voxel
+            reg.fieldDimX = field.dims.x
+            reg.fieldDimY = field.dims.y
+            reg.fieldDimZ = field.dims.z
+        }
+        reg.needleWeight = tuning.needlePriorWeight
+        reg.needleMaxLogRatio = logf(Swift.max(tuning.needleMaxRatio, 1.01))
+        reg.edgeNeedleMaxLogRatio = logf(Swift.max(tuning.edgeNeedleMaxRatio, 1.01))
         reg.sparse = 1                  // MUST match adam.sparse in adamUniforms
         return reg
     }
@@ -5815,6 +5854,64 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         return cloud
     }
 
+    /// BUILD 464: LONE POINTS LEAVE THE EXPORT.
+    ///
+    /// 7,096 points of the Nov 9 model had no other point within 3 cm: specks
+    /// hanging in the air in Look Around. A point keeps its place if at least
+    /// three others sit in its own or a neighbouring 3 cm cell, and if it is
+    /// visible at all (opacity 0.02 and up). Training is untouched; this is
+    /// the file only. Points a metre or more across are left alone.
+    static func removingStrays(_ cloud: SplatCloud) -> SplatCloud {
+        let n = cloud.count
+        guard n > 1_000 else { return cloud }
+        let cell: Float = 0.03
+        func key(_ p: SIMD3<Float>) -> SIMD3<Int32>? {
+            let q = (p / cell).rounded(.down)
+            guard q.x.isFinite, q.y.isFinite, q.z.isFinite,
+                  abs(q.x) < 1_000_000, abs(q.y) < 1_000_000, abs(q.z) < 1_000_000 else { return nil }
+            return SIMD3<Int32>(Int32(q.x), Int32(q.y), Int32(q.z))
+        }
+        var counts: [SIMD3<Int32>: Int] = [:]
+        counts.reserveCapacity(n / 4)
+        var keys = [SIMD3<Int32>?](repeating: nil, count: n)
+        for i in 0..<n {
+            guard let k = key(cloud.positions[i]) else { continue }
+            keys[i] = k
+            counts[k, default: 0] += 1
+        }
+        var keep: [Int] = []
+        keep.reserveCapacity(n)
+        for i in 0..<n {
+            let s = cloud.logScales[i]
+            if Swift.max(s.x, s.y, s.z) >= 0 { keep.append(i); continue }
+            guard cloud.opacityLogits[i] >= -3.9, let k = keys[i] else { continue }
+            var others = -1
+            outer: for dz in -1...1 {
+                for dy in -1...1 {
+                    for dx in -1...1 {
+                        others += counts[k &+ SIMD3<Int32>(Int32(dx), Int32(dy), Int32(dz)), default: 0]
+                        if others >= 3 { break outer }
+                    }
+                }
+            }
+            if others >= 3 { keep.append(i) }
+        }
+        guard keep.count < n, keep.count > 0 else { return cloud }
+        let hasRest = cloud.shDegree != .zero && cloud.shRest.count == n
+        guard var trimmed = try? SplatCloud(
+            shDegree: cloud.shDegree,
+            positions: keep.map { cloud.positions[$0] },
+            rotations: keep.map { cloud.rotations[$0] },
+            logScales: keep.map { cloud.logScales[$0] },
+            opacityLogits: keep.map { cloud.opacityLogits[$0] },
+            colorDC: keep.map { cloud.colorDC[$0] },
+            shRest: hasRest ? keep.map { cloud.shRest[$0] } : []
+        ) else { return cloud }
+        trimmed.filter3DFused = cloud.filter3DFused
+        TrainerLog.general.notice("Removed \(n - keep.count) stray points from the export")
+        return trimmed
+    }
+
     /// The preview during a multi-slice run shows the parts already finished
     /// plus the one being worked on, so the user watches their house fill in
     /// rather than watching one room appear and vanish.
@@ -5867,6 +5964,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         heldOutPSNR: Float?,
         background: DirectionalBackgroundModel?
     ) async throws -> SplatModel {
+        // Build 464: no lone floating points in what the owner looks at.
+        let cloud = Self.removingStrays(cloud)
 
         // `PLYCodec.write` refuses an empty cloud, and rightly so. Reaching
         // here with nothing means every Gaussian was pruned or carved away,

@@ -442,7 +442,18 @@ struct TrainerRegUniforms {
     float maxScaleMeters;         // 24
     float maxScaleWeight;         // 28
     uint  sparse;                 // 32  mirrors TrainerAdamUniforms.sparse
-};                                // 36 bytes
+    float normalWeight;           // 36  build 464
+    float needleWeight;           // 40
+    float needleMaxLogRatio;      // 44
+    float edgeNeedleMaxLogRatio;  // 48
+    float fieldOriginX;           // 52
+    float fieldOriginY;           // 56
+    float fieldOriginZ;           // 60
+    float fieldVoxel;             // 64
+    uint  fieldDimX;              // 68
+    uint  fieldDimY;              // 72
+    uint  fieldDimZ;              // 76
+};                                // 80 bytes
 
 struct TrainerScanUniforms {
     uint count;       //  0
@@ -490,7 +501,7 @@ static_assert(sizeof(TrainerDepthSample) == 32, "TrainerDepthSample must be 32 b
 static_assert(sizeof(TrainerCameraUniforms) == 144, "TrainerCameraUniforms must be 144 bytes");
 static_assert(sizeof(TrainerLossUniforms) == 68, "TrainerLossUniforms must be 68 bytes");
 static_assert(sizeof(TrainerAdamUniforms) == 68, "TrainerAdamUniforms must be 68 bytes");
-static_assert(sizeof(TrainerRegUniforms) == 36, "TrainerRegUniforms must be 36 bytes");
+static_assert(sizeof(TrainerRegUniforms) == 80, "TrainerRegUniforms must be 80 bytes");
 static_assert(sizeof(TrainerScanUniforms) == 16, "TrainerScanUniforms must be 16 bytes");
 static_assert(sizeof(TrainerRadixUniforms) == 16, "TrainerRadixUniforms must be 16 bytes");
 static_assert(sizeof(TrainerBlurUniforms) == 16, "TrainerBlurUniforms must be 16 bytes");
@@ -3796,6 +3807,7 @@ kernel void trainer_regularizer(
     device atomic_float*            lossAccum [[buffer(3)]],
     constant TrainerRegUniforms&    u      [[buffer(4)]],
     const device uint*              tilesTouched [[buffer(5)]],
+    const device half4*             normalField [[buffer(6)]],
     uint                            gid    [[thread_position_in_grid]]
 ) {
     if (gid >= u.count) { return; }
@@ -3878,6 +3890,92 @@ kernel void trainer_regularizer(
     // Push opacity to a decision in the last stretch of the run, EXCEPT where
     // this Gaussian's observations were mostly UNKNOWN (glass, out of range,
     // low confidence). Forcing a decision there is inventing an answer.
+    // --- Build 464: lie ON the surface -----------------------------------------
+    // The splat's thin axis (column k of its rotation, k = smallest scale) is
+    // pulled toward the LiDAR normal of the cell it sits in, weighted by how
+    // well the seeds in that cell agreed and by how flat the splat is. Loss
+    // w * c * f * (1 - (n.t)^2): sign-free, zero when aligned. Edge splats are
+    // exempt (they are lines, not surface). The quaternion gradient is the
+    // derivative of the column, projected off q because q is kept unit.
+    const bool lineSplat = (s.flags & 4u) != 0u;
+    if (u.normalWeight > 0.0f && u.fieldDimX > 0u && !lineSplat) {
+        uint k = 0u;
+        float smin = logScale.x;
+        if (logScale.y < smin) { k = 1u; smin = logScale.y; }
+        if (logScale.z < smin) { k = 2u; smin = logScale.z; }
+        const float smax = max(logScale.x, max(logScale.y, logScale.z));
+        const float smid = logScale.x + logScale.y + logScale.z - smin - smax;
+        // ln(mid/min): 0.36 (ratio 0.7) gives 0, 1.2 (ratio 0.3) and up gives 1.
+        const float flat = clamp((smid - smin - 0.36f) / 0.84f, 0.0f, 1.0f);
+        const float3 rel = (float3(s.mean)
+            - float3(u.fieldOriginX, u.fieldOriginY, u.fieldOriginZ)) / u.fieldVoxel;
+        if (flat > 0.0f && rel.x >= 0.0f && rel.y >= 0.0f && rel.z >= 0.0f
+            && rel.x < float(u.fieldDimX) && rel.y < float(u.fieldDimY)
+            && rel.z < float(u.fieldDimZ)) {
+            const uint3 c = uint3(rel);
+            const float4 cell = float4(normalField[(c.z * u.fieldDimY + c.y) * u.fieldDimX + c.x]);
+            const float tLen = length(cell.xyz);
+            if (cell.w > 0.0f && tLen > 1e-3f) {
+                const float3 t = cell.xyz / tLen;
+                const float4 q = normalize(float4(s.rotation));
+                const float x = q.x, y = q.y, z = q.z, w = q.w;
+                float3 n, dx, dy, dz, dw;
+                if (k == 0u) {
+                    n  = float3(1.0f - 2.0f * (y * y + z * z), 2.0f * (x * y + w * z), 2.0f * (x * z - w * y));
+                    dx = float3(0.0f, 2.0f * y, 2.0f * z);
+                    dy = float3(-4.0f * y, 2.0f * x, -2.0f * w);
+                    dz = float3(-4.0f * z, 2.0f * w, 2.0f * x);
+                    dw = float3(0.0f, 2.0f * z, -2.0f * y);
+                } else if (k == 1u) {
+                    n  = float3(2.0f * (x * y - w * z), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z + w * x));
+                    dx = float3(2.0f * y, -4.0f * x, 2.0f * w);
+                    dy = float3(2.0f * x, 0.0f, 2.0f * z);
+                    dz = float3(-2.0f * w, -4.0f * z, 2.0f * y);
+                    dw = float3(-2.0f * z, 0.0f, 2.0f * x);
+                } else {
+                    n  = float3(2.0f * (x * z + w * y), 2.0f * (y * z - w * x), 1.0f - 2.0f * (x * x + y * y));
+                    dx = float3(2.0f * z, -2.0f * w, -4.0f * x);
+                    dy = float3(2.0f * w, 2.0f * z, -4.0f * y);
+                    dz = float3(2.0f * x, 2.0f * y, 0.0f);
+                    dw = float3(2.0f * y, -2.0f * x, 0.0f);
+                }
+                const float d = dot(n, t);
+                const float wgt = u.normalWeight * cell.w * flat;
+                lossSum += trainer_finiteOrZero(wgt * (1.0f - d * d));
+                const float3 gn = -2.0f * wgt * d * t;
+                float4 gq = float4(dot(dx, gn), dot(dy, gn), dot(dz, gn), dot(dw, gn));
+                gq -= dot(gq, q) * q;
+                grad[gid].rot0 += trainer_finiteOrZero(gq.x);
+                grad[gid].rot1 += trainer_finiteOrZero(gq.y);
+                grad[gid].rot2 += trainer_finiteOrZero(gq.z);
+                grad[gid].rot3 += trainer_finiteOrZero(gq.w);
+            }
+        }
+    }
+
+    // --- Build 464: no needles ------------------------------------------------
+    // Hinge on ln(long / middle) above the limit (3:1 for surface splats, 6:1
+    // for edge splats): shrinks the long axis, grows the middle one. 11.5 %
+    // of the Nov 9 model was over 5:1, the streaks across shelves and walls.
+    if (u.needleWeight > 0.0f) {
+        uint kMax = 0u, kMin = 0u;
+        if (logScale.y > logScale[kMax]) { kMax = 1u; }
+        if (logScale.z > logScale[kMax]) { kMax = 2u; }
+        if (logScale.y < logScale[kMin]) { kMin = 1u; }
+        if (logScale.z < logScale[kMin]) { kMin = 2u; }
+        if (kMax != kMin) {
+            const uint kMid = 3u - kMax - kMin;
+            const float limit = lineSplat ? u.edgeNeedleMaxLogRatio : u.needleMaxLogRatio;
+            const float excess = (logScale[kMax] - logScale[kMid]) - limit;
+            if (excess > 0.0f) {
+                lossSum += trainer_finiteOrZero(u.needleWeight * excess * excess);
+                const float g = trainer_finiteOrZero(2.0f * u.needleWeight * excess);
+                if (kMax == 0u) { grad[gid].scale0 += g; } else if (kMax == 1u) { grad[gid].scale1 += g; } else { grad[gid].scale2 += g; }
+                if (kMid == 0u) { grad[gid].scale0 -= g; } else if (kMid == 1u) { grad[gid].scale1 -= g; } else { grad[gid].scale2 -= g; }
+            }
+        }
+    }
+
     if (u.binarizeWeight > 0.0f) {
         const float vis = max(st.visAccum, 1e-6f);
         const float unknownFraction = clamp(st.unknownAccum / vis, 0.0f, 1.0f);

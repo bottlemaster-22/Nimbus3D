@@ -1923,14 +1923,19 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 // Build 458: 19,500, owner's choice of quality over time (Nov 10):
                 // about 4 m 45 s for the Nov 9 room, 6 m 40 s for the heavier
                 // Nov 10 one. The extra 3,000 rounds are all at 720 px.
-                iterations: 19_500,
+                // Build 464: 20,100 = 458's schedule with the 1,080 stage cut to
+                // ~900 rounds and a 1,440-px stage of ~1,470 after it.
+                iterations: 20_100,
                 // Build 360: 1,080 (was 720). The exported points' median long axis
                 // stayed at 7.1 mm through every size change because a point has
                 // no reason to shrink below the pixel it is trained against, and a
                 // 720-px pixel is about 7 mm at room distance; the Scaniverse
                 // reference sits at 3.4 mm. Only the last fifth of the run renders
                 // at this size (see coarseResolutionFractions).
-                renderLongEdgePixels: 1080,
+                // Build 464: 1,440 (the photos are 1,920 x 1,440). On the owner's
+                // 2,868-px screen a 1,080-px training pixel spans about 2.7
+                // screen pixels, which is part of the softness up close.
+                renderLongEdgePixels: 1440,
                 // Build 366: degree 3, the reference's (and Scaniverse's).
                 shDegree: .three,
                 // Build 342: 200 for a room (was 120). 338 trained 108 of 868

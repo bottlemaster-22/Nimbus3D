@@ -418,6 +418,7 @@ enum TrainerBind {
         static let lossAccum = 3
         static let uniforms = 4      // TrainerRegUniforms
         static let tilesTouched = 5
+        static let normalField = 6   // build 464, half4 per cell
     }
 
     enum AdamSplat {
@@ -1159,6 +1160,13 @@ struct TrainerTuning: Sendable {
     /// residual near 3 cm. The per-step clamps and the ceiling are unchanged.
     var cameraRotationLR: Float = 3e-4
     var cameraTranslationLR: Float = 3e-4
+    /// Build 464: shape priors in trainer_regularizer (see TrainerNormalField).
+    /// Same order of weight as the disc prior (0.001), which is what made the
+    /// splats flat in the first place. 0 switches each off.
+    var normalPriorWeight: Float = 0.001
+    var needlePriorWeight: Float = 0.001
+    var needleMaxRatio: Float = 3
+    var edgeNeedleMaxRatio: Float = 6
     /// Build 460: training-time camera corrections take Adam steps (see
     /// `adamCameraDelta`). Radians and metres per visit: 5e-4 is 0.03 degrees
     /// and 0.5 mm, the rotation clamp below, so a camera can travel the pose
@@ -1311,8 +1319,11 @@ struct TrainerTuning: Sendable {
     // 3,000 rounds put back all go to the 720-px level, where 16,500 had
     // cut deepest (Nov 9 room: held-out 20.12 vs 20.35 at 30,000, trained
     // 23.1 vs 24.0).
-    var coarseResolutionFractions: [Float] = [0.19, 0.42, 0.91]
-    var coarseResolutionScales: [Float] = [0.3333, 0.5, 0.6667]
+    // Build 464: render size 1,440, so the scales are 1/4, 3/8, 1/2 and 3/4
+    // of it (360 / 540 / 720 / 1,080 px) and full size is 1,440. Of 20,100
+    // rounds: 3,698 / 4,482 / 9,548 / 904 / 1,468.
+    var coarseResolutionFractions: [Float] = [0.1843, 0.4075, 0.8828, 0.9276]
+    var coarseResolutionScales: [Float] = [0.25, 0.375, 0.5, 0.75]
     /// BUILD 338: OFF. The background preload (build 332) put a second
     /// builder to work while the active level's prefetch worker built on
     /// another, the first time two frames were ever built at once for the

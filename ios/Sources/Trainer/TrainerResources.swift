@@ -67,6 +67,8 @@ final class TrainerResources {
     private(set) var draws: MTLBuffer
     private(set) var samplingTopK: MTLBuffer
     private(set) var tilesTouched: MTLBuffer
+    /// Build 464: TrainerNormalField's cells (half4 each), or nil.
+    var normalField: MTLBuffer?
     private(set) var offsets: MTLBuffer
 
     private(set) var splatGrad: MTLBuffer

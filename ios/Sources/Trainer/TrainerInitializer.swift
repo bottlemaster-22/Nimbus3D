@@ -135,6 +135,10 @@ struct TrainerSeedResult {
     /// recorded it in `PrePassCensus.seeding`. Optional rather than zeroed so
     /// that nothing downstream can print a cut for a run that never took one.
     var trustCut: TrainerSeedTrustCut?
+    /// Build 464: which way the surface faces, from the pre-pass discs (see
+    /// TrainerNormalField). nil on the depth-map path and when too few seeds
+    /// were disc-shaped.
+    var normalField: TrainerNormalField? = nil
 
     /// How many seeds were laid as SOLID DISCS across the surface because the
     /// depth sample was trusted, and how many were STRETCHED ALONG THE VIEWING
@@ -418,6 +422,9 @@ enum TrainerInitializer {
         // was supposed to switch densification back on.
         seeds = thin(seeds, to: seedTarget(forSplatCap: budget.splatCap))
         let spacing = medianNearestSpacing(of: seeds)
+        // Build 464: from ALL the pre-pass discs, before thinning, so the
+        // field covers every surface the LiDAR saw.
+        let normalField = TrainerNormalField.build(from: cloud)
         return TrainerSeedResult(
             seeds: seeds,
             source: refs.path,
@@ -429,7 +436,8 @@ enum TrainerInitializer {
             // in `PrePassCensus.seeding`; these flags came out of that decision
             // already made. Nothing here re-decides it, so there is no cut to
             // report and this must not pretend otherwise.
-            trustCut: nil
+            trustCut: nil,
+            normalField: normalField
         )
     }
 

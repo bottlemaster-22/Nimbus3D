@@ -571,7 +571,20 @@ struct TrainerRegUniforms {
     /// Mirrors TrainerAdamUniforms.sparse. Always set together: with it off,
     /// Adam reads undrawn rows and the regulariser must write them.
     var sparse: UInt32 = 0                // offset 32
-    // stride 36
+    /// Build 464: pull a flat splat's thin axis onto the LiDAR surface normal
+    /// (TrainerNormalField), and a hinge on long/middle axis ratio.
+    var normalWeight: Float = 0           // offset 36
+    var needleWeight: Float = 0           // offset 40
+    var needleMaxLogRatio: Float = 1.1    // offset 44
+    var edgeNeedleMaxLogRatio: Float = 1.8  // offset 48
+    var fieldOriginX: Float = 0           // offset 52
+    var fieldOriginY: Float = 0           // offset 56
+    var fieldOriginZ: Float = 0           // offset 60
+    var fieldVoxel: Float = 1             // offset 64
+    var fieldDimX: UInt32 = 0             // offset 68
+    var fieldDimY: UInt32 = 0             // offset 72
+    var fieldDimZ: UInt32 = 0             // offset 76
+    // stride 80
 }
 
 /// Generic exclusive-scan arguments.
@@ -737,7 +750,7 @@ enum TrainerGPULayouts {
         check("TrainerCameraUniforms", MemoryLayout<TrainerCameraUniforms>.stride, 144)
         check("TrainerLossUniforms", MemoryLayout<TrainerLossUniforms>.stride, 68)
         check("TrainerAdamUniforms", MemoryLayout<TrainerAdamUniforms>.stride, 68)
-        check("TrainerRegUniforms", MemoryLayout<TrainerRegUniforms>.stride, 36)
+        check("TrainerRegUniforms", MemoryLayout<TrainerRegUniforms>.stride, 80)
         check("TrainerScanUniforms", MemoryLayout<TrainerScanUniforms>.stride, 16)
         check("TrainerRadixUniforms", MemoryLayout<TrainerRadixUniforms>.stride, 16)
         check("TrainerBlurUniforms", MemoryLayout<TrainerBlurUniforms>.stride, 16)

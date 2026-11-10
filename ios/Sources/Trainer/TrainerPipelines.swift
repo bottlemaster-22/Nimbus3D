@@ -1260,6 +1260,13 @@ struct TrainerGPU {
         encoder.setBuffer(
             resources.tilesTouched, offset: 0, index: TrainerBind.Regularizer.tilesTouched
         )
+        // Build 464: any valid buffer when there is no field; the kernel reads
+        // it only when fieldDimX > 0, which regularizerUniforms sets only
+        // together with the field.
+        encoder.setBuffer(
+            resources.normalField ?? resources.tilesTouched, offset: 0,
+            index: TrainerBind.Regularizer.normalField
+        )
         encoder.setBytes(
             &reg,
             length: MemoryLayout<TrainerRegUniforms>.stride,

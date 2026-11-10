@@ -339,6 +339,10 @@ struct TrainerCensusSlice: Codable {
     /// say the starting points were on top of each other. nil reads as "not
     /// measured", which is what happened.
     var seedMedianSpacingMillimetres: Int?
+    /// Build 464: cells of the LiDAR surface-direction field that carry a
+    /// normal. nil when no field was built (depth-map seeding, or too few
+    /// disc-shaped seeds).
+    var normalFieldCells: Int?
 
     // --- The trust line the seeder drew, and the data it drew it on ---------
 
