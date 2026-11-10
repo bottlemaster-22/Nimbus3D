@@ -1159,6 +1159,14 @@ struct TrainerTuning: Sendable {
     /// residual near 3 cm. The per-step clamps and the ceiling are unchanged.
     var cameraRotationLR: Float = 3e-4
     var cameraTranslationLR: Float = 3e-4
+    /// Build 460: training-time camera corrections take Adam steps (see
+    /// `adamCameraDelta`). Radians and metres per visit: 5e-4 is 0.03 degrees
+    /// and 0.5 mm, the rotation clamp below, so a camera can travel the pose
+    /// graph's 2 to 3 cm residual within its ~80 visits, decaying a
+    /// hundredfold so the last visits settle rather than wander.
+    var cameraAdam: Bool = true
+    var cameraAdamLRStart: Float = 5e-4
+    var cameraAdamLREnd: Float = 5e-6
     /// Build 330: at the first profiled step past warm-up and the coarse
     /// phase, render the frame at its current camera correction and at that
     /// correction plus one gradient step, both after the step's own Adam

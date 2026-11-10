@@ -421,6 +421,9 @@ public final class ARCaptureService: NSObject, CaptureService {
 
         resetForNewSession()
 
+        // Build 460: the previous scan's white-balance hold is released
+        // before the camera restarts, so this scan settles on its own light.
+        _ = exposureController.setWhiteBalanceLocked(false)
         session.delegate = self
         session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
         gyro.start()
@@ -430,6 +433,7 @@ public final class ARCaptureService: NSObject, CaptureService {
         focusPoints = []
         phase = .recording
         startLiveTick()
+        holdWhiteBalanceAfterSettling()
 
         CaptureLog.session.notice(
             "Capture started: \(folder.scanID, privacy: .public)"
@@ -1226,8 +1230,33 @@ public final class ARCaptureService: NSObject, CaptureService {
     @discardableResult
     func unlockExposureAndWhiteBalance() -> Bool {
         let exposure = exposureController.setExposureLocked(false)
-        let whiteBalance = exposureController.setWhiteBalanceLocked(false)
+        // Build 460: white balance stays held while recording (see
+        // holdWhiteBalanceAfterSettling); only brightness is handed back.
+        let whiteBalance = phase == .recording
+            ? true : exposureController.setWhiteBalanceLocked(false)
         return exposure && whiteBalance
+    }
+
+    /// BUILD 460: HOLD THE WHITE BALANCE FOR THE WHOLE SCAN.
+    ///
+    /// Until now the camera re-judged white balance on every frame
+    /// (`whiteBalanceLocked: false` in every bundle), so turning from a warm
+    /// lamp to a cool window tinted whole runs of photos differently. The
+    /// trainer corrects each photo's brightness with one gain and one offset,
+    /// which cannot undo a colour shift, so the model was fitting photos that
+    /// disagree about the colour of the same wall: blotches, and the low
+    /// trained-view scores (21 to 23 dB). Held 1.5 s after recording starts,
+    /// once the restarted camera has settled on the room's light. A phone that
+    /// will not hand over white balance records as before.
+    private func holdWhiteBalanceAfterSettling() {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard let self, self.phase == .recording else { return }
+            let held = self.exposureController.setWhiteBalanceLocked(true)
+            if !held {
+                CaptureLog.session.notice("White balance could not be held for this scan")
+            }
+        }
     }
 
     func setBracketingEnabled(_ enabled: Bool) {

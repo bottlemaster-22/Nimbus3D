@@ -107,6 +107,14 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// Build 330: the camera learning rates are multiplied by this. 0.1
     /// (build 292's inert rate) until the pose check has passed, then 1.
     private var poseRefinementScale: Float = 0.1
+    /// Build 460: per-frame Adam state for the camera corrections (see
+    /// `adamCameraDelta`). Reset per slice, with the corrections themselves.
+    private struct CameraAdamState {
+        var m = [Float](repeating: 0, count: 6)
+        var v = [Float](repeating: 0, count: 6)
+        var t = 0
+    }
+    private var cameraAdam: [FrameID: CameraAdamState] = [:]
     private var poseCheckDone = false
     /// Set by the sort calibration (build 306): use the splat-order tile sort.
     private var splatOrderChosen = false
@@ -1176,6 +1184,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         )
         var exposures: [FrameID: SIMD2<Float>] = [:]      // (gain, bias)
         var cameraDeltas: [FrameID: Pose] = [:]
+        cameraAdam = [:]
         var lossEMA: Float?
         var order = Array(slice.keyframes.indices)
         var orderCursor = 0
@@ -2686,8 +2695,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         if pending.iteration > warmupEnd {
             let gradient = Array(staged[(base + 8)..<(base + 14)])
             if gradient.allSatisfy({ $0.isFinite }) {
-                cameraDeltas[pending.frame.index] = updatedCameraDelta(
-                    current: cameraDeltas[pending.frame.index], gradient: gradient
+                cameraDeltas[pending.frame.index] = adamCameraDelta(
+                    frame: pending.frame.index,
+                    current: cameraDeltas[pending.frame.index], gradient: gradient,
+                    iteration: pending.iteration, totalIterations: pending.totalIterations
                 )
             }
         }
@@ -4010,8 +4021,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         if iteration > warmupEnd {
             let gradient = resources.cameraGrad.readArray(Float.self, count: 6)
             if gradient.count == 6, gradient.allSatisfy({ $0.isFinite }) {
-                cameraDeltas[frame.index] = updatedCameraDelta(
-                    current: cameraDeltas[frame.index], gradient: gradient
+                cameraDeltas[frame.index] = adamCameraDelta(
+                    frame: frame.index,
+                    current: cameraDeltas[frame.index], gradient: gradient,
+                    iteration: iteration, totalIterations: totalIterations
                 )
             }
         }
@@ -4695,6 +4708,85 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
     /// both rotation and translation before it is composed, so a single bad
     /// frame cannot throw a camera across the room no matter how large its
     /// gradient was.
+    /// BUILD 460: THE CAMERA CORRECTIONS TAKE ADAM STEPS.
+    ///
+    /// `updatedCameraDelta` is a plain gradient step, lr times the gradient,
+    /// and the photometric gradient with respect to a camera is tiny: every
+    /// census since build 330 measured the corrections at a median 0.3 cm
+    /// and at most 1.2 cm over a whole run, while the pose graph's own
+    /// residual is 2 to 3 cm and 1.5 degrees, and aligning the held-out
+    /// cameras alone is worth +0.5 dB (Nov 9 room) to +1.9 dB (Nov 10). Raising
+    /// the rate ten times twice moved the median from 0.01 to 0.08 to 0.3 cm:
+    /// the step was following the gradient's SIZE, which says nothing about
+    /// how far the camera is off. Adam normalises each of the six components
+    /// by its own running size, so a camera that is consistently pushed one
+    /// way moves at the learning rate whatever the gradient's scale, and a
+    /// noisy component averages out in the first moment. The rate decays
+    /// exponentially from `cameraAdamLRStart` at the end of warm-up to
+    /// `cameraAdamLREnd` at the end of the run, times the pose-check scale
+    /// (0.1 until a full-rate step is shown to lower the loss). The per-step
+    /// clamps and the composition are unchanged. `cameraAdam = false` goes
+    /// back to the plain step. The pose check and the held-out alignment
+    /// still use the plain step, so the held-out score is measured as before.
+    private func adamCameraDelta(
+        frame: FrameID, current: Pose?, gradient: [Float],
+        iteration: Int, totalIterations: Int
+    ) -> Pose {
+        guard tuning.cameraAdam, gradient.count == 6 else {
+            return updatedCameraDelta(current: current, gradient: gradient)
+        }
+        var state = cameraAdam[frame] ?? CameraAdamState()
+        state.t += 1
+        let beta1: Float = 0.9
+        let beta2: Float = 0.999
+        let epsilon: Float = 1e-12
+        let bc1 = 1 - powf(beta1, Float(state.t))
+        let bc2 = 1 - powf(beta2, Float(state.t))
+
+        let total = Float(Swift.max(totalIterations, 1))
+        let warm = Swift.min(Swift.max(tuning.warmupFraction, 0), 0.99)
+        let fraction = Swift.min(Swift.max(Float(iteration) / total, warm), 1)
+        let progress = (fraction - warm) / (1 - warm)
+        let start = Swift.max(tuning.cameraAdamLRStart, 1e-9)
+        let end = Swift.max(tuning.cameraAdamLREnd, 1e-12)
+        let lr = start * powf(end / start, progress) * poseRefinementScale
+
+        var step = [Float](repeating: 0, count: 6)
+        for i in 0..<6 {
+            let g = gradient[i].isFinite ? gradient[i] : 0
+            state.m[i] = beta1 * state.m[i] + (1 - beta1) * g
+            state.v[i] = beta2 * state.v[i] + (1 - beta2) * g * g
+            let mh = state.m[i] / bc1
+            let vh = state.v[i] / bc2
+            let s = lr * mh / (vh.squareRoot() + epsilon)
+            step[i] = s.isFinite ? s : 0
+        }
+        cameraAdam[frame] = state
+
+        let omega = -SIMD3<Float>(step[0], step[1], step[2])
+        let nu = -SIMD3<Float>(step[3], step[4], step[5])
+        let omegaLength = simd_length(omega)
+        let clampedOmega = omegaLength > tuning.cameraMaxRotationStepRadians
+            ? omega * (tuning.cameraMaxRotationStepRadians / omegaLength)
+            : omega
+        let nuLength = simd_length(nu)
+        let clampedNu = nuLength > tuning.cameraMaxTranslationStepMeters
+            ? nu * (tuning.cameraMaxTranslationStepMeters / nuLength)
+            : nu
+
+        let angle = simd_length(clampedOmega)
+        let rotationStep: simd_quatf = angle > 1e-9
+            ? simd_quatf(angle: angle, axis: clampedOmega / angle)
+            : simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+        let existing = current ?? Pose.identity
+        let composedRotation = (rotationStep * existing.rotation.simd).normalized
+        let composedTranslation = rotationStep.act(existing.translation.simd) + clampedNu
+        return Pose(
+            rotation: Quaternion(composedRotation),
+            translation: Vector3(composedTranslation)
+        )
+    }
+
     private func updatedCameraDelta(
         current: Pose?, gradient: [Float], rateScale: Float? = nil
     ) -> Pose {
