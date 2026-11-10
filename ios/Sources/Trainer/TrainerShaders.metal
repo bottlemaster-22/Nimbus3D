@@ -3827,13 +3827,35 @@ kernel void trainer_regularizer(
     // Build 308: this splat's prior terms, added to lossAccum once at the end.
     float lossSum = 0.0f;
 
+    // BUILD 466: THE SHAPE PRIORS ARE SIZED AGAINST THE PHOTOS, NOT FIXED.
+    // Build 464 gave the normal and needle priors a fixed weight of 0.001,
+    // which is a gradient near 2e-3 a splat against a photometric gradient
+    // some hundred times smaller (and sixteen times smaller again at 1,440 px
+    // than at 360, because the loss is a mean over pixels). Adam followed the
+    // priors and the photographs lost the vote: trained-view PSNR fell 23.1
+    // to 17.8 dB. Here each prior's gradient is a FRACTION of the size of the
+    // gradient the photographs put on the same parameters this step, read
+    // before any prior has added to it. On a blank wall the photographs' pull
+    // on a splat's tilt is noise that averages out, so even half its size,
+    // always the same way, wins and the splat lies flat. Where the
+    // photographs consistently want something else (a coat, a shelf edge),
+    // they outvote it.
+    const float photoRot = trainer_finiteOrZero(length(float4(
+        grad[gid].rot0, grad[gid].rot1, grad[gid].rot2, grad[gid].rot3)));
+    const float photoScale = trainer_finiteOrZero(length(float3(
+        grad[gid].scale0, grad[gid].scale1, grad[gid].scale2)));
+    const bool lineSplat = (s.flags & 4u) != 0u;
+
     // --- effective-rank / disc prior ---------------------------------------
     // Effective rank of the covariance's eigenvalue spectrum, via the entropy
     // of the normalised eigenvalues. 2 is a disc, 1 is a needle. Surfaces want
     // discs; a Gaussian sitting on a detected 3D edge curve wants a needle,
     // which is why the flag exempts it rather than the prior being switched
     // off wholesale.
-    if (u.discWeight > 0.0f) {
+    // Build 466: edgeTargetRank <= 0 means edge splats get NO rank target.
+    // Rank 1 (a needle) was the design for them, and it is where the model's
+    // streaks came from: 13 % of the Nov 9 model was over 5:1.
+    if (u.discWeight > 0.0f && !(lineSplat && u.edgeTargetRank <= 0.0f)) {
         const float3 lambda = scale * scale;
         const float sum = max(lambda.x + lambda.y + lambda.z, 1e-20f);
         const float3 p = lambda / sum;
@@ -3897,8 +3919,7 @@ kernel void trainer_regularizer(
     // w * c * f * (1 - (n.t)^2): sign-free, zero when aligned. Edge splats are
     // exempt (they are lines, not surface). The quaternion gradient is the
     // derivative of the column, projected off q because q is kept unit.
-    const bool lineSplat = (s.flags & 4u) != 0u;
-    if (u.normalWeight > 0.0f && u.fieldDimX > 0u && !lineSplat) {
+    if (u.normalWeight > 0.0f && u.fieldDimX > 0u && !lineSplat && photoRot > 0.0f) {
         uint k = 0u;
         float smin = logScale.x;
         if (logScale.y < smin) { k = 1u; smin = logScale.y; }
@@ -3940,11 +3961,13 @@ kernel void trainer_regularizer(
                     dw = float3(2.0f * y, -2.0f * x, 0.0f);
                 }
                 const float d = dot(n, t);
-                const float wgt = u.normalWeight * cell.w * flat;
-                lossSum += trainer_finiteOrZero(wgt * (1.0f - d * d));
-                const float3 gn = -2.0f * wgt * d * t;
+                // |J^T(-2 d t)| projected is 2 sin(2 theta), at most 2, so the
+                // half makes the prior at most normalWeight x the photographs'.
+                const float wgt = u.normalWeight * cell.w * flat * photoRot * 0.5f;
+                const float3 gn = -2.0f * d * t;
                 float4 gq = float4(dot(dx, gn), dot(dy, gn), dot(dz, gn), dot(dw, gn));
                 gq -= dot(gq, q) * q;
+                gq *= wgt;
                 grad[gid].rot0 += trainer_finiteOrZero(gq.x);
                 grad[gid].rot1 += trainer_finiteOrZero(gq.y);
                 grad[gid].rot2 += trainer_finiteOrZero(gq.z);
@@ -3968,8 +3991,10 @@ kernel void trainer_regularizer(
             const float limit = lineSplat ? u.edgeNeedleMaxLogRatio : u.needleMaxLogRatio;
             const float excess = (logScale[kMax] - logScale[kMid]) - limit;
             if (excess > 0.0f) {
-                lossSum += trainer_finiteOrZero(u.needleWeight * excess * excess);
-                const float g = trainer_finiteOrZero(2.0f * u.needleWeight * excess);
+                // Up to needleWeight x the photographs' own scale gradient,
+                // reached once the splat is e^0.7 = 2x past the limit.
+                const float g = trainer_finiteOrZero(
+                    u.needleWeight * photoScale * 0.7071f * clamp(excess / 0.7f, 0.0f, 1.0f));
                 if (kMax == 0u) { grad[gid].scale0 += g; } else if (kMax == 1u) { grad[gid].scale1 += g; } else { grad[gid].scale2 += g; }
                 if (kMid == 0u) { grad[gid].scale0 -= g; } else if (kMid == 1u) { grad[gid].scale1 -= g; } else { grad[gid].scale2 -= g; }
             }

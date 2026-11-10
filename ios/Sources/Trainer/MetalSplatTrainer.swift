@@ -320,6 +320,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // life of the process, so leaving these full would write the previous
         // scan's exposures and held-out list into the next scan's model folder.
         exposureRecords.removeAll()
+        cameraDeltaRecords.removeAll()
         heldOutFrameIndices.removeAll()
         lock.unlock()
 
@@ -2375,6 +2376,7 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         // slice that saw it most recently.
         lock.lock()
         for (frameIndex, value) in exposures { exposureRecords[frameIndex] = value }
+        for (frameIndex, value) in cameraDeltas { cameraDeltaRecords[frameIndex] = value }
         lock.unlock()
 
         // --- Held-out evaluation -------------------------------------------------
@@ -4174,7 +4176,8 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         reg.count = UInt32(splatCount)
         reg.discWeight = settings.discPriorWeight
         reg.discTargetRank = settings.discTargetEffectiveRank
-        reg.edgeTargetRank = settings.edgeTargetEffectiveRank
+        // Build 466: 0 tells the kernel edge splats have no rank target.
+        reg.edgeTargetRank = tuning.edgeNeedlePrior ? settings.edgeTargetEffectiveRank : 0
 
         // Late opacity binarization (F4), over the last stretch only, and
         // switched off per Gaussian by the kernel wherever what it saw was
@@ -4771,7 +4774,9 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
         frame: FrameID, current: Pose?, gradient: [Float],
         iteration: Int, totalIterations: Int
     ) -> Pose {
-        guard tuning.cameraAdam, gradient.count == 6 else {
+        guard tuning.cameraAdam, gradient.count == 6,
+              !tuning.cameraAdamSplitTest || frame % 2 == 0
+        else {
             return updatedCameraDelta(current: current, gradient: gradient)
         }
         var state = cameraAdam[frame] ?? CameraAdamState()
@@ -6048,6 +6053,27 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
             exposurePath = relative
         }
 
+        // Build 466: the final camera corrections, for comparing a model with
+        // its photographs off the phone. `adam` says which kind of step the
+        // frame took (see cameraAdamSplitTest).
+        if !cameraDeltaRecords.isEmpty {
+            let adamOn = tuning.cameraAdam
+            let split = tuning.cameraAdamSplitTest
+            let rows: [[String: Any]] = cameraDeltaRecords.sorted(by: { $0.key < $1.key }).map { entry in
+                let q = entry.value.rotation.simd.vector
+                let t = entry.value.translation.simd
+                return [
+                    "index": Int(entry.key),
+                    "rotation": [Double(q.x), Double(q.y), Double(q.z), Double(q.w)],
+                    "translation": [Double(t.x), Double(t.y), Double(t.z)],
+                    "adam": adamOn && (!split || entry.key % 2 == 0)
+                ]
+            }
+            if let json = try? JSONSerialization.data(withJSONObject: rows) {
+                try? json.write(to: ref.url(forRelativePath: "\(folder)/camera_deltas.json"))
+            }
+        }
+
         var recordedBudget = governor.current
         // Honest record: the GPU structs in TrainerGPULayouts.swift are fp32
         // by design, so this run did not use half precision whatever was asked.
@@ -6096,6 +6122,10 @@ public final class MetalSplatTrainer: SplatTrainer, @unchecked Sendable {
 
     /// Collected across slices so `writeModel` can serialise them in one pass.
     private var exposureRecords: [FrameID: SIMD2<Float>] = [:]
+    /// Build 466: each trained frame's final camera correction (applied on
+    /// the left of its world-to-camera pose), written to
+    /// model/camera_deltas.json.
+    private var cameraDeltaRecords: [FrameID: Pose] = [:]
 
     /// Every frame this run kept out of training, across all slices. Written
     /// as `model/held_out_frames.json` so the review screen can prove which

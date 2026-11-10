@@ -1163,18 +1163,33 @@ struct TrainerTuning: Sendable {
     /// Build 464: shape priors in trainer_regularizer (see TrainerNormalField).
     /// Same order of weight as the disc prior (0.001), which is what made the
     /// splats flat in the first place. 0 switches each off.
-    var normalPriorWeight: Float = 0.001
-    var needlePriorWeight: Float = 0.001
-    var needleMaxRatio: Float = 3
-    var edgeNeedleMaxRatio: Float = 6
+    /// BUILD 466: these two are now FRACTIONS of the photographs' own
+    /// gradient on the same parameters (see trainer_regularizer), not fixed
+    /// weights. 0.5 = the prior pulls at most half as hard as the photos.
+    var normalPriorWeight: Float = 0.5
+    var needlePriorWeight: Float = 0.5
+    var needleMaxRatio: Float = 4
+    var edgeNeedleMaxRatio: Float = 8
+    /// Build 466: false = edge-flagged splats get no rank target at all. True
+    /// restores the old behaviour, which drove them to rank 1 (needles).
+    var edgeNeedlePrior: Bool = false
+    /// Build 466: a within-run test. Even-numbered frames take Adam camera
+    /// steps, odd-numbered frames the old plain steps, on the same model. The
+    /// per-frame corrections are exported (model/camera_deltas.json), so the
+    /// two groups' fit to their own photos can be compared on the PC.
+    var cameraAdamSplitTest: Bool = true
     /// Build 460: training-time camera corrections take Adam steps (see
     /// `adamCameraDelta`). Radians and metres per visit: 5e-4 is 0.03 degrees
     /// and 0.5 mm, the rotation clamp below, so a camera can travel the pose
     /// graph's 2 to 3 cm residual within its ~80 visits, decaying a
     /// hundredfold so the last visits settle rather than wander.
     var cameraAdam: Bool = true
-    var cameraAdamLRStart: Float = 5e-4
-    var cameraAdamLREnd: Float = 5e-6
+    // Build 466: 1e-4 -> 1e-6 (was 5e-4 -> 5e-6). At 5e-4 the cameras ended a
+    // median 0.6 cm and 0.28 degrees from where they started, which at 2 m is
+    // about 5 px at 1,440: the size an Adam random walk of that step reaches
+    // on its own, so it could not be told from a correction.
+    var cameraAdamLRStart: Float = 1e-4
+    var cameraAdamLREnd: Float = 1e-6
     /// Build 330: at the first profiled step past warm-up and the coarse
     /// phase, render the frame at its current camera correction and at that
     /// correction plus one gradient step, both after the step's own Adam

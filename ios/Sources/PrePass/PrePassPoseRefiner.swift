@@ -236,11 +236,14 @@ public final class SubmapPoseRefiner: PoseRefiner, @unchecked Sendable {
         /// 56 s. 300 iterations costs about 73 ms, which is a tenth of one per
         /// cent of the run, and the solver stops on its own convergence test
         /// long before that if it gets there.
-        /// Build 464: 1,500. At 300 the owner's Nov 9 and Nov 10 rooms still
-        /// ended `iterationLimit`, not converged, with a median residual of
-        /// 2.1 to 2.7 cm and 1.6 degrees. 300 took 0.71 s; the solver stops on
-        /// its own test when it gets there.
-        public var maxIterations = 1_500
+        /// Build 466: BACK TO 300. 464 tried 1,500 and the solve ended
+        /// `dampingBlewUp` after 20 iterations at the same residual. The robust
+        /// delta is annealed over maxIterations, so at 300 the cost keeps
+        /// falling simply because delta shrinks, which is what "still
+        /// improving at the iteration limit" was; with the anneal five times
+        /// slower the solver found no improving step. The 2.1 to 2.7 cm
+        /// residual is this formulation's floor, not a budget problem.
+        public var maxIterations = 300
 
         public init() {}
     }

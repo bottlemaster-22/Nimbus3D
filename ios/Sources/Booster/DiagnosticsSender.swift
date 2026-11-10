@@ -53,8 +53,76 @@ public final class DiagnosticsSender: ObservableObject {
         "prepass/prepass_result.json",
         "prepass/census.json",
         "prepass/revisits.json",
-        "model/exposure.bin"
+        "model/exposure.bin",
+        "model/camera_deltas.json"
     ]
+
+    /// BUILD 466: THE PHOTOS AND LIDAR MAPS BEHIND THE MODEL.
+    ///
+    /// Every number so far described a model nobody on the PC could hold up
+    /// against what the camera saw. This sends the photo, depth map and
+    /// confidence map of each frame the model trained on (the frames in
+    /// model/exposure.bin) and was scored on (model/held_out_frames.json):
+    /// about 200 frames, 150 MB for a room. Each frame goes once per scan and
+    /// Booster; which ones went is remembered, so later sends carry only what
+    /// is new.
+    private func sendFrames(
+        scanID: String, scanDirectory: URL, address: BoosterEndpointAddress, boosterID: String
+    ) async throws -> (files: Int, bytes: Int) {
+        var indices = Set<Int>()
+        if let data = try? Data(contentsOf: scanDirectory.appendingPathComponent("model/exposure.bin")) {
+            let count = data.count / 12
+            data.withUnsafeBytes { raw in
+                for i in 0..<count {
+                    let value = raw.loadUnaligned(fromByteOffset: i * 12, as: UInt32.self)
+                    indices.insert(Int(UInt32(littleEndian: value)))
+                }
+            }
+        }
+        if let data = try? Data(
+            contentsOf: scanDirectory.appendingPathComponent("model/held_out_frames.json")
+        ), let list = try? JSONDecoder().decode([Int].self, from: data) {
+            indices.formUnion(list)
+        }
+        guard !indices.isEmpty else { return (0, 0) }
+
+        struct FrameFiles: Decodable {
+            var index: Int
+            var imagePath: String?
+            var depthPath: String?
+            var confidencePath: String?
+        }
+        struct BundleFrames: Decodable { var frames: [FrameFiles] }
+        guard let bundleData = try? Data(
+            contentsOf: scanDirectory.appendingPathComponent("capture_bundle.json")
+        ), let bundle = try? JSONDecoder().decode(BundleFrames.self, from: bundleData)
+        else { return (0, 0) }
+
+        let key = "diagnostics.sentFrames.\(boosterID).\(scanID)"
+        var already = Set(UserDefaults.standard.array(forKey: key) as? [Int] ?? [])
+        var files = 0
+        var bytes = 0
+        for frame in bundle.frames where indices.contains(frame.index) && !already.contains(frame.index) {
+            for relative in [frame.imagePath, frame.depthPath, frame.confidencePath].compactMap({ $0 }) {
+                let source = scanDirectory.appendingPathComponent(relative)
+                guard let data = try? Data(contentsOf: source, options: .mappedIfSafe) else { continue }
+                try await BoosterHTTP.putFile(
+                    address,
+                    path: BoosterAPI.diagnosticsFile(scanID: scanID, relativePath: relative),
+                    data: data
+                )
+                files += 1
+                bytes += data.count
+            }
+            already.insert(frame.index)
+            if already.count % 20 == 0 {
+                UserDefaults.standard.set(Array(already), forKey: key)
+                message = "Sending photos: \(files) files so far..."
+            }
+        }
+        UserDefaults.standard.set(Array(already), forKey: key)
+        return (files, bytes)
+    }
 
     @Published public private(set) var isSending = false
     @Published public private(set) var message: String?
@@ -129,6 +197,13 @@ public final class DiagnosticsSender: ObservableObject {
                 sent += 1
                 bytes += data.count
             }
+            // Build 466: the frames behind the model, once per scan and Booster.
+            let frames = try await sendFrames(
+                scanID: scanID, scanDirectory: scanDirectory, address: address, boosterID: device.id
+            )
+            sent += frames.files
+            bytes += frames.bytes
+
             let megabytes = Double(bytes) / 1_000_000
             message = String(
                 format: "Sent %d file%@ (%.1f MB) to %@.%@",

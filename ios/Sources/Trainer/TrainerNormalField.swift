@@ -134,7 +134,9 @@ struct TrainerNormalField {
             guard length > 1e-6 else { continue }
             // 1 when every seed in the cell agrees; ~0.5 or less at a corner.
             let coherence = length / count
-            let confidence = Swift.min(Swift.max((coherence - 0.75) / 0.2, 0), 1)
+            // Build 466: 0.85 -> 0, 0.97 -> 1 (was 0.75 -> 0.95), so a cell that
+            // mixes a wall with what hangs on it has no say.
+            let confidence = Swift.min(Swift.max((coherence - 0.85) / 0.12, 0), 1)
                 * Swift.min(count / 4, 1)
             guard confidence > 0 else { continue }
             let normal = sum / length
