@@ -1579,3 +1579,7 @@ Training 332 s (5 m 32 s; 442: 388 s) at 16,500 rounds. Per level 9.8 / 16.4 / 2
 ### Build 444 on the Nov 9 room (scan_20261109_223238): 16,500 vs 434's 30,000
 
 Training 239 s (3 m 59 s) + 5.6 s pre-pass = 4 m 05 s total (434: 510 + 5.6 s). Per level 7.2 / 11.5 / 16.3 / 27.0 ms (heavy Nov 10 room 1.36-1.43x at every level: one scene factor). Held-out fitted 20.12 (434: 20.35), raw 19.83, SSIM 0.6774 (0.682), aligned 20.59 / 0.7006, trained 23.12 (434: ~24.0), point size 5.5 mm (5.3). Every number slightly worse in the same direction: about -0.2 dB held-out, inside the +/-0.4 run noise but treat it as small and real; it comes from the middle (720 px) cut. Profile: backward 6.01 ms (56 %), optimiser 1.64, forward 1.48, losses 1.05, sort 0.50. NOTE: the 434 census for this scan was overwritten by this run's upload (same scan folder). New MetricKit report: disk-write exception again (frame caches on disk, 4 levels, many reprocesses today); a report, not a kill.
+
+### BUILD 458: 19,500 rounds (owner's choice)
+
+Asked the owner: fit each scan to ~4:45 / keep 16,500 / more rounds over 5 min. He chose MORE ROUNDS, ACCEPT OVER 5 MIN. 19,500 rounds, levels 19 / 42 / 91 %: 3,705 at 360, 4,485 at 540, 9,555 at 720 (was 6,600), 1,755 at 1,080. Estimates from the measured per-level costs: Nov 9 room ~4 m 47 s total, Nov 10 room ~6 m 38 s. Calibrations at 8,300 still inside the 720 level (starts 8,190).

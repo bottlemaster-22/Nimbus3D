@@ -1920,7 +1920,10 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 // scan_20261109_223238 (held-out 20.35 / 0.682, 5.3 mm).
                 // Build 456: 16,500. The 1,500 rounds removed are all from the
                 // 1,080-px tail (see coarseResolutionFractions).
-                iterations: 16_500,
+                // Build 458: 19,500, owner's choice of quality over time (Nov 10):
+                // about 4 m 45 s for the Nov 9 room, 6 m 40 s for the heavier
+                // Nov 10 one. The extra 3,000 rounds are all at 720 px.
+                iterations: 19_500,
                 // Build 360: 1,080 (was 720). The exported points' median long axis
                 // stayed at 7.1 mm through every size change because a point has
                 // no reason to shrink below the pixel it is trained against, and a

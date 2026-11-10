@@ -1298,7 +1298,12 @@ struct TrainerTuning: Sendable {
     // measured curves flatten inside the first few hundred full-size rounds:
     // 434 +0.04 dB over its last 7,200, 442 +0.014 dB from 240 rounds in to
     // 2,640 rounds in.
-    var coarseResolutionFractions: [Float] = [0.22, 0.49, 0.89]
+    // Build 458: 19 / 42 / 91 % of 19,500 = 3,705 / 4,485 / 9,555 / 1,755
+    // rounds. The owner chose quality over the 5-minute line (Nov 10): the
+    // 3,000 rounds put back all go to the 720-px level, where 16,500 had
+    // cut deepest (Nov 9 room: held-out 20.12 vs 20.35 at 30,000, trained
+    // 23.1 vs 24.0).
+    var coarseResolutionFractions: [Float] = [0.19, 0.42, 0.91]
     var coarseResolutionScales: [Float] = [0.3333, 0.5, 0.6667]
     /// BUILD 338: OFF. The background preload (build 332) put a second
     /// builder to work while the active level's prefetch worker built on
