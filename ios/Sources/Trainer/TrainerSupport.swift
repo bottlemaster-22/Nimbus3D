@@ -665,7 +665,7 @@ struct TrainerTuning: Sendable {
     // records the curve and a best checkpoint that ships only if it beats
     // the end state by 0.3 dB; a 0.35 s eval every 400 rounds of the 1,080-px
     // level was about 8 s a run for that.
-    var earlyStopEvalIntervalIterations: Int = 1200
+    var earlyStopEvalIntervalIterations: Int = 600  // build 454: the 1,080-px level is 3,240 rounds; 600 keeps five points on its curve
 
     /// Stop after this many consecutive evaluations fail to beat the best
     /// held-out score by `earlyStopMinImprovementDB`.
@@ -1204,31 +1204,31 @@ struct TrainerTuning: Sendable {
     // Build 406: 12,300, early in the 720-px level (40 % of 30,000), so
     // the kernels a window keeps run for the last 60 % of the run instead of
     // the last 20 %. Away from profiled steps (iteration % 250 == 125).
-    var backwardCalibrationStart: Int = 12300
+    var backwardCalibrationStart: Int = 8300  // build 454: inside the 720-px level of 18,000 (starts at 8,100)
     var backwardCalibrationSteps: Int = 6
 
     /// Build 290: the same for the radix scatter. After the backward window,
     /// so the two never share an iteration. Build 306: this window also checks
     /// the splat-order sort against the legacy one (see `splatOrderSort`).
-    var sortCalibrationStart: Int = 12310
+    var sortCalibrationStart: Int = 8310  // build 454: inside the 720-px level of 18,000 (starts at 8,100)
     var sortCalibrationSteps: Int = 4
 
     /// Build 302: the same for the two-pixel forward rasteriser, after the
     /// sort window.
-    var forwardCalibrationStart: Int = 12316
+    var forwardCalibrationStart: Int = 8316  // build 454: inside the 720-px level of 18,000 (starts at 8,100)
     var forwardCalibrationSteps: Int = 4
 
     /// Build 304: the two-pixel backward against the backward the first
     /// window chose (plain or SIMD-summed), after the forward window. Kept
     /// only if its gradients agree (relative L1 < 1e-3) and it is at least
     /// 3 % faster.
-    var backwardTwoPixelCalibrationStart: Int = 12322
+    var backwardTwoPixelCalibrationStart: Int = 8322  // build 454: inside the 720-px level of 18,000 (starts at 8,100)
     var backwardTwoPixelCalibrationSteps: Int = 6
 
     /// Build 318: the fused SSIM blur against the two-pass one, after the
     /// two-pixel backward window. Kept only if every blurred plane matched
     /// BIT FOR BIT on every step and it was at least 3 % faster.
-    var blurCalibrationStart: Int = 12328
+    var blurCalibrationStart: Int = 8328  // build 454: inside the 720-px level of 18,000 (starts at 8,100)
     var blurCalibrationSteps: Int = 2
 
     /// Build 306: allow the splat-order tile sort (depth-sort the splats, then
@@ -1287,8 +1287,13 @@ struct TrainerTuning: Sendable {
     // size; with 450k points and SH3 they cost 10.2 ms against 17.1 at 720 px
     // (the per-point work dominates), so 7,500 of them move to 720 px for
     // about +50 s, and all growth now happens closer to working resolution.
-    var coarseResolutionFractions: [Float] = [0.15, 0.70]
-    var coarseResolutionScales: [Float] = [0.3333, 0.6667]
+    // Build 454: four steps, 360 px to 20 %, 540 px to 45 %, 720 px to 82 %,
+    // 1,080 px for the last 18 % (3,240 of 18,000 rounds). A finer ramp so
+    // each round costs what its stage needs: measured 6.9 / 14.7 / 25.7 ms
+    // a round at 360 / 720 / 1,080 px (434), about 10 at 540 by the same
+    // per-point plus per-pixel split.
+    var coarseResolutionFractions: [Float] = [0.20, 0.45, 0.82]
+    var coarseResolutionScales: [Float] = [0.3333, 0.5, 0.6667]
     /// BUILD 338: OFF. The background preload (build 332) put a second
     /// builder to work while the active level's prefetch worker built on
     /// another, the first time two frames were ever built at once for the

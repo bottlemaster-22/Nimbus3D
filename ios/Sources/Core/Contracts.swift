@@ -1843,8 +1843,8 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
         let scaleCap: Int
         switch sceneExtentMeters {
         case ..<3: scaleCap = 150_000    // one object
-        case ..<8: scaleCap = 600_000    // a room (build 448: 450k filled by round 15,000 under paced growth with points still 5.3 mm against Scaniverse's 3.4; 821 MB peak; previously build 420: 330,000 bound from round 700 of 30,000 and the trained views stopped at 26 dB, the model was short of points; builds 398-412 freed about 300 MB; previously: build 396: the proven value; 400,000 with 200 frames ran out of memory in ordinary rounds, see the journal; 382 sat at the 330,000 cap for the whole 1,080-px phase at 1.05 GB, nothing could split; the 330,000 cap bound from round 700 with 420 MB of the memory ceiling unused)
-        default: scaleCap = 600_000      // a floor or a house (build 448; previously build 420; previously build 398: the proven room envelope; 500,000 was never run at SH3 / 1,080 px)
+        case ..<8: scaleCap = 450_000    // a room (build 454: back to 450k, the cap build 434 measured; 600k was never run and every point adds per-round work; build 448: 450k filled by round 15,000 under paced growth with points still 5.3 mm against Scaniverse's 3.4; 821 MB peak; previously build 420: 330,000 bound from round 700 of 30,000 and the trained views stopped at 26 dB, the model was short of points; builds 398-412 freed about 300 MB; previously: build 396: the proven value; 400,000 with 200 frames ran out of memory in ordinary rounds, see the journal; 382 sat at the 330,000 cap for the whole 1,080-px phase at 1.05 GB, nothing could split; the 330,000 cap bound from round 700 with 420 MB of the memory ceiling unused)
+        default: scaleCap = 450_000      // a floor or a house (build 454, as rooms; build 448; previously build 420; previously build 398: the proven room envelope; 500,000 was never run at SH3 / 1,080 px)
         }
 
         switch tier {
@@ -1905,7 +1905,20 @@ public struct TrainingBudget: Codable, Hashable, Sendable {
                 // Build 398: 30,000 for EVERY scene (was 3,500 at 8 m and over;
                 // the pre-pass measures extent from a different box than the
                 // plan, so one scan could land on either side).
-                iterations: 30_000,
+                // BUILD 454: 18,000 for every scene, to bring a room under
+                // five minutes (owner, Nov 10: "no user would ever wait 10
+                // minutes"). Build 434 measured 510 s at 30,000: 31 s at
+                // 360 px, 243 s at 720 and 231 s at 1,080. Its held-out
+                // curve moved 20.30 -> 20.34 dB over the last 7,200 rounds
+                // (21,600 to 28,800), and build 338 scored the same with
+                // 2,025 full-size rounds as 330 with 4,500, so the 1,080-px
+                // tail is cut hardest (9,000 -> 3,240 rounds). The rest of
+                // the saving is fewer middle rounds plus a 540-px level (see
+                // coarseResolutionFractions). Estimated 250 s of GPU, about
+                // 4.5 minutes in all. The quality cost of the shorter middle
+                // is NOT measured yet: compare against 434 on
+                // scan_20261109_223238 (held-out 20.35 / 0.682, 5.3 mm).
+                iterations: 18_000,
                 // Build 360: 1,080 (was 720). The exported points' median long axis
                 // stayed at 7.1 mm through every size change because a point has
                 // no reason to shrink below the pixel it is trained against, and a
