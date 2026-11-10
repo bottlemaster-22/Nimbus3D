@@ -46,6 +46,10 @@ struct CaptureCoverageUniforms {
     /// x overlay opacity, y done threshold, z isolated channel (-1 for all),
     /// w unused.
     var params: SIMD4<Float>
+    /// Build 450: drawable width and height in pixels (xy).
+    var screen: SIMD4<Float>
+    /// Build 450: view UV -> camera image UV, as the background uses.
+    var textureTransform: simd_float3x3
 }
 
 struct CaptureBackgroundUniforms {
@@ -93,6 +97,8 @@ final class CaptureCoverageRenderer: NSObject, MTKViewDelegate {
         textureTransform: matrix_identity_float3x3
     )
     private var viewProjection = matrix_identity_float4x4
+    /// Build 450: for the saturation view's screen-to-image mapping.
+    private var drawablePixels = SIMD2<Float>(1, 1)
     private var cameraPosition = SIMD4<Float>(0, 0, 0, 1)
     private var hasFrame = false
 
@@ -320,6 +326,9 @@ final class CaptureCoverageRenderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
+        drawablePixels = SIMD2<Float>(
+            Float(Swift.max(view.drawableSize.width, 1)), Float(Swift.max(view.drawableSize.height, 1))
+        )
         guard
             hasFrame,
             let descriptor = view.currentRenderPassDescriptor,
@@ -361,7 +370,7 @@ final class CaptureCoverageRenderer: NSObject, MTKViewDelegate {
     }
 
     private func drawCoverage(with encoder: MTLRenderCommandEncoder) {
-        guard overlayOpacity > 0.001, let coveragePipeline else { return }
+        guard let coveragePipeline else { return }
         encoder.setRenderPipelineState(coveragePipeline)
         if let depthState { encoder.setDepthStencilState(depthState) }
 
@@ -373,8 +382,13 @@ final class CaptureCoverageRenderer: NSObject, MTKViewDelegate {
                 CaptureTuning.coverageChannelDoneThreshold,
                 Float(isolatedChannel?.rawValue ?? -1),
                 0
-            )
+            ),
+            screen: SIMD4<Float>(drawablePixels.x, drawablePixels.y, 0, 0),
+            textureTransform: backgroundUniforms.textureTransform
         )
+        // The saturation view samples the camera image (see the shader).
+        encoder.setFragmentTexture(lumaTexture, index: 0)
+        encoder.setFragmentTexture(chromaTexture, index: 1)
 
         for chunk in chunks.values where chunk.indexCount > 0 {
             encoder.setVertexBuffer(chunk.positions, offset: 0, index: 0)

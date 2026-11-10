@@ -58,6 +58,11 @@ struct CaptureCoverageUniforms {
     // z: channel to isolate, -1 for all three at once
     // w: unused
     float4   params;
+    // Build 450: the saturation view samples the camera image under each
+    // mesh fragment: drawable size in pixels (xy) and the same view-UV ->
+    // image-UV transform the background uses.
+    float4   screen;
+    float3x3 textureTransform;
 };
 
 struct CaptureBackgroundUniforms {
@@ -129,7 +134,10 @@ fragment float4 capture_background_fragment(
     );
 
     float4 rgb = ycbcrToRGB * float4(y, cbcr.x, cbcr.y, 1.0);
-    return float4(rgb.rgb, 1.0);
+    // Build 450: the world starts grey; scanned surfaces regain their colour
+    // in the coverage pass drawn over this.
+    float grey = dot(rgb.rgb, float3(0.299, 0.587, 0.114));
+    return float4(float3(grey * 0.9), 1.0);
 }
 
 // =============================================================================
@@ -175,7 +183,9 @@ constant float3 kCaptureColorUnreliable = float3(0.35, 0.78, 0.85);  // teal
 
 fragment float4 capture_coverage_fragment(
     CaptureCoverageVaryings in [[stage_in]],
-    constant CaptureCoverageUniforms &uniforms [[buffer(0)]]
+    constant CaptureCoverageUniforms &uniforms [[buffer(0)]],
+    texture2d<float, access::sample> lumaTexture   [[texture(0)]],
+    texture2d<float, access::sample> chromaTexture [[texture(1)]]
 ) {
     const float opacity   = uniforms.params.x;
     const float threshold = uniforms.params.y;
@@ -192,6 +202,36 @@ fragment float4 capture_coverage_fragment(
     float3 normal = normalize(in.worldNormal);
     float facing = clamp(abs(dot(normal, toEye)), 0.0, 1.0);
     float facingFade = mix(0.25, 1.0, facing);
+
+    // BUILD 450: THE SATURATION VIEW (the default; the coloured channel view
+    // below is kept for when one channel is isolated). The camera image is
+    // sampled under this fragment and drawn from grey towards full colour by
+    // how complete this patch of surface is: the weakest of angles, distance
+    // and sharpness against the done threshold. Unseen surface stays grey;
+    // glass and other unreliable surface tops out at half colour.
+    if (isolate < 0) {
+        constexpr sampler cameraSampler(filter::linear, address::clamp_to_edge);
+        const float2 viewUV = in.position.xy / max(uniforms.screen.xy, float2(1.0));
+        const float3 mapped = uniforms.textureTransform * float3(viewUV, 1.0);
+        const float2 uv = mapped.xy / mapped.z;
+        const float y = lumaTexture.sample(cameraSampler, uv).r;
+        const float2 cbcr = chromaTexture.sample(cameraSampler, uv).rg;
+        const float3 rgb = clamp(float3(
+            y + 1.4020 * (cbcr.y - 0.5),
+            y - 0.3441 * (cbcr.x - 0.5) - 0.7141 * (cbcr.y - 0.5),
+            y + 1.7720 * (cbcr.x - 0.5)
+        ), 0.0, 1.0);
+        const float grey = dot(rgb, float3(0.299, 0.587, 0.114));
+        float done = 0.0;
+        if (seen) {
+            const float3 c = clamp(in.coverage.xyz / max(threshold, 1e-4), 0.0, 1.0);
+            done = min(c.x, min(c.y, c.z));
+            if (unreliable) { done = min(done, 0.5); }
+        }
+        const float saturation = smoothstep(0.0, 1.0, done);
+        const float3 shade = mix(float3(grey * 0.9), rgb, saturation);
+        return float4(shade, 1.0);
+    }
 
     if (!seen) {
         return float4(kCaptureColorUnseen, opacity * 0.22 * facingFade);

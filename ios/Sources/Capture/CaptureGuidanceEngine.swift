@@ -75,6 +75,8 @@ final class CaptureGuidanceEngine {
     private let audioEngine = AVAudioEngine()
     private var toneNode: AVAudioSourceNode?
     private let synthesizer = AVSpeechSynthesizer()
+    /// Build 450: spoken guidance is off.
+    private static let speechEnabled = false
 
     /// [0] frequency in Hz, [1] amplitude 0...1, [2] phase. Written from the
     /// main actor, read from the audio render thread. See the note at the top
@@ -221,8 +223,8 @@ final class CaptureGuidanceEngine {
                         1,
                         blurPixels / (CaptureTuning.blurRedPixels * 2)
                     )
+                    // Build 450: a light haptic only; no beeping.
                     playTap(intensity: intensity)
-                    playBlip(frequency: 1_100, seconds: 0.05, amplitude: 0.18)
                 }
                 setHint(
                     Self.blurHint(exposureSeconds: exposureSeconds),
@@ -242,17 +244,13 @@ final class CaptureGuidanceEngine {
             return
         }
 
-        // 4. Window mode.
-        if let windowHint {
-            setHint(windowHint, now: now, urgent: false)
-            return
-        }
-
-        // 5. The coverage channel with the largest deficit, and its own fix.
-        if let worstChannel, !isDone {
-            setHint(worstChannel.fixHint, now: now, urgent: false)
-            return
-        }
+        // 4-5. BUILD 450: NO COACHING HINTS. The owner: "it says random shit
+        // at random times", "Window Window Window", "look around it a bit
+        // more". Coverage is shown by colour now (grey -> full colour), so the
+        // window and per-channel hints are not shown at all; only tracking
+        // trouble and moving too fast still get a line of text.
+        _ = windowHint
+        _ = worstChannel
 
         // 6. Nothing needs saying. Say nothing; do not fill the silence with
         //    a percentage the user can already see.
@@ -372,6 +370,8 @@ final class CaptureGuidanceEngine {
     // MARK: - Speech
 
     private func speak(_ text: String, now: TimeInterval) {
+        // Build 450: the scanner no longer talks. Text on screen only.
+        guard Self.speechEnabled else { return }
         lastSpokenAt = now
         lastSpokenText = text
         guard isSoundEnabled, !text.isEmpty else { return }
