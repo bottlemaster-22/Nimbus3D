@@ -1,0 +1,377 @@
+# =============================================================================
+#  XcodeGen spec for the iOS app.
+#
+#  Generate with:      cd ios && xcodegen generate
+#  Build in CI with:   xcodebuild -project ios/App.xcodeproj -scheme App \
+#                                 -configuration Release -sdk iphoneos \
+#                                 -archivePath build/App.xcarchive archive \
+#                                 CODE_SIGNING_ALLOWED=NO
+#
+#  The Xcode PROJECT / TARGET / SCHEME are deliberately called "App" so they are
+#  brand-neutral and never need renaming. The user-visible product name, the
+#  bundle id, the Bonjour service type and the on-disk folder names all come
+#  from the ONE settings group below.
+#
+#  CI note: the built product is named $(NIMBUS_PRODUCT_NAME).app, NOT App.app.
+#  Package the IPA by globbing Products/Applications/*.app so a rename never
+#  breaks the workflow.
+# =============================================================================
+
+name: App
+
+# -----------------------------------------------------------------------------
+#  BRAND BLOCK - THE ONLY PLACE THE PRODUCT IS NAMED.
+#  Change these five lines to rename the whole product. Nothing else, anywhere,
+#  hardcodes the name: Info.plist, the entitlements, and Core/BrandConfig.swift
+#  all read from here (BrandConfig reads the generated Info.plist at runtime).
+#
+#  Rules if you rename:
+#    * NIMBUS_PRODUCT_NAME  - no spaces, no punctuation. Becomes the .app bundle
+#                             name, the executable name and the .ipa name.
+#    * NIMBUS_DISPLAY_NAME  - what the user reads on the home screen. May have
+#                             spaces.
+#    * NIMBUS_BUNDLE_ID     - reverse-DNS. TOMBLINE is the brand.
+#    * NIMBUS_BRAND_SLUG    - lowercase a-z0-9 only. Used to build the Bonjour
+#                             type "_<slug>boost._tcp". DNS-SD caps a service
+#                             type label at 15 characters INCLUDING the leading
+#                             underscore, so the slug must be 9 characters or
+#                             fewer while the "boost" suffix stays.
+#    * NIMBUS_DOCS_FOLDER   - the folder created under ~/Documents on the phone
+#                             and under Documents/ on the PC Booster.
+# -----------------------------------------------------------------------------
+settingGroups:
+  brand:
+    NIMBUS_PRODUCT_NAME: LiKOVA
+    NIMBUS_DISPLAY_NAME: LiKOVA
+    NIMBUS_BUNDLE_ID: com.tombline.likova
+    NIMBUS_BRAND_SLUG: likova
+    NIMBUS_DOCS_FOLDER: LiKOVA
+    # Derived - do not edit these two; they exist so the value is written once.
+    NIMBUS_BOOSTER_SERVICE_TYPE: _$(NIMBUS_BRAND_SLUG)boost._tcp
+    NIMBUS_MARKETING_VERSION: 0.1.0
+    # LOCAL DEFAULT ONLY. CI OVERRIDES THIS AND MUST KEEP DOING SO.
+    #
+    # `.github/workflows/ios.yml` passes
+    # `CURRENT_PROJECT_VERSION=${{ github.run_number }}` on the xcodebuild
+    # command line, which beats this value. That matters because
+    # CFBundleVersion is the ONLY field an update manifest can use to say "this
+    # build is newer than that one", and it sat hardcoded at 1 for the first
+    # seven builds. Every one of them reported CFBundleVersion 1 with a
+    # different binary inside, so nothing downstream could tell them apart and
+    # the Bottle sideload pipeline could not do update detection at all.
+    #
+    # If you ever build locally, expect 1. If CI ever produces 1, the override
+    # has been lost and update detection is broken again.
+    NIMBUS_BUILD_NUMBER: 1
+
+    # The commit the binary was built from, short form. CI overrides it.
+    #
+    # This exists because of a real incident. Seven builds all reported
+    # `0.1.0 (1)` and there was NO way, on the phone or in a crash report,
+    # to tell which one was installed. A bug was reported against a build
+    # three releases behind its own fix and neither side could see it. A
+    # build number alone would not have been enough: the ambiguity was
+    # only resolved afterwards by matching Mach-O UUIDs against the
+    # release artefacts. The commit is the thing that maps a running app
+    # back to source, so it is now on screen.
+    NIMBUS_SOURCE_REVISION: dev
+
+    # Development self-update, injected by CI from GitHub secrets and
+    # EMPTY here on purpose. An empty endpoint or token means
+    # BrandConfig.selfUpdate is nil and the feature does not exist in the
+    # build, which is how a local build gets no update UI and how the
+    # feature is stripped later: clear the secrets, or delete these two
+    # lines with SelfUpdateService.swift and its Section in BoosterTabView.
+    #
+    # The token is NOT written here. It ships inside the binary once CI
+    # injects it, which is a real exposure and is argued for at the top of
+    # SelfUpdateService.swift; putting it in source control as well would
+    # be exposure with nothing bought for it.
+    NIMBUS_SELFUPDATE_URL: ""
+    NIMBUS_SELFUPDATE_TOKEN: ""
+
+options:
+  bundleIdPrefix: com.tombline
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+  groupSortPosition: top
+  xcodeVersion: "16.0"
+
+# No Swift Package / CocoaPods / Carthage dependencies at all.
+# Pure Swift + Metal + Apple system frameworks, so CI has nothing to resolve,
+# nothing to cross-compile, and no reason to fail. Keep it that way.
+packages: {}
+
+configs:
+  Debug: debug
+  Release: release
+
+targets:
+  App:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+
+    settings:
+      groups:
+        - brand
+      base:
+        PRODUCT_NAME: $(NIMBUS_PRODUCT_NAME)
+        PRODUCT_BUNDLE_IDENTIFIER: $(NIMBUS_BUNDLE_ID)
+        MARKETING_VERSION: $(NIMBUS_MARKETING_VERSION)
+        CURRENT_PROJECT_VERSION: $(NIMBUS_BUILD_NUMBER)
+
+        # iPhone only. 1 = iPhone/iPod. No iPad, no Mac Catalyst, no visionOS.
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
+
+        # Swift 5.10 toolchain, language mode 5.
+        # NOTE: SWIFT_VERSION is the LANGUAGE MODE and only accepts 4.0 / 4.2 /
+        # 5.0 / 6.0 - "5.10" is not a legal value and makes Xcode fail the
+        # build. Xcode 16 ships a Swift 6 compiler running in mode 5, which is
+        # what "Swift 5.10" means for us in practice.
+        SWIFT_VERSION: "5.0"
+        # "targeted", not "complete": every contract here is Sendable, but ARKit
+        # and Metal types are not all Sendable yet and "complete" would drown
+        # eleven modules in warnings that hide the real ones.
+        SWIFT_STRICT_CONCURRENCY: targeted
+        SWIFT_EMIT_LOC_STRINGS: YES
+
+        # Metal shaders. Every .metal file under Sources/ is compiled into the
+        # default.metallib automatically by the compile-sources phase.
+        # The app icon, Assets.xcassets/AppIcon.appiconset. A single
+        # 1024x1024 with no alpha channel, which is all iOS has needed
+        # since Xcode 14; the old ladder of a dozen sizes is generated.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+        MTL_LANGUAGE_REVISION: Metal30
+        MTL_FAST_MATH: YES
+
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+        GCC_WARN_UNDECLARED_SELECTOR: YES
+        CLANG_WARN_DOCUMENTATION_COMMENTS: YES
+        DEAD_CODE_STRIPPING: YES
+
+        CODE_SIGN_ENTITLEMENTS: Support/App.entitlements
+        INFOPLIST_FILE: Support/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+
+      configs:
+        Debug:
+          MTL_ENABLE_DEBUG_INFO: INCLUDE_SOURCE
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+        Release:
+          MTL_ENABLE_DEBUG_INFO: NO
+          SWIFT_OPTIMIZATION_LEVEL: "-O"
+          SWIFT_COMPILATION_MODE: wholemodule
+          VALIDATE_PRODUCT: YES
+
+    # -------------------------------------------------------------------------
+    #  Module tree. One directory per owning agent; see CONTRACTS.md.
+    #  A module may add Swift and .metal files inside its own directory and
+    #  nowhere else.
+    # -------------------------------------------------------------------------
+    #  EVERY MODULE DIRECTORY NOW EXISTS AND NONE OF THEM IS OPTIONAL.
+    #
+    #  `optional: true` means "skip this directory if it is not on disk yet".
+    #  It was on six of these while their agents were still writing them,
+    #  because XcodeGen hard-errors on a missing source path and one unwritten
+    #  module would have broken `xcodegen generate` for everybody. All twelve
+    #  have landed (Pipeline joined them last), so the flag is gone: if a
+    #  directory ever vanishes, CI must fail loudly rather than quietly
+    #  archiving an app with a hole in it.
+    #
+    #  Each directory is listed with the `name` it appears under in Xcode's
+    #  navigator. Every `.swift` AND `.metal` file inside is picked up
+    #  recursively and added to the compile-sources phase, which is what puts
+    #  the three shader files into `default.metallib`. There is no separate
+    #  Metal build phase to keep in sync, and there must not be one.
+    sources:
+      # Shared contracts, brand config, math conventions. NOT dependency-free:
+      # Contracts.swift borrows SHDegree, SplatCloud and ExportFormat from
+      # Sources/Export and BoosterJobStage from Sources/Booster (and extends
+      # SHDegree with Codable). That is legal only because this is one Xcode
+      # target with no module boundary, so Core cannot be split out as-is.
+      - path: Sources/Core
+        name: Core
+      # App shell: @main, root flow, tab container, service registry.
+      - path: Sources/App
+        name: App
+      # First-launch device compatibility gate + tier explanation screens.
+      - path: Sources/Onboarding
+        name: Onboarding
+      # ARKit/LiDAR session, sidecar logging, coverage HUD, haptics and audio.
+      # Metal: CaptureCoverageShaders.metal
+      - path: Sources/Capture
+        name: Capture
+      # No-training pre-pass: submaps, loop closure, carving, trust, QC card.
+      - path: Sources/PrePass
+        name: PrePass
+      # On-device 3DGS: Metal rasterizer + optimizer.
+      # Metal: TrainerShaders.metal
+      - path: Sources/Trainer
+        name: Trainer
+      # The processing flow: the coordinator that drives PrePass then Trainer
+      # for one scan, the budget it sizes from the device and the scan itself,
+      # and the "Finish this scan" screen that starts it.
+      - path: Sources/Pipeline
+        name: Pipeline
+      # Smart losses, background model, trust field, edge classifier.
+      - path: Sources/Smart
+        name: Smart
+      # Preview renderer, honesty mask, A/B slider, artifact heatmap.
+      # Metal: SplatRenderShaders.metal
+      - path: Sources/Viewer
+        name: Viewer
+      # PLY / SPZ / COLMAP writers.
+      - path: Sources/Export
+        name: Export
+      # Bonjour discovery, pairing, chunked upload, job stream (iOS client).
+      - path: Sources/Booster
+        name: Booster
+      # THE PRIVACY MANIFEST, which was written months ago and then never
+      # referenced by anything, so it has been sitting in Support/ and NOT
+      # going into the bundle. Apple has required it for submission since
+      # May 2024, and a manifest that is not in the app is the same as no
+      # manifest at all.
+      #
+      # `buildPhase: resources` is load-bearing: without it XcodeGen puts a
+      # file in the compile-sources phase, and the build would either fail
+      # or silently drop it. It has to land at the bundle root under its
+      # own name, which a resource copy of a single file does.
+      - path: Support/PrivacyInfo.xcprivacy
+        buildPhase: resources
+      # Bundled assets. NO LONGER optional: it holds Assets.xcassets, which
+      # holds the app icon, and a build that silently shipped without an icon
+      # is not a build anyone wants. It was optional while the folder was
+      # empty, because git does not track empty folders and it was genuinely
+      # absent on a fresh CI checkout.
+      - path: Resources
+        name: Resources
+
+    # -------------------------------------------------------------------------
+    #  Info.plist, generated by XcodeGen into Support/Info.plist.
+    # -------------------------------------------------------------------------
+    info:
+      path: Support/Info.plist
+      properties:
+        CFBundleName: $(NIMBUS_PRODUCT_NAME)
+        CFBundleDisplayName: $(NIMBUS_DISPLAY_NAME)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleExecutable: $(EXECUTABLE_NAME)
+        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
+        CFBundlePackageType: APPL
+        LSRequiresIPhoneOS: true
+
+        # --- Read by Core/BrandConfig.swift so no Swift file hardcodes a name.
+        NBBrandDisplayName: $(NIMBUS_DISPLAY_NAME)
+        NBBrandProductName: $(NIMBUS_PRODUCT_NAME)
+        NBBrandSlug: $(NIMBUS_BRAND_SLUG)
+        NBBoosterServiceType: $(NIMBUS_BOOSTER_SERVICE_TYPE)
+        NBDocumentsFolderName: $(NIMBUS_DOCS_FOLDER)
+        NBSourceRevision: $(NIMBUS_SOURCE_REVISION)
+        NBSelfUpdateURL: $(NIMBUS_SELFUPDATE_URL)
+        NBSelfUpdateToken: $(NIMBUS_SELFUPDATE_TOKEN)
+
+        # --- Orientation. Capture is handheld portrait; preview may rotate.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UILaunchScreen:
+          UIColorName: ""
+        UIApplicationSupportsIndirectInputEvents: true
+        UIViewControllerBasedStatusBarAppearance: true
+
+        # --- Hard device requirements. The installer honours these, so a phone
+        #     without ARKit or Metal cannot install a build that can only
+        #     disappoint it. LiDAR itself has no capability key, which is
+        #     exactly why the Onboarding compatibility gate exists.
+        UIRequiredDeviceCapabilities:
+          - arkit
+          - metal
+          - arm64
+
+        # --- Files. Scans are user data; let them reach the Files app.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+
+        # --- Permission strings. Plain language, specific, no jargon.
+        #     There is deliberately NO NSMicrophoneUsageDescription: the ARKit
+        #     session sets providesAudioData = false and nothing in this app
+        #     records audio, so the microphone permission is never requested and
+        #     the string must not exist. An unused usage string is both an App
+        #     Store review rejection and a privacy smell. Audio GUIDANCE is
+        #     output only (AVAudioEngine playback) and needs no permission.
+        NSCameraUsageDescription: >-
+          The camera is how this app sees your space. It records the photos that
+          become your 3D scan. Nothing is uploaded anywhere.
+        NSMotionUsageDescription: >-
+          Motion data tells the app how fast you are turning, so it can warn you
+          when a shot will come out blurry and keep the scan lined up properly.
+        #     There is deliberately NO NSPhotoLibraryAddUsageDescription
+        #     either, for the same reason. Nothing in the app writes to the
+        #     photo library today: the only sharing it does is a share sheet
+        #     over an exported .ply / .spz / .glb / .zip file, and none of
+        #     those can go to Photos. Add the key back in the same commit that
+        #     adds a "save a picture of this scan" button, and not before.
+        NSLocalNetworkUsageDescription: >-
+          Used to find your PC on your own Wi-Fi so it can help finish a large
+          scan, and in development builds to reach the update relay on the same
+          network. Your scans stay on your local network.
+        # DEVELOPMENT ONLY, and it goes when SelfUpdateService does.
+        # Cleartext HTTP to a private address, because the update relay on the
+        # owner's own Wi-Fi speaks plain HTTP and has no certificate anyone
+        # could validate. This key allows local addresses ONLY; it does not
+        # weaken transport security for anything on the internet, which is
+        # what a blanket NSAllowsArbitraryLoads would have done.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        NSBonjourServices:
+          - $(NIMBUS_BOOSTER_SERVICE_TYPE)
+          # DEVELOPMENT ONLY, and it goes when SelfUpdateService does. The
+          # over-the-air update reaches a relay on the owner's own Wi-Fi at
+          # `bottle-relay.local`, and resolving a plain `.local` HTTP host
+          # needs `_http._tcp` declared here or the lookup fails silently with
+          # no permission prompt and no error.
+          - _http._tcp
+
+    # -------------------------------------------------------------------------
+    #  Entitlements.
+    # -------------------------------------------------------------------------
+    entitlements:
+      path: Support/App.entitlements
+      properties:
+        # Large scans allocate far past the normal per-app cap. These raise it
+        # on 6 GB+ devices.
+        #
+        # HONEST WARNING - read this before filing a bug. An entitlement must be
+        # present in the provisioning profile that signs the build. A FREE
+        # personal Apple ID team cannot enable increased-memory-limit, so a
+        # sideloaded re-sign will either strip it or fail outright.
+        # TrainingBudget must therefore NEVER assume it was granted: measure the
+        # real ceiling at runtime with os_proc_available_memory() and degrade.
+        # If sideloading fails on signing, delete these two keys; nothing else
+        # in the app breaks.
+        com.apple.developer.kernel.increased-memory-limit: true
+        com.apple.developer.kernel.extended-virtual-addressing: true
+
+schemes:
+  App:
+    build:
+      targets:
+        App: all
+    run:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

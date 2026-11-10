@@ -1,0 +1,9 @@
+   266 shipped                    train entries render-blur p50 1.09 p90 1.55 px | >1px  71/108 | qc.weight mean 0.631
+   lookahead 0 N=120              train entries render-blur p50 1.46 p90 2.55 px | >1px  84/108 | qc.weight mean 0.546
+   lookahead 0 N=130              train entries render-blur p50 1.45 p90 2.37 px | >1px  91/117 | qc.weight mean 0.562
+   lookahead 0 N=140              train entries render-blur p50 1.43 p90 2.44 px | >1px  93/126 | qc.weight mean 0.561
+   lookahead 0 N=150              train entries render-blur p50 1.50 p90 2.71 px | >1px 100/135 | qc.weight mean 0.547
+lookahead 0 N=130                  n 130 (130 dist) tr 117 (117 dist) ho 13 leak 0 | span   0..544 | views/G 14.94 <=3  6.13% 0v  0.03% | ang med  27.8 | visits/kf  34.2 per distinct  34.2 | visits/G mean    511 p10   171 | slices 1
+lookahead 0 N=140                  n 140 (140 dist) tr 126 (126 dist) ho 14 leak 0 | span   0..589 | views/G 15.36 <=3  6.17% 0v  0.02% | ang med  28.6 | visits/kf  31.7 per distinct  31.7 | visits/G mean    488 p10   159 | slices 1
+lookahead 0 N=150                  n 150 (150 dist) tr 135 (135 dist) ho 15 leak 0 | span   0..602 | views/G 16.21 <=3  4.67% 0v  0.04% | ang med  29.3 | visits/kf  29.6 per distinct  29.6 | visits/G mean    480 p10   148 | slices 1
+done

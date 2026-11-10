@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    PRIVACY MANIFEST. Mandatory for App Store submission since May 2024.
+
+    Written early, while the code is fresh, because the alternative is auditing
+    125 files later for API calls nobody remembers making. Every entry below was
+    verified by grepping the actual source, not assumed:
+
+      UserDefaults          DeviceReportStore, onboarding completion, Booster pairing
+      File timestamps       scan folders, census files, ScanLibraryStore
+      Disk space            the capture storage guard and TrainingBudget
+
+    NOTHING IS COLLECTED. This app has no account, no login, no analytics, no
+    third-party SDKs. Scans, photographs, depth measurements and models never
+    leave the device unless the user sends them to their own computer. That is
+    why NSPrivacyCollectedDataTypes is empty, and it is a genuinely strong
+    position at review rather than a shortcut.
+
+    ONE EXCEPTION, AND IT MUST NOT SHIP. This file used to say there were no
+    network calls except to a PC on the user's own Wi-Fi. That stopped being
+    true when the over-the-air self-update went in: Sources/Booster/
+    SelfUpdateService.swift posts the bundle id, the installed build number
+    and the phone's LAN address to a build broker on the internet. It
+    collects nothing about the user and it is development-only, compiled in
+    only when CI injects an endpoint, but it is still a call off the local
+    network and this file is where that gets admitted.
+
+    BEFORE ANY SUBMISSION: strip SelfUpdateService.swift and its section in
+    BoosterTabView, then delete this paragraph. The two go together.
+
+    If anything else ever stops being true, this file must change in the same
+    commit.
+-->
+<plist version="1.0">
+<dict>
+    <!-- No tracking, no tracking domains. -->
+    <key>NSPrivacyTracking</key>
+    <false/>
+    <key>NSPrivacyTrackingDomains</key>
+    <array/>
+
+    <!-- Nothing is collected, so nothing is declared. -->
+    <key>NSPrivacyCollectedDataTypes</key>
+    <array/>
+
+    <key>NSPrivacyAccessedAPITypes</key>
+    <array>
+        <!--
+            UserDefaults. CA92.1: read and write only within the app's own
+            container, never an app group, never shared with anything.
+        -->
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>CA92.1</string>
+            </array>
+        </dict>
+
+        <!--
+            File timestamps. C617.1: timestamps of files inside the app's own
+            container, to sort the scan library newest first and to tell whether
+            a census file belongs to the scan beside it.
+        -->
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>C617.1</string>
+            </array>
+        </dict>
+
+        <!--
+            Disk space. E174.1: checked before and during a capture so the app
+            can stop cleanly and say so, rather than filling the phone and
+            failing to write the scan it just spent three minutes recording.
+        -->
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryDiskSpace</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>E174.1</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

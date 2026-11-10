@@ -1,0 +1,39 @@
+TARGET  p10 1.327 p50 3.388 p90 11.825  spread 8.913x  sd 0.6361
+"cover" is total disc face area relative to the 150k seed set; 1.00 means the model still covers the room as well as the seeds did.
+"miss" is the RMS distance from the target in decades over p10/p50/p90; 0 is a perfect match.
+
+--- relocation: as an else-branch (current) vs as its own pass ----
+current head                             p10   6.716 p50  10.002 p90   14.322  spread    2.132x  sd 0.1271  reloc       0 split   30937 clone  123671  cover  4.21x  miss 0.491 dec
+reloc made unconditional, frac 0.05      p10   2.593 p50   5.776 p90   11.550  spread    4.454x  sd 0.2474  reloc  328261 split   30937 clone  123671  cover  1.69x  miss 0.215 dec
+reloc unconditional, frac 0.10           p10   2.004 p50   4.176 p90   10.239  spread    5.109x  sd 0.2667  reloc  457999 split   30937 clone  123671  cover  1.11x  miss 0.121 dec
+reloc unconditional, frac 0.20           p10   2.004 p50   4.176 p90   10.239  spread    5.109x  sd 0.2667  reloc  457999 split   30937 clone  123671  cover  1.11x  miss 0.121 dec
+reloc unconditional, donors unlimited    p10   3.972 p50   8.848 p90   13.826  spread    3.480x  sd 0.2121  reloc  328261 split   30937 clone  123671  cover  3.21x  miss 0.367 dec
+reloc uncond .20 + donors unlimited      p10   1.455 p50   4.046 p90   11.747  spread    8.074x  sd 0.3455  reloc 1313063 split   30937 clone  123671  cover  1.45x  miss 0.050 dec
+
+--- searching for the setting that lands ON the target ------------
+  share 0.6 shrink 1.6             p10   4.348 p50   7.518 p90   12.932 spread   2.974x cover  2.85x  miss 0.359 dec
+  share 0.6 shrink 1.6 +reloc      p10   1.479 p50   3.536 p90    8.349 spread   5.645x cover  0.89x  miss 0.092 dec
+  share 0.6 shrink 1.8             p10   3.509 p50   6.751 p90   12.884 spread   3.672x cover  2.60x  miss 0.300 dec
+  share 0.6 shrink 1.8 +reloc      p10   0.977 p50   2.700 p90    7.532 spread   7.712x cover  0.71x  miss 0.148 dec
+  share 0.6 shrink 2.0             p10   2.865 p50   6.106 p90   12.869 spread   4.491x cover  2.43x  miss 0.244 dec
+  share 0.6 shrink 2.0 +reloc      p10   0.658 p50   2.146 p90    6.843 spread  10.398x cover  0.61x  miss 0.251 dec
+  share 0.6 shrink 2.2             p10   2.375 p50   5.562 p90   12.866 spread   5.417x cover  2.30x  miss 0.193 dec
+  share 0.6 shrink 2.2 +reloc      p10   0.459 p50   1.759 p90    6.245 spread  13.621x cover  0.54x  miss 0.352 dec
+  share 0.8 shrink 1.6             p10   3.333 p50   6.575 p90   12.733 spread   3.820x cover  2.51x  miss 0.285 dec
+  share 0.8 shrink 1.6 +reloc      p10   1.041 p50   2.724 p90    7.464 spread   7.171x cover  0.71x  miss 0.141 dec
+  share 0.8 shrink 1.8             p10   2.543 p50   5.752 p90   12.691 spread   4.989x cover  2.27x  miss 0.211 dec
+  share 0.8 shrink 1.8 +reloc      p10   0.619 p50   1.943 p90    6.621 spread  10.700x cover  0.57x  miss 0.278 dec
+  share 0.8 shrink 2.0             p10   2.000 p50   5.132 p90   12.675 spread   6.337x cover  2.13x  miss 0.147 dec
+  share 0.8 shrink 2.0 +reloc      p10   0.388 p50   1.444 p90    5.969 spread  15.370x cover  0.49x  miss 0.412 dec
+  share 0.8 shrink 2.2             p10   1.617 p50   4.649 p90   12.673 spread   7.835x cover  2.03x  miss 0.095 dec
+  share 0.8 shrink 2.2 +reloc      p10   0.252 p50   1.093 p90    5.418 spread  21.459x cover  0.45x  miss 0.540 dec
+  share 1.0 shrink 1.6             p10   2.426 p50   5.882 p90   12.573 spread   5.183x cover  2.27x  miss 0.206 dec
+  share 1.0 shrink 1.6 +reloc      p10   0.676 p50   2.090 p90    6.758 spread   9.992x cover  0.60x  miss 0.251 dec
+  share 1.0 shrink 1.8             p10   1.696 p50   4.989 p90   12.524 spread   7.382x cover  2.06x  miss 0.116 dec
+  share 1.0 shrink 1.8 +reloc      p10   0.361 p50   1.398 p90    5.849 spread  16.207x cover  0.48x  miss 0.432 dec
+  share 1.0 shrink 2.0             p10   1.234 p50   4.328 p90   12.509 spread  10.140x cover  1.93x  miss 0.066 dec
+  share 1.0 shrink 2.0 +reloc      p10   0.206 p50   0.984 p90    5.194 spread  25.166x cover  0.42x  miss 0.597 dec
+  share 1.0 shrink 2.2             p10   0.926 p50   3.828 p90   12.504 spread  13.508x cover  1.84x  miss 0.096 dec
+  share 1.0 shrink 2.2 +reloc      p10   0.124 p50   0.723 p90    4.699 spread  38.006x cover  0.39x  miss 0.747 dec
+
+CLOSEST: share 1.0 shrink 2.0  miss 0.066 decades  spread 10.140x  coverage 1.93x

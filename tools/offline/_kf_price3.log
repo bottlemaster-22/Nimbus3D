@@ -1,0 +1,15 @@
+266 shipped N=120: reasons {'first': 1, 'R': 108, 'M': 8, 'MR': 3} | fallback False | authority builds 215 | tiles/entry +0.0% | held-out [18, 47, 94, 131, 164, 209, 233, 294, 328, 355, 394, 421]
+   266 shipped N=120              train entries render-blur p50 1.09 p90 1.55 px | >1px  71/108 | qc.weight mean 0.631
+monotonic N=120: reasons {'first': 1, 'R': 110, 'M': 8, 'MR': 1} | fallback False | authority builds 244 | tiles/entry +14.7% | held-out [15, 25, 48, 104, 127, 153, 173, 206, 236, 262, 294, 328]
+   monotonic N=120                train entries render-blur p50 1.23 p90 2.31 px | >1px  76/108 | qc.weight mean 0.626
+monotonic N=120                    n 120 (120 dist) tr 108 (108 dist) ho 12 leak 0 | span   0..332 | views/G 18.46 <=3  3.11% 0v  0.03% | ang med  23.6 | visits/kf  37.0 per distinct  37.0 | visits/G mean    684 p10   222 | slices 1
+monotonic N=130: reasons {'first': 1, 'R': 115, 'MR': 6, 'M': 8} | fallback False | authority builds 1281 | tiles/entry +14.0% | held-out [15, 25, 48, 94, 120, 152, 169, 205, 235, 261, 287, 327, 337]
+   monotonic N=130                train entries render-blur p50 1.26 p90 2.31 px | >1px  84/117 | qc.weight mean 0.621
+monotonic N=130                    n 130 (130 dist) tr 117 (117 dist) ho 13 leak 0 | span   0..341 | views/G 19.83 <=3  3.10% 0v  0.03% | ang med  23.5 | visits/kf  34.2 per distinct  34.2 | visits/G mean    678 p10   205 | slices 1
+monotonic N=140: reasons {'first': 1, 'R': 122, 'M': 9, 'MR': 8} | fallback False | authority builds 1370 | tiles/entry +10.3% | held-out [15, 25, 47, 93, 112, 151, 168, 204, 234, 260, 280, 326, 336, 356]
+   monotonic N=140                train entries render-blur p50 1.26 p90 2.29 px | >1px  92/126 | qc.weight mean 0.620
+monotonic N=140                    n 140 (140 dist) tr 126 (126 dist) ho 14 leak 0 | span   0..370 | views/G 20.39 <=3  3.25% 0v  0.03% | ang med  23.4 | visits/kf  31.7 per distinct  31.7 | visits/G mean    647 p10   190 | slices 1
+monotonic N=150: reasons {'first': 1, 'R': 130, 'M': 15, 'MR': 4} | fallback False | authority builds 3696 | tiles/entry +1.7% | held-out [15, 25, 46, 87, 111, 163, 190, 217, 239, 265, 311, 331, 341, 380, 401]
+   monotonic N=150                train entries render-blur p50 1.30 p90 2.17 px | >1px  95/135 | qc.weight mean 0.586
+monotonic N=150                    n 150 (150 dist) tr 135 (135 dist) ho 15 leak 0 | span   0..405 | views/G 19.53 <=3  2.72% 0v  0.03% | ang med  23.6 | visits/kf  29.6 per distinct  29.6 | visits/G mean    579 p10   178 | slices 1
+done
